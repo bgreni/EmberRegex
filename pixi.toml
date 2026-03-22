@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Brian Grenier <grenierb96@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "emberregex"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+test = { cmd = "python3 run_test.py" }
+build = { cmd = "mojo build emberregex/__init__.mojo -o emberregex"}
+bench = { cmd = "mojo -I . bench/bench_basic.mojo" }
+bench_ext = { cmd = "mojo -I . bench/bench_extended.mojo" }
+bench_all = {depends-on=["bench", "bench_ext"]}
+
+[dependencies]
+mojo = ">=0.26.3.0.dev2026032005,<0.27"
