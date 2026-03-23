@@ -11,6 +11,7 @@ build = { cmd = "mojo build emberregex/__init__.mojo -o emberregex"}
 bench = { cmd = "mojo -I . bench/bench_basic.mojo" }
 bench_ext = { cmd = "mojo -I . bench/bench_extended.mojo" }
 bench_all = {depends-on=["bench", "bench_ext"]}
+compare = { cmd = "python3 bench/bench_compare.py" }
 
 [dependencies]
 mojo = ">=0.26.3.0.dev2026032005,<0.27"

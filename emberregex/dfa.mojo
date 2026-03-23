@@ -24,11 +24,6 @@ struct _DFAState(Copyable, Movable):
         self.is_match = is_match
         self.nfa_states = nfa_states^
 
-    def __init__(out self, *, copy: Self):
-        self.transitions = copy.transitions.copy()
-        self.is_match = copy.is_match
-        self.nfa_states = copy.nfa_states.copy()
-
 
 struct LazyDFA(Copyable, Movable):
     """Persistent lazy DFA with cached state transitions.
@@ -45,11 +40,6 @@ struct LazyDFA(Copyable, Movable):
         self.states = List[_DFAState]()
         self.state_map = Dict[String, Int]()
         self._initialized = False
-
-    def __init__(out self, *, copy: Self):
-        self.states = copy.states.copy()
-        self.state_map = copy.state_map.copy()
-        self._initialized = copy._initialized
 
     def _ensure_init(mut self, nfa: NFA):
         if self._initialized:

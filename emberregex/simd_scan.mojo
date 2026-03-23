@@ -1,31 +1,34 @@
 """SIMD-accelerated byte scanning.
 
-Uses SIMD vector operations to scan 16 bytes at a time for
-finding literal prefix positions in input strings.
+Uses SIMD vector operations to scan simd_width_of[DType.uint8]() bytes at a
+time for finding literal prefix positions in input strings.
 """
+
+from std.sys import simd_width_of
 
 
 def simd_find_byte(input: String, byte_val: UInt8, start: Int) -> Int:
     """Find the first occurrence of byte_val in input starting from start.
 
-    Uses SIMD to scan 16 bytes at a time, with scalar fallback for
-    the tail and for compile-time evaluation.
+    Uses SIMD to scan simd_width_of[DType.uint8]() bytes at a time,
+    with scalar fallback for the tail.
     """
+    comptime W = simd_width_of[DType.uint8]()
     var length = len(input)
     var i = start
     var ptr = input.unsafe_ptr()
 
-    var target = SIMD[DType.uint8, 16](byte_val)
+    var target = SIMD[DType.uint8, W](byte_val)
 
-    # SIMD scan 16 bytes at a time
-    while i + 16 <= length:
-        var chunk = (ptr + i).load[width=16]()
+    # SIMD scan W bytes at a time
+    while i + W <= length:
+        var chunk = (ptr + i).load[width=W]()
         # Quick reject: XOR with target; zero byte means match
         if (chunk ^ target).reduce_min() == 0:
-            for j in range(16):
+            for j in range(W):
                 if chunk[j] == byte_val:
                     return i + j
-        i += 16
+        i += W
 
     # Scalar tail
     while i < length:

@@ -23,6 +23,12 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
     def has(self, flag: Int) -> Bool:
         return (self.value & flag) != 0
 
+    def __eq__(self, other: Self) -> Bool:
+        return self.value == other.value
+
+    def __ne__(self, other: Self) -> Bool:
+        return self.value != other.value
+
     def ignorecase(self) -> Bool:
         return self.has(Self.IGNORECASE)
 

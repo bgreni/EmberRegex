@@ -33,6 +33,8 @@ struct AnchorKind:
     comptime EOL = 1  # End of line/string ($)
     comptime WORD_BOUNDARY = 2  # \b
     comptime NOT_WORD_BOUNDARY = 3  # \B
+    comptime BOL_MULTILINE = 4  # ^ with MULTILINE — matches after \n too
+    comptime EOL_MULTILINE = 5  # $ with MULTILINE — matches before \n too
 
 
 struct ASTNode(Copyable, Movable):
@@ -61,89 +63,67 @@ struct ASTNode(Copyable, Movable):
         self.negated = False
         self.anchor_type = -1
 
-    def __init__(out self, *, copy: Self):
-        self.kind = copy.kind
-        self.char_value = copy.char_value
-        self.quantifier_min = copy.quantifier_min
-        self.quantifier_max = copy.quantifier_max
-        self.greedy = copy.greedy
-        self.group_index = copy.group_index
-        self.charset_index = copy.charset_index
-        self.children = copy.children.copy()
-        self.negated = copy.negated
-        self.anchor_type = copy.anchor_type
-
     @staticmethod
-    def literal(ch: UInt32) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.LITERAL)
+    def literal(ch: UInt32, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.LITERAL)
         node.char_value = ch
-        return node^
 
     @staticmethod
     def dot() -> ASTNode:
         return ASTNode(ASTNodeKind.DOT)
 
     @staticmethod
-    def char_class(charset_idx: Int, negated: Bool) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.CHAR_CLASS)
+    def char_class(charset_idx: Int, negated: Bool, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.CHAR_CLASS)
         node.charset_index = charset_idx
         node.negated = negated
-        return node^
 
     @staticmethod
-    def alternation(children: List[Int]) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.ALTERNATION)
-        node.children = children.copy()
-        return node^
+    def alternation(var children: List[Int], out node: ASTNode):
+        node = ASTNode(ASTNodeKind.ALTERNATION)
+        node.children = children^
 
     @staticmethod
-    def concat(children: List[Int]) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.CONCAT)
-        node.children = children.copy()
-        return node^
+    def concat(var children: List[Int], out node: ASTNode):
+        node = ASTNode(ASTNodeKind.CONCAT)
+        node.children = children^
 
     @staticmethod
-    def quantifier(child: Int, min_rep: Int, max_rep: Int, greedy: Bool) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.QUANTIFIER)
+    def quantifier(child: Int, min_rep: Int, max_rep: Int, greedy: Bool, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.QUANTIFIER)
         node.children = [child]
         node.quantifier_min = min_rep
         node.quantifier_max = max_rep
         node.greedy = greedy
-        return node^
 
     @staticmethod
-    def group(child: Int, group_index: Int) -> ASTNode:
+    def group(child: Int, group_index: Int, out node: ASTNode):
         """Create a group node. group_index=-1 for non-capturing."""
-        var node = ASTNode(ASTNodeKind.GROUP)
+        node = ASTNode(ASTNodeKind.GROUP)
         node.children = [child]
         node.group_index = group_index
-        return node^
 
     @staticmethod
-    def anchor(anchor_type: Int) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.ANCHOR)
+    def anchor(anchor_type: Int, out node: ASTNode) :
+        node = ASTNode(ASTNodeKind.ANCHOR)
         node.anchor_type = anchor_type
-        return node^
 
     @staticmethod
-    def lookahead(child: Int, negated: Bool) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.LOOKAHEAD)
+    def lookahead(child: Int, negated: Bool, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.LOOKAHEAD)
         node.children = [child]
         node.negated = negated
-        return node^
 
     @staticmethod
-    def lookbehind(child: Int, negated: Bool) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.LOOKBEHIND)
+    def lookbehind(child: Int, negated: Bool, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.LOOKBEHIND)
         node.children = [child]
         node.negated = negated
-        return node^
 
     @staticmethod
-    def backreference(group_index: Int) -> ASTNode:
-        var node = ASTNode(ASTNodeKind.BACKREFERENCE)
+    def backreference(group_index: Int, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.BACKREFERENCE)
         node.group_index = group_index
-        return node^
 
 
 struct AST(Movable):

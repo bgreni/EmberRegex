@@ -1,5 +1,9 @@
 """Character set representation with SIMD-accelerated ASCII membership testing."""
 
+# 32 bytes = 256 bits: one bit per possible byte value (0–255).
+# This is a semantic constant (the size of the lookup table), not a hardware SIMD width.
+comptime BITMAP_WIDTH = 32
+
 
 @fieldwise_init
 struct CharRange(ImplicitlyCopyable, Movable):
@@ -20,20 +24,14 @@ struct CharSet(Copyable, Movable):
     var negated: Bool
     # 256-bit bitmap for ASCII fast path: bit i is set if char i is in the set.
     # Stored as 32 bytes.
-    var bitmap: SIMD[DType.uint8, 32]
+    var bitmap: SIMD[DType.uint8, BITMAP_WIDTH]
     var bitmap_valid: Bool
 
     def __init__(out self):
         self.ranges = List[CharRange]()
         self.negated = False
-        self.bitmap = SIMD[DType.uint8, 32](0)
+        self.bitmap = SIMD[DType.uint8, BITMAP_WIDTH](0)
         self.bitmap_valid = False
-
-    def __init__(out self, *, copy: Self):
-        self.ranges = copy.ranges.copy()
-        self.negated = copy.negated
-        self.bitmap = copy.bitmap
-        self.bitmap_valid = copy.bitmap_valid
 
     @staticmethod
     def from_char(ch: UInt32) -> CharSet:
@@ -88,7 +86,7 @@ struct CharSet(Copyable, Movable):
 
     def build_bitmap(mut self):
         """Build the 256-bit bitmap for ASCII fast path."""
-        self.bitmap = SIMD[DType.uint8, 32](0)
+        self.bitmap = SIMD[DType.uint8, BITMAP_WIDTH](0)
         for i in range(len(self.ranges)):
             var lo = Int(self.ranges[i].lo)
             var hi = Int(self.ranges[i].hi)

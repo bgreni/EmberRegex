@@ -8,7 +8,6 @@ from .nfa import NFA, NFAState, NFAStateKind
 from .charset import CharSet
 from .ast import AnchorKind
 from .result import MatchResult
-from .flags import RegexFlags
 
 
 def bt_full_match(nfa: NFA, input: String) -> MatchResult:
@@ -110,7 +109,7 @@ def _bt_try_match(
 
     elif kind == NFAStateKind.ANCHOR:
         var anchor = nfa.states[state_idx].anchor_type
-        if _bt_check_anchor(anchor, input, len(input), pos, nfa.flags):
+        if _bt_check_anchor(anchor, input, len(input), pos):
             return _bt_try_match(nfa, input, nfa.states[state_idx].out1, pos, slots, depth + 1)
         return -1
 
@@ -152,8 +151,9 @@ def _bt_try_match(
         if pos + ref_len > len(input):
             return -1
         # Compare the captured text with input at current position
+        # icase is baked into the BACKREF state at NFA construction time
         var input_bytes = input.as_bytes()
-        var icase = nfa.flags.ignorecase()
+        var icase = nfa.states[state_idx].icase
         for i in range(ref_len):
             var a = input_bytes[gs + i]
             var b = input_bytes[pos + i]
@@ -168,17 +168,21 @@ def _bt_try_match(
     return -1
 
 
-def _bt_check_anchor(anchor_type: Int, input: String, input_len: Int, pos: Int, flags: RegexFlags = RegexFlags()) -> Bool:
-    """Check if an anchor assertion holds at the given position."""
+def _bt_check_anchor(anchor_type: Int, input: String, input_len: Int, pos: Int) -> Bool:
+    """Check if an anchor assertion holds at the given position.
+
+    MULTILINE behavior is baked into the anchor kind at NFA construction time:
+    BOL_MULTILINE / EOL_MULTILINE handle line-boundary matching without a runtime flag check.
+    """
     var bytes = input.as_bytes()
     if anchor_type == AnchorKind.BOL:
-        if flags.multiline():
-            return pos == 0 or Int(bytes[pos - 1]) == ord("\n")
         return pos == 0
+    elif anchor_type == AnchorKind.BOL_MULTILINE:
+        return pos == 0 or Int(bytes[pos - 1]) == ord("\n")
     elif anchor_type == AnchorKind.EOL:
-        if flags.multiline():
-            return pos == input_len or Int(bytes[pos]) == ord("\n")
         return pos == input_len
+    elif anchor_type == AnchorKind.EOL_MULTILINE:
+        return pos == input_len or Int(bytes[pos]) == ord("\n")
     elif anchor_type == AnchorKind.WORD_BOUNDARY:
         var before_word = pos > 0 and _bt_is_word_char(Int(bytes[pos - 1]))
         var after_word = pos < input_len and _bt_is_word_char(Int(bytes[pos]))

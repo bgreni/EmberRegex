@@ -6,6 +6,7 @@ match must start with.
 """
 
 from .nfa import NFA, NFAStateKind
+from .charset import BITMAP_WIDTH
 
 
 def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
@@ -34,7 +35,7 @@ def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
     return prefix^
 
 
-def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, 32]:
+def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
     """Extract a 256-bit bitmap of possible first bytes from the NFA.
 
     Follows epsilon transitions from the start state, collecting all
@@ -43,7 +44,7 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, 32]:
 
     Returns all-ones if the pattern can match any first byte.
     """
-    var bitmap = SIMD[DType.uint8, 32](0)
+    var bitmap = SIMD[DType.uint8, BITMAP_WIDTH](0)
     var visited = List[Bool]()
     for _ in range(len(nfa.states)):
         visited.append(False)
@@ -83,7 +84,7 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, 32]:
             var cs_idx = nfa.states[s].charset_index
             if nfa.charsets[cs_idx].negated:
                 # Negated charset: matches all bytes NOT in the ranges
-                var tmp = SIMD[DType.uint8, 32](0)
+                var tmp = SIMD[DType.uint8, BITMAP_WIDTH](0)
                 for i in range(len(nfa.charsets[cs_idx].ranges)):
                     var lo = Int(nfa.charsets[cs_idx].ranges[i].lo)
                     var hi = Int(nfa.charsets[cs_idx].ranges[i].hi)
@@ -96,7 +97,7 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, 32]:
                         var bbit = ch & 7
                         tmp[bidx] = tmp[bidx] | (UInt8(1) << UInt8(bbit))
                 # Invert and merge
-                bitmap = bitmap | (tmp ^ SIMD[DType.uint8, 32](0xFF))
+                bitmap = bitmap | (tmp ^ SIMD[DType.uint8, BITMAP_WIDTH](0xFF))
             else:
                 for i in range(len(nfa.charsets[cs_idx].ranges)):
                     var lo = Int(nfa.charsets[cs_idx].ranges[i].lo)
@@ -111,9 +112,9 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, 32]:
                         bitmap[bidx] = bitmap[bidx] | (UInt8(1) << UInt8(bbit))
         elif kind == NFAStateKind.ANY:
             # ANY matches everything except \n — almost all bytes
-            return SIMD[DType.uint8, 32](0xFF)
+            return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
         elif kind == NFAStateKind.MATCH:
             # Empty pattern — can match at any position
-            return SIMD[DType.uint8, 32](0xFF)
+            return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
 
     return bitmap

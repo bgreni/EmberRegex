@@ -7,7 +7,7 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 # --- IGNORECASE flag ---
 
 def test_ignorecase_flag() raises:
-    var re = compile("hello", RegexFlags(RegexFlags.IGNORECASE))
+    var re = compile[RegexFlags(RegexFlags.IGNORECASE)]("hello")
     assert_true(re.match("hello").matched)
     assert_true(re.match("HELLO").matched)
     assert_true(re.match("Hello").matched)
@@ -15,7 +15,7 @@ def test_ignorecase_flag() raises:
     assert_false(re.match("hell").matched)
 
 def test_ignorecase_charset() raises:
-    var re = compile("[a-z]+", RegexFlags(RegexFlags.IGNORECASE))
+    var re = compile[RegexFlags(RegexFlags.IGNORECASE)]("[a-z]+")
     assert_true(re.match("abc").matched)
     assert_true(re.match("ABC").matched)
     assert_true(re.match("AbC").matched)
@@ -27,7 +27,7 @@ def test_ignorecase_inline() raises:
     assert_true(re.match("Hello").matched)
 
 def test_ignorecase_search() raises:
-    var re = compile("world", RegexFlags(RegexFlags.IGNORECASE))
+    var re = compile[RegexFlags(RegexFlags.IGNORECASE)]("world")
     var result = re.search("Hello WORLD")
     assert_true(result.matched)
     assert_equal(result.start, 6)
@@ -36,12 +36,12 @@ def test_ignorecase_search() raises:
 # --- MULTILINE flag ---
 
 def test_multiline_bol() raises:
-    var re = compile("^hello", RegexFlags(RegexFlags.MULTILINE))
+    var re = compile[RegexFlags(RegexFlags.MULTILINE)]("^hello")
     assert_true(re.search("hello world").matched)
     assert_true(re.search("foo\nhello").matched)
 
 def test_multiline_eol() raises:
-    var re = compile("world$", RegexFlags(RegexFlags.MULTILINE))
+    var re = compile[RegexFlags(RegexFlags.MULTILINE)]("world$")
     assert_true(re.search("world\nfoo").matched)
     assert_true(re.search("hello world").matched)
 
@@ -59,7 +59,7 @@ def test_multiline_inline() raises:
 # --- DOTALL flag ---
 
 def test_dotall_flag() raises:
-    var re = compile("a.b", RegexFlags(RegexFlags.DOTALL))
+    var re = compile[RegexFlags(RegexFlags.DOTALL)]("a.b")
     assert_true(re.match("axb").matched)
     assert_true(re.match("a\nb").matched)
 
@@ -81,8 +81,7 @@ def test_combined_flags() raises:
     assert_true(re.search("foo\nHELLO").matched)
 
 def test_combined_flag_param() raises:
-    var flags = RegexFlags(RegexFlags.IGNORECASE | RegexFlags.MULTILINE)
-    var re = compile("^hello", flags)
+    var re = compile[RegexFlags(RegexFlags.IGNORECASE | RegexFlags.MULTILINE)]("^hello")
     assert_true(re.search("foo\nHELLO").matched)
 
 

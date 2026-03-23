@@ -2,17 +2,22 @@
 
 from .parser import parse
 from .nfa import build_nfa, NFA
-from .executor import PikeVM
+from .executor import PikeVM, _VMBuffers
 from .backtrack import bt_full_match, _bt_try_match
 from .dfa import LazyDFA
 from .optimize import extract_literal_prefix, extract_first_byte_bitmap
 from .simd_scan import simd_find_prefix
 from .result import MatchResult
 from .flags import RegexFlags
+from .charset import BITMAP_WIDTH
 
 
-struct CompiledRegex(Copyable, Movable):
+struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
     """A compiled regular expression ready for matching.
+
+    The `flags` parameter is a compile-time constant. Inline flags from the
+    pattern (e.g. ``(?i)``) are merged at construction time and baked into
+    the NFA states, so no runtime flag checks occur in the hot matching path.
 
     Automatically selects the optimal engine:
     - DFA: patterns without captures, anchors, or lookaround (fastest)
@@ -25,26 +30,16 @@ struct CompiledRegex(Copyable, Movable):
     var _needs_backtrack: Bool
     var _can_use_dfa: Bool
     var _literal_prefix: List[UInt8]
-    var _first_byte_bitmap: SIMD[DType.uint8, 32]
+    var _first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH]
     var _first_byte_useful: Bool
     var pattern: String
     var group_names: Dict[String, Int]
 
-    def __init__(out self, *, copy: Self):
-        self._vm = copy._vm.copy()
-        self._dfa = copy._dfa.copy()
-        self._needs_backtrack = copy._needs_backtrack
-        self._can_use_dfa = copy._can_use_dfa
-        self._literal_prefix = copy._literal_prefix.copy()
-        self._first_byte_bitmap = copy._first_byte_bitmap
-        self._first_byte_useful = copy._first_byte_useful
-        self.pattern = copy.pattern
-        self.group_names = copy.group_names.copy()
 
-    def __init__(out self, pattern: String, flags: RegexFlags = RegexFlags()) raises:
+    def __init__(out self, pattern: String) raises:
         var ast = parse(pattern)
-        # Merge inline flags from parser with explicit flags
-        var merged_flags = RegexFlags(flags.value | ast.flags.value)
+        # Merge compile-time flags with inline flags extracted from the pattern
+        var merged_flags = RegexFlags(Self.flags.value | ast.flags.value)
         # Extract group names before consuming AST
         var names = Dict[String, Int]()
         for entry in ast.group_names.items():
@@ -93,8 +88,11 @@ struct CompiledRegex(Copyable, Movable):
         """Find all non-overlapping matches and return their text."""
         var results = List[String]()
         var pos = 0
+        var num_states = len(self._vm.nfa.states)
+        var num_slots = 2 * self._vm.nfa.group_count
+        var bufs = _VMBuffers(num_states, num_slots)
         while pos <= len(input):
-            var result = self._search_from(input, pos)
+            var result = self._search_from_bufs(input, pos, bufs)
             if not result.matched:
                 break
             # If there's a capture group, return group 1; otherwise full match
@@ -116,8 +114,11 @@ struct CompiledRegex(Copyable, Movable):
         """
         var output = String()
         var pos = 0
+        var num_states = len(self._vm.nfa.states)
+        var num_slots = 2 * self._vm.nfa.group_count
+        var bufs = _VMBuffers(num_states, num_slots)
         while pos <= len(input):
-            var result = self._search_from(input, pos)
+            var result = self._search_from_bufs(input, pos, bufs)
             if not result.matched:
                 break
             # Add text before match
@@ -138,9 +139,12 @@ struct CompiledRegex(Copyable, Movable):
         """Split input by matches of the pattern."""
         var parts = List[String]()
         var pos = 0
+        var num_states = len(self._vm.nfa.states)
+        var num_slots = 2 * self._vm.nfa.group_count
+        var bufs = _VMBuffers(num_states, num_slots)
         while pos <= len(input):
             # Search for next match starting from pos
-            var result = self._search_from(input, pos)
+            var result = self._search_from_bufs(input, pos, bufs)
             if not result.matched:
                 break
             parts.append(String(input[byte=pos:result.start]))
@@ -155,6 +159,51 @@ struct CompiledRegex(Copyable, Movable):
 
     def _search_from(mut self, input: String, start: Int) -> MatchResult:
         """Search for a match starting from the given position."""
+        # DFA-only fast path: no buffer allocation needed
+        if self._can_use_dfa and self._vm.nfa.group_count == 0 and not self._vm.nfa.has_lazy:
+            return self._search_from_dfa_only(input, start)
+        var num_states = len(self._vm.nfa.states)
+        var num_slots = 2 * self._vm.nfa.group_count
+        var bufs = _VMBuffers(num_states, num_slots)
+        return self._search_from_bufs(input, start, bufs)
+
+    def _search_from_dfa_only(mut self, input: String, start: Int) -> MatchResult:
+        """DFA-only search path — zero Pike VM overhead."""
+        var pos = start
+        var input_len = len(input)
+        var has_prefix = len(self._literal_prefix) > 0
+        var use_bitmap = self._first_byte_useful and not has_prefix
+        var ptr = input.unsafe_ptr()
+
+        while pos <= input_len:
+            if has_prefix:
+                var candidate = simd_find_prefix(input, self._literal_prefix, pos)
+                if candidate < 0:
+                    break
+                pos = candidate
+            elif use_bitmap and pos < input_len:
+                while pos < input_len:
+                    var b = UInt8((ptr + pos).load())
+                    var byte_idx = Int(b) >> 3
+                    var bit_idx = UInt8(Int(b) & 7)
+                    if (self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) != 0:
+                        break
+                    pos += 1
+
+            var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
+            if match_end >= 0:
+                var empty = List[Int]()
+                return MatchResult(
+                    matched=True, start=pos, end=match_end,
+                    group_count=0, slots=empty^,
+                )
+            pos += 1
+        return MatchResult.no_match(0)
+
+    def _search_from_bufs(
+        mut self, input: String, start: Int, mut bufs: _VMBuffers,
+    ) -> MatchResult:
+        """Search for a match, reusing pre-allocated VM buffers."""
         var pos = start
         var input_len = len(input)
         var has_prefix = len(self._literal_prefix) > 0
@@ -191,19 +240,31 @@ struct CompiledRegex(Copyable, Movable):
                     )
                 else:
                     result = MatchResult.no_match(self._vm.nfa.group_count)
-            elif self._can_use_dfa and self._vm.nfa.group_count == 0 and not self._vm.nfa.has_lazy:
-                # DFA fast path for capture-free patterns
-                var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
-                if match_end >= 0:
-                    var empty = List[Int]()
-                    result = MatchResult(
-                        matched=True, start=pos, end=match_end,
-                        group_count=0, slots=empty^,
-                    )
+            elif self._can_use_dfa and not self._vm.nfa.has_lazy:
+                if self._vm.nfa.group_count == 0:
+                    # DFA fast path for capture-free patterns
+                    var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
+                    if match_end >= 0:
+                        var empty = List[Int]()
+                        result = MatchResult(
+                            matched=True, start=pos, end=match_end,
+                            group_count=0, slots=empty^,
+                        )
+                    else:
+                        result = MatchResult.no_match(0)
                 else:
-                    result = MatchResult.no_match(0)
+                    # Hybrid DFA+Pike: use DFA to quickly reject non-matching
+                    # positions, only invoke Pike VM where DFA confirms a match.
+                    # Run Pike VM only on the matched substring to minimize work.
+                    var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
+                    if match_end >= 0:
+                        result = self._vm._execute_with_bufs(
+                            input, pos, bufs, match_end,
+                        )
+                    else:
+                        result = MatchResult.no_match(self._vm.nfa.group_count)
             else:
-                result = self._vm._execute(input, pos)
+                result = self._vm._execute_with_bufs(input, pos, bufs)
             if result.matched:
                 return result^
             pos += 1
@@ -245,17 +306,22 @@ struct CompiledRegex(Copyable, Movable):
         return output^
 
 
-def compile(pattern: String, flags: RegexFlags = RegexFlags()) raises -> CompiledRegex:
-    """Compile a regex pattern string into a CompiledRegex."""
-    return CompiledRegex(pattern, flags)
+def compile[flags: RegexFlags = RegexFlags()](pattern: String) raises -> CompiledRegex[flags]:
+    """Compile a regex pattern string into a CompiledRegex.
+
+    Pass flags as a compile-time parameter:
+        compile[RegexFlags(RegexFlags.IGNORECASE)]("hello")
+    Inline flags in the pattern (e.g. ``(?i)``) are always respected.
+    """
+    return CompiledRegex[flags](pattern)
 
 
-def try_compile(pattern: String, flags: RegexFlags = RegexFlags()) -> Optional[CompiledRegex]:
+def try_compile[flags: RegexFlags = RegexFlags()](pattern: String) -> Optional[CompiledRegex[flags]]:
     """Compile a regex pattern, returning None on error.
 
     Safe for use in comptime initializers since it does not raise.
     """
     try:
-        return Optional(CompiledRegex(pattern, flags))
+        return Optional(CompiledRegex[flags](pattern))
     except:
-        return Optional[CompiledRegex](None)
+        return Optional[CompiledRegex[flags]](None)

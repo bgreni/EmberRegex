@@ -84,7 +84,7 @@ struct Parser(Movable):
             self.pos += 1  # consume '|'
             alternatives.append(self._parse_concat())
 
-        var node = ASTNode.alternation(alternatives)
+        var node = ASTNode.alternation(alternatives^)
         return self.ast.add_node(node^)
 
     def _parse_concat(mut self) raises -> Int:
@@ -100,7 +100,7 @@ struct Parser(Movable):
         if len(parts) == 1:
             return parts[0]
 
-        var node = ASTNode.concat(parts)
+        var node = ASTNode.concat(parts^)
         return self.ast.add_node(node^)
 
     def _parse_quantified(mut self) raises -> Int:

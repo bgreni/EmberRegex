@@ -24,13 +24,6 @@ struct MatchResult(Copyable, Movable, Writable):
         self.group_count = group_count
         self.slots = slots^
 
-    def __init__(out self, *, copy: Self):
-        self.matched = copy.matched
-        self.start = copy.start
-        self.end = copy.end
-        self.group_count = copy.group_count
-        self.slots = copy.slots.copy()
-
     @staticmethod
     def no_match(group_count: Int = 0) -> MatchResult:
         var slots = List[Int]()
