@@ -1,10 +1,22 @@
 """High-level regex compilation: pattern string -> CompiledRegex."""
 
+from .constants import (
+    CHAR_BACKSLASH,
+    CHAR_GREATER_THAN,
+    CHAR_G_LOWER,
+    CHAR_LESS_THAN,
+    CHAR_NEWLINE,
+    CHAR_NINE,
+    CHAR_ONE,
+    CHAR_ZERO,
+)
 from .parser import parse
 from .nfa import build_nfa, NFA
+from .ast import AnchorKind
 from .executor import PikeVM, _VMBuffers
 from .backtrack import bt_full_match, _bt_try_match
 from .dfa import LazyDFA
+from .onepass import OnePassNFA, build_onepass, onepass_match, onepass_search_at, onepass_findall, _OnePassBufs
 from .optimize import extract_literal_prefix, extract_first_byte_bitmap
 from .simd_scan import simd_find_prefix
 from .result import MatchResult
@@ -12,12 +24,12 @@ from .flags import RegexFlags
 from .charset import BITMAP_WIDTH
 
 
-struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
+struct CompiledRegex(Copyable, Movable):
     """A compiled regular expression ready for matching.
 
-    The `flags` parameter is a compile-time constant. Inline flags from the
-    pattern (e.g. ``(?i)``) are merged at construction time and baked into
-    the NFA states, so no runtime flag checks occur in the hot matching path.
+    Inline flags from the pattern (e.g. ``(?i)``) are merged with explicit
+    flags at construction time and baked into the NFA states, so no runtime
+    flag checks occur in the hot matching path.
 
     Automatically selects the optimal engine:
     - DFA: patterns without captures, anchors, or lookaround (fastest)
@@ -27,8 +39,13 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
 
     var _vm: PikeVM
     var _dfa: LazyDFA
+    var _onepass: OnePassNFA
+    var _op_bufs: _OnePassBufs
+    var _bufs: _VMBuffers
     var _needs_backtrack: Bool
     var _can_use_dfa: Bool
+    var _can_use_onepass: Bool
+    var _start_anchor: Int
     var _literal_prefix: List[UInt8]
     var _first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH]
     var _first_byte_useful: Bool
@@ -36,21 +53,29 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
     var group_names: Dict[String, Int]
 
 
-    def __init__(out self, pattern: String) raises:
+    def __init__(out self, pattern: String, flags: RegexFlags = RegexFlags()) raises:
         var ast = parse(pattern)
-        # Merge compile-time flags with inline flags extracted from the pattern
-        var merged_flags = RegexFlags(Self.flags.value | ast.flags.value)
         # Extract group names before consuming AST
-        var names = Dict[String, Int]()
-        for entry in ast.group_names.items():
-            names[entry.key] = entry.value
+        self.group_names = ast.group_names.copy()
+        # Merge explicit flags with inline flags from the pattern
+        var merged_flags = RegexFlags(flags.value | ast.flags.value)
         var nfa = build_nfa(ast^, merged_flags)
         var needs_bt = nfa.needs_backtrack
         var can_dfa = nfa.can_use_dfa and not nfa.needs_backtrack
         var prefix = extract_literal_prefix(nfa)
         var fb_bitmap = extract_first_byte_bitmap(nfa)
+        var num_states = len(nfa.states)
+        var num_slots = 2 * nfa.group_count
+        # Build one-pass NFA before consuming the NFA
+        var op = build_onepass(nfa)
+        var can_onepass = op.is_valid and nfa.group_count > 0
+        self._onepass = op^
+        self._op_bufs = _OnePassBufs(num_slots)
+        self._can_use_onepass = can_onepass
+        self._start_anchor = nfa.start_anchor
         self._vm = PikeVM(nfa^)
         self._dfa = LazyDFA()
+        self._bufs = _VMBuffers(num_states, num_slots)
         self._needs_backtrack = needs_bt
         self._can_use_dfa = can_dfa
         self._literal_prefix = prefix^
@@ -62,7 +87,6 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
                 break
         self._first_byte_useful = fb_useful
         self.pattern = pattern
-        self.group_names = names^
 
     def match(mut self, input: String) -> MatchResult:
         """Match the entire input against the pattern."""
@@ -78,7 +102,7 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
                     group_count=0, slots=empty^,
                 )
             return MatchResult.no_match(0)
-        return self._vm.full_match(input)
+        return self._vm.full_match_with_bufs(input, self._bufs)
 
     def search(mut self, input: String) -> MatchResult:
         """Search for the first occurrence of the pattern in the input."""
@@ -86,13 +110,16 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
 
     def findall(mut self, input: String) -> List[String]:
         """Find all non-overlapping matches and return their text."""
+        # Fast path: one-pass findall avoids per-match MatchResult allocation
+        if self._can_use_onepass and self._can_use_dfa and not self._vm.nfa.has_lazy:
+            return onepass_findall(
+                self._onepass, input, self._op_bufs,
+                self._literal_prefix, self._first_byte_bitmap, self._first_byte_useful,
+            )
         var results = List[String]()
         var pos = 0
-        var num_states = len(self._vm.nfa.states)
-        var num_slots = 2 * self._vm.nfa.group_count
-        var bufs = _VMBuffers(num_states, num_slots)
         while pos <= len(input):
-            var result = self._search_from_bufs(input, pos, bufs)
+            var result = self._search_from(input, pos)
             if not result.matched:
                 break
             # If there's a capture group, return group 1; otherwise full match
@@ -114,11 +141,8 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
         """
         var output = String()
         var pos = 0
-        var num_states = len(self._vm.nfa.states)
-        var num_slots = 2 * self._vm.nfa.group_count
-        var bufs = _VMBuffers(num_states, num_slots)
         while pos <= len(input):
-            var result = self._search_from_bufs(input, pos, bufs)
+            var result = self._search_from(input, pos)
             if not result.matched:
                 break
             # Add text before match
@@ -139,12 +163,9 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
         """Split input by matches of the pattern."""
         var parts = List[String]()
         var pos = 0
-        var num_states = len(self._vm.nfa.states)
-        var num_slots = 2 * self._vm.nfa.group_count
-        var bufs = _VMBuffers(num_states, num_slots)
         while pos <= len(input):
             # Search for next match starting from pos
-            var result = self._search_from_bufs(input, pos, bufs)
+            var result = self._search_from(input, pos)
             if not result.matched:
                 break
             parts.append(String(input[byte=pos:result.start]))
@@ -159,16 +180,25 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
 
     def _search_from(mut self, input: String, start: Int) -> MatchResult:
         """Search for a match starting from the given position."""
+        # Anchor-aware skip: only try valid anchor positions (highest priority)
+        if self._start_anchor == AnchorKind.BOL:
+            if start > 0:
+                return MatchResult.no_match(self._vm.nfa.group_count)
+            if self._can_use_dfa and self._vm.nfa.group_count == 0:
+                return self._search_from_dfa_only(input, 0)
+            return self._search_from_bufs(input, 0)
+        if self._start_anchor == AnchorKind.BOL_MULTILINE:
+            return self._search_from_bol_multiline(input, start)
         # DFA-only fast path: no buffer allocation needed
         if self._can_use_dfa and self._vm.nfa.group_count == 0 and not self._vm.nfa.has_lazy:
             return self._search_from_dfa_only(input, start)
-        var num_states = len(self._vm.nfa.states)
-        var num_slots = 2 * self._vm.nfa.group_count
-        var bufs = _VMBuffers(num_states, num_slots)
-        return self._search_from_bufs(input, start, bufs)
+        # One-pass direct search: no DFA or Pike VM needed
+        if self._can_use_onepass and self._can_use_dfa and not self._vm.nfa.has_lazy:
+            return self._search_from_onepass(input, start)
+        return self._search_from_bufs(input, start)
 
-    def _search_from_dfa_only(mut self, input: String, start: Int) -> MatchResult:
-        """DFA-only search path — zero Pike VM overhead."""
+    def _search_from_onepass(mut self, input: String, start: Int) -> MatchResult:
+        """One-pass NFA search — single linear scan with captures, no DFA."""
         var pos = start
         var input_len = len(input)
         var has_prefix = len(self._literal_prefix) > 0
@@ -176,6 +206,7 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
         var ptr = input.unsafe_ptr()
 
         while pos <= input_len:
+            # Acceleration: skip to next candidate position
             if has_prefix:
                 var candidate = simd_find_prefix(input, self._literal_prefix, pos)
                 if candidate < 0:
@@ -190,6 +221,81 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
                         break
                     pos += 1
 
+            var result = onepass_search_at(self._onepass, input, input_len, pos, self._op_bufs)
+            if result.matched:
+                return result^
+            pos += 1
+        return MatchResult.no_match(self._vm.nfa.group_count)
+
+    def _search_from_bol_multiline(mut self, input: String, start: Int) -> MatchResult:
+        """Search skipping to valid BOL_MULTILINE positions (pos=0 or after \\n)."""
+        var ptr = input.unsafe_ptr()
+        var input_len = len(input)
+        var pos = start
+        var use_dfa = self._can_use_dfa and self._vm.nfa.group_count == 0
+
+        # If start is 0, it's a valid BOL position; otherwise skip to after next \n
+        if pos > 0 and pos < input_len:
+            if Int((ptr + pos - 1).load()) != CHAR_NEWLINE:
+                # Not at a BOL position — find the next \n
+                while pos < input_len:
+                    if Int((ptr + pos).load()) == CHAR_NEWLINE:
+                        pos += 1  # position after \n
+                        break
+                    pos += 1
+                else:
+                    return MatchResult.no_match(self._vm.nfa.group_count)
+
+        while pos <= input_len:
+            if use_dfa:
+                var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
+                if match_end >= 0:
+                    var empty = List[Int]()
+                    return MatchResult(
+                        matched=True, start=pos, end=match_end,
+                        group_count=0, slots=empty^,
+                    )
+            else:
+                var result = self._vm._execute_with_bufs(input, pos, self._bufs)
+                if result.matched:
+                    return result^
+            # Skip to next BOL position (after next \n)
+            while pos < input_len:
+                if Int((ptr + pos).load()) == CHAR_NEWLINE:
+                    pos += 1
+                    break
+                pos += 1
+            else:
+                break  # no more \n found
+
+        return MatchResult.no_match(self._vm.nfa.group_count)
+
+    def _search_from_dfa_only(mut self, input: String, start: Int) -> MatchResult:
+        """DFA-only search path — zero Pike VM overhead."""
+        var has_prefix = len(self._literal_prefix) > 0
+
+        # Fast path: single-pass search with position skipping and bitmap
+        if not has_prefix:
+            var result = self._dfa.search_forward(
+                self._vm.nfa, input, start,
+                self._first_byte_bitmap, self._first_byte_useful,
+            )
+            if result[0] >= 0:
+                var empty = List[Int]()
+                return MatchResult(
+                    matched=True, start=result[0], end=result[1],
+                    group_count=0, slots=empty^,
+                )
+            return MatchResult.no_match(0)
+
+        # Prefix-accelerated search: use SIMD prefix scan + match_at
+        var input_len = len(input)
+        var pos = start
+        while pos <= input_len:
+            var candidate = simd_find_prefix(input, self._literal_prefix, pos)
+            if candidate < 0:
+                break
+            pos = candidate
             var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
             if match_end >= 0:
                 var empty = List[Int]()
@@ -201,7 +307,7 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
         return MatchResult.no_match(0)
 
     def _search_from_bufs(
-        mut self, input: String, start: Int, mut bufs: _VMBuffers,
+        mut self, input: String, start: Int,
     ) -> MatchResult:
         """Search for a match, reusing pre-allocated VM buffers."""
         var pos = start
@@ -253,18 +359,20 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
                     else:
                         result = MatchResult.no_match(0)
                 else:
-                    # Hybrid DFA+Pike: use DFA to quickly reject non-matching
-                    # positions, only invoke Pike VM where DFA confirms a match.
-                    # Run Pike VM only on the matched substring to minimize work.
+                    # Hybrid DFA + capture extraction.
+                    # DFA finds match boundaries, then one-pass NFA or Pike VM extracts captures.
                     var match_end = self._dfa.match_at(self._vm.nfa, input, pos)
                     if match_end >= 0:
-                        result = self._vm._execute_with_bufs(
-                            input, pos, bufs, match_end,
-                        )
+                        if self._can_use_onepass:
+                            result = onepass_match(self._onepass, input, pos, match_end)
+                        else:
+                            result = self._vm._execute_with_bufs(
+                                input, pos, self._bufs, match_end,
+                            )
                     else:
                         result = MatchResult.no_match(self._vm.nfa.group_count)
             else:
-                result = self._vm._execute_with_bufs(input, pos, bufs)
+                result = self._vm._execute_with_bufs(input, pos, self._bufs)
             if result.matched:
                 return result^
             pos += 1
@@ -277,18 +385,18 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
         var rep_len = len(replacement)
         var i = 0
         while i < rep_len:
-            if Int(rep_bytes[i]) == ord("\\") and i + 1 < rep_len:
+            if Int(rep_bytes[i]) == CHAR_BACKSLASH and i + 1 < rep_len:
                 var next_ch = Int(rep_bytes[i + 1])
-                if next_ch >= ord("1") and next_ch <= ord("9"):
-                    var group = next_ch - ord("0")
+                if next_ch >= CHAR_ONE and next_ch <= CHAR_NINE:
+                    var group = next_ch - CHAR_ZERO
                     output += result.group_str(input, group)
                     i += 2
                     continue
-                elif next_ch == ord("g") and i + 2 < rep_len and Int(rep_bytes[i + 2]) == ord("<"):
+                elif next_ch == CHAR_G_LOWER and i + 2 < rep_len and Int(rep_bytes[i + 2]) == CHAR_LESS_THAN:
                     # \g<name> backreference
                     var name_start = i + 3
                     var name_end = name_start
-                    while name_end < rep_len and Int(rep_bytes[name_end]) != ord(">"):
+                    while name_end < rep_len and Int(rep_bytes[name_end]) != CHAR_GREATER_THAN:
                         name_end += 1
                     if name_end < rep_len:
                         var name = String(replacement[byte=name_start:name_end])
@@ -297,7 +405,7 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
                             output += result.group_str(input, maybe_idx.value())
                         i = name_end + 1
                         continue
-                elif next_ch == ord("\\"):
+                elif next_ch == CHAR_BACKSLASH:
                     output += "\\"
                     i += 2
                     continue
@@ -306,22 +414,21 @@ struct CompiledRegex[flags: RegexFlags = RegexFlags()](Copyable, Movable):
         return output^
 
 
-def compile[flags: RegexFlags = RegexFlags()](pattern: String) raises -> CompiledRegex[flags]:
+def compile(pattern: String, flags: RegexFlags = RegexFlags()) raises -> CompiledRegex:
     """Compile a regex pattern string into a CompiledRegex.
 
-    Pass flags as a compile-time parameter:
-        compile[RegexFlags(RegexFlags.IGNORECASE)]("hello")
-    Inline flags in the pattern (e.g. ``(?i)``) are always respected.
+    Inline flags in the pattern (e.g. ``(?i)``) are always respected
+    and merged with explicit flags.
     """
-    return CompiledRegex[flags](pattern)
+    return CompiledRegex(pattern, flags)
 
 
-def try_compile[flags: RegexFlags = RegexFlags()](pattern: String) -> Optional[CompiledRegex[flags]]:
+def try_compile(pattern: String, flags: RegexFlags = RegexFlags()) -> Optional[CompiledRegex]:
     """Compile a regex pattern, returning None on error.
 
     Safe for use in comptime initializers since it does not raise.
     """
     try:
-        return Optional(CompiledRegex[flags](pattern))
+        return Optional(CompiledRegex(pattern, flags))
     except:
-        return Optional[CompiledRegex[flags]](None)
+        return Optional[CompiledRegex](None)

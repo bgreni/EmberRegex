@@ -10,13 +10,24 @@ per-state heap allocations. SAVE states use in-place modification
 with restore-on-return to eliminate slot copying.
 """
 
+from .constants import (
+    CHAR_A_LOWER,
+    CHAR_A_UPPER,
+    CHAR_NEWLINE,
+    CHAR_NINE,
+    CHAR_UNDERSCORE,
+    CHAR_ZERO,
+    CHAR_Z_LOWER,
+    CHAR_Z_UPPER,
+)
 from .nfa import NFA, NFAState, NFAStateKind
 from .charset import CharSet
 from .ast import AnchorKind
 from .result import MatchResult
+from .backtrack import _bt_try_match
 
 
-struct _VMBuffers(Movable):
+struct _VMBuffers(Copyable, Movable):
     """Pre-allocated buffers for Pike VM execution.
 
     Avoids re-allocating Lists on every _execute call. The generation
@@ -36,38 +47,25 @@ struct _VMBuffers(Movable):
     var num_slots: Int
 
     def __init__(out self, num_states: Int, num_slots: Int):
-        self.current_states = List[Int]()
-        self.current_slot_data = List[Int]()
-        self.next_states = List[Int]()
-        self.next_slot_data = List[Int]()
-        self.gen = List[Int]()
+        self.current_states = List[Int](capacity=num_states)
+        self.current_slot_data = List[Int](capacity=num_states * num_slots)
+        self.next_states = List[Int](capacity=num_states)
+        self.next_slot_data = List[Int](capacity=num_states * num_slots)
+        self.gen = List[Int](capacity=num_states)
         for _s in range(num_states):
             self.gen.append(0)
         self.gen_counter = 0
-        self.temp_slots = List[Int]()
+        self.temp_slots = List[Int](capacity=num_slots)
         for _s in range(num_slots):
             self.temp_slots.append(-1)
-        self.best_slots = List[Int]()
+        self.best_slots = List[Int](capacity=num_slots)
         for _s in range(num_slots):
             self.best_slots.append(-1)
-        self.init_slots = List[Int]()
+        self.init_slots = List[Int](capacity=num_slots)
         for _s in range(num_slots):
             self.init_slots.append(-1)
         self.num_states = num_states
         self.num_slots = num_slots
-
-    def __init__(out self, *, deinit take: Self):
-        self.current_states = take.current_states^
-        self.current_slot_data = take.current_slot_data^
-        self.next_states = take.next_states^
-        self.next_slot_data = take.next_slot_data^
-        self.gen = take.gen^
-        self.gen_counter = take.gen_counter
-        self.temp_slots = take.temp_slots^
-        self.best_slots = take.best_slots^
-        self.init_slots = take.init_slots^
-        self.num_states = take.num_states
-        self.num_slots = take.num_slots
 
     def reset(mut self):
         """Reset buffers for a new _execute call. O(1) — no clearing needed."""
@@ -89,31 +87,22 @@ struct PikeVM(Copyable, Movable):
     def __init__(out self, var nfa: NFA):
         self.nfa = nfa^
 
-    def full_match(self, input: String) -> MatchResult:
+    def full_match_with_bufs(self, input: String, mut bufs: _VMBuffers) -> MatchResult:
         """Match the entire input string against the pattern."""
-        var result = self._execute(input, 0)
+        var result = self._execute_with_bufs(input, 0, bufs)
         if result.matched and result.end == len(input):
             return result^
         return MatchResult.no_match(self.nfa.group_count)
 
-    def search(self, input: String) -> MatchResult:
+    def search_with_bufs(self, input: String, mut bufs: _VMBuffers) -> MatchResult:
         """Search for the first match anywhere in the input."""
         var i = 0
         while i <= len(input):
-            var result = self._execute(input, i)
+            var result = self._execute_with_bufs(input, i, bufs)
             if result.matched:
                 return result^
             i += 1
         return MatchResult.no_match(self.nfa.group_count)
-
-    def _execute(self, input: String, start_pos: Int) -> MatchResult:
-        """Core NFA simulation — allocates fresh buffers each call."""
-        var num_states = len(self.nfa.states)
-        if num_states == 0:
-            return MatchResult.no_match(self.nfa.group_count)
-        var num_slots = 2 * self.nfa.group_count
-        var bufs = _VMBuffers(num_states, num_slots)
-        return self._execute_with_bufs(input, start_pos, bufs)
 
     def _execute_with_bufs(
         self, input: String, start_pos: Int, mut bufs: _VMBuffers,
@@ -187,7 +176,7 @@ struct PikeVM(Copyable, Movable):
                             input, input_len, pos + 1, num_slots,
                         )
                 elif kind == NFAStateKind.ANY:
-                    if ch != UInt32(ord("\n")):
+                    if ch != UInt32(CHAR_NEWLINE):
                         self._add_state(
                             bufs.next_states, bufs.next_slot_data, bufs.gen, next_gen,
                             out1, bufs.temp_slots,
@@ -275,9 +264,9 @@ struct PikeVM(Copyable, Movable):
 
             if kind == NFAStateKind.SPLIT:
                 gen.unsafe_set(state_idx, gen_val)
-                # Recurse on out2 (lower priority), loop on out1 (higher priority)
-                self._add_state(state_list, slot_data, gen, gen_val, state.out2, slots, input, input_len, pos, num_slots)
-                state_idx = state.out1
+                # Recurse on out1 (higher priority), loop on out2 (lower priority)
+                self._add_state(state_list, slot_data, gen, gen_val, state.out1, slots, input, input_len, pos, num_slots)
+                state_idx = state.out2
                 continue
 
             elif kind == NFAStateKind.SAVE:
@@ -304,7 +293,7 @@ struct PikeVM(Copyable, Movable):
 
             elif kind == NFAStateKind.LOOKAHEAD:
                 gen.unsafe_set(state_idx, gen_val)
-                var match_end = self._matches_at(input, state.sub_start, pos)
+                var match_end = _bt_try_match(self.nfa, input, state.sub_start, pos, slots, 0)
                 if (match_end >= 0) != state.negated:
                     state_idx = state.out1
                     continue
@@ -315,7 +304,7 @@ struct PikeVM(Copyable, Movable):
                 var lb_len = state.lookbehind_len
                 var lb_matched = False
                 if pos >= lb_len:
-                    var match_end = self._matches_at(input, state.sub_start, pos - lb_len)
+                    var match_end = _bt_try_match(self.nfa, input, state.sub_start, pos - lb_len, slots, 0)
                     lb_matched = match_end == pos
                 if lb_matched != state.negated:
                     state_idx = state.out1
@@ -346,11 +335,11 @@ struct PikeVM(Copyable, Movable):
         if anchor_type == AnchorKind.BOL:
             return pos == 0
         elif anchor_type == AnchorKind.BOL_MULTILINE:
-            return pos == 0 or Int((ptr + pos - 1).load()) == ord("\n")
+            return pos == 0 or Int((ptr + pos - 1).load()) == CHAR_NEWLINE
         elif anchor_type == AnchorKind.EOL:
             return pos == input_len
         elif anchor_type == AnchorKind.EOL_MULTILINE:
-            return pos == input_len or Int((ptr + pos).load()) == ord("\n")
+            return pos == input_len or Int((ptr + pos).load()) == CHAR_NEWLINE
         elif anchor_type == AnchorKind.WORD_BOUNDARY:
             var before_word = pos > 0 and Self._is_word_char(Int((ptr + pos - 1).load()))
             var after_word = pos < input_len and Self._is_word_char(Int((ptr + pos).load()))
@@ -361,89 +350,13 @@ struct PikeVM(Copyable, Movable):
             return before_word == after_word
         return False
 
-    def _matches_at(self, input: String, start_state: Int, pos: Int) -> Int:
-        """Run sub-pattern from start_state at pos. Returns end position or -1.
-
-        Used for lookahead/lookbehind assertions.
-        """
-        var input_len = len(input)
-        var num_states = len(self.nfa.states)
-
-        var curr_states = List[Int]()
-        var curr_slot_data = List[Int]()
-        var gen = List[Int]()
-        for _s in range(num_states):
-            gen.append(0)
-        var gen_counter = 0
-
-        gen_counter += 1
-        var dummy_slots = List[Int]()
-        self._add_state(curr_states, curr_slot_data, gen, gen_counter,
-            start_state, dummy_slots, input, input_len, pos, 0)
-
-        # Check immediate match
-        for i in range(len(curr_states)):
-            if self.nfa.states.unsafe_get(curr_states.unsafe_get(i)).kind == NFAStateKind.MATCH:
-                return pos
-
-        var nxt_states = List[Int]()
-        var nxt_slot_data = List[Int]()
-        var ptr = input.unsafe_ptr()
-
-        var curr_pos = pos
-        while curr_pos < input_len:
-            var ch = UInt32((ptr + curr_pos).load())
-            nxt_states.clear()
-            nxt_slot_data.clear()
-            gen_counter += 1
-
-            for i in range(len(curr_states)):
-                var si = curr_states.unsafe_get(i)
-                ref st = self.nfa.states.unsafe_get(si)
-                var kind = st.kind
-                var out1 = st.out1
-
-                if kind == NFAStateKind.CHAR:
-                    if ch == st.char_value:
-                        self._add_state(nxt_states, nxt_slot_data, gen, gen_counter,
-                            out1, dummy_slots, input, input_len, curr_pos + 1, 0)
-                elif kind == NFAStateKind.ANY:
-                    if ch != UInt32(ord("\n")):
-                        self._add_state(nxt_states, nxt_slot_data, gen, gen_counter,
-                            out1, dummy_slots, input, input_len, curr_pos + 1, 0)
-                elif kind == NFAStateKind.CHARSET:
-                    var cs_idx = st.charset_index
-                    if self.nfa.charsets.unsafe_get(cs_idx).contains(ch):
-                        self._add_state(nxt_states, nxt_slot_data, gen, gen_counter,
-                            out1, dummy_slots, input, input_len, curr_pos + 1, 0)
-
-            curr_pos += 1
-
-            # Check for match
-            for i in range(len(nxt_states)):
-                if self.nfa.states.unsafe_get(nxt_states.unsafe_get(i)).kind == NFAStateKind.MATCH:
-                    return curr_pos
-
-            # Swap
-            var tmp = curr_states^
-            curr_states = nxt_states^
-            nxt_states = tmp^
-            nxt_states.clear()
-            _ = curr_slot_data^
-            curr_slot_data = nxt_slot_data^
-            nxt_slot_data = List[Int]()
-
-            if len(curr_states) == 0:
-                break
-
-        return -1
 
     @staticmethod
     def _is_word_char(ch: Int) -> Bool:
         """Check if a character is a word character [a-zA-Z0-9_]."""
         return (
-            (ch >= ord("a") and ch <= ord("z"))
-            or (ch >= ord("A") and ch <= ord("Z"))
-            or (ch >= ord("0") and ch <= ord("9"))
-            or ch == ord("_")
+            (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
+            or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
+            or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
+            or ch == CHAR_UNDERSCORE
         )

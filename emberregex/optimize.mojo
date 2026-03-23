@@ -92,10 +92,17 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
                         continue
                     if hi > 255:
                         hi = 255
-                    for ch in range(lo, hi + 1):
-                        var bidx = ch >> 3
-                        var bbit = ch & 7
-                        tmp[bidx] = tmp[bidx] | (UInt8(1) << UInt8(bbit))
+                    var start_byte = lo >> 3
+                    var end_byte = hi >> 3
+                    var start_mask = UInt8(0xFF) << UInt8(lo & 7)
+                    var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
+                    if start_byte == end_byte:
+                        tmp[start_byte] |= (start_mask & end_mask)
+                    else:
+                        tmp[start_byte] |= start_mask
+                        for b in range(start_byte + 1, end_byte):
+                            tmp[b] = 0xFF
+                        tmp[end_byte] |= end_mask
                 # Invert and merge
                 bitmap = bitmap | (tmp ^ SIMD[DType.uint8, BITMAP_WIDTH](0xFF))
             else:
@@ -106,10 +113,17 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
                         continue
                     if hi > 255:
                         hi = 255
-                    for ch in range(lo, hi + 1):
-                        var bidx = ch >> 3
-                        var bbit = ch & 7
-                        bitmap[bidx] = bitmap[bidx] | (UInt8(1) << UInt8(bbit))
+                    var start_byte = lo >> 3
+                    var end_byte = hi >> 3
+                    var start_mask = UInt8(0xFF) << UInt8(lo & 7)
+                    var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
+                    if start_byte == end_byte:
+                        bitmap[start_byte] |= (start_mask & end_mask)
+                    else:
+                        bitmap[start_byte] |= start_mask
+                        for b in range(start_byte + 1, end_byte):
+                            bitmap[b] = 0xFF
+                        bitmap[end_byte] |= end_mask
         elif kind == NFAStateKind.ANY:
             # ANY matches everything except \n — almost all bytes
             return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)

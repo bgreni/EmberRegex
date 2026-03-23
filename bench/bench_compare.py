@@ -295,13 +295,15 @@ def run_python_benchmarks() -> dict[str, float]:
           lambda: re.match(r"([a-z]+)\d+\1", "abc123abc"))
 
     # 14. Compilation
+    # re.purge() flushes the internal pattern cache so we measure actual
+    # compilation work, not a dict lookup returning the cached object.
     section("14. Compilation")
     bench(py, "compile_wide_char_class",
-          lambda: re.compile(r"[a-zA-Z0-9!@#$%^&*()\-_+=]+"))
+          lambda: (re.purge(), re.compile(r"[a-zA-Z0-9!@#$%^&*()\-_+=]+")))
     bench(py, "compile_8_groups",
-          lambda: re.compile(r"(\w+) (\w+) (\w+) (\w+) (\w+) (\w+) (\w+) (\w+)"))
+          lambda: (re.purge(), re.compile(r"(\w+) (\w+) (\w+) (\w+) (\w+) (\w+) (\w+) (\w+)")))
     bench(py, "compile_nested_alternation",
-          lambda: re.compile(r"(?:a|b|c)(?:d|e|f)(?:g|h|i)(?:j|k|l)(?:m|n|o)(?:p|q|r)"))
+          lambda: (re.purge(), re.compile(r"(?:a|b|c)(?:d|e|f)(?:g|h|i)(?:j|k|l)(?:m|n|o)(?:p|q|r)")))
 
     return py
 

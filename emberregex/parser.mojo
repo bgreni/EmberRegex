@@ -8,6 +8,55 @@ Grammar (Milestone 1):
     atom       = CHAR | '.' | '[' charset ']' | '(' regex ')' | '\\' ESCAPE
 """
 
+from .constants import (
+    CHAR_A_LOWER,
+    CHAR_A_UPPER,
+    CHAR_BACKSLASH,
+    CHAR_BANG,
+    CHAR_B_LOWER,
+    CHAR_B_UPPER,
+    CHAR_CARET,
+    CHAR_COLON,
+    CHAR_COMMA,
+    CHAR_CR,
+    CHAR_DOLLAR,
+    CHAR_DOT,
+    CHAR_D_LOWER,
+    CHAR_D_UPPER,
+    CHAR_EQUALS,
+    CHAR_GREATER_THAN,
+    CHAR_I_LOWER,
+    CHAR_LBRACE,
+    CHAR_LBRACKET,
+    CHAR_LESS_THAN,
+    CHAR_LPAREN,
+    CHAR_MINUS,
+    CHAR_M_LOWER,
+    CHAR_NEWLINE,
+    CHAR_NINE,
+    CHAR_ONE,
+    CHAR_PIPE,
+    CHAR_PLUS,
+    CHAR_P_UPPER,
+    CHAR_QUESTION,
+    CHAR_RBRACE,
+    CHAR_RBRACKET,
+    CHAR_RPAREN,
+    CHAR_S,
+    CHAR_SPACE,
+    CHAR_STAR,
+    CHAR_S_LOWER,
+    CHAR_TAB,
+    CHAR_UNDERSCORE,
+    CHAR_W_LOWER,
+    CHAR_W_UPPER,
+    CHAR_ZERO,
+    CHAR_Z_LOWER,
+    CHAR_Z_UPPER,
+    CHAR_n,
+    CHAR_r,
+    CHAR_t,
+)
 from .ast import AST, ASTNode, ASTNodeKind, AnchorKind
 from .charset import CharSet, CharRange
 from .errors import RegexError
@@ -20,11 +69,13 @@ struct Parser(Movable):
     var pattern: String
     var pos: Int
     var ast: AST
+    var inline_flags: RegexFlags  # collected from (?i), (?m), (?s) in the pattern
 
     def __init__(out self, pattern: String):
         self.pattern = pattern
         self.pos = 0
         self.ast = AST()
+        self.inline_flags = RegexFlags()
 
     def parse(mut self) raises -> AST:
         """Parse the pattern and return the AST."""
@@ -39,6 +90,8 @@ struct Parser(Movable):
         # Build bitmaps for all charsets
         for i in range(len(self.ast.charsets)):
             self.ast.charsets[i].build_bitmap()
+        # Store inline flags on the AST so callers can access them
+        self.ast.flags = self.inline_flags
         var result = self.ast^
         self.ast = AST()
         return result^
@@ -75,12 +128,12 @@ struct Parser(Movable):
     def _parse_alternation(mut self) raises -> Int:
         """alternation = concat ('|' concat)*"""
         var first = self._parse_concat()
-        if self._at_end() or self._peek() != ord("|"):
+        if self._at_end() or self._peek() != CHAR_PIPE:
             return first
 
         var alternatives = List[Int]()
         alternatives.append(first)
-        while not self._at_end() and self._peek() == ord("|"):
+        while not self._at_end() and self._peek() == CHAR_PIPE:
             self.pos += 1  # consume '|'
             alternatives.append(self._parse_concat())
 
@@ -90,7 +143,7 @@ struct Parser(Movable):
     def _parse_concat(mut self) raises -> Int:
         """concat = quantified+"""
         var parts = List[Int]()
-        while not self._at_end() and self._peek() != ord("|") and self._peek() != ord(")"):
+        while not self._at_end() and self._peek() != CHAR_PIPE and self._peek() != CHAR_RPAREN:
             parts.append(self._parse_quantified())
 
         if len(parts) == 0:
@@ -115,22 +168,22 @@ struct Parser(Movable):
         var max_rep = 0
         var has_quantifier = False
 
-        if ch == ord("*"):
+        if ch == CHAR_STAR:
             self.pos += 1
             min_rep = 0
             max_rep = -1
             has_quantifier = True
-        elif ch == ord("+"):
+        elif ch == CHAR_PLUS:
             self.pos += 1
             min_rep = 1
             max_rep = -1
             has_quantifier = True
-        elif ch == ord("?"):
+        elif ch == CHAR_QUESTION:
             self.pos += 1
             min_rep = 0
             max_rep = 1
             has_quantifier = True
-        elif ch == ord("{"):
+        elif ch == CHAR_LBRACE:
             var result = self._try_parse_repetition()
             if result[0]:
                 min_rep = result[1]
@@ -142,7 +195,7 @@ struct Parser(Movable):
 
         # Check for lazy modifier
         var greedy = True
-        if not self._at_end() and self._peek() == ord("?"):
+        if not self._at_end() and self._peek() == CHAR_QUESTION:
             self.pos += 1
             greedy = False
 
@@ -168,23 +221,23 @@ struct Parser(Movable):
             return (False, 0, 0)
 
         var next_ch = self._peek()
-        if next_ch == ord("}"):
+        if next_ch == CHAR_RBRACE:
             # {n} — exact
             self.pos += 1
             return (True, min_val, min_val)
-        elif next_ch == ord(","):
+        elif next_ch == CHAR_COMMA:
             self.pos += 1  # consume ','
             if self._at_end():
                 self.pos = save_pos
                 return (False, 0, 0)
-            if self._peek() == ord("}"):
+            if self._peek() == CHAR_RBRACE:
                 # {n,} — unbounded
                 self.pos += 1
                 return (True, min_val, -1)
             elif self._is_digit(self._peek()):
                 # {n,m}
                 var max_val = self._parse_int()
-                if self._at_end() or self._peek() != ord("}"):
+                if self._at_end() or self._peek() != CHAR_RBRACE:
                     self.pos = save_pos
                     return (False, 0, 0)
                 self.pos += 1  # consume '}'
@@ -213,13 +266,13 @@ struct Parser(Movable):
         """Parse a decimal integer from the current position."""
         var result = 0
         while not self._at_end() and self._is_digit(self._peek()):
-            result = result * 10 + (self._peek() - ord("0"))
+            result = result * 10 + (self._peek() - CHAR_ZERO)
             self.pos += 1
         return result
 
     @staticmethod
     def _is_digit(ch: Int) -> Bool:
-        return ch >= ord("0") and ch <= ord("9")
+        return ch >= CHAR_ZERO and ch <= CHAR_NINE
 
     def _parse_atom(mut self) raises -> Int:
         """atom = CHAR | '.' | '[' charset ']' | '(' regex ')' | '\\\\' ESCAPE | '^' | '$'"""
@@ -232,25 +285,25 @@ struct Parser(Movable):
 
         var ch = self._peek()
 
-        if ch == ord("."):
+        if ch == CHAR_DOT:
             self.pos += 1
             var node = ASTNode.dot()
             return self.ast.add_node(node^)
-        elif ch == ord("["):
+        elif ch == CHAR_LBRACKET:
             return self._parse_char_class()
-        elif ch == ord("("):
+        elif ch == CHAR_LPAREN:
             return self._parse_group()
-        elif ch == ord("\\"):
+        elif ch == CHAR_BACKSLASH:
             return self._parse_escape()
-        elif ch == ord("^"):
+        elif ch == CHAR_CARET:
             self.pos += 1
             var node = ASTNode.anchor(AnchorKind.BOL)
             return self.ast.add_node(node^)
-        elif ch == ord("$"):
+        elif ch == CHAR_DOLLAR:
             self.pos += 1
             var node = ASTNode.anchor(AnchorKind.EOL)
             return self.ast.add_node(node^)
-        elif ch == ord("*") or ch == ord("+") or ch == ord("?"):
+        elif ch == CHAR_STAR or ch == CHAR_PLUS or ch == CHAR_QUESTION:
             raise Error(
                 String.write(
                     RegexError(
@@ -259,7 +312,7 @@ struct Parser(Movable):
                     )
                 )
             )
-        elif ch == ord(")"):
+        elif ch == CHAR_RPAREN:
             raise Error(
                 String.write(
                     RegexError("Unmatched ')'", self.pos)
@@ -277,7 +330,7 @@ struct Parser(Movable):
         var group_index = -1  # -1 = non-capturing by default
 
         # Check for group modifiers
-        if not self._at_end() and self._peek() == ord("?"):
+        if not self._at_end() and self._peek() == CHAR_QUESTION:
             self.pos += 1  # consume '?'
             if self._at_end():
                 raise Error(
@@ -286,22 +339,22 @@ struct Parser(Movable):
                     )
                 )
             var modifier = self._peek()
-            if modifier == ord(":"):
+            if modifier == CHAR_COLON:
                 self.pos += 1  # consume ':'
                 # Non-capturing group — group_index stays -1
-            elif modifier == ord("="):
+            elif modifier == CHAR_EQUALS:
                 self.pos += 1  # consume '='
                 var inner = self._parse_alternation()
-                self._expect(ord(")"))
+                self._expect(CHAR_RPAREN)
                 var node = ASTNode.lookahead(inner, False)
                 return self.ast.add_node(node^)
-            elif modifier == ord("!"):
+            elif modifier == CHAR_BANG:
                 self.pos += 1  # consume '!'
                 var inner = self._parse_alternation()
-                self._expect(ord(")"))
+                self._expect(CHAR_RPAREN)
                 var node = ASTNode.lookahead(inner, True)
                 return self.ast.add_node(node^)
-            elif modifier == ord("<"):
+            elif modifier == CHAR_LESS_THAN:
                 self.pos += 1  # consume '<'
                 if self._at_end():
                     raise Error(
@@ -310,16 +363,16 @@ struct Parser(Movable):
                         )
                     )
                 var next_ch = self._peek()
-                if next_ch == ord("="):
+                if next_ch == CHAR_EQUALS:
                     self.pos += 1  # consume '='
                     var inner = self._parse_alternation()
-                    self._expect(ord(")"))
+                    self._expect(CHAR_RPAREN)
                     var node = ASTNode.lookbehind(inner, False)
                     return self.ast.add_node(node^)
-                elif next_ch == ord("!"):
+                elif next_ch == CHAR_BANG:
                     self.pos += 1  # consume '!'
                     var inner = self._parse_alternation()
-                    self._expect(ord(")"))
+                    self._expect(CHAR_RPAREN)
                     var node = ASTNode.lookbehind(inner, True)
                     return self.ast.add_node(node^)
                 else:
@@ -331,30 +384,30 @@ struct Parser(Movable):
                             )
                         )
                     )
-            elif modifier == ord("P"):
+            elif modifier == CHAR_P_UPPER:
                 self.pos += 1  # consume 'P'
-                self._expect(ord("<"))
+                self._expect(CHAR_LESS_THAN)
                 var name = self._parse_group_name()
-                self._expect(ord(">"))
+                self._expect(CHAR_GREATER_THAN)
                 self.ast.group_count += 1
                 group_index = self.ast.group_count
                 self.ast.group_names[name^] = group_index
-            elif modifier == ord("i") or modifier == ord("m") or modifier == ord("s"):
+            elif modifier == CHAR_I_LOWER or modifier == CHAR_M_LOWER or modifier == CHAR_S_LOWER:
                 # Inline flags: (?i), (?m), (?s) or (?i:...) etc.
                 var inline_flags = self._parse_inline_flags()
-                if not self._at_end() and self._peek() == ord(")"):
+                if not self._at_end() and self._peek() == CHAR_RPAREN:
                     # (?ims) — set flags globally
                     self.pos += 1  # consume ')'
-                    self.ast.flags = RegexFlags(self.ast.flags.value | inline_flags.value)
+                    self.inline_flags = RegexFlags(self.inline_flags.value | inline_flags.value)
                     # Return empty concat node
                     var node = ASTNode.concat(List[Int]())
                     return self.ast.add_node(node^)
-                elif not self._at_end() and self._peek() == ord(":"):
+                elif not self._at_end() and self._peek() == CHAR_COLON:
                     self.pos += 1  # consume ':'
                     # (?ims:...) — scoped flags, treat as non-capturing group
                     # Flags are set globally for now (scoped flags would need
                     # per-node flag tracking)
-                    self.ast.flags = RegexFlags(self.ast.flags.value | inline_flags.value)
+                    self.inline_flags = RegexFlags(self.inline_flags.value | inline_flags.value)
                 else:
                     raise Error(
                         String.write(
@@ -379,7 +432,7 @@ struct Parser(Movable):
             group_index = self.ast.group_count
 
         var inner = self._parse_alternation()
-        self._expect(ord(")"))
+        self._expect(CHAR_RPAREN)
 
         if group_index == -1:
             # Non-capturing: just return the inner node directly
@@ -393,13 +446,13 @@ struct Parser(Movable):
         var flags = RegexFlags()
         while not self._at_end():
             var ch = self._peek()
-            if ch == ord("i"):
+            if ch == CHAR_I_LOWER:
                 flags = RegexFlags(flags.value | RegexFlags.IGNORECASE)
                 self.pos += 1
-            elif ch == ord("m"):
+            elif ch == CHAR_M_LOWER:
                 flags = RegexFlags(flags.value | RegexFlags.MULTILINE)
                 self.pos += 1
-            elif ch == ord("s"):
+            elif ch == CHAR_S_LOWER:
                 flags = RegexFlags(flags.value | RegexFlags.DOTALL)
                 self.pos += 1
             else:
@@ -409,13 +462,13 @@ struct Parser(Movable):
     def _parse_group_name(mut self) raises -> String:
         """Parse a group name (letters, digits, underscores)."""
         var start = self.pos
-        while not self._at_end() and self._peek() != ord(">"):
+        while not self._at_end() and self._peek() != CHAR_GREATER_THAN:
             var ch = self._peek()
             if not (
-                (ch >= ord("a") and ch <= ord("z"))
-                or (ch >= ord("A") and ch <= ord("Z"))
-                or (ch >= ord("0") and ch <= ord("9"))
-                or ch == ord("_")
+                (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
+                or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
+                or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
+                or ch == CHAR_UNDERSCORE
             ):
                 raise Error(
                     String.write(
@@ -447,72 +500,72 @@ struct Parser(Movable):
         var ch = self._advance()
 
         # Word boundary anchors
-        if ch == ord("b"):
+        if ch == CHAR_B_LOWER:
             var node = ASTNode.anchor(AnchorKind.WORD_BOUNDARY)
             return self.ast.add_node(node^)
-        elif ch == ord("B"):
+        elif ch == CHAR_B_UPPER:
             var node = ASTNode.anchor(AnchorKind.NOT_WORD_BOUNDARY)
             return self.ast.add_node(node^)
 
         # Backreferences \1 through \9
-        if ch >= ord("1") and ch <= ord("9"):
-            var group = ch - ord("0")
+        if ch >= CHAR_ONE and ch <= CHAR_NINE:
+            var group = ch - CHAR_ZERO
             var node = ASTNode.backreference(group)
             return self.ast.add_node(node^)
 
         # Shorthand character classes
-        if ch == ord("d") or ch == ord("D"):
+        if ch == CHAR_D_LOWER or ch == CHAR_D_UPPER:
             var cs = CharSet.digit()
-            if ch == ord("D"):
+            if ch == CHAR_D_UPPER:
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            var node = ASTNode.char_class(cs_idx, ch == ord("D"))
+            var node = ASTNode.char_class(cs_idx, ch == CHAR_D_UPPER)
             return self.ast.add_node(node^)
-        elif ch == ord("w") or ch == ord("W"):
+        elif ch == CHAR_W_LOWER or ch == CHAR_W_UPPER:
             var cs = CharSet.word()
-            if ch == ord("W"):
+            if ch == CHAR_W_UPPER:
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            var node = ASTNode.char_class(cs_idx, ch == ord("W"))
+            var node = ASTNode.char_class(cs_idx, ch == CHAR_W_UPPER)
             return self.ast.add_node(node^)
-        elif ch == ord("s") or ch == ord("S"):
+        elif ch == CHAR_S_LOWER or ch == CHAR_S:
             var cs = CharSet.whitespace()
-            if ch == ord("S"):
+            if ch == CHAR_S:
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            var node = ASTNode.char_class(cs_idx, ch == ord("S"))
+            var node = ASTNode.char_class(cs_idx, ch == CHAR_S)
             return self.ast.add_node(node^)
 
         # Literal character escapes
-        if ch == ord("t"):
-            var node = ASTNode.literal(UInt32(ord("\t")))
+        if ch == CHAR_t:
+            var node = ASTNode.literal(UInt32(CHAR_TAB))
             return self.ast.add_node(node^)
-        elif ch == ord("n"):
-            var node = ASTNode.literal(UInt32(ord("\n")))
+        elif ch == CHAR_n:
+            var node = ASTNode.literal(UInt32(CHAR_NEWLINE))
             return self.ast.add_node(node^)
-        elif ch == ord("r"):
-            var node = ASTNode.literal(UInt32(ord("\r")))
+        elif ch == CHAR_r:
+            var node = ASTNode.literal(UInt32(CHAR_CR))
             return self.ast.add_node(node^)
 
         # Metacharacter escapes
         if (
-            ch == ord("\\")
-            or ch == ord(".")
-            or ch == ord("*")
-            or ch == ord("+")
-            or ch == ord("?")
-            or ch == ord("[")
-            or ch == ord("]")
-            or ch == ord("(")
-            or ch == ord(")")
-            or ch == ord("|")
-            or ch == ord("{")
-            or ch == ord("}")
-            or ch == ord("^")
-            or ch == ord("$")
+            ch == CHAR_BACKSLASH
+            or ch == CHAR_DOT
+            or ch == CHAR_STAR
+            or ch == CHAR_PLUS
+            or ch == CHAR_QUESTION
+            or ch == CHAR_LBRACKET
+            or ch == CHAR_RBRACKET
+            or ch == CHAR_LPAREN
+            or ch == CHAR_RPAREN
+            or ch == CHAR_PIPE
+            or ch == CHAR_LBRACE
+            or ch == CHAR_RBRACE
+            or ch == CHAR_CARET
+            or ch == CHAR_DOLLAR
         ):
             var node = ASTNode.literal(UInt32(ch))
             return self.ast.add_node(node^)
@@ -530,20 +583,20 @@ struct Parser(Movable):
         """Parse a character class: [abc], [a-z], [^abc], etc."""
         self.pos += 1  # consume '['
         var negated = False
-        if not self._at_end() and self._peek() == ord("^"):
+        if not self._at_end() and self._peek() == CHAR_CARET:
             negated = True
             self.pos += 1
 
         var cs = CharSet()
 
         # Handle ']' as first character in class (literal)
-        if not self._at_end() and self._peek() == ord("]"):
-            cs.add_range(UInt32(ord("]")), UInt32(ord("]")))
+        if not self._at_end() and self._peek() == CHAR_RBRACKET:
+            cs.add_range(UInt32(CHAR_RBRACKET), UInt32(CHAR_RBRACKET))
             self.pos += 1
 
-        while not self._at_end() and self._peek() != ord("]"):
+        while not self._at_end() and self._peek() != CHAR_RBRACKET:
             var ch = self._advance()
-            if ch == ord("\\"):
+            if ch == CHAR_BACKSLASH:
                 # Escape inside char class
                 if self._at_end():
                     raise Error(
@@ -556,58 +609,58 @@ struct Parser(Movable):
                     )
                 var esc = self._peek()
                 # Shorthand classes inside char class
-                if esc == ord("d"):
+                if esc == CHAR_D_LOWER:
                     self.pos += 1
-                    cs.add_range(UInt32(ord("0")), UInt32(ord("9")))
+                    cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
                     continue
-                elif esc == ord("D"):
+                elif esc == CHAR_D_UPPER:
                     # \D inside a class is complex — skip for now, just add ranges
                     self.pos += 1
-                    cs.add_range(0, UInt32(ord("0")) - 1)
-                    cs.add_range(UInt32(ord("9")) + 1, 127)
+                    cs.add_range(0, UInt32(CHAR_ZERO) - 1)
+                    cs.add_range(UInt32(CHAR_NINE) + 1, 127)
                     continue
-                elif esc == ord("w"):
+                elif esc == CHAR_W_LOWER:
                     self.pos += 1
-                    cs.add_range(UInt32(ord("a")), UInt32(ord("z")))
-                    cs.add_range(UInt32(ord("A")), UInt32(ord("Z")))
-                    cs.add_range(UInt32(ord("0")), UInt32(ord("9")))
-                    cs.add_range(UInt32(ord("_")), UInt32(ord("_")))
+                    cs.add_range(UInt32(CHAR_A_LOWER), UInt32(CHAR_Z_LOWER))
+                    cs.add_range(UInt32(CHAR_A_UPPER), UInt32(CHAR_Z_UPPER))
+                    cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
+                    cs.add_range(UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE))
                     continue
-                elif esc == ord("W"):
+                elif esc == CHAR_W_UPPER:
                     # \W inside class — hard to represent, skip detailed handling
                     self.pos += 1
                     continue
-                elif esc == ord("s"):
+                elif esc == CHAR_S_LOWER:
                     self.pos += 1
-                    cs.add_range(UInt32(ord(" ")), UInt32(ord(" ")))
-                    cs.add_range(UInt32(ord("\t")), UInt32(ord("\t")))
-                    cs.add_range(UInt32(ord("\n")), UInt32(ord("\n")))
-                    cs.add_range(UInt32(ord("\r")), UInt32(ord("\r")))
+                    cs.add_range(UInt32(CHAR_SPACE), UInt32(CHAR_SPACE))
+                    cs.add_range(UInt32(CHAR_TAB), UInt32(CHAR_TAB))
+                    cs.add_range(UInt32(CHAR_NEWLINE), UInt32(CHAR_NEWLINE))
+                    cs.add_range(UInt32(CHAR_CR), UInt32(CHAR_CR))
                     cs.add_range(0x0B, 0x0B)
                     cs.add_range(0x0C, 0x0C)
                     continue
-                elif esc == ord("S"):
+                elif esc == CHAR_S:
                     self.pos += 1
                     continue
-                elif esc == ord("t"):
+                elif esc == CHAR_t:
                     self.pos += 1
-                    ch = ord("\t")
-                elif esc == ord("n"):
+                    ch = CHAR_TAB
+                elif esc == CHAR_n:
                     self.pos += 1
-                    ch = ord("\n")
-                elif esc == ord("r"):
+                    ch = CHAR_NEWLINE
+                elif esc == CHAR_r:
                     self.pos += 1
-                    ch = ord("\r")
+                    ch = CHAR_CR
                 else:
                     ch = self._advance()
 
             # Check for range: a-z
-            if not self._at_end() and self._peek() == ord("-"):
+            if not self._at_end() and self._peek() == CHAR_MINUS:
                 # Peek ahead to see if this is a range or a literal '-' at end
-                if self.pos + 1 < len(self.pattern) and Int(self.pattern.as_bytes()[self.pos + 1]) != ord("]"):
+                if self.pos + 1 < len(self.pattern) and Int(self.pattern.as_bytes()[self.pos + 1]) != CHAR_RBRACKET:
                     self.pos += 1  # consume '-'
                     var hi_ch = self._advance()
-                    if hi_ch == ord("\\"):
+                    if hi_ch == CHAR_BACKSLASH:
                         if self._at_end():
                             raise Error(
                                 String.write(
@@ -641,6 +694,9 @@ struct Parser(Movable):
 
 
 def parse(pattern: String) raises -> AST:
-    """Parse a regex pattern string into an AST."""
+    """Parse a regex pattern string into an AST.
+
+    Inline flags (e.g. ``(?i)``) are stored in ``ast.flags``.
+    """
     var p = Parser(pattern)
     return p.parse()

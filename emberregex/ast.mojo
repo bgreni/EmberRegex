@@ -138,7 +138,7 @@ struct AST(Movable):
     var root: Int
     var group_count: Int
     var group_names: Dict[String, Int]
-    var flags: RegexFlags
+    var flags: RegexFlags  # Inline flags extracted from the pattern (e.g. (?i), (?m), (?s))
 
     def __init__(out self):
         self.nodes = List[ASTNode]()

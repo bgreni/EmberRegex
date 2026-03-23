@@ -1,5 +1,18 @@
 """Character set representation with SIMD-accelerated ASCII membership testing."""
 
+from .constants import (
+    CHAR_A_LOWER,
+    CHAR_A_UPPER,
+    CHAR_CR,
+    CHAR_NEWLINE,
+    CHAR_NINE,
+    CHAR_SPACE,
+    CHAR_TAB,
+    CHAR_UNDERSCORE,
+    CHAR_ZERO,
+    CHAR_Z_LOWER,
+    CHAR_Z_UPPER,
+)
 # 32 bytes = 256 bits: one bit per possible byte value (0–255).
 # This is a semantic constant (the size of the lookup table), not a hardware SIMD width.
 comptime BITMAP_WIDTH = 32
@@ -49,27 +62,27 @@ struct CharSet(Copyable, Movable):
 
     @staticmethod
     def digit() -> CharSet:
-        """[0-9]"""
-        return CharSet.from_range(UInt32(ord("0")), UInt32(ord("9")))
+        """[0-9]."""
+        return CharSet.from_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
 
     @staticmethod
     def word() -> CharSet:
-        """[a-zA-Z0-9_]"""
+        """[a-zA-Z0-9_]."""
         var cs = CharSet()
-        cs.add_range(UInt32(ord("a")), UInt32(ord("z")))
-        cs.add_range(UInt32(ord("A")), UInt32(ord("Z")))
-        cs.add_range(UInt32(ord("0")), UInt32(ord("9")))
-        cs.add_range(UInt32(ord("_")), UInt32(ord("_")))
+        cs.add_range(UInt32(CHAR_A_LOWER), UInt32(CHAR_Z_LOWER))
+        cs.add_range(UInt32(CHAR_A_UPPER), UInt32(CHAR_Z_UPPER))
+        cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
+        cs.add_range(UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE))
         return cs^
 
     @staticmethod
     def whitespace() -> CharSet:
-        """[ \\t\\n\\r\\f\\v]"""
+        """[ \\t\\n\\r\\f\\v]."""
         var cs = CharSet()
-        cs.add_range(UInt32(ord(" ")), UInt32(ord(" ")))
-        cs.add_range(UInt32(ord("\t")), UInt32(ord("\t")))
-        cs.add_range(UInt32(ord("\n")), UInt32(ord("\n")))
-        cs.add_range(UInt32(ord("\r")), UInt32(ord("\r")))
+        cs.add_range(UInt32(CHAR_SPACE), UInt32(CHAR_SPACE))
+        cs.add_range(UInt32(CHAR_TAB), UInt32(CHAR_TAB))
+        cs.add_range(UInt32(CHAR_NEWLINE), UInt32(CHAR_NEWLINE))
+        cs.add_range(UInt32(CHAR_CR), UInt32(CHAR_CR))
         cs.add_range(0x0C, 0x0C)  # form feed
         cs.add_range(0x0B, 0x0B)  # vertical tab
         return cs^
@@ -94,11 +107,17 @@ struct CharSet(Copyable, Movable):
                 continue
             if hi > 255:
                 hi = 255
-            for ch in range(lo, hi + 1):
-                var byte_idx = ch >> 3
-                var bit_idx = ch & 7
-                var mask = UInt8(1) << UInt8(bit_idx)
-                self.bitmap[byte_idx] = self.bitmap[byte_idx] | mask
+            var start_byte = lo >> 3
+            var end_byte = hi >> 3
+            var start_mask = UInt8(0xFF) << UInt8(lo & 7)
+            var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
+            if start_byte == end_byte:
+                self.bitmap[start_byte] |= (start_mask & end_mask)
+            else:
+                self.bitmap[start_byte] |= start_mask
+                for b in range(start_byte + 1, end_byte):
+                    self.bitmap[b] = 0xFF
+                self.bitmap[end_byte] |= end_mask
         self.bitmap_valid = True
 
     def contains(self, ch: UInt32) -> Bool:
