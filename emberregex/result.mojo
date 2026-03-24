@@ -8,7 +8,9 @@ struct MatchResult(Copyable, Movable, Writable):
     var start: Int
     var end: Int
     var group_count: Int
-    var slots: List[Int]  # 2 * group_count entries: [start0, end0, start1, end1, ...]
+    var slots: List[
+        Int
+    ]  # 2 * group_count entries: [start0, end0, start1, end1, ...]
 
     def __init__(
         out self,
@@ -30,8 +32,11 @@ struct MatchResult(Copyable, Movable, Writable):
         for _i in range(2 * group_count):
             slots.append(-1)
         return MatchResult(
-            matched=False, start=-1, end=-1,
-            group_count=group_count, slots=slots^,
+            matched=False,
+            start=-1,
+            end=-1,
+            group_count=group_count,
+            slots=slots^,
         )
 
     def __bool__(self) -> Bool:
@@ -53,7 +58,8 @@ struct MatchResult(Copyable, Movable, Writable):
         return (slot_start, slot_end)
 
     def group_matched(self, index: Int) -> Bool:
-        """Check if capture group `index` (1-based) participated in the match."""
+        """Check if capture group `index` (1-based) participated in the match.
+        """
         if index < 1 or index > self.group_count:
             return False
         return self.slots[2 * index - 2] != -1
@@ -70,7 +76,23 @@ struct MatchResult(Copyable, Movable, Writable):
         if s == -1 or e == -1:
             return ""
         # Use string slicing to extract the matched text
-        return String(input[byte=s:e])
+        return String(unsafe_from_utf8=input.as_bytes()[s:e])
+
+    def group_str[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], index: Int) -> String:
+        """Extract the text matched by capture group `index` (1-based).
+
+        Returns empty string if the group didn't match.
+        """
+        if index < 1 or index > self.group_count:
+            return ""
+        var s = self.slots[2 * index - 2]
+        var e = self.slots[2 * index - 1]
+        if s == -1 or e == -1:
+            return ""
+        # Use string slicing to extract the matched text
+        return String(unsafe_from_utf8=input[s:e])
 
     def write_to(self, mut writer: Some[Writer]):
         if self.matched:

@@ -12,6 +12,17 @@ bench = { cmd = "mojo -I . bench/bench_basic.mojo" }
 bench_ext = { cmd = "mojo -I . bench/bench_extended.mojo" }
 bench_all = {depends-on=["bench", "bench_ext"]}
 compare = { cmd = "python3 bench/bench_compare.py" }
+format = "mojo format emberregex test bench"
 
 [dependencies]
 mojo = ">=0.26.3.0.dev2026032005,<0.27"
+
+[feature.pdf.dependencies]
+reportlab = "*"
+
+[feature.pdf.tasks]
+compare_pdf = { cmd = "python3 bench/gen_pdf.py" }
+
+[environments]
+default = { features = [], solve-group = "default" }
+pdf = { features = ["pdf"], solve-group = "default" }

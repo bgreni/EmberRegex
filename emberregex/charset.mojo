@@ -13,6 +13,7 @@ from .constants import (
     CHAR_Z_LOWER,
     CHAR_Z_UPPER,
 )
+
 # 32 bytes = 256 bits: one bit per possible byte value (0–255).
 # This is a semantic constant (the size of the lookup table), not a hardware SIMD width.
 comptime BITMAP_WIDTH = 32
@@ -112,7 +113,7 @@ struct CharSet(Copyable, Movable):
             var start_mask = UInt8(0xFF) << UInt8(lo & 7)
             var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
             if start_byte == end_byte:
-                self.bitmap[start_byte] |= (start_mask & end_mask)
+                self.bitmap[start_byte] |= start_mask & end_mask
             else:
                 self.bitmap[start_byte] |= start_mask
                 for b in range(start_byte + 1, end_byte):

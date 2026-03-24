@@ -24,7 +24,7 @@ def bt_full_match(nfa: NFA, input: String) -> MatchResult:
     """Full match using backtracking engine."""
     var num_slots = 2 * nfa.group_count
     var slots = List[Int](fill=-1, length=num_slots)
-    var end = _bt_try_match(nfa, input, nfa.start, 0, slots, 0)
+    var end = _bt_try_match(nfa, input.as_bytes(), nfa.start, 0, slots, 0)
     if end >= 0 and end == len(input):
         return MatchResult(
             matched=True,
@@ -42,7 +42,7 @@ def bt_search(nfa: NFA, input: String) -> MatchResult:
     var i = 0
     while i <= len(input):
         var slots = List[Int](fill=-1, length=num_slots)
-        var end = _bt_try_match(nfa, input, nfa.start, i, slots, 0)
+        var end = _bt_try_match(nfa, input.as_bytes(), nfa.start, i, slots, 0)
         if end >= 0:
             return MatchResult(
                 matched=True,
@@ -55,9 +55,11 @@ def bt_search(nfa: NFA, input: String) -> MatchResult:
     return MatchResult.no_match(nfa.group_count)
 
 
-def _bt_try_match(
+def _bt_try_match[
+    origin: Origin, //
+](
     nfa: NFA,
-    input: String,
+    input: Span[Byte, origin],
     state_idx: Int,
     pos: Int,
     mut slots: List[Int],
@@ -78,8 +80,8 @@ def _bt_try_match(
     elif kind == NFAStateKind.CHAR:
         if pos >= len(input):
             return -1
-        var ch = UInt32((input.unsafe_ptr() + pos).load())
-        if ch == state.char_value:
+        var ch = input.unsafe_get(pos)
+        if UInt32(ch) == state.char_value:
             return _bt_try_match(
                 nfa, input, state.out1, pos + 1, slots, depth + 1
             )
@@ -88,8 +90,8 @@ def _bt_try_match(
     elif kind == NFAStateKind.ANY:
         if pos >= len(input):
             return -1
-        var ch = UInt32((input.unsafe_ptr() + pos).load())
-        if ch != UInt32(CHAR_NEWLINE):
+        var ch = input.unsafe_get(pos)
+        if ch != CHAR_NEWLINE:
             return _bt_try_match(
                 nfa, input, state.out1, pos + 1, slots, depth + 1
             )
@@ -98,9 +100,9 @@ def _bt_try_match(
     elif kind == NFAStateKind.CHARSET:
         if pos >= len(input):
             return -1
-        var ch = UInt32((input.unsafe_ptr() + pos).load())
+        var ch = UInt32(input.unsafe_get(pos)) # Charset contains UInt32
         var cs_idx = state.charset_index
-        if nfa.charsets[cs_idx].contains(ch):
+        if nfa.charsets.unsafe_get(cs_idx).contains(ch):
             return _bt_try_match(
                 nfa, input, state.out1, pos + 1, slots, depth + 1
             )
@@ -109,26 +111,44 @@ def _bt_try_match(
     elif kind == NFAStateKind.SPLIT:
         var out1 = state.out1
         var out2 = state.out2
-        # Try preferred branch first (out1), then alternative (out2)
-        var saved = slots.copy()
+        # Detect greedy .* pattern: SPLIT(out1=ANY, out2=cont) where ANY.out1=SPLIT
+        # Fast-forward to end of line, then try continuation backwards.
+        if state.greedy and out1 >= 0 and out1 < len(nfa.states):
+            ref any_state = nfa.states.unsafe_get(out1)
+            if any_state.kind == NFAStateKind.ANY and any_state.out1 == state_idx:
+                # Greedy .* — scan forward to find max extent (stop at newline)
+                var max_pos = pos
+                var input_len = len(input)
+                while max_pos < input_len and input.unsafe_get(max_pos) != CHAR_NEWLINE:
+                    max_pos += 1
+                # Try continuation from farthest position back to current
+                var p = max_pos
+                while p >= pos:
+                    var result = _bt_try_match(
+                        nfa, input, out2, p, slots, depth + 1
+                    )
+                    if result >= 0:
+                        return result
+                    p -= 1
+                return -1
+        # General SPLIT: try preferred branch first, then alternative.
+        # No slots.copy() needed: SAVE states restore on failure.
         var result = _bt_try_match(nfa, input, out1, pos, slots, depth + 1)
         if result >= 0:
             return result
-        # Restore slots and try other branch
-        slots = saved^
         return _bt_try_match(nfa, input, out2, pos, slots, depth + 1)
 
     elif kind == NFAStateKind.SAVE:
         var slot = state.save_slot
         var old_val = -1
         if slot >= 0 and slot < len(slots):
-            old_val = slots[slot]
-            slots[slot] = pos
+            old_val = slots.unsafe_get(slot)
+            slots.unsafe_set(slot, pos)
         var result = _bt_try_match(
             nfa, input, state.out1, pos, slots, depth + 1
         )
         if result < 0 and slot >= 0 and slot < len(slots):
-            slots[slot] = old_val  # Restore on failure
+            slots.unsafe_set(slot, old_val)  # Restore on failure
         return result
 
     elif kind == NFAStateKind.ANCHOR:
@@ -180,16 +200,15 @@ def _bt_try_match(
             return -1
         # Compare the captured text with input at current position
         # icase is baked into the BACKREF state at NFA construction time
-        var ptr = input.unsafe_ptr()
-        var icase = state.icase
-        for i in range(ref_len):
-            var a = (ptr + gs + i).load()
-            var b = (ptr + pos + i).load()
-            if icase:
-                if _bt_to_lower(Int(a)) != _bt_to_lower(Int(b)):
+        if state.icase:
+            for i in range(ref_len):
+                if _bt_to_lower(input.unsafe_get(gs + i)) != _bt_to_lower(
+                    input.unsafe_get(pos + i)
+                ):
                     return -1
-            else:
-                if a != b:
+        else:
+            for i in range(ref_len):
+                if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
                     return -1
         return _bt_try_match(
             nfa, input, state.out1, pos + ref_len, slots, depth + 1
@@ -198,43 +217,47 @@ def _bt_try_match(
     return -1
 
 
-def _bt_check_anchor(
-    anchor_type: Int, input: String, input_len: Int, pos: Int
+def _bt_check_anchor[
+    origin: Origin, //
+](
+    anchor_type: Int,
+    input: Span[Byte, origin],
+    input_len: Int,
+    pos: Int,
 ) -> Bool:
     """Check if an anchor assertion holds at the given position.
 
     MULTILINE behavior is baked into the anchor kind at NFA construction time:
     BOL_MULTILINE / EOL_MULTILINE handle line-boundary matching without a runtime flag check.
     """
-    var ptr = input.unsafe_ptr()
     if anchor_type == AnchorKind.BOL:
         return pos == 0
     elif anchor_type == AnchorKind.BOL_MULTILINE:
-        return pos == 0 or Int((ptr + pos - 1).load()) == CHAR_NEWLINE
+        return pos == 0 or input.unsafe_get(pos - 1) == CHAR_NEWLINE
     elif anchor_type == AnchorKind.EOL:
         return pos == input_len
     elif anchor_type == AnchorKind.EOL_MULTILINE:
-        return pos == input_len or Int((ptr + pos).load()) == CHAR_NEWLINE
+        return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
     elif anchor_type == AnchorKind.WORD_BOUNDARY:
         var left_is_word = False
         var right_is_word = False
         if pos > 0:
-            left_is_word = _bt_is_word_char(Int((ptr + pos - 1).load()))
+            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
         if pos < input_len:
-            right_is_word = _bt_is_word_char(Int((ptr + pos).load()))
+            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
         return left_is_word != right_is_word
     elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
         var left_is_word = False
         var right_is_word = False
         if pos > 0:
-            left_is_word = _bt_is_word_char(Int((ptr + pos - 1).load()))
+            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
         if pos < input_len:
-            right_is_word = _bt_is_word_char(Int((ptr + pos).load()))
+            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
         return left_is_word == right_is_word
     return False
 
 
-def _bt_is_word_char(ch: Int) -> Bool:
+def _bt_is_word_char(ch: Byte) -> Bool:
     return (
         (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
         or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
@@ -243,7 +266,7 @@ def _bt_is_word_char(ch: Int) -> Bool:
     )
 
 
-def _bt_to_lower(ch: Int) -> Int:
+def _bt_to_lower(ch: Byte) -> Byte:
     if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
         return ch + 32
     return ch

@@ -2,7 +2,7 @@
 
 A high-performance regular expression library for [Mojo](https://www.modular.com/mojo).
 
-EmberRegex automatically selects the fastest matching engine for each pattern — a lazy DFA for simple patterns, a Pike VM for patterns with capture groups, and a backtracking engine when backreferences are needed.
+EmberRegex automatically selects the fastest matching engine for each pattern — a lazy DFA for simple patterns, a one-pass NFA for patterns with captures, a Pike VM for more complex captures, and a backtracking engine when backreferences are needed.
 
 ## Quick Start
 
@@ -244,16 +244,22 @@ re4.match("a\nb").matched  # True
 
 EmberRegex selects the optimal engine automatically:
 
-- **Lazy DFA** for patterns without captures or assertions — O(n) single-pass matching, up to 20x faster than Python's `re`
-- **Pike VM** for patterns with capture groups — parallel NFA simulation with SIMD-accelerated search
-- **Backtracking** only when backreferences require it
+- **Lazy DFA** for patterns without captures — O(n) single-pass matching with no capture overhead. Simple line anchors (`^`, `$`, multiline variants) are handled directly by the DFA rather than disabling it. Up to 20x faster than Python's `re` on throughput-heavy patterns.
+- **One-pass NFA** for DFA-compatible patterns with captures — single linear scan extracts captures with no thread management overhead. Used as a fast-path in hybrid search (DFA finds boundaries, one-pass extracts captures).
+- **Pike VM** for patterns with captures that aren't one-pass eligible — parallel NFA simulation.
+- **Backtracking** only when backreferences require it.
 
-The library uses SIMD to scan for literal prefixes (e.g., the `<` in `<\w+>`) to skip non-candidate positions during search.
+Additional search accelerations applied regardless of engine:
+
+- **SIMD literal prefix scan** — when the pattern starts with a fixed string (e.g. `<` in `<\w+>`), scans 16 bytes at a time to skip non-candidate positions.
+- **First-byte bitmap** — 256-bit SIMD bitmap rejects positions where the first byte can't match.
+- **Position-skip optimization** — when the DFA dies at position P after starting at S, skips directly to P rather than trying every position in between.
+- **BOL/MULTILINE position skip** — patterns anchored at `^` with MULTILINE only try positions after each `\n`, reducing O(n) to O(lines).
 
 ## Development
 
 ```bash
-pixi run test       # run all 146 tests
+pixi run test       # run all 147 tests
 pixi run bench      # basic benchmark suite
 pixi run bench_ext  # extended benchmark suite
 ```

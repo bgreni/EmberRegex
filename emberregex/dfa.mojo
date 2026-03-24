@@ -50,6 +50,7 @@ struct LazyDFA(Copyable, Movable):
     var _init_start: Int  # initial state at position 0 (BOL + BOL_MULTILINE hold)
     var _init_after_nl: Int  # initial state after '\n' (only BOL_MULTILINE holds)
     var _init_other: Int  # initial state at mid-line (no BOL anchors hold)
+    var _sub_init_cache: Dict[Int, Int]  # nfa_start*4+ctx → DFA state idx
 
     def __init__(out self):
         self.states = List[_DFAState]()
@@ -58,6 +59,7 @@ struct LazyDFA(Copyable, Movable):
         self._init_start = 0
         self._init_after_nl = 0
         self._init_other = 0
+        self._sub_init_cache = Dict[Int, Int]()
 
     def _ensure_init(mut self, nfa: NFA):
         if self._initialized:
@@ -110,14 +112,26 @@ struct LazyDFA(Copyable, Movable):
         var length = len(input)
 
         for i in range(length):
-            current = self._step(nfa, current, UInt8((ptr + i).load()))
-            if current < 0:
+            # Inline the cache-hit path to avoid _step call overhead
+            var byte_idx = Int(UInt8((ptr + i).load()))
+            var cached = self.states.unsafe_get(current).transitions.unsafe_get(
+                byte_idx
+            )
+            if cached >= 0:
+                current = cached
+            elif cached == -2:
                 return False
+            else:
+                current = self._step(nfa, current, UInt8(byte_idx))
+                if current < 0:
+                    return False
 
         ref final_state = self.states.unsafe_get(current)
         return final_state.is_match or final_state.eol_at_end
 
-    def match_at(mut self, nfa: NFA, input: String, start: Int) -> Int:
+    def match_at[
+        origin: Origin, //
+    ](mut self, nfa: NFA, input: Span[Byte, origin], start: Int) -> Int:
         """Try to match at start position. Returns end position or -1."""
         self._ensure_init(nfa)
         var ptr = input.unsafe_ptr()
@@ -127,7 +141,7 @@ struct LazyDFA(Copyable, Movable):
         var current: Int
         if start == 0:
             current = self._init_start
-        elif start > 0 and Int((ptr + start - 1).load()) == CHAR_NEWLINE:
+        elif start > 0 and input.unsafe_get(start - 1) == CHAR_NEWLINE:
             current = self._init_after_nl
         else:
             current = self._init_other
@@ -138,10 +152,10 @@ struct LazyDFA(Copyable, Movable):
 
         var pos = start
         while pos < input_len:
-            var byte = UInt8((ptr + pos).load())
+            var byte = input.unsafe_get(pos)
 
             # Check EOL_MULTILINE anchors before consuming '\n'
-            if Int(byte) == CHAR_NEWLINE:
+            if byte == CHAR_NEWLINE:
                 if self.states.unsafe_get(current).eol_at_newline:
                     last_match = pos
             current = self._step(nfa, current, byte)
@@ -157,10 +171,12 @@ struct LazyDFA(Copyable, Movable):
 
         return last_match
 
-    def search_forward(
+    def search_forward[
+        origin: Origin, //
+    ](
         mut self,
         nfa: NFA,
-        input: String,
+        input: Span[Byte, origin],
         start: Int,
         first_byte_bitmap: SIMD[DType.uint8, 32],
         bitmap_useful: Bool,
@@ -171,7 +187,6 @@ struct LazyDFA(Copyable, Movable):
         skips ahead to P instead of trying P-1, P-2, etc.
         """
         self._ensure_init(nfa)
-        var ptr = input.unsafe_ptr()
         var input_len = len(input)
         var pos = start
 
@@ -179,9 +194,9 @@ struct LazyDFA(Copyable, Movable):
             # Bitmap skip: advance to first byte that could start a match
             if bitmap_useful and pos < input_len:
                 while pos < input_len:
-                    var b = UInt8((ptr + pos).load())
-                    var byte_idx = Int(b) >> 3
-                    var bit_idx = UInt8(Int(b) & 7)
+                    var b = input.unsafe_get(pos)
+                    var byte_idx = Int(b >> 3)
+                    var bit_idx = UInt8(b & 7)
                     if (
                         first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)
                     ) != 0:
@@ -195,7 +210,7 @@ struct LazyDFA(Copyable, Movable):
             var current: Int
             if pos == 0:
                 current = self._init_start
-            elif pos > 0 and Int((ptr + pos - 1).load()) == CHAR_NEWLINE:
+            elif pos > 0 and input.unsafe_get(pos - 1) == CHAR_NEWLINE:
                 current = self._init_after_nl
             else:
                 current = self._init_other
@@ -206,8 +221,8 @@ struct LazyDFA(Copyable, Movable):
 
             var p = pos
             while p < input_len:
-                var byte = UInt8((ptr + p).load())
-                if Int(byte) == CHAR_NEWLINE:
+                var byte = input.unsafe_get(p)
+                if byte == CHAR_NEWLINE:
                     if self.states.unsafe_get(current).eol_at_newline:
                         last_match = p
                 current = self._step(nfa, current, byte)
@@ -232,6 +247,79 @@ struct LazyDFA(Copyable, Movable):
                 pos += 1
 
         return (-1, -1)
+
+    def match_from[
+        origin: Origin, //
+    ](
+        mut self,
+        nfa: NFA,
+        input: Span[Byte, origin],
+        nfa_start: Int,
+        pos: Int,
+    ) -> Int:
+        """Match from an arbitrary NFA start state. Returns end position or -1.
+
+        Used for DFA-accelerated lookahead evaluation. DFA states are cached
+        in the same state_map as the main pattern's states. Initial state
+        lookups are cached per (nfa_start, position_context) to avoid
+        repeated epsilon closure computation.
+        """
+        var at_start = pos == 0
+        var after_nl = pos > 0 and input.unsafe_get(pos - 1) == CHAR_NEWLINE
+        var cache_key = nfa_start * 4 + Int(at_start) * 2 + Int(after_nl)
+
+        var current: Int
+        var cached_init = self._sub_init_cache.get(cache_key)
+        if cached_init:
+            current = cached_init.value()
+        else:
+            # Compute initial DFA state from the custom NFA start
+            var seeds = List[Int]()
+            seeds.append(nfa_start)
+            var closed = List[Int]()
+            var has_match = _epsilon_closure(
+                nfa, seeds^, closed, at_start, after_nl
+            )
+            var key = _state_key(closed)
+
+            var maybe = self.state_map.get(key)
+            if maybe:
+                current = maybe.value()
+            else:
+                var eol_end = _check_eol_match(nfa, closed, at_end=True)
+                var eol_nl = _check_eol_match(nfa, closed, at_end=False)
+                current = len(self.states)
+                var new_state = _DFAState(
+                    closed^, has_match, eol_end, eol_nl
+                )
+                self.states.append(new_state^)
+                self.state_map[key^] = current
+            self._sub_init_cache[cache_key] = current
+
+        # Check immediate match (e.g. empty-matching lookahead)
+        if self.states.unsafe_get(current).is_match:
+            return pos
+
+        # Run the DFA forward
+        var input_len = len(input)
+        var p = pos
+        while p < input_len:
+            var byte = input.unsafe_get(p)
+            if byte == CHAR_NEWLINE:
+                if self.states.unsafe_get(current).eol_at_newline:
+                    return p
+            current = self._step(nfa, current, byte)
+            if current < 0:
+                return -1
+            p += 1
+            if self.states.unsafe_get(current).is_match:
+                return p
+
+        # End of input: check EOL anchors
+        if current >= 0 and self.states.unsafe_get(current).eol_at_end:
+            return p
+
+        return -1
 
     @always_inline
     def _step(
@@ -276,7 +364,7 @@ struct LazyDFA(Copyable, Movable):
         # Epsilon closure of next states.
         # After consuming '\n', the next position is after a newline (BOL_MULTILINE holds).
         # at_start is always False in step (only True for initial state).
-        var after_nl = byte_idx == CHAR_NEWLINE
+        var after_nl = byte == CHAR_NEWLINE
         var closed = List[Int]()
         var has_match = _epsilon_closure(
             nfa, next_nfa^, closed, at_start=False, after_newline=after_nl
@@ -316,8 +404,8 @@ def dfa_full_match(nfa: NFA, input: String) -> Bool:
 def dfa_search(nfa: NFA, input: String) -> Int:
     """Search for first match start position. Creates a fresh DFA each call."""
     var dfa = LazyDFA()
-    var input_len = len(input)
-    var ptr = input.unsafe_ptr()
+    var bytes = input.as_bytes()
+    var input_len = len(bytes)
 
     dfa._ensure_init(nfa)
 
@@ -326,7 +414,7 @@ def dfa_search(nfa: NFA, input: String) -> Int:
         var current: Int
         if start == 0:
             current = dfa._init_start
-        elif start > 0 and Int((ptr + start - 1).load()) == CHAR_NEWLINE:
+        elif start > 0 and bytes.unsafe_get(start - 1) == CHAR_NEWLINE:
             current = dfa._init_after_nl
         else:
             current = dfa._init_other
@@ -337,8 +425,8 @@ def dfa_search(nfa: NFA, input: String) -> Int:
 
         var pos = start
         while pos < input_len:
-            var byte = UInt8((ptr + pos).load())
-            if Int(byte) == CHAR_NEWLINE:
+            var byte = bytes.unsafe_get(pos)
+            if byte == CHAR_NEWLINE:
                 if dfa.states.unsafe_get(current).eol_at_newline:
                     last_match = pos
             current = dfa._step(nfa, current, byte)
@@ -470,6 +558,56 @@ def _reaches_match(nfa: NFA, start: Int) -> Bool:
         elif kind == NFAStateKind.SAVE:
             stack.append(nfa.states.unsafe_get(s).out1)
     return False
+
+
+def sub_nfa_is_dfa_safe(nfa: NFA, start: Int) -> Bool:
+    """Check if a sub-NFA (e.g. lookahead body) benefits from DFA evaluation.
+
+    Returns True when:
+    1. All reachable states are DFA-compatible (no LOOKAHEAD, LOOKBEHIND,
+       BACKREF, or word-boundary ANCHOR).
+    2. The sub-expression contains SPLIT states (quantifiers/alternation),
+       making it complex enough that the DFA amortizes its startup cost.
+       For simple linear patterns (like a single character), the backtracker
+       is faster due to lower overhead.
+    """
+    var visited = List[Bool](fill=False, length=len(nfa.states))
+    var stack = List[Int]()
+    var has_split = False
+    stack.append(start)
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= len(nfa.states) or visited.unsafe_get(s):
+            continue
+        visited.unsafe_set(s, True)
+        ref state = nfa.states.unsafe_get(s)
+        var kind = state.kind
+        if kind == NFAStateKind.SPLIT:
+            has_split = True
+            stack.append(state.out1)
+            stack.append(state.out2)
+        elif kind == NFAStateKind.SAVE:
+            stack.append(state.out1)
+        elif kind == NFAStateKind.ANCHOR:
+            var at = state.anchor_type
+            if (
+                at == AnchorKind.WORD_BOUNDARY
+                or at == AnchorKind.NOT_WORD_BOUNDARY
+            ):
+                return False
+            stack.append(state.out1)
+        elif (
+            kind == NFAStateKind.CHAR
+            or kind == NFAStateKind.ANY
+            or kind == NFAStateKind.CHARSET
+            or kind == NFAStateKind.MATCH
+        ):
+            if kind != NFAStateKind.MATCH:
+                stack.append(state.out1)
+        else:
+            # LOOKAHEAD, LOOKBEHIND, BACKREF — not DFA-safe
+            return False
+    return has_split
 
 
 def _state_key(states: List[Int]) -> String:

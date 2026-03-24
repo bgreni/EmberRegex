@@ -63,15 +63,15 @@ from .errors import RegexError
 from .flags import RegexFlags
 
 
-struct Parser(Movable):
+struct Parser[origin: Origin](Movable):
     """Recursive descent parser for regex patterns."""
 
-    var pattern: String
+    var pattern: Span[Byte, Self.origin]
     var pos: Int
     var ast: AST
     var inline_flags: RegexFlags  # collected from (?i), (?m), (?s) in the pattern
 
-    def __init__(out self, pattern: String):
+    def __init__(out self, pattern: Span[Byte, Self.origin]):
         self.pattern = pattern
         self.pos = 0
         self.ast = AST()
@@ -83,9 +83,7 @@ struct Parser(Movable):
         self.ast.root = root
         if self.pos < len(self.pattern):
             raise Error(
-                String.write(
-                    RegexError("Unexpected character", self.pos)
-                )
+                String.write(RegexError("Unexpected character", self.pos))
             )
         # Build bitmaps for all charsets
         for i in range(len(self.ast.charsets)):
@@ -96,13 +94,13 @@ struct Parser(Movable):
         self.ast = AST()
         return result^
 
-    def _peek(self) -> Int:
-        """Look at the current character without consuming. Returns -1 at end."""
+    def _peek(self) -> Byte:
+        """Look at the current character without consuming it."""
         if self.pos >= len(self.pattern):
-            return -1
-        return Int(self.pattern.as_bytes()[self.pos])
+            return Byte(0)
+        return self.pattern.unsafe_get(self.pos)
 
-    def _advance(mut self) -> Int:
+    def _advance(mut self) -> Byte:
         """Consume and return the current character."""
         var ch = self._peek()
         self.pos += 1
@@ -111,12 +109,12 @@ struct Parser(Movable):
     def _at_end(self) -> Bool:
         return self.pos >= len(self.pattern)
 
-    def _expect(mut self, ch: Int) raises:
+    def _expect(mut self, ch: Byte) raises:
         if self._at_end() or self._peek() != ch:
             raise Error(
                 String.write(
                     RegexError(
-                        "Expected '" + chr(ch) + "'",
+                        "Expected '" + chr(Int(ch)) + "'",
                         self.pos,
                     )
                 )
@@ -143,7 +141,11 @@ struct Parser(Movable):
     def _parse_concat(mut self) raises -> Int:
         """concat = quantified+"""
         var parts = List[Int]()
-        while not self._at_end() and self._peek() != CHAR_PIPE and self._peek() != CHAR_RPAREN:
+        while (
+            not self._at_end()
+            and self._peek() != CHAR_PIPE
+            and self._peek() != CHAR_RPAREN
+        ):
             parts.append(self._parse_quantified())
 
         if len(parts) == 0:
@@ -266,25 +268,23 @@ struct Parser(Movable):
         """Parse a decimal integer from the current position."""
         var result = 0
         while not self._at_end() and self._is_digit(self._peek()):
-            result = result * 10 + (self._peek() - CHAR_ZERO)
+            result = result * 10 + Int(self._peek() - CHAR_ZERO)
             self.pos += 1
         return result
 
     @staticmethod
-    def _is_digit(ch: Int) -> Bool:
+    def _is_digit(ch: Byte) -> Bool:
         return ch >= CHAR_ZERO and ch <= CHAR_NINE
 
     def _parse_atom(mut self) raises -> Int:
-        """atom = CHAR | '.' | '[' charset ']' | '(' regex ')' | '\\\\' ESCAPE | '^' | '$'"""
+        """atom = CHAR | '.' | '[' charset ']' | '(' regex ')' | '\\\\' ESCAPE | '^' | '$'
+        """
         if self._at_end():
             raise Error(
-                String.write(
-                    RegexError("Unexpected end of pattern", self.pos)
-                )
+                String.write(RegexError("Unexpected end of pattern", self.pos))
             )
 
         var ch = self._peek()
-
         if ch == CHAR_DOT:
             self.pos += 1
             var node = ASTNode.dot()
@@ -313,18 +313,15 @@ struct Parser(Movable):
                 )
             )
         elif ch == CHAR_RPAREN:
-            raise Error(
-                String.write(
-                    RegexError("Unmatched ')'", self.pos)
-                )
-            )
+            raise Error(String.write(RegexError("Unmatched ')'", self.pos)))
         else:
             self.pos += 1
             var node = ASTNode.literal(UInt32(ch))
             return self.ast.add_node(node^)
 
     def _parse_group(mut self) raises -> Int:
-        """Parse a group: (regex), (?:regex), (?=), (?!), (?<=), (?<!), (?P<name>)."""
+        """Parse a group: (regex), (?:regex), (?=), (?!), (?<=), (?<!), (?P<name>).
+        """
         self.pos += 1  # consume '('
 
         var group_index = -1  # -1 = non-capturing by default
@@ -335,7 +332,9 @@ struct Parser(Movable):
             if self._at_end():
                 raise Error(
                     String.write(
-                        RegexError("Unexpected end of pattern after '(?'", self.pos)
+                        RegexError(
+                            "Unexpected end of pattern after '(?'", self.pos
+                        )
                     )
                 )
             var modifier = self._peek()
@@ -379,7 +378,9 @@ struct Parser(Movable):
                     raise Error(
                         String.write(
                             RegexError(
-                                "Unknown lookbehind modifier '(?<" + chr(next_ch) + "'",
+                                "Unknown lookbehind modifier '(?<"
+                                + chr(Int(next_ch))
+                                + "'",
                                 self.pos - 2,
                             )
                         )
@@ -392,13 +393,19 @@ struct Parser(Movable):
                 self.ast.group_count += 1
                 group_index = self.ast.group_count
                 self.ast.group_names[name^] = group_index
-            elif modifier == CHAR_I_LOWER or modifier == CHAR_M_LOWER or modifier == CHAR_S_LOWER:
+            elif (
+                modifier == CHAR_I_LOWER
+                or modifier == CHAR_M_LOWER
+                or modifier == CHAR_S_LOWER
+            ):
                 # Inline flags: (?i), (?m), (?s) or (?i:...) etc.
                 var inline_flags = self._parse_inline_flags()
                 if not self._at_end() and self._peek() == CHAR_RPAREN:
                     # (?ims) — set flags globally
                     self.pos += 1  # consume ')'
-                    self.inline_flags = RegexFlags(self.inline_flags.value | inline_flags.value)
+                    self.inline_flags = RegexFlags(
+                        self.inline_flags.value | inline_flags.value
+                    )
                     # Return empty concat node
                     var node = ASTNode.concat(List[Int]())
                     return self.ast.add_node(node^)
@@ -407,7 +414,9 @@ struct Parser(Movable):
                     # (?ims:...) — scoped flags, treat as non-capturing group
                     # Flags are set globally for now (scoped flags would need
                     # per-node flag tracking)
-                    self.inline_flags = RegexFlags(self.inline_flags.value | inline_flags.value)
+                    self.inline_flags = RegexFlags(
+                        self.inline_flags.value | inline_flags.value
+                    )
                 else:
                     raise Error(
                         String.write(
@@ -421,7 +430,7 @@ struct Parser(Movable):
                 raise Error(
                     String.write(
                         RegexError(
-                            "Unknown group modifier '(?" + chr(modifier) + "'",
+                            "Unknown group modifier '(?" + chr(Int(modifier)) + "'",
                             self.pos - 1,
                         )
                     )
@@ -472,17 +481,16 @@ struct Parser(Movable):
             ):
                 raise Error(
                     String.write(
-                        RegexError("Invalid character in group name", self.pos)
+                        RegexError(
+                            "Invalid group name: '" + chr(Int(ch)) + "'",
+                            self.pos,
+                        )
                     )
                 )
             self.pos += 1
         if self.pos == start:
-            raise Error(
-                String.write(
-                    RegexError("Empty group name", self.pos)
-                )
-            )
-        return String(self.pattern[byte=start : self.pos])
+            raise Error(String.write(RegexError("Empty group name", self.pos)))
+        return String(unsafe_from_utf8=self.pattern[start : self.pos])
 
     def _parse_escape(mut self) raises -> Int:
         """Parse a backslash escape sequence."""
@@ -509,8 +517,8 @@ struct Parser(Movable):
 
         # Backreferences \1 through \9
         if ch >= CHAR_ONE and ch <= CHAR_NINE:
-            var group = ch - CHAR_ZERO
-            var node = ASTNode.backreference(group)
+            var group_index = Int(ch - CHAR_ZERO)
+            var node = ASTNode.backreference(group_index)
             return self.ast.add_node(node^)
 
         # Shorthand character classes
@@ -573,7 +581,7 @@ struct Parser(Movable):
         raise Error(
             String.write(
                 RegexError(
-                    "Invalid escape sequence '\\" + chr(ch) + "'",
+                    "Invalid escape sequence '\\" + chr(Int(ch)) + "'",
                     self.pos - 2,
                 )
             )
@@ -624,7 +632,9 @@ struct Parser(Movable):
                     cs.add_range(UInt32(CHAR_A_LOWER), UInt32(CHAR_Z_LOWER))
                     cs.add_range(UInt32(CHAR_A_UPPER), UInt32(CHAR_Z_UPPER))
                     cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
-                    cs.add_range(UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE))
+                    cs.add_range(
+                        UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE)
+                    )
                     continue
                 elif esc == CHAR_W_UPPER:
                     # \W inside class — hard to represent, skip detailed handling
@@ -657,7 +667,11 @@ struct Parser(Movable):
             # Check for range: a-z
             if not self._at_end() and self._peek() == CHAR_MINUS:
                 # Peek ahead to see if this is a range or a literal '-' at end
-                if self.pos + 1 < len(self.pattern) and Int(self.pattern.as_bytes()[self.pos + 1]) != CHAR_RBRACKET:
+                if (
+                    self.pos + 1 < len(self.pattern)
+                    and self.pattern.unsafe_get(self.pos + 1)
+                    != CHAR_RBRACKET
+                ):
                     self.pos += 1  # consume '-'
                     var hi_ch = self._advance()
                     if hi_ch == CHAR_BACKSLASH:
@@ -698,5 +712,5 @@ def parse(pattern: String) raises -> AST:
 
     Inline flags (e.g. ``(?i)``) are stored in ``ast.flags``.
     """
-    var p = Parser(pattern)
+    var p = Parser(pattern.as_bytes())
     return p.parse()

@@ -7,7 +7,9 @@ time for finding literal prefix positions in input strings.
 from std.sys import simd_width_of
 
 
-def simd_find_byte(input: String, byte_val: UInt8, start: Int) -> Int:
+def simd_find_byte[
+    origin: Origin, //
+](input: Span[Byte, origin], byte_val: UInt8, start: Int,) -> Int:
     """Find the first occurrence of byte_val in input starting from start.
 
     Uses SIMD to scan simd_width_of[DType.uint8]() bytes at a time,
@@ -32,14 +34,16 @@ def simd_find_byte(input: String, byte_val: UInt8, start: Int) -> Int:
 
     # Scalar tail
     while i < length:
-        if UInt8((ptr + i).load()) == byte_val:
+        if UInt8(ptr[i]) == byte_val:
             return i
         i += 1
 
     return -1
 
 
-def simd_find_prefix(input: String, prefix: List[UInt8], start: Int) -> Int:
+def simd_find_prefix[
+    origin: Origin, //
+](input: Span[Byte, origin], prefix: List[UInt8], start: Int,) -> Int:
     """Find the first position where the full prefix matches.
 
     Uses SIMD to find candidates for the first byte, then verifies
@@ -52,7 +56,7 @@ def simd_find_prefix(input: String, prefix: List[UInt8], start: Int) -> Int:
     if start + prefix_len > input_len:
         return -1
 
-    var first_byte = prefix[0]
+    var first_byte = prefix.unsafe_get(0)
     var pos = start
     var ptr = input.unsafe_ptr()
 
@@ -65,7 +69,7 @@ def simd_find_prefix(input: String, prefix: List[UInt8], start: Int) -> Int:
         # Verify remaining prefix bytes
         var ok = True
         for j in range(1, prefix_len):
-            if UInt8((ptr + candidate + j).load()) != prefix[j]:
+            if (ptr + candidate + j)[] != prefix.unsafe_get(j):
                 ok = False
                 break
 

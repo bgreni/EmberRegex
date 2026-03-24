@@ -32,25 +32,29 @@ Thompson's construction. Builds `NFAFragment` values (start state + list of dang
 - `SAVE` — entry/exit of each capture group (two per group)
 - `ANCHOR`, `LOOKAHEAD`, `LOOKBEHIND`, `BACKREF` — advanced features
 
-The NFA records two capability flags used for engine selection:
-- `can_use_dfa` — true when there are no captures, anchors, or lookaround
+The NFA records capability flags used for engine selection:
+- `can_use_dfa` — true when there are no captures, lookaround, or word-boundary anchors. Simple line anchors (`^`, `$`, and their multiline variants) do NOT disable the DFA.
 - `needs_backtrack` — true when the pattern contains backreferences
+- `start_anchor` — leading anchor kind (`BOL`, `BOL_MULTILINE`, or `-1`), used for position-skip optimizations
 
 ### 3. Engine selection (`compile.mojo` — `CompiledRegex.__init__`)
 
 | Condition | Engine |
 |---|---|
 | `needs_backtrack` | Backtracking (`backtrack.mojo`) |
-| `can_use_dfa and not needs_backtrack` | Lazy DFA (`dfa.mojo`) |
+| `can_use_dfa and group_count == 0` | Lazy DFA (`dfa.mojo`) |
+| `can_use_dfa and group_count > 0` (one-pass eligible) | One-Pass NFA (`onepass.mojo`) |
 | otherwise | Pike VM (`executor.mojo`) |
 
 After engine selection, `extract_literal_prefix` (`optimize.mojo`) walks the NFA to find any guaranteed literal byte sequence at the start. If found, `search` / `findall` / `replace` use `simd_find_prefix` (`simd_scan.mojo`) to skip non-candidate positions before invoking the engine.
 
 ### 4. Execution engines
 
-**Pike VM** (`executor.mojo`) — default for patterns with captures. Parallel NFA simulation: two lists of `(state_idx, slots)` pairs swap at each input byte. Capture positions are carried per-thread through SAVE states via `_add_state()`. Greedy/lazy ordering is encoded in which branch of a SPLIT state is enqueued first.
+**Lazy DFA** (`dfa.mojo`) — used when `can_use_dfa` is true and `group_count == 0`. Builds DFA states on demand from NFA epsilon closures and caches transitions in a 256-entry table per state. Single-pass O(n), no capture overhead. Handles simple line anchors directly: BOL/BOL_MULTILINE resolved in epsilon closure, EOL/EOL_MULTILINE checked at `\n` positions and end-of-input via precomputed flags. Uses `search_forward()` with a position-skip optimization.
 
-**Lazy DFA** (`dfa.mojo`) — used when `can_use_dfa` is true. Builds DFA states on demand from NFA epsilon closures and caches transitions in a 256-entry table per state. Single-pass O(n), no capture overhead.
+**One-Pass NFA** (`onepass.mojo`) — used when `can_use_dfa` is true and `group_count > 0`. A single linear scan extracts captures with no thread-management overhead. Applicable when at each (state, byte) there is at most one valid transition (conflicts resolved by greedy priority). Also used as the capture-extraction step in the hybrid DFA+one-pass path.
+
+**Pike VM** (`executor.mojo`) — default for patterns with captures that are not one-pass eligible. Parallel NFA simulation: two lists of `(state_idx, slots)` pairs swap at each input byte. Capture positions are carried per-thread through SAVE states via `_add_state()`. Greedy/lazy ordering is encoded in which branch of a SPLIT state is enqueued first.
 
 **Backtracking** (`backtrack.mojo`) — used when the pattern has backreferences. Recursive descent with a 10 000-depth limit. BACKREF states compare current input against the previously saved group text.
 

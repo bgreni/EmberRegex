@@ -89,7 +89,9 @@ struct ASTNode(Copyable, Movable):
         node.children = children^
 
     @staticmethod
-    def quantifier(child: Int, min_rep: Int, max_rep: Int, greedy: Bool, out node: ASTNode):
+    def quantifier(
+        child: Int, min_rep: Int, max_rep: Int, greedy: Bool, out node: ASTNode
+    ):
         node = ASTNode(ASTNodeKind.QUANTIFIER)
         node.children = [child]
         node.quantifier_min = min_rep
@@ -104,7 +106,7 @@ struct ASTNode(Copyable, Movable):
         node.group_index = group_index
 
     @staticmethod
-    def anchor(anchor_type: Int, out node: ASTNode) :
+    def anchor(anchor_type: Int, out node: ASTNode):
         node = ASTNode(ASTNodeKind.ANCHOR)
         node.anchor_type = anchor_type
 

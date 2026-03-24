@@ -79,7 +79,9 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
             if ch < 256:
                 var byte_idx = ch >> 3
                 var bit_idx = ch & 7
-                bitmap[byte_idx] = bitmap[byte_idx] | (UInt8(1) << UInt8(bit_idx))
+                bitmap[byte_idx] = bitmap[byte_idx] | (
+                    UInt8(1) << UInt8(bit_idx)
+                )
         elif kind == NFAStateKind.CHARSET:
             var cs_idx = nfa.states[s].charset_index
             if nfa.charsets[cs_idx].negated:
@@ -97,7 +99,7 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
                     var start_mask = UInt8(0xFF) << UInt8(lo & 7)
                     var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
                     if start_byte == end_byte:
-                        tmp[start_byte] |= (start_mask & end_mask)
+                        tmp[start_byte] |= start_mask & end_mask
                     else:
                         tmp[start_byte] |= start_mask
                         for b in range(start_byte + 1, end_byte):
@@ -118,7 +120,7 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
                     var start_mask = UInt8(0xFF) << UInt8(lo & 7)
                     var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
                     if start_byte == end_byte:
-                        bitmap[start_byte] |= (start_mask & end_mask)
+                        bitmap[start_byte] |= start_mask & end_mask
                     else:
                         bitmap[start_byte] |= start_mask
                         for b in range(start_byte + 1, end_byte):

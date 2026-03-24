@@ -5,9 +5,9 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
     """Bitmask flags for regex compilation."""
 
     comptime NONE = 0
-    comptime IGNORECASE = 1   # (?i) - case-insensitive matching
-    comptime MULTILINE = 2    # (?m) - ^ and $ match line boundaries
-    comptime DOTALL = 4       # (?s) - dot matches newline
+    comptime IGNORECASE = 1  # (?i) - case-insensitive matching
+    comptime MULTILINE = 2  # (?m) - ^ and $ match line boundaries
+    comptime DOTALL = 4  # (?s) - dot matches newline
 
     var value: Int
 

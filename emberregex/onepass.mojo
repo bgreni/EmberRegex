@@ -13,6 +13,7 @@ from .nfa import NFA, NFAState, NFAStateKind
 from .ast import AnchorKind
 from .charset import CharSet, BITMAP_WIDTH
 from .result import MatchResult
+from .simd_scan import simd_find_prefix
 
 
 # Sentinel: no transition for this byte.
@@ -124,6 +125,7 @@ struct OnePassNFA(Copyable, Movable):
 
 # --- Build ---
 
+
 struct _EpsClosure(Movable):
     """Result of following epsilon transitions from a set of NFA states.
 
@@ -131,10 +133,12 @@ struct _EpsClosure(Movable):
     epsilon transitions, along with the save actions accumulated along the path.
     """
 
-    var consuming: List[Int]       # NFA state indices (CHAR, CHARSET, ANY)
-    var save_lists: List[List[Int]] # parallel to consuming: save slots per path
+    var consuming: List[Int]  # NFA state indices (CHAR, CHARSET, ANY)
+    var save_lists: List[
+        List[Int]
+    ]  # parallel to consuming: save slots per path
     var match_found: Bool
-    var match_saves: List[Int]     # save slots on path to MATCH
+    var match_saves: List[Int]  # save slots on path to MATCH
 
     def __init__(out self):
         self.consuming = List[Int]()
@@ -164,7 +168,11 @@ def _eps_follow(
         result.match_saves = saves.copy()
         return
 
-    if state.kind == NFAStateKind.CHAR or state.kind == NFAStateKind.CHARSET or state.kind == NFAStateKind.ANY:
+    if (
+        state.kind == NFAStateKind.CHAR
+        or state.kind == NFAStateKind.CHARSET
+        or state.kind == NFAStateKind.ANY
+    ):
         # This is a consuming state — record it
         result.consuming.append(state_idx)
         result.save_lists.append(saves.copy())
@@ -203,11 +211,11 @@ def _eps_follow(
     # Don't follow; the pattern will fail eligibility check.
 
 
-def _nfa_state_matches_byte(nfa: NFA, state_idx: Int, byte_val: Int) -> Bool:
+def _nfa_state_matches_byte(nfa: NFA, state_idx: Int, byte_val: Byte) -> Bool:
     """Check if an NFA consuming state matches a given byte value."""
     ref state = nfa.states[state_idx]
     if state.kind == NFAStateKind.CHAR:
-        return Int(state.char_value) == byte_val
+        return state.char_value == UInt32(byte_val)
     elif state.kind == NFAStateKind.ANY:
         return byte_val != CHAR_NEWLINE
     elif state.kind == NFAStateKind.CHARSET:
@@ -334,7 +342,7 @@ def build_onepass(nfa: NFA) -> OnePassNFA:
             var matched_idx = -1
 
             for ci in range(num_consuming):
-                if _nfa_state_matches_byte(nfa, consuming[ci], byte_val):
+                if _nfa_state_matches_byte(nfa, consuming[ci], Byte(byte_val)):
                     matched_idx = ci
                     break
 
@@ -376,9 +384,12 @@ def _sort_list(mut lst: List[Int]):
 
 # --- Execute ---
 
-def onepass_match(
+
+def onepass_match[
+    origin: Origin, //
+](
     op: OnePassNFA,
-    input: String,
+    input: Span[Byte, origin],
     start: Int,
     end: Int,
 ) -> MatchResult:
@@ -440,6 +451,74 @@ def onepass_match(
     return MatchResult.no_match(op.group_count)
 
 
+def onepass_full_match[
+    origin: Origin, //
+](
+    op: OnePassNFA,
+    input: Span[Byte, origin],
+    mut bufs: _OnePassBufs,
+) -> MatchResult:
+    """Run the one-pass NFA as a full match (entire input must match).
+
+    Uses pre-allocated buffers to avoid per-call heap allocation.
+    """
+    var num_slots = bufs.num_slots
+    bufs.reset()
+
+    var ptr = input.unsafe_ptr()
+    var state = op.start
+    var input_len = len(input)
+
+    for pos in range(input_len):
+        var byte_val = Int((ptr + pos).load())
+        ref trans = op.op_states.unsafe_get(state).transitions.unsafe_get(
+            byte_val
+        )
+
+        if trans.next_state == _NO_TRANSITION:
+            return MatchResult.no_match(op.group_count)
+
+        # Apply save actions
+        var ns = trans.num_saves
+        if ns > 0:
+            bufs.slots.unsafe_set(trans.save0, pos)
+        if ns > 1:
+            bufs.slots.unsafe_set(trans.save1, pos)
+        if ns > 2:
+            bufs.slots.unsafe_set(trans.save2, pos)
+        if ns > 3:
+            bufs.slots.unsafe_set(trans.save3, pos)
+
+        state = trans.next_state
+
+    # Check if the final state is accepting
+    ref final_state = op.op_states.unsafe_get(state)
+    if final_state.is_match:
+        # Apply match save actions
+        var ms = final_state.match_num_saves
+        if ms > 0:
+            bufs.slots.unsafe_set(final_state.match_save0, input_len)
+        if ms > 1:
+            bufs.slots.unsafe_set(final_state.match_save1, input_len)
+        if ms > 2:
+            bufs.slots.unsafe_set(final_state.match_save2, input_len)
+        if ms > 3:
+            bufs.slots.unsafe_set(final_state.match_save3, input_len)
+
+        var result_slots = List[Int](capacity=num_slots)
+        for si in range(num_slots):
+            result_slots.append(bufs.slots.unsafe_get(si))
+        return MatchResult(
+            matched=True,
+            start=0,
+            end=input_len,
+            group_count=op.group_count,
+            slots=result_slots^,
+        )
+
+    return MatchResult.no_match(op.group_count)
+
+
 struct _OnePassBufs(Copyable, Movable):
     """Pre-allocated buffers for one-pass NFA execution."""
 
@@ -461,9 +540,11 @@ struct _OnePassBufs(Copyable, Movable):
             self.best_slots.unsafe_set(i, -1)
 
 
-def onepass_search_at(
+def onepass_search_at[
+    origin: Origin, //
+](
     op: OnePassNFA,
-    input: String,
+    input: Span[Byte, origin],
     input_len: Int,
     start: Int,
     mut bufs: _OnePassBufs,
@@ -562,8 +643,8 @@ def onepass_findall(
     first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH],
     first_byte_useful: Bool,
 ) -> List[String]:
-    """Specialized findall using one-pass NFA — avoids MatchResult allocation."""
-    from .simd_scan import simd_find_prefix
+    """Specialized findall using one-pass NFA — avoids MatchResult allocation.
+    """
 
     var results = List[String]()
     var pos = 0
@@ -577,7 +658,9 @@ def onepass_findall(
     while pos <= input_len:
         # Acceleration: skip to next candidate position
         if has_prefix:
-            var candidate = simd_find_prefix(input, literal_prefix, pos)
+            var candidate = simd_find_prefix(
+                input.as_bytes(), literal_prefix, pos
+            )
             if candidate < 0:
                 break
             pos = candidate
@@ -639,13 +722,21 @@ def onepass_findall(
                     bufs.best_slots.unsafe_set(si, bufs.slots.unsafe_get(si))
                 var ms = next_st.match_num_saves
                 if ms > 0:
-                    bufs.best_slots.unsafe_set(next_st.match_save0, scan_pos + 1)
+                    bufs.best_slots.unsafe_set(
+                        next_st.match_save0, scan_pos + 1
+                    )
                 if ms > 1:
-                    bufs.best_slots.unsafe_set(next_st.match_save1, scan_pos + 1)
+                    bufs.best_slots.unsafe_set(
+                        next_st.match_save1, scan_pos + 1
+                    )
                 if ms > 2:
-                    bufs.best_slots.unsafe_set(next_st.match_save2, scan_pos + 1)
+                    bufs.best_slots.unsafe_set(
+                        next_st.match_save2, scan_pos + 1
+                    )
                 if ms > 3:
-                    bufs.best_slots.unsafe_set(next_st.match_save3, scan_pos + 1)
+                    bufs.best_slots.unsafe_set(
+                        next_st.match_save3, scan_pos + 1
+                    )
 
             scan_pos += 1
 
@@ -655,11 +746,17 @@ def onepass_findall(
                 var gs = bufs.best_slots.unsafe_get(0)
                 var ge = bufs.best_slots.unsafe_get(1)
                 if gs >= 0 and ge >= 0:
-                    results.append(String(input[byte=gs:ge]))
+                    results.append(
+                        String(unsafe_from_utf8=input.as_bytes()[gs:ge])
+                    )
                 else:
-                    results.append(String(input[byte=pos:best_end]))
+                    results.append(
+                        String(unsafe_from_utf8=input.as_bytes()[pos:best_end])
+                    )
             else:
-                results.append(String(input[byte=pos:best_end]))
+                results.append(
+                    String(unsafe_from_utf8=input.as_bytes()[pos:best_end])
+                )
             if best_end > pos:
                 pos = best_end
             else:

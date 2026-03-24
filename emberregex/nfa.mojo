@@ -42,6 +42,7 @@ struct NFAState(Copyable, Movable):
     var lookbehind_len: Int  # For LOOKBEHIND: fixed length to look back
     var backref_group: Int  # For BACKREF: group index (1-based)
     var icase: Bool  # For BACKREF: case-insensitive comparison (baked in at construction)
+    var sub_dfa_safe: Bool  # For LOOKAHEAD/LOOKBEHIND: sub-expr can use DFA
 
     def __init__(out self, kind: Int):
         self.kind = kind
@@ -57,6 +58,7 @@ struct NFAState(Copyable, Movable):
         self.lookbehind_len = -1
         self.backref_group = -1
         self.icase = False
+        self.sub_dfa_safe = False
 
     def __init__(out self, *, copy: Self):
         self.kind = copy.kind
@@ -72,6 +74,7 @@ struct NFAState(Copyable, Movable):
         self.lookbehind_len = copy.lookbehind_len
         self.backref_group = copy.backref_group
         self.icase = copy.icase
+        self.sub_dfa_safe = copy.sub_dfa_safe
 
     @staticmethod
     def char_state(ch: UInt32) -> NFAState:
@@ -121,7 +124,9 @@ struct NFAState(Copyable, Movable):
         return s^
 
     @staticmethod
-    def lookbehind_state(sub_start: Int, negated: Bool, length: Int) -> NFAState:
+    def lookbehind_state(
+        sub_start: Int, negated: Bool, length: Int
+    ) -> NFAState:
         var s = NFAState(NFAStateKind.LOOKBEHIND)
         s.sub_start = sub_start
         s.negated = negated
@@ -262,7 +267,9 @@ def _detect_start_anchor(mut nfa: NFA):
             return  # consuming state or other — no anchor
 
 
-def _build_fragment(mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags) raises -> NFAFragment:
+def _build_fragment(
+    mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags
+) raises -> NFAFragment:
     """Recursively build an NFA fragment for an AST node."""
     ref node = ast.nodes[node_idx]
 
@@ -303,7 +310,9 @@ def _build_fragment(mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags) ra
         return frag^
 
     elif node.kind == ASTNodeKind.CHAR_CLASS:
-        var state_idx = nfa.add_state(NFAState.charset_state(node.charset_index))
+        var state_idx = nfa.add_state(
+            NFAState.charset_state(node.charset_index)
+        )
         var frag = NFAFragment(state_idx)
         frag.add_out(state_idx, 1)
         return frag^
@@ -348,7 +357,9 @@ def _build_fragment(mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags) ra
                 nfa, ast, node.children[len(node.children) - 1], flags
             )
             for i in range(len(node.children) - 2, -1, -1):
-                var alt_frag = _build_fragment(nfa, ast, node.children[i], flags)
+                var alt_frag = _build_fragment(
+                    nfa, ast, node.children[i], flags
+                )
                 var split_idx = nfa.add_state(
                     NFAState.split_state(alt_frag.start, last_frag.start)
                 )
@@ -356,9 +367,7 @@ def _build_fragment(mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags) ra
                 for j in range(len(alt_frag.outs)):
                     combined.add_out(alt_frag.outs[j], alt_frag.out_slots[j])
                 for j in range(len(last_frag.outs)):
-                    combined.add_out(
-                        last_frag.outs[j], last_frag.out_slots[j]
-                    )
+                    combined.add_out(last_frag.outs[j], last_frag.out_slots[j])
                 last_frag = combined^
             return last_frag^
 
@@ -396,7 +405,10 @@ def _build_fragment(mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags) ra
             elif anchor_type == AnchorKind.EOL:
                 anchor_type = AnchorKind.EOL_MULTILINE
         # Simple line anchors are handled by the DFA; word boundaries are not
-        if anchor_type == AnchorKind.WORD_BOUNDARY or anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
+        if (
+            anchor_type == AnchorKind.WORD_BOUNDARY
+            or anchor_type == AnchorKind.NOT_WORD_BOUNDARY
+        ):
             nfa.can_use_dfa = False
         var state_idx = nfa.add_state(NFAState.anchor_state(anchor_type))
         var frag = NFAFragment(state_idx)
@@ -419,7 +431,9 @@ def _build_fragment(mut nfa: NFA, ast: AST, node_idx: Int, flags: RegexFlags) ra
         elif min_rep == 0 and max_rep == 1:
             return _build_question(nfa, ast, child_idx, greedy, flags)
         else:
-            return _build_repetition(nfa, ast, child_idx, min_rep, max_rep, greedy, flags)
+            return _build_repetition(
+                nfa, ast, child_idx, min_rep, max_rep, greedy, flags
+            )
 
     elif node.kind == ASTNodeKind.LOOKAHEAD:
         nfa.can_use_dfa = False
@@ -508,7 +522,11 @@ def _compute_fixed_length(ast: AST, node_idx: Int) raises -> Int:
 
 
 def _build_star(
-    mut nfa: NFA, ast: AST, child_idx: Int, greedy: Bool, flags: RegexFlags,
+    mut nfa: NFA,
+    ast: AST,
+    child_idx: Int,
+    greedy: Bool,
+    flags: RegexFlags,
 ) raises -> NFAFragment:
     """Build NFA fragment for * (zero or more)."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
@@ -537,7 +555,11 @@ def _build_star(
 
 
 def _build_plus(
-    mut nfa: NFA, ast: AST, child_idx: Int, greedy: Bool, flags: RegexFlags,
+    mut nfa: NFA,
+    ast: AST,
+    child_idx: Int,
+    greedy: Bool,
+    flags: RegexFlags,
 ) raises -> NFAFragment:
     """Build NFA fragment for + (one or more)."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
@@ -567,7 +589,11 @@ def _build_plus(
 
 
 def _build_question(
-    mut nfa: NFA, ast: AST, child_idx: Int, greedy: Bool, flags: RegexFlags,
+    mut nfa: NFA,
+    ast: AST,
+    child_idx: Int,
+    greedy: Bool,
+    flags: RegexFlags,
 ) raises -> NFAFragment:
     """Build NFA fragment for ? (zero or one)."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
@@ -596,8 +622,13 @@ def _build_question(
 
 
 def _build_repetition(
-    mut nfa: NFA, ast: AST, child_idx: Int,
-    min_rep: Int, max_rep: Int, greedy: Bool, flags: RegexFlags,
+    mut nfa: NFA,
+    ast: AST,
+    child_idx: Int,
+    min_rep: Int,
+    max_rep: Int,
+    greedy: Bool,
+    flags: RegexFlags,
 ) raises -> NFAFragment:
     """Build NFA fragment for general {n,m} quantifiers.
 
@@ -653,7 +684,7 @@ def _build_repetition(
     else:
         # {n,m} — required copies + (max-min) optional copies
         var optional_count = max_rep - min_rep
-        for _i in range(optional_count):
+        for _ in range(optional_count):
             var opt = _build_question(nfa, ast, child_idx, greedy, flags)
             if has_result:
                 var patch_frag = NFAFragment(res_start)
@@ -698,9 +729,9 @@ def _to_upper(ch: UInt32) -> UInt32:
 def _add_case_folding(mut cs: CharSet):
     """Add case-folded ASCII ranges to a charset for IGNORECASE."""
     var new_ranges = List[CharRange]()
-    for i in range(len(cs.ranges)):
-        var lo = cs.ranges[i].lo
-        var hi = cs.ranges[i].hi
+    for r in cs.ranges:
+        var lo = r.lo
+        var hi = r.hi
         # Add lowercase versions
         var lo_lower = _to_lower(lo)
         var hi_lower = _to_lower(hi)
