@@ -1,5 +1,8 @@
 # EmberRegex
 
+> [!WARNING]
+> ⚠️ This project is basically entirely vibe coded.
+
 A high-performance regular expression library for [Mojo](https://www.modular.com/mojo).
 
 EmberRegex automatically selects the fastest matching engine for each pattern — a lazy DFA for simple patterns, a one-pass NFA for patterns with captures, a Pike VM for more complex captures, and a backtracking engine when backreferences are needed.
