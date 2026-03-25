@@ -7,6 +7,8 @@ A high-performance regular expression library for [Mojo](https://www.modular.com
 
 EmberRegex automatically selects the fastest matching engine for each pattern — a lazy DFA for simple patterns, a one-pass NFA for patterns with captures, a Pike VM for more complex captures, and a backtracking engine when backreferences are needed.
 
+For patterns known at compile time, `StaticRegex` parses the pattern and builds the NFA during compilation, then specializes the entire match engine per NFA state — eliminating runtime dispatch entirely.
+
 ## Quick Start
 
 ```mojo
@@ -18,6 +20,21 @@ def main() raises:
     if result:
         print(result)  # MatchResult(start=0, end=5)
 ```
+
+### Compile-Time Regex
+
+When the pattern is a string literal, use `StaticRegex` to move all parsing and NFA construction to compile time:
+
+```mojo
+from emberregex import StaticRegex
+
+def main():
+    var re = StaticRegex["\\d{3}-\\d{4}"]()
+    var result = re.match("555-1234")
+    print(result.matched)  # True
+```
+
+`StaticRegex` exposes the same API as `CompiledRegex` (`match`, `search`, `findall`, `replace`, `split`). Invalid patterns produce a compile error rather than a runtime exception.
 
 ## Installation
 
@@ -247,6 +264,7 @@ re4.match("a\nb").matched  # True
 
 EmberRegex selects the optimal engine automatically:
 
+- **`StaticRegex`** for compile-time patterns — parsing and NFA construction happen during compilation. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct `@always_inline` function instantiation, the compiler eliminates dead branches, and all recursive calls collapse into a single inlined function with zero runtime dispatch.
 - **Lazy DFA** for patterns without captures — O(n) single-pass matching with no capture overhead. Simple line anchors (`^`, `$`, multiline variants) are handled directly by the DFA rather than disabling it. Up to 20x faster than Python's `re` on throughput-heavy patterns.
 - **One-pass NFA** for DFA-compatible patterns with captures — single linear scan extracts captures with no thread management overhead. Used as a fast-path in hybrid search (DFA finds boundaries, one-pass extracts captures).
 - **Pike VM** for patterns with captures that aren't one-pass eligible — parallel NFA simulation.

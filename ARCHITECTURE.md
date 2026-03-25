@@ -7,40 +7,41 @@ A high-performance regex library for Mojo with four matching engines selected au
 ```
 Pattern String
     │
-    ▼
-┌──────────────────┐
-│  Parser          │  Recursive descent: alternation > concat > quantified > atom
-│  (parser.mojo)   │  Extracts inline flags (?i), (?m), (?s) and named groups
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  AST             │  Flat-pool of ASTNode + CharSet, indexed by Int (not pointers)
-│  (ast.mojo)      │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  NFA Builder     │  Thompson's construction: AST fragments → NFA states
-│  (nfa.mojo)      │  Sets capability flags: can_use_dfa, needs_backtrack, has_lazy
-│                  │  Detects start_anchor for position-skipping optimizations
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  CompiledRegex   │  Engine selection + search acceleration setup
-│  (compile.mojo)  │  Builds one-pass NFA if eligible
-└────────┬─────────┘
-         │
-    ┌────┴────┬────────────┬───────────────┐
-    ▼         ▼            ▼               ▼
-┌────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
-│Lazy DFA│ │One-Pass  │ │ Pike VM  │ │ Backtracking │
-│  O(n)  │ │  NFA     │ │ captures │ │ backrefs     │
-│anchors │ │ captures │ │          │ │              │
-└────────┘ └──────────┘ └──────────┘ └──────────────┘
-    │           │            │               │
-    └────┬──────┴────────────┴───────────────┘
+    ├──── StringLiteral? ──────────────────────────────────────────┐
+    │                                                               │
+    ▼                                                               ▼
+┌──────────────────┐                                   ┌──────────────────────┐
+│  Parser          │  Recursive descent                │  StaticRegex         │
+│  (parser.mojo)   │  Extracts inline flags, groups    │  (static.mojo)       │
+└────────┬─────────┘                                   │  Runs pipeline at    │
+         │                                             │  *compile time*      │
+         ▼                                             └──────────┬───────────┘
+┌──────────────────┐                                              │
+│  AST             │  Flat-pool of ASTNode + CharSet              │ (same parser/NFA
+│  (ast.mojo)      │                                              │  but comptime)
+└────────┬─────────┘                                              │
+         │                                                        ▼
+         ▼                                             ┌──────────────────────┐
+┌──────────────────┐                                   │  Specialized         │
+│  NFA Builder     │  Thompson's construction          │  Backtracking Engine │
+│  (nfa.mojo)      │  Capability flags, start_anchor   │  (static_backtrack)  │
+└────────┬─────────┘                                   │  Per-state comptime  │
+         │                                             │  specialization      │
+         ▼                                             └──────────┬───────────┘
+┌──────────────────┐                                              │
+│  CompiledRegex   │  Engine selection + acceleration             │
+│  (compile.mojo)  │  Builds one-pass NFA if eligible             │
+└────────┬─────────┘                                              │
+         │                                                        │
+    ┌────┴────┬────────────┬───────────────┐                      │
+    ▼         ▼            ▼               ▼                      │
+┌────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐            │
+│Lazy DFA│ │One-Pass  │ │ Pike VM  │ │ Backtracking │            │
+│  O(n)  │ │  NFA     │ │ captures │ │ backrefs     │            │
+│anchors │ │ captures │ │          │ │              │            │
+└────────┘ └──────────┘ └──────────┘ └──────────────┘            │
+    │           │            │               │                    │
+    └────┬──────┴────────────┴───────────────┴────────────────────┘
          ▼
 ┌──────────────────┐
 │  MatchResult     │  Flat slots array: [g1_start, g1_end, g2_start, g2_end, ...]
@@ -276,6 +277,38 @@ CompiledRegex
 3. Otherwise: Pike VM `_execute_with_bufs()` with `max_pos` bound
 
 **`findall` fast path**: When both `_can_use_onepass` and `_can_use_dfa` are true and the pattern has no lazy quantifiers, calls `onepass_findall()` directly, avoiding per-match `MatchResult` allocation.
+
+### StaticRegex (`static.mojo`, `static_backtrack.mojo`)
+
+`StaticRegex[pattern]` runs the full parser → NFA pipeline at compile time and specializes the match engine per NFA state via comptime parameters.
+
+**Compile-time NFA construction** (`_build_static_nfa`): calls `parse()` and `build_nfa()` inside a `comptime` field initializer. Invalid patterns abort at compile time rather than raising at runtime. All NFA metadata is stored as comptime struct fields:
+
+```text
+StaticRegex[pattern]
+├── comptime nfa              — full NFA (states, charsets, capability flags)
+├── comptime _group_count     — nfa.group_count
+├── comptime _num_slots       — 2 * group_count
+├── comptime _start           — nfa.start (entry state index)
+├── comptime _start_anchor    — nfa.start_anchor (BOL, BOL_MULTILINE, or -1)
+├── comptime _prefix          — extract_literal_prefix(nfa)
+├── comptime _prefix_len      — len(_prefix)
+├── comptime _first_byte_bitmap — extract_first_byte_bitmap(nfa)
+└── comptime _first_byte_useful — any byte rejected by bitmap?
+```
+
+**Specialized backtracking engine** (`static_backtrack.mojo`): `_sbt_try_match[nfa, state_idx, num_slots]` is parameterized by both the NFA and the current state index. Each instantiation handles exactly one NFA state kind with all fields baked in as compile-time constants:
+
+- `comptime state = nfa.states[state_idx]` — state fields become constants
+- `comptime if kind == NFAStateKind.CHAR:` — dead branches are eliminated entirely
+- Recursive calls `_sbt_try_match[nfa=nfa, state_idx=state.out1, ...]` produce distinct function instantiations for each successor state
+- `@always_inline` causes the compiler to collapse all instantiations into a single flat function with no dispatch overhead
+
+For SPLIT states with a simple single-body loop (`a*`, `\d+`, `[a-z]*`), a dedicated greedy/lazy fast path scans forward without recursion, avoiding per-character function calls.
+
+**InlineArray slots**: capture group slot data uses `InlineArray[Int, num_slots]` (stack-allocated, fixed size known at compile time) rather than `List[Int]`. Value copies are free stack memcpys. `_slots_to_list` converts to `List[Int]` only when constructing the final `MatchResult`.
+
+**Search acceleration**: all the same prefix/bitmap skip logic as `CompiledRegex` is applied via `comptime if` blocks at compile time, so patterns with no literal prefix pay no branch overhead for prefix logic at runtime.
 
 ### Search Acceleration (`optimize.mojo`, `simd_scan.mojo`)
 

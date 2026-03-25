@@ -29,6 +29,15 @@ from .optimize import extract_literal_prefix, extract_first_byte_bitmap
 from .simd_scan import simd_find_byte
 from .charset import BITMAP_WIDTH
 from .static_backtrack import _sbt_try_match
+from std.memory import memcpy
+
+
+@always_inline
+def _slots_to_list[n: Int](slots: InlineArray[Int, n]) -> List[Int]:
+    var result = List[Int](capacity=n)
+    memcpy(dest=result.unsafe_ptr(), src=slots.unsafe_ptr(), count=n)
+    result._len = n
+    return result^
 
 
 def _build_static_nfa(pattern: String) -> NFA:
@@ -43,26 +52,15 @@ def _build_static_nfa(pattern: String) -> NFA:
     except e:
         abort("StaticRegex: invalid pattern")
 
-
-def _static_nfa_group_count(nfa: NFA) -> Int:
-    return nfa.group_count
-
-
-def _static_nfa_start(nfa: NFA) -> Int:
-    return nfa.start
-
-
-def _static_nfa_start_anchor(nfa: NFA) -> Int:
-    return nfa.start_anchor
-
-
+@always_inline
 def _is_bitmap_useful(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Bool:
     """Check if the first-byte bitmap filters any bytes (not all 0xFF)."""
-    for i in range(BITMAP_WIDTH):
-        if bitmap[i] != UInt8(0xFF):
-            return True
-    return False
+    return bitmap.ne(UInt8(0xFF)).reduce_or()
 
+
+# Sometimes this produces better IR since the __init__ gets folded into
+# a constant.
+comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
 
 struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
     """A compile-time regex where parsing and NFA construction happen during
@@ -75,10 +73,10 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
     """
 
     comptime nfa = _build_static_nfa(String(Self.pattern))
-    comptime _group_count = _static_nfa_group_count(Self.nfa)
-    comptime _num_slots = 2 * _static_nfa_group_count(Self.nfa)
-    comptime _start = _static_nfa_start(Self.nfa)
-    comptime _start_anchor = _static_nfa_start_anchor(Self.nfa)
+    comptime _group_count = Self.nfa.group_count
+    comptime _num_slots = 2 * Self.nfa.group_count
+    comptime _start = Self.nfa.start
+    comptime _start_anchor = Self.nfa.start_anchor
     comptime _prefix = extract_literal_prefix(Self.nfa)
     comptime _prefix_len = len(Self._prefix)
     comptime _first_byte_bitmap = extract_first_byte_bitmap(Self.nfa)
@@ -90,8 +88,8 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
 
     def match(self, input: String) -> MatchResult:
         """Match the entire input against the pattern."""
-        var slots = List[Int](fill=-1, length=Self._num_slots)
-        var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+        var slots = ALL_NEG_ONES[Self._num_slots]
+        var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
             input.as_bytes(), 0, slots, 0
         )
         if end >= 0 and end == len(input):
@@ -100,7 +98,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                 start=0,
                 end=end,
                 group_count=Self._group_count,
-                slots=slots^,
+                slots=_slots_to_list(slots),
             )
         return MatchResult.no_match(Self._group_count)
 
@@ -111,8 +109,8 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
 
         # BOL anchor: only try position 0
         comptime if Self._start_anchor == AnchorKind.BOL:
-            var slots = List[Int](fill=-1, length=Self._num_slots)
-            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+            var slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
                 input_bytes, 0, slots, 0
             )
             if end >= 0:
@@ -121,7 +119,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                     start=0,
                     end=end,
                     group_count=Self._group_count,
-                    slots=slots^,
+                    slots=_slots_to_list(slots),
                 )
             return MatchResult.no_match(Self._group_count)
 
@@ -164,8 +162,8 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         if (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) == 0:
                             pos += 1
                             continue
-            var slots = List[Int](fill=-1, length=Self._num_slots)
-            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+            var slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
                 input, pos, slots, 0
             )
             if end >= 0:
@@ -174,7 +172,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                     start=pos,
                     end=end,
                     group_count=Self._group_count,
-                    slots=slots^,
+                    slots=_slots_to_list(slots),
                 )
             pos += 1
         return MatchResult.no_match(Self._group_count)
@@ -200,8 +198,8 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                     if not full_prefix:
                         pos += 1
                         continue
-            var slots = List[Int](fill=-1, length=Self._num_slots)
-            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+            var slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
                 input, pos, slots, 0
             )
             if end >= 0:
@@ -210,7 +208,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                     start=pos,
                     end=end,
                     group_count=Self._group_count,
-                    slots=slots^,
+                    slots=_slots_to_list(slots),
                 )
             # Skip to next BOL position using SIMD scan for \n
             var nl = simd_find_byte(input, CHAR_NEWLINE, pos)
@@ -224,7 +222,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
         var results = List[String]()
         var input_bytes = input.as_bytes()
         var input_len = len(input)
-        var slots = List[Int](fill=-1, length=Self._num_slots)
+        var slots = ALL_NEG_ONES[Self._num_slots]
         var pos = 0
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
@@ -251,19 +249,20 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         if (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) == 0:
                             pos += 1
                             continue
-            # Reset slots instead of reallocating
-            for k in range(Self._num_slots):
-                slots.unsafe_set(k, -1)
-            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+            slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
                 input_bytes, pos, slots, 0
             )
             if end < 0:
                 pos += 1
                 continue
             # Group 1 if available, else full match
-            if Self._group_count > 0 and len(slots) >= 4 and slots[2] >= 0 and slots[3] >= 0:
-                results.append(String(input[byte = slots[2] : slots[3]]))
-            else:
+            comptime if Self._num_slots >= 4:
+                if Self._group_count > 0 and slots[2] >= 0 and slots[3] >= 0:
+                    results.append(String(input[byte = slots[2] : slots[3]]))
+                else:
+                    results.append(String(input[byte = pos : end]))
+            comptime if Self._num_slots < 4:
                 results.append(String(input[byte = pos : end]))
             if end > pos:
                 pos = end
@@ -281,7 +280,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
         var input_len = len(input)
         var prev_end = 0
         var pos = 0
-        var slots = List[Int](fill=-1, length=Self._num_slots)
+        var slots = ALL_NEG_ONES[Self._num_slots]
 
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
@@ -308,9 +307,8 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         if (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) == 0:
                             pos += 1
                             continue
-            for k in range(Self._num_slots):
-                slots.unsafe_set(k, -1)
-            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+            slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
                 input_bytes, pos, slots, 0
             )
             if end < 0:
@@ -325,7 +323,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                 start=pos,
                 end=end,
                 group_count=Self._group_count,
-                slots=slots.copy(),
+                slots=_slots_to_list(slots),
             )
             output += self._expand_replacement(input_bytes, match_result, replacement)
             if end > pos:
@@ -346,7 +344,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
         var input_len = len(input)
         var pos = 0
         var prev_end = 0
-        var slots = List[Int](fill=-1, length=Self._num_slots)
+        var slots = ALL_NEG_ONES[Self._num_slots]
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
                 comptime first_byte = Self._prefix[0]
@@ -372,9 +370,8 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         if (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) == 0:
                             pos += 1
                             continue
-            for k in range(Self._num_slots):
-                slots.unsafe_set(k, -1)
-            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start](
+            slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_try_match[nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots](
                 input_bytes, pos, slots, 0
             )
             if end < 0:
