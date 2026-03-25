@@ -2,3 +2,4 @@
 .pixi/*
 !.pixi/config.toml
 **__pycache__**
+playground.mojo

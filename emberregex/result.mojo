@@ -28,15 +28,13 @@ struct MatchResult(Copyable, Movable, Writable):
 
     @staticmethod
     def no_match(group_count: Int = 0) -> MatchResult:
-        var slots = List[Int]()
-        for _i in range(2 * group_count):
-            slots.append(-1)
+        # Empty List — zero allocation; slots are not accessed on no-match.
         return MatchResult(
             matched=False,
             start=-1,
             end=-1,
             group_count=group_count,
-            slots=slots^,
+            slots=List[Int](),
         )
 
     def __bool__(self) -> Bool:
@@ -51,16 +49,14 @@ struct MatchResult(Copyable, Movable, Writable):
 
         Returns (-1, -1) if the group didn't participate in the match.
         """
-        if index < 1 or index > self.group_count:
+        if index < 1 or index > self.group_count or not self.matched:
             return (-1, -1)
-        var slot_start = self.slots[2 * index - 2]
-        var slot_end = self.slots[2 * index - 1]
-        return (slot_start, slot_end)
+        return (self.slots[2 * index - 2], self.slots[2 * index - 1])
 
     def group_matched(self, index: Int) -> Bool:
         """Check if capture group `index` (1-based) participated in the match.
         """
-        if index < 1 or index > self.group_count:
+        if index < 1 or index > self.group_count or not self.matched:
             return False
         return self.slots[2 * index - 2] != -1
 
@@ -69,7 +65,7 @@ struct MatchResult(Copyable, Movable, Writable):
 
         Returns empty string if the group didn't match.
         """
-        if index < 1 or index > self.group_count:
+        if index < 1 or index > self.group_count or not self.matched:
             return ""
         var s = self.slots[2 * index - 2]
         var e = self.slots[2 * index - 1]
@@ -85,7 +81,7 @@ struct MatchResult(Copyable, Movable, Writable):
 
         Returns empty string if the group didn't match.
         """
-        if index < 1 or index > self.group_count:
+        if index < 1 or index > self.group_count or not self.matched:
             return ""
         var s = self.slots[2 * index - 2]
         var e = self.slots[2 * index - 1]

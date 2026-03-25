@@ -1,8 +1,17 @@
-"""Extended benchmark suite for EmberRegex.
+"""StaticRegex extended benchmark suite — compile-time specialized engine.
 
-Covers areas not in bench_basic: throughput scaling, anchors, multiline/DOTALL
-flags, named groups, negative lookaround, alternation scaling, large-input
-processing, and additional pathological patterns.
+Mirrors bench_extended.mojo but uses StaticRegex instead of CompiledRegex.
+BenchIds are IDENTICAL to bench_extended.mojo so bench_compare.py can pair
+them side-by-side in the three-column comparison table.
+
+Differences from bench_extended.mojo:
+- Sections 1–13 replicated with StaticRegex (same BenchIds)
+- Section 14 (compilation) omitted — NFA is built at compile time, making
+  runtime compilation benchmarks meaningless for StaticRegex
+- Runtime flags (MULTILINE, DOTALL, IGNORECASE) are specified as inline flags
+  in the pattern string instead (e.g. (?m), (?s), (?i))
+- Named-group replace \\g<name> uses positional \\1/\\2 instead, since
+  StaticRegex replace only supports numeric backreferences
 """
 
 from std.benchmark import (
@@ -14,7 +23,7 @@ from std.benchmark import (
     ThroughputMeasure,
 )
 from std.benchmark.compiler import keep
-from emberregex import compile, RegexFlags
+from emberregex import StaticRegex
 
 comptime ITERS_PER_CALL = 100
 
@@ -38,12 +47,12 @@ def repeat_with_sep(word: String, sep: String, n: Int) -> String:
 
 
 # ---------------------------------------------------------------------------
-# 1. Throughput scaling — same pattern, growing input
+# 1. Throughput scaling
 # ---------------------------------------------------------------------------
 
 
 def bench_throughput_literal_100B(mut b: Bench) raises:
-    var re = compile("needle")
+    var re = StaticRegex["needle"]()
     var input = "a" * 94 + "needle"
 
     @always_inline
@@ -62,7 +71,7 @@ def bench_throughput_literal_100B(mut b: Bench) raises:
 
 
 def bench_throughput_literal_10KB(mut b: Bench) raises:
-    var re = compile("needle")
+    var re = StaticRegex["needle"]()
     var input = "a" * 10000 + "needle"
 
     @always_inline
@@ -81,7 +90,7 @@ def bench_throughput_literal_10KB(mut b: Bench) raises:
 
 
 def bench_throughput_literal_100KB(mut b: Bench) raises:
-    var re = compile("needle")
+    var re = StaticRegex["needle"]()
     var input = "a" * 100000 + "needle"
 
     @always_inline
@@ -100,7 +109,7 @@ def bench_throughput_literal_100KB(mut b: Bench) raises:
 
 
 def bench_throughput_literal_1MB(mut b: Bench) raises:
-    var re = compile("needle")
+    var re = StaticRegex["needle"]()
     var input = "a" * 1000000 + "needle"
 
     @always_inline
@@ -119,8 +128,7 @@ def bench_throughput_literal_1MB(mut b: Bench) raises:
 
 
 def bench_throughput_class_10KB(mut b: Bench) raises:
-    """Search with a character class pattern across 10KB."""
-    var re = compile("[xyz]+")
+    var re = StaticRegex["[xyz]+"]()
     var input = "a" * 9990 + "xyzxyzxyz"
 
     @always_inline
@@ -139,8 +147,7 @@ def bench_throughput_class_10KB(mut b: Bench) raises:
 
 
 def bench_throughput_nomatch_100KB(mut b: Bench) raises:
-    """Full scan with no match — measures worst-case scan speed."""
-    var re = compile("zzzzzz")
+    var re = StaticRegex["zzzzzz"]()
     var input = "a" * 100000
 
     @always_inline
@@ -159,12 +166,12 @@ def bench_throughput_nomatch_100KB(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 2. Anchor benchmarks
+# 2. Anchors
 # ---------------------------------------------------------------------------
 
 
 def bench_anchor_bol(mut b: Bench) raises:
-    var re = compile("^hello")
+    var re = StaticRegex["^hello"]()
     var input = "hello world"
 
     @always_inline
@@ -183,7 +190,7 @@ def bench_anchor_bol(mut b: Bench) raises:
 
 
 def bench_anchor_eol(mut b: Bench) raises:
-    var re = compile("world$")
+    var re = StaticRegex["world$"]()
     var input = "hello world"
 
     @always_inline
@@ -202,7 +209,7 @@ def bench_anchor_eol(mut b: Bench) raises:
 
 
 def bench_anchor_word_boundary(mut b: Bench) raises:
-    var re = compile("\\bworld\\b")
+    var re = StaticRegex["\\bworld\\b"]()
     var input = "say hello world today"
 
     @always_inline
@@ -221,8 +228,7 @@ def bench_anchor_word_boundary(mut b: Bench) raises:
 
 
 def bench_anchor_word_boundary_miss(mut b: Bench) raises:
-    """Word boundary that doesn't match — tests rejection speed."""
-    var re = compile("\\borld\\b")
+    var re = StaticRegex["\\borld\\b"]()
     var input = "say hello world today"
 
     @always_inline
@@ -241,8 +247,7 @@ def bench_anchor_word_boundary_miss(mut b: Bench) raises:
 
 
 def bench_anchor_bol_long_input(mut b: Bench) raises:
-    """BOL anchor should short-circuit on long non-matching input."""
-    var re = compile("^zzz")
+    var re = StaticRegex["^zzz"]()
     var input = "a" * 10000
 
     @always_inline
@@ -261,12 +266,13 @@ def bench_anchor_bol_long_input(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 3. Multiline and DOTALL flags
+# 3. Multiline and DOTALL (via inline flags)
 # ---------------------------------------------------------------------------
 
 
 def bench_multiline_bol(mut b: Bench) raises:
-    var re = compile("^\\w+", RegexFlags(RegexFlags.MULTILINE))
+    # (?m) enables multiline mode — same semantic as RegexFlags.MULTILINE
+    var re = StaticRegex["(?m)^\\w+"]()
     var input = make_lines(100)
 
     @always_inline
@@ -285,7 +291,7 @@ def bench_multiline_bol(mut b: Bench) raises:
 
 
 def bench_multiline_eol(mut b: Bench) raises:
-    var re = compile("\\w+$", RegexFlags(RegexFlags.MULTILINE))
+    var re = StaticRegex["(?m)\\w+$"]()
     var input = make_lines(100)
 
     @always_inline
@@ -304,7 +310,8 @@ def bench_multiline_eol(mut b: Bench) raises:
 
 
 def bench_dotall_match(mut b: Bench) raises:
-    var re = compile("<body>.*</body>", RegexFlags(RegexFlags.DOTALL))
+    # (?s) enables DOTALL mode — dot matches newline
+    var re = StaticRegex["(?s)<body>.*</body>"]()
     var input = "<body>\nline1\nline2\nline3\n</body>"
 
     @always_inline
@@ -323,12 +330,13 @@ def bench_dotall_match(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 4. Named groups
+# 4. Groups
 # ---------------------------------------------------------------------------
 
 
 def bench_named_groups(mut b: Bench) raises:
-    var re = compile("(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})")
+    # Named groups are supported in the pattern (they work as capturing groups)
+    var re = StaticRegex["(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"]()
     var input = "2026-03-21"
 
     @always_inline
@@ -347,9 +355,8 @@ def bench_named_groups(mut b: Bench) raises:
 
 
 def bench_named_vs_unnamed(mut b: Bench) raises:
-    """Compare named groups vs positional groups."""
-    var re_named = compile("(?P<a>\\w+)@(?P<b>\\w+)\\.(?P<c>\\w+)")
-    var re_pos = compile("(\\w+)@(\\w+)\\.(\\w+)")
+    var re_named = StaticRegex["(?P<a>\\w+)@(?P<b>\\w+)\\.(?P<c>\\w+)"]()
+    var re_pos = StaticRegex["(\\w+)@(\\w+)\\.(\\w+)"]()
     var input = "user@example.com"
 
     @always_inline
@@ -386,7 +393,7 @@ def bench_named_vs_unnamed(mut b: Bench) raises:
 
 
 def bench_neg_lookahead(mut b: Bench) raises:
-    var re = compile("\\w+(?!@)")
+    var re = StaticRegex["\\w+(?!@)"]()
     var input = "hello world"
 
     @always_inline
@@ -405,7 +412,7 @@ def bench_neg_lookahead(mut b: Bench) raises:
 
 
 def bench_neg_lookbehind(mut b: Bench) raises:
-    var re = compile("(?<!\\d)\\w+")
+    var re = StaticRegex["(?<!\\d)\\w+"]()
     var input = "hello world"
 
     @always_inline
@@ -424,9 +431,7 @@ def bench_neg_lookbehind(mut b: Bench) raises:
 
 
 def bench_password_lookahead(mut b: Bench) raises:
-    """Password validation: at least one digit, one upper, one lower, 8+ chars.
-    """
-    var re = compile("(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).{8,}")
+    var re = StaticRegex["(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).{8,}"]()
     var input = "MyP4ssw0rd"
 
     @always_inline
@@ -450,7 +455,7 @@ def bench_password_lookahead(mut b: Bench) raises:
 
 
 def bench_alternation_4(mut b: Bench) raises:
-    var re = compile("alpha|beta|gamma|delta")
+    var re = StaticRegex["alpha|beta|gamma|delta"]()
     var input = "delta"
 
     @always_inline
@@ -469,10 +474,10 @@ def bench_alternation_4(mut b: Bench) raises:
 
 
 def bench_alternation_16(mut b: Bench) raises:
-    var re = compile(
+    var re = StaticRegex[
         "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
         "|iota|kappa|lambda|mu|nu|xi|omicron|pi"
-    )
+    ]()
     var input = "pi"
 
     @always_inline
@@ -491,10 +496,10 @@ def bench_alternation_16(mut b: Bench) raises:
 
 
 def bench_alternation_miss(mut b: Bench) raises:
-    var re = compile(
+    var re = StaticRegex[
         "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
         "|iota|kappa|lambda|mu|nu|xi|omicron|pi"
-    )
+    ]()
     var input = "sigma"
 
     @always_inline
@@ -518,8 +523,7 @@ def bench_alternation_miss(mut b: Bench) raises:
 
 
 def bench_findall_few(mut b: Bench) raises:
-    """Findall with 3 matches in short input."""
-    var re = compile("\\d+")
+    var re = StaticRegex["\\d+"]()
     var input = "a1b2c3"
 
     @always_inline
@@ -538,8 +542,7 @@ def bench_findall_few(mut b: Bench) raises:
 
 
 def bench_findall_many(mut b: Bench) raises:
-    """Findall with ~100 matches."""
-    var re = compile("\\d+")
+    var re = StaticRegex["\\d+"]()
     var input = repeat_with_sep("42", " word ", 100)
 
     @always_inline
@@ -558,8 +561,7 @@ def bench_findall_many(mut b: Bench) raises:
 
 
 def bench_findall_dense(mut b: Bench) raises:
-    """Dense matches — every character matches."""
-    var re = compile(".")
+    var re = StaticRegex["."]()
     var input = "a" * 500
 
     @always_inline
@@ -583,8 +585,7 @@ def bench_findall_dense(mut b: Bench) raises:
 
 
 def bench_replace_many(mut b: Bench) raises:
-    """Replace across many matches."""
-    var re = compile("\\d+")
+    var re = StaticRegex["\\d+"]()
     var input = repeat_with_sep("42", " text ", 50)
 
     @always_inline
@@ -602,8 +603,9 @@ def bench_replace_many(mut b: Bench) raises:
     b.bench_function[go](BenchId("replace_50_matches"))
 
 
-def bench_replace_named_backref(mut b: Bench) raises:
-    var re = compile("(?P<first>\\w+) (?P<last>\\w+)")
+def bench_replace_backref(mut b: Bench) raises:
+    # Use positional \\2, \\1 instead of named \\g<last>, \\g<first>
+    var re = StaticRegex["(\\w+) (\\w+)"]()
     var input = "John Doe"
 
     @always_inline
@@ -613,7 +615,7 @@ def bench_replace_named_backref(mut b: Bench) raises:
         @parameter
         def call() raises:
             for _ in range(ITERS_PER_CALL):
-                var r = re.replace(input, "\\g<last>, \\g<first>")
+                var r = re.replace(input, "\\2, \\1")
                 keep(r.byte_length())
 
         bench.iter[call]()
@@ -627,8 +629,7 @@ def bench_replace_named_backref(mut b: Bench) raises:
 
 
 def bench_split_many(mut b: Bench) raises:
-    """Split a string with many delimiters."""
-    var re = compile("[,;|]+")
+    var re = StaticRegex["[,;|]+"]()
     var input = repeat_with_sep("word", ",", 100)
 
     @always_inline
@@ -647,13 +648,12 @@ def bench_split_many(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 10. Additional pathological patterns
+# 10. Pathological patterns
 # ---------------------------------------------------------------------------
 
 
 def bench_pathological_optional_16(mut b: Bench) raises:
-    """Doubled version of bench_basic's optional_8."""
-    var re = compile("a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaa")
+    var re = StaticRegex["a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaa"]()
     var input = "aaaaaaaaaaaaaaaa"
 
     @always_inline
@@ -672,8 +672,7 @@ def bench_pathological_optional_16(mut b: Bench) raises:
 
 
 def bench_pathological_dotstar_anchored(mut b: Bench) raises:
-    """^.*x$ on input that ends with x — greedy must scan entire string."""
-    var re = compile("^.*x$")
+    var re = StaticRegex["^.*x$"]()
     var input = "a" * 5000 + "x"
 
     @always_inline
@@ -692,8 +691,7 @@ def bench_pathological_dotstar_anchored(mut b: Bench) raises:
 
 
 def bench_pathological_dotstar_miss(mut b: Bench) raises:
-    """.*x where x never appears — worst case scan."""
-    var re = compile(".*x")
+    var re = StaticRegex[".*x"]()
     var input = "a" * 5000
 
     @always_inline
@@ -712,8 +710,7 @@ def bench_pathological_dotstar_miss(mut b: Bench) raises:
 
 
 def bench_pathological_backref_repeated(mut b: Bench) raises:
-    """Backtracking with backreference on triple repeated text."""
-    var re = compile("(\\w+)\\s\\1\\s\\1")
+    var re = StaticRegex["(\\w+)\\s\\1\\s\\1"]()
     var input = "hello hello hello"
 
     @always_inline
@@ -732,12 +729,12 @@ def bench_pathological_backref_repeated(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 11. More real-world patterns
+# 11. Real-world patterns
 # ---------------------------------------------------------------------------
 
 
 def bench_url_parse(mut b: Bench) raises:
-    var re = compile("(https?|ftp)://([^/\\s]+)(/[^\\s]*)?")
+    var re = StaticRegex["(https?|ftp)://([^/\\s]+)(/[^\\s]*)?"]()
     var input = "https://www.example.com/path/to/page?q=1&r=2"
 
     @always_inline
@@ -756,7 +753,7 @@ def bench_url_parse(mut b: Bench) raises:
 
 
 def bench_phone_number(mut b: Bench) raises:
-    var re = compile("\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}")
+    var re = StaticRegex["\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}"]()
     var input = "(555) 123-4567"
 
     @always_inline
@@ -775,7 +772,7 @@ def bench_phone_number(mut b: Bench) raises:
 
 
 def bench_hex_color(mut b: Bench) raises:
-    var re = compile("#[0-9a-fA-F]{6}")
+    var re = StaticRegex["#[0-9a-fA-F]{6}"]()
     var input = "#1a2B3c"
 
     @always_inline
@@ -794,7 +791,8 @@ def bench_hex_color(mut b: Bench) raises:
 
 
 def bench_semver(mut b: Bench) raises:
-    var re = compile("(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?")
+    var re = StaticRegex[
+        "(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?"]()
     var input = "12.34.56-beta.1"
 
     @always_inline
@@ -813,8 +811,7 @@ def bench_semver(mut b: Bench) raises:
 
 
 def bench_key_value_pairs(mut b: Bench) raises:
-    """Extract key=value pairs from config-like text."""
-    var re = compile("(\\w+)=(\\S+)")
+    var re = StaticRegex["(\\w+)=(\\S+)"]()
     var input = "host=localhost port=5432 db=mydb user=admin timeout=30"
 
     @always_inline
@@ -833,11 +830,10 @@ def bench_key_value_pairs(mut b: Bench) raises:
 
 
 def bench_html_tag_extraction(mut b: Bench) raises:
-    """Extract HTML tag names from a page fragment."""
-    var re = compile("<(\\w+)[^>]*>")
+    var re = StaticRegex["<(\\w+)[^>]*>"]()
     var input = (
         "<html><head><title>Test</title></head><body><div"
-        ' class="x"><p>Hello</p><a href="#">Link</a></div></body></html>'
+        " class=\"x\"><p>Hello</p><a href=\"#\">Link</a></div></body></html>"
     )
 
     @always_inline
@@ -856,8 +852,7 @@ def bench_html_tag_extraction(mut b: Bench) raises:
 
 
 def bench_whitespace_normalize(mut b: Bench) raises:
-    """Collapse runs of whitespace — common text-processing task."""
-    var re = compile("\\s+")
+    var re = StaticRegex["\\s+"]()
     var input = "hello   world\t\tfoo  bar\n\nbaz   qux"
 
     @always_inline
@@ -876,8 +871,6 @@ def bench_whitespace_normalize(mut b: Bench) raises:
 
 
 def bench_log_search_in_bulk(mut b: Bench) raises:
-    """Search for ERROR line in a large log."""
-    var re = compile("\\[ERROR\\].*")
     var lines = List[String]()
     for i in range(1000):
         if i == 750:
@@ -887,6 +880,7 @@ def bench_log_search_in_bulk(mut b: Bench) raises:
                 "2026-03-21 14:30:05 [INFO] All good line " + String(i)
             )
     var input = String("\n").join(lines)
+    var re = StaticRegex["\\[ERROR\\].*"]()
 
     @always_inline
     @parameter
@@ -909,7 +903,7 @@ def bench_log_search_in_bulk(mut b: Bench) raises:
 
 
 def bench_inline_ignorecase(mut b: Bench) raises:
-    var re = compile("(?i)hello world")
+    var re = StaticRegex["(?i)hello world"]()
     var input = "HeLLo WoRLd"
 
     @always_inline
@@ -928,7 +922,7 @@ def bench_inline_ignorecase(mut b: Bench) raises:
 
 
 def bench_inline_multiline(mut b: Bench) raises:
-    var re = compile("(?m)^error.*$")
+    var re = StaticRegex["(?m)^error.*$"]()
     var input = "info: ok\nwarn: hmm\nerror: bad\ninfo: ok"
 
     @always_inline
@@ -947,13 +941,12 @@ def bench_inline_multiline(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 13. Engine comparison — DFA vs Pike VM vs backtracking, same structure
+# 13. Engine comparison (StaticRegex always uses specialized backtracker)
 # ---------------------------------------------------------------------------
 
 
 def bench_engine_dfa_simple(mut b: Bench) raises:
-    """No captures → DFA path."""
-    var re = compile("[a-z]+\\d+[a-z]+")
+    var re = StaticRegex["[a-z]+\\d+[a-z]+"]()
     var input = "abc123def"
 
     @always_inline
@@ -972,8 +965,7 @@ def bench_engine_dfa_simple(mut b: Bench) raises:
 
 
 def bench_engine_pike_same(mut b: Bench) raises:
-    """Same pattern with captures → Pike VM path."""
-    var re = compile("([a-z]+)(\\d+)([a-z]+)")
+    var re = StaticRegex["([a-z]+)(\\d+)([a-z]+)"]()
     var input = "abc123def"
 
     @always_inline
@@ -992,8 +984,7 @@ def bench_engine_pike_same(mut b: Bench) raises:
 
 
 def bench_engine_backtrack_same(mut b: Bench) raises:
-    """Same shape with backreference → backtracking path."""
-    var re = compile("([a-z]+)\\d+\\1")
+    var re = StaticRegex["([a-z]+)\\d+\\1"]()
     var input = "abc123abc"
 
     @always_inline
@@ -1009,69 +1000,6 @@ def bench_engine_backtrack_same(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("engine_backtrack_with_backref"))
-
-
-# ---------------------------------------------------------------------------
-# 14. Compilation scaling
-# ---------------------------------------------------------------------------
-
-
-def bench_compile_char_class_wide(mut b: Bench) raises:
-    """Compile a pattern with many character class ranges."""
-
-    @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
-        @always_inline
-        @parameter
-        def call() raises:
-            for _ in range(ITERS_PER_CALL):
-                var re = compile("[a-zA-Z0-9!@#$%^&*()_+=-]+")
-                keep(re.pattern.unsafe_ptr())
-
-        bench.iter[call]()
-
-    b.bench_function[go](BenchId("compile_wide_char_class"))
-
-
-def bench_compile_many_groups(mut b: Bench) raises:
-    """Compile a pattern with many capturing groups."""
-
-    @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
-        @always_inline
-        @parameter
-        def call() raises:
-            for _ in range(ITERS_PER_CALL):
-                var re = compile(
-                    "(\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+)"
-                )
-                keep(re.pattern.unsafe_ptr())
-
-        bench.iter[call]()
-
-    b.bench_function[go](BenchId("compile_8_groups"))
-
-
-def bench_compile_nested_alternation(mut b: Bench) raises:
-    """Compile deeply nested alternation."""
-
-    @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
-        @always_inline
-        @parameter
-        def call() raises:
-            for _ in range(ITERS_PER_CALL):
-                var re = compile(
-                    "(?:a|b|c)(?:d|e|f)(?:g|h|i)(?:j|k|l)(?:m|n|o)(?:p|q|r)"
-                )
-                keep(re.pattern.unsafe_ptr())
-
-        bench.iter[call]()
-
-    b.bench_function[go](BenchId("compile_nested_alternation"))
 
 
 # ---------------------------------------------------------------------------
@@ -1100,12 +1028,12 @@ def main() raises:
     bench_anchor_word_boundary_miss(b)
     bench_anchor_bol_long_input(b)
 
-    # Multiline / DOTALL flags
+    # Multiline / DOTALL
     bench_multiline_bol(b)
     bench_multiline_eol(b)
     bench_dotall_match(b)
 
-    # Named groups
+    # Groups
     bench_named_groups(b)
     bench_named_vs_unnamed(b)
 
@@ -1126,7 +1054,7 @@ def main() raises:
 
     # Replace scaling
     bench_replace_many(b)
-    bench_replace_named_backref(b)
+    bench_replace_backref(b)
 
     # Split scaling
     bench_split_many(b)
@@ -1155,10 +1083,5 @@ def main() raises:
     bench_engine_dfa_simple(b)
     bench_engine_pike_same(b)
     bench_engine_backtrack_same(b)
-
-    # Compilation scaling
-    bench_compile_char_class_wide(b)
-    bench_compile_many_groups(b)
-    bench_compile_nested_alternation(b)
 
     b.dump_report()

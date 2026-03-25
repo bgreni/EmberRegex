@@ -10,7 +10,9 @@ test = { cmd = "python3 run_test.py" }
 build = { cmd = "mojo build emberregex/__init__.mojo -o emberregex"}
 bench = { cmd = "mojo -I . bench/bench_basic.mojo" }
 bench_ext = { cmd = "mojo -I . bench/bench_extended.mojo" }
-bench_all = {depends-on=["bench", "bench_ext"]}
+bench_static = { cmd = "mojo -I . bench/bench_static.mojo" }
+bench_static_ext = { cmd = "mojo -I . bench/bench_static_ext.mojo" }
+bench_all = {depends-on=["bench", "bench_ext", "bench_static", "bench_static_ext"]}
 compare = { cmd = "python3 bench/bench_compare.py" }
 format = "mojo format emberregex test bench"
 

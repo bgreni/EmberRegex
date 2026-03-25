@@ -69,3 +69,8 @@ After engine selection, `extract_literal_prefix` (`optimize.mojo`) walks the NFA
 - `UInt8(1) << bit_idx` requires `bit_idx: UInt8` — explicit cast needed.
 - After transferring a field with `^` in a `mut self` method, reinitialize the field before the method returns or the struct will be partially uninitialized.
 - Structs need the explicit `Movable` trait to use the `^` transfer operator.
+
+
+## Investigating code behaviour
+
+Instead of writing a million temp files that I need to accept access to each time. Just use playground.mojo as code scratch pad when you want to investigate the behavior of something.
