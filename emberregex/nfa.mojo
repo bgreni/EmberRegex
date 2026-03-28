@@ -60,22 +60,6 @@ struct NFAState(Copyable, Movable):
         self.icase = False
         self.sub_dfa_safe = False
 
-    def __init__(out self, *, copy: Self):
-        self.kind = copy.kind
-        self.char_value = copy.char_value
-        self.charset_index = copy.charset_index
-        self.out1 = copy.out1
-        self.out2 = copy.out2
-        self.greedy = copy.greedy
-        self.save_slot = copy.save_slot
-        self.anchor_type = copy.anchor_type
-        self.sub_start = copy.sub_start
-        self.negated = copy.negated
-        self.lookbehind_len = copy.lookbehind_len
-        self.backref_group = copy.backref_group
-        self.icase = copy.icase
-        self.sub_dfa_safe = copy.sub_dfa_safe
-
     @staticmethod
     def char_state(ch: UInt32) -> NFAState:
         var s = NFAState(NFAStateKind.CHAR)
@@ -162,7 +146,7 @@ struct NFAFragment(Movable):
         self.out_slots.append(slot)
 
 
-struct NFA(Copyable, Movable):
+struct NFA(Copyable):
     """A complete NFA for a regex pattern.
 
     All flag-dependent behavior is baked into NFA states during construction:
@@ -565,7 +549,7 @@ def _build_plus(
     var body = _build_fragment(nfa, ast, child_idx, flags)
     var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
 
-    ref state = nfa.states[split_idx]
+    ref state = nfa.states.unsafe_get(split_idx)
 
     if greedy:
         state.out1 = body.start  # Prefer looping
@@ -599,7 +583,7 @@ def _build_question(
     var body = _build_fragment(nfa, ast, child_idx, flags)
     var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
 
-    ref state = nfa.states[split_idx]
+    ref state = nfa.states.unsafe_get(split_idx)
 
     if greedy:
         state.out1 = body.start  # Prefer matching
@@ -613,7 +597,7 @@ def _build_question(
     var frag = NFAFragment(split_idx)
     # Both body outputs and the skip edge are dangling
     for i in range(len(body.outs)):
-        frag.add_out(body.outs[i], body.out_slots[i])
+        frag.add_out(body.outs.unsafe_get(i), body.out_slots.unsafe_get(i))
     if greedy:
         frag.add_out(split_idx, 2)
     else:
@@ -640,7 +624,7 @@ def _build_repetition(
     if min_rep == 0 and max_rep == 0:
         # {0} — matches empty; create epsilon transition
         var state_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
-        nfa.states[state_idx].out1 = -1
+        nfa.states.unsafe_get(state_idx).out1 = -1
         var frag = NFAFragment(state_idx)
         frag.add_out(state_idx, 1)
         return frag^
@@ -659,13 +643,16 @@ def _build_repetition(
             patch_frag.outs = res_outs.copy()
             patch_frag.out_slots = res_out_slots.copy()
             nfa.patch(patch_frag, copy.start)
-            res_outs = copy.outs.copy()
-            res_out_slots = copy.out_slots.copy()
+            res_outs = copy.outs^
+            res_out_slots = copy.out_slots^
         else:
             res_start = copy.start
-            res_outs = copy.outs.copy()
-            res_out_slots = copy.out_slots.copy()
+            res_outs = copy.outs^
+            res_out_slots = copy.out_slots^
             has_result = True
+        # reinitializing this memory so compiler doesn't complain
+        copy.outs = []
+        copy.out_slots = []
 
     if max_rep == -1:
         # {n,} — required copies + star loop
@@ -679,8 +666,7 @@ def _build_repetition(
             new_frag.outs = star.outs.copy()
             new_frag.out_slots = star.out_slots.copy()
             return new_frag^
-        else:
-            return star^
+        return star^
     else:
         # {n,m} — required copies + (max-min) optional copies
         var optional_count = max_rep - min_rep
@@ -706,7 +692,7 @@ def _build_repetition(
             return frag^
         # Shouldn't reach here, but just in case
         var state_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
-        nfa.states[state_idx].out1 = -1
+        nfa.states.unsafe_get(state_idx).out1 = -1
         var frag = NFAFragment(state_idx)
         frag.add_out(state_idx, 1)
         return frag^
@@ -742,5 +728,5 @@ def _add_case_folding(mut cs: CharSet):
         var hi_upper = _to_upper(hi)
         if lo_upper != lo or hi_upper != hi:
             new_ranges.append(CharRange(lo_upper, hi_upper))
-    for i in range(len(new_ranges)):
-        cs.ranges.append(new_ranges[i])
+
+    cs.ranges.extend(new_ranges^)

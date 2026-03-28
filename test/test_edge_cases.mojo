@@ -603,9 +603,7 @@ def test_multiline_with_anchored_findall() raises:
 
 def test_all_three_flags() raises:
     """IGNORECASE + MULTILINE + DOTALL combined."""
-    var re = compile(
-        "(?ims)^hello.world$"
-    )
+    var re = compile("(?ims)^hello.world$")
     assert_true(re.search("HELLO\nWORLD").matched)
 
 

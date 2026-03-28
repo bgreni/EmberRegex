@@ -72,7 +72,8 @@ def test_result_group_span_out_of_range() raises:
 
 
 def test_result_group_span_zero_index() raises:
-    """Group span with index 0 returns (-1, -1) since it's out of range (1-based)."""
+    """Group span with index 0 returns (-1, -1) since it's out of range (1-based).
+    """
     var re = compile("(a)")
     var result = re.match("a")
     assert_true(result.matched)
@@ -155,8 +156,8 @@ def test_result_writable_match() raises:
     var s = String()
     result.write_to(s)
     # Check it contains key info
-    assert_true("4" in s)   # start
-    assert_true("9" in s)   # end
+    assert_true("4" in s)  # start
+    assert_true("9" in s)  # end
 
 
 def test_result_writable_no_match() raises:
@@ -356,9 +357,9 @@ def test_password_validation() raises:
     var re = compile("(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).{8,}")
     assert_true(re.match("MyP4ssw0rd").matched)
     assert_true(re.match("Str0ngPwd").matched)
-    assert_false(re.match("weakpwd1").matched)   # no uppercase
-    assert_false(re.match("STRONGPWD").matched)   # no lowercase or digit
-    assert_false(re.match("Aa1").matched)          # too short
+    assert_false(re.match("weakpwd1").matched)  # no uppercase
+    assert_false(re.match("STRONGPWD").matched)  # no lowercase or digit
+    assert_false(re.match("Aa1").matched)  # too short
 
 
 def main() raises:

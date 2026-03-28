@@ -61,7 +61,7 @@ struct CompiledRegex(Copyable, Movable):
     var group_names: Dict[String, Int]
 
     def __init__(
-        out self, pattern: String, flags: RegexFlags = RegexFlags()
+        out self, var pattern: String, flags: RegexFlags = RegexFlags()
     ) raises:
         var ast = parse(pattern)
         # Extract group names before consuming AST
@@ -70,32 +70,22 @@ struct CompiledRegex(Copyable, Movable):
         var merged_flags = RegexFlags(flags.value | ast.flags.value)
         var nfa = build_nfa(ast^, merged_flags)
         var needs_bt = nfa.needs_backtrack
-        var can_dfa = nfa.can_use_dfa and not nfa.needs_backtrack
+        self._can_use_dfa = nfa.can_use_dfa and not nfa.needs_backtrack
         var prefix = extract_literal_prefix(nfa)
-        var fb_bitmap = extract_first_byte_bitmap(nfa)
+        self._first_byte_bitmap = extract_first_byte_bitmap(nfa)
         var num_states = len(nfa.states)
         var num_slots = 2 * nfa.group_count
-        # Build one-pass NFA before consuming the NFA
-        var op = build_onepass(nfa)
-        var can_onepass = op.is_valid and nfa.group_count > 0
-        self._onepass = op^
+        self._onepass = build_onepass(nfa)
+        self._can_use_onepass = self._onepass.is_valid and nfa.group_count > 0
         self._op_bufs = _OnePassBufs(num_slots)
-        self._can_use_onepass = can_onepass
         self._start_anchor = nfa.start_anchor
         self._vm = PikeVM(nfa^)
         self._dfa = LazyDFA()
         self._bufs = _VMBuffers(num_states, num_slots)
         self._needs_backtrack = needs_bt
-        self._can_use_dfa = can_dfa
         self._literal_prefix = prefix^
-        self._first_byte_bitmap = fb_bitmap
-        var fb_useful = False
-        for _i in range(32):
-            if fb_bitmap[_i] != UInt8(0xFF):
-                fb_useful = True
-                break
-        self._first_byte_useful = fb_useful
-        self.pattern = pattern
+        self._first_byte_useful = self._first_byte_bitmap.ne(-1).reduce_or()
+        self.pattern = pattern^
 
     def match(mut self, input: String) -> MatchResult:
         """Match the entire input against the pattern."""
@@ -219,9 +209,7 @@ struct CompiledRegex(Copyable, Movable):
                 return MatchResult.no_match(self._vm.nfa.group_count)
             # BOL: only position 0 can match — try once and done
             if self._can_use_dfa and self._vm.nfa.group_count == 0:
-                var match_end = self._dfa.match_at(
-                    self._vm.nfa, input, 0
-                )
+                var match_end = self._dfa.match_at(self._vm.nfa, input, 0)
                 if match_end >= 0:
                     return MatchResult(
                         matched=True,

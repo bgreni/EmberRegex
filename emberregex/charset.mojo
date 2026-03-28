@@ -20,17 +20,18 @@ comptime BITMAP_WIDTH = 32
 
 
 @fieldwise_init
-struct CharRange(ImplicitlyCopyable, Movable):
+struct CharRange(TrivialRegisterPassable):
     """A range of Unicode codepoints [lo, hi] inclusive."""
 
     var lo: UInt32
     var hi: UInt32
 
+    @always_inline
     def contains(self, ch: UInt32) -> Bool:
         return ch >= self.lo and ch <= self.hi
 
 
-struct CharSet(Copyable, Movable):
+struct CharSet(Copyable):
     """A set of characters represented as sorted, non-overlapping ranges
     with a 256-bit bitmap for fast ASCII lookups."""
 
@@ -121,6 +122,7 @@ struct CharSet(Copyable, Movable):
                 self.bitmap[end_byte] |= end_mask
         self.bitmap_valid = True
 
+    @always_inline
     def contains(self, ch: UInt32) -> Bool:
         """Check if a character is in the set."""
         var result: Bool

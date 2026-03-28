@@ -1,8 +1,9 @@
-"""Extended benchmark suite for EmberRegex.
+"""EmberRegex benchmark suite.
 
-Covers areas not in bench_basic: throughput scaling, anchors, multiline/DOTALL
+Covers: compilation, matching (DFA/Pike VM/backtrack), search, findall,
+replace, split, flag handling, throughput scaling, anchors, multiline/DOTALL
 flags, named groups, negative lookaround, alternation scaling, large-input
-processing, and additional pathological patterns.
+processing, and pathological patterns.
 """
 
 from std.benchmark import (
@@ -23,6 +24,10 @@ comptime ITERS_PER_CALL = 100
 # ---------------------------------------------------------------------------
 
 
+def throughput(input: String) -> ThroughputMeasure:
+    return ThroughputMeasure(BenchMetric.bytes, input.byte_length())
+
+
 def make_lines(n: Int) -> String:
     var parts = List[String]()
     for i in range(n):
@@ -38,7 +43,725 @@ def repeat_with_sep(word: String, sep: String, n: Int) -> String:
 
 
 # ---------------------------------------------------------------------------
-# 1. Throughput scaling — same pattern, growing input
+# 1. Compilation benchmarks
+# ---------------------------------------------------------------------------
+
+
+def bench_compile_literal(mut b: Bench) raises:
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var re = compile("hello")
+                keep(re.pattern.unsafe_ptr())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("compile_literal"))
+
+
+def bench_compile_medium(mut b: Bench) raises:
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var re = compile(
+                    "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+                )
+                keep(re.pattern.unsafe_ptr())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("compile_email_pattern"))
+
+
+def bench_compile_complex(mut b: Bench) raises:
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var re = compile(
+                    "(?:https?://)(?:www\\.)?[a-zA-Z0-9-]+(?:\\.[a-zA-Z]{2,})+(?:/[^\\s]*)?"
+                )
+                keep(re.pattern.unsafe_ptr())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("compile_url_pattern"))
+
+
+def bench_compile_char_class_wide(mut b: Bench) raises:
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var re = compile("[a-zA-Z0-9!@#$%^&*()_+=-]+")
+                keep(re.pattern.unsafe_ptr())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("compile_wide_char_class"))
+
+
+def bench_compile_many_groups(mut b: Bench) raises:
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var re = compile(
+                    "(\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+)"
+                )
+                keep(re.pattern.unsafe_ptr())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("compile_8_groups"))
+
+
+def bench_compile_nested_alternation(mut b: Bench) raises:
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var re = compile(
+                    "(?:a|b|c)(?:d|e|f)(?:g|h|i)(?:j|k|l)(?:m|n|o)(?:p|q|r)"
+                )
+                keep(re.pattern.unsafe_ptr())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("compile_nested_alternation"))
+
+
+# ---------------------------------------------------------------------------
+# 2. DFA full_match (no captures, no backrefs)
+# ---------------------------------------------------------------------------
+
+
+def bench_dfa_literal_match(mut b: Bench) raises:
+    var re = compile("abcdefghij")
+    var input = "abcdefghij"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("dfa_literal_match"))
+
+
+def bench_dfa_char_class(mut b: Bench) raises:
+    var re = compile("[a-z]+")
+    var input = "abcdefghijklmnopqrstuvwxyz"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("dfa_char_class_26"))
+
+
+def bench_dfa_alternation(mut b: Bench) raises:
+    var re = compile("cat|dog|bird|fish|frog|snake|mouse|horse")
+    var input = "horse"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("dfa_alternation_8"))
+
+
+def bench_dfa_quantifier(mut b: Bench) raises:
+    var re = compile("[a-z]{5,10}[0-9]{3,5}")
+    var input = "abcdefg1234"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("dfa_quantifier_bounded"))
+
+
+# ---------------------------------------------------------------------------
+# 3. Pike VM full_match (with captures)
+# ---------------------------------------------------------------------------
+
+
+def bench_pike_capture_simple(mut b: Bench) raises:
+    var re = compile("(\\w+)@(\\w+)\\.(\\w+)")
+    var input = "user@example.com"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("pike_capture_email"))
+
+
+def bench_pike_nested_groups(mut b: Bench) raises:
+    var re = compile("((\\w+)(-(\\w+))*)@(\\w+)")
+    var input = "foo-bar-baz@host"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("pike_nested_groups"))
+
+
+def bench_pike_greedy_vs_lazy(mut b: Bench) raises:
+    var re_greedy = compile("<(.+)>")
+    var re_lazy = compile("<(.+?)>")
+    var input = "<a>hello</a>"
+
+    @always_inline
+    @parameter
+    def go_greedy(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re_greedy.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    @always_inline
+    @parameter
+    def go_lazy(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re_lazy.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go_greedy](BenchId("pike_greedy_tag"))
+    b.bench_function[go_lazy](BenchId("pike_lazy_tag"))
+
+
+# ---------------------------------------------------------------------------
+# 4. Backtracking engine (backreferences)
+# ---------------------------------------------------------------------------
+
+
+def bench_backtrack_backref(mut b: Bench) raises:
+    var re = compile("(\\w+)\\s\\1")
+    var input = "hello hello"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("backtrack_backref"))
+
+
+def bench_backtrack_html_tag(mut b: Bench) raises:
+    var re = compile("<([a-z]+)>[^<]*</\\1>")
+    var input = "<div>content</div>"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("backtrack_html_tag"))
+
+
+# ---------------------------------------------------------------------------
+# 5. Search benchmarks (prefix-accelerated)
+# ---------------------------------------------------------------------------
+
+
+def bench_search_short_haystack(mut b: Bench) raises:
+    var re = compile("world")
+    var input = "hello world"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("search_short_11B"))
+
+
+def bench_search_medium_haystack(mut b: Bench) raises:
+    var re = compile("needle")
+    var input = "a" * 500 + "needle" + "b" * 500
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("search_medium_1KB"))
+
+
+def bench_search_long_haystack(mut b: Bench) raises:
+    var re = compile("needle")
+    var input = "a" * 10000 + "needle" + "b" * 10000
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("search_long_20KB"))
+
+
+def bench_search_no_match(mut b: Bench) raises:
+    var re = compile("zzzzz")
+    var input = "a" * 10000
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("search_miss_10KB"))
+
+
+def bench_search_with_capture(mut b: Bench) raises:
+    var re = compile("(\\d{4})-(\\d{2})-(\\d{2})")
+    var input = "x" * 200 + "2026-03-21" + "y" * 200
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("search_date_capture"))
+
+
+# ---------------------------------------------------------------------------
+# 6. findall / replace / split
+# ---------------------------------------------------------------------------
+
+
+def bench_findall(mut b: Bench) raises:
+    var re = compile("[0-9]+")
+    var input = "abc 12 def 345 ghi 6789 jkl 0 mno 42 pqr 100"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.findall(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("findall_numbers"))
+
+
+def bench_replace(mut b: Bench) raises:
+    var re = compile("[0-9]+")
+    var input = "abc 12 def 345 ghi 6789 jkl 0 mno 42 pqr 100"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.replace(input, "NUM")
+                keep(r.byte_length())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("replace_numbers"))
+
+
+def bench_replace_backref(mut b: Bench) raises:
+    var re = compile("(\\w+)=(\\w+)")
+    var input = "a=1 b=2 c=3 d=4 e=5"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.replace(input, "\\2=\\1")
+                keep(r.byte_length())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("replace_with_backref"))
+
+
+def bench_split(mut b: Bench) raises:
+    var re = compile("[,;\\s]+")
+    var input = "one, two; three  four,five;six seven , eight"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.split(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("split_delimiters"))
+
+
+# ---------------------------------------------------------------------------
+# 7. Flags
+# ---------------------------------------------------------------------------
+
+
+def bench_ignorecase(mut b: Bench) raises:
+    var re_plain = compile("[a-zA-Z]+")
+    var re_icase = compile("[a-z]+", RegexFlags(RegexFlags.IGNORECASE))
+    var input = "HeLLo WoRLd FoO BaR"
+
+    @always_inline
+    @parameter
+    def go_plain(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re_plain.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    @always_inline
+    @parameter
+    def go_icase(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re_icase.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go_plain](BenchId("flag_explicit_case_range"))
+    b.bench_function[go_icase](BenchId("flag_ignorecase"))
+
+
+# ---------------------------------------------------------------------------
+# 8. Lookaround
+# ---------------------------------------------------------------------------
+
+
+def bench_lookahead(mut b: Bench) raises:
+    var re = compile("\\w+(?=@)")
+    var input = "user@host"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("lookahead_positive"))
+
+
+def bench_lookbehind(mut b: Bench) raises:
+    var re = compile("(?<=@)\\w+")
+    var input = "user@host"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("lookbehind_positive"))
+
+
+# ---------------------------------------------------------------------------
+# 9. Pathological / stress patterns
+# ---------------------------------------------------------------------------
+
+
+def bench_star_star(mut b: Bench) raises:
+    """a*a*a*...b pattern — tests NFA parallel simulation efficiency."""
+    var re = compile("a?a?a?a?a?a?a?a?aaaaaaaa")
+    var input = "aaaaaaaa"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("pathological_optional_8"))
+
+
+def bench_dot_star(mut b: Bench) raises:
+    """Greedy .* backtracking stress test."""
+    var re = compile(".*x")
+    var input = "a" * 1000 + "x"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("dotstar_1K"))
+
+
+def bench_nested_quantifier(mut b: Bench) raises:
+    var re = compile("([a-z]+[0-9]+)+x")
+    var input = "abc123def456ghi789x"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("nested_quantifier"))
+
+
+# ---------------------------------------------------------------------------
+# 10. Real-world patterns
+# ---------------------------------------------------------------------------
+
+
+def bench_email_validation(mut b: Bench) raises:
+    var re = compile("[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}")
+    var input = "john.doe+test@example.co.uk"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("realworld_email"))
+
+
+def bench_ip_address(mut b: Bench) raises:
+    var re = compile("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")
+    var input = "192.168.1.100"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("realworld_ipv4"))
+
+
+def bench_log_line_parse(mut b: Bench) raises:
+    var re = compile(
+        "(\\d{4}-\\d{2}-\\d{2}) (\\d{2}:\\d{2}:\\d{2}) \\[(\\w+)\\] (.*)"
+    )
+    var input = "2026-03-21 14:30:05 [ERROR] Connection timeout after 30s"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("realworld_log_parse"))
+
+
+def bench_csv_field(mut b: Bench) raises:
+    var re = compile("[^,]+")
+    var input = "field1,field2,field3,field4,field5,field6,field7,field8"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.findall(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("realworld_csv_fields"))
+
+
+# ---------------------------------------------------------------------------
+# 11. Throughput scaling — same pattern, growing input
 # ---------------------------------------------------------------------------
 
 
@@ -159,7 +882,7 @@ def bench_throughput_nomatch_100KB(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 2. Anchor benchmarks
+# 12. Anchor benchmarks
 # ---------------------------------------------------------------------------
 
 
@@ -261,7 +984,7 @@ def bench_anchor_bol_long_input(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 3. Multiline and DOTALL flags
+# 13. Multiline and DOTALL flags
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +1046,7 @@ def bench_dotall_match(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 4. Named groups
+# 14. Named groups
 # ---------------------------------------------------------------------------
 
 
@@ -381,7 +1104,7 @@ def bench_named_vs_unnamed(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 5. Negative lookaround
+# 15. Negative lookaround
 # ---------------------------------------------------------------------------
 
 
@@ -445,7 +1168,7 @@ def bench_password_lookahead(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 6. Alternation scaling
+# 16. Alternation scaling
 # ---------------------------------------------------------------------------
 
 
@@ -513,7 +1236,7 @@ def bench_alternation_miss(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 7. Findall scaling
+# 17. Findall scaling
 # ---------------------------------------------------------------------------
 
 
@@ -578,7 +1301,7 @@ def bench_findall_dense(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 8. Replace scaling
+# 18. Replace scaling
 # ---------------------------------------------------------------------------
 
 
@@ -622,7 +1345,7 @@ def bench_replace_named_backref(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 9. Split scaling
+# 19. Split scaling
 # ---------------------------------------------------------------------------
 
 
@@ -647,12 +1370,11 @@ def bench_split_many(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 10. Additional pathological patterns
+# 20. Additional pathological patterns
 # ---------------------------------------------------------------------------
 
 
 def bench_pathological_optional_16(mut b: Bench) raises:
-    """Doubled version of bench_basic's optional_8."""
     var re = compile("a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaa")
     var input = "aaaaaaaaaaaaaaaa"
 
@@ -731,8 +1453,28 @@ def bench_pathological_backref_repeated(mut b: Bench) raises:
     b.bench_function[go](BenchId("pathological_triple_backref"))
 
 
+def bench_pathological_nested_quantifier_miss(mut b: Bench) raises:
+    """([a-z]+[0-9]+)+x on non-matching input."""
+    var re = compile("([a-z]+[0-9]+)+x")
+    var input = "aaaaaaaaaaaaaaaa"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("pathological_nested_quantifier_miss"))
+
+
 # ---------------------------------------------------------------------------
-# 11. More real-world patterns
+# 21. More real-world patterns
 # ---------------------------------------------------------------------------
 
 
@@ -904,7 +1646,7 @@ def bench_log_search_in_bulk(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 12. Inline flags
+# 22. Inline flags
 # ---------------------------------------------------------------------------
 
 
@@ -947,7 +1689,7 @@ def bench_inline_multiline(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 13. Engine comparison — DFA vs Pike VM vs backtracking, same structure
+# 23. Engine comparison — DFA vs Pike VM vs backtracking, same structure
 # ---------------------------------------------------------------------------
 
 
@@ -1012,69 +1754,6 @@ def bench_engine_backtrack_same(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
-# 14. Compilation scaling
-# ---------------------------------------------------------------------------
-
-
-def bench_compile_char_class_wide(mut b: Bench) raises:
-    """Compile a pattern with many character class ranges."""
-
-    @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
-        @always_inline
-        @parameter
-        def call() raises:
-            for _ in range(ITERS_PER_CALL):
-                var re = compile("[a-zA-Z0-9!@#$%^&*()_+=-]+")
-                keep(re.pattern.unsafe_ptr())
-
-        bench.iter[call]()
-
-    b.bench_function[go](BenchId("compile_wide_char_class"))
-
-
-def bench_compile_many_groups(mut b: Bench) raises:
-    """Compile a pattern with many capturing groups."""
-
-    @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
-        @always_inline
-        @parameter
-        def call() raises:
-            for _ in range(ITERS_PER_CALL):
-                var re = compile(
-                    "(\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+) (\\w+)"
-                )
-                keep(re.pattern.unsafe_ptr())
-
-        bench.iter[call]()
-
-    b.bench_function[go](BenchId("compile_8_groups"))
-
-
-def bench_compile_nested_alternation(mut b: Bench) raises:
-    """Compile deeply nested alternation."""
-
-    @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
-        @always_inline
-        @parameter
-        def call() raises:
-            for _ in range(ITERS_PER_CALL):
-                var re = compile(
-                    "(?:a|b|c)(?:d|e|f)(?:g|h|i)(?:j|k|l)(?:m|n|o)(?:p|q|r)"
-                )
-                keep(re.pattern.unsafe_ptr())
-
-        bench.iter[call]()
-
-    b.bench_function[go](BenchId("compile_nested_alternation"))
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1084,6 +1763,54 @@ def main() raises:
     config.verbose_timing = True
     config.show_progress = True
     var b = Bench(config^)
+
+    # Compilation
+    bench_compile_literal(b)
+    bench_compile_medium(b)
+    bench_compile_complex(b)
+    bench_compile_char_class_wide(b)
+    bench_compile_many_groups(b)
+    bench_compile_nested_alternation(b)
+
+    # DFA matching
+    bench_dfa_literal_match(b)
+    bench_dfa_char_class(b)
+    bench_dfa_alternation(b)
+    bench_dfa_quantifier(b)
+
+    # Pike VM matching
+    bench_pike_capture_simple(b)
+    bench_pike_nested_groups(b)
+    bench_pike_greedy_vs_lazy(b)
+
+    # Backtracking
+    bench_backtrack_backref(b)
+    bench_backtrack_html_tag(b)
+
+    # Search
+    bench_search_short_haystack(b)
+    bench_search_medium_haystack(b)
+    bench_search_long_haystack(b)
+    bench_search_no_match(b)
+    bench_search_with_capture(b)
+
+    # API: findall / replace / split
+    bench_findall(b)
+    bench_replace(b)
+    bench_replace_backref(b)
+    bench_split(b)
+
+    # Flags
+    bench_ignorecase(b)
+    bench_inline_ignorecase(b)
+    bench_inline_multiline(b)
+
+    # Lookaround
+    bench_lookahead(b)
+    bench_lookbehind(b)
+    bench_neg_lookahead(b)
+    bench_neg_lookbehind(b)
+    bench_password_lookahead(b)
 
     # Throughput scaling
     bench_throughput_literal_100B(b)
@@ -1109,11 +1836,6 @@ def main() raises:
     bench_named_groups(b)
     bench_named_vs_unnamed(b)
 
-    # Negative lookaround
-    bench_neg_lookahead(b)
-    bench_neg_lookbehind(b)
-    bench_password_lookahead(b)
-
     # Alternation scaling
     bench_alternation_4(b)
     bench_alternation_16(b)
@@ -1132,12 +1854,20 @@ def main() raises:
     bench_split_many(b)
 
     # Pathological
+    bench_star_star(b)
+    bench_dot_star(b)
+    bench_nested_quantifier(b)
     bench_pathological_optional_16(b)
     bench_pathological_dotstar_anchored(b)
     bench_pathological_dotstar_miss(b)
     bench_pathological_backref_repeated(b)
+    bench_pathological_nested_quantifier_miss(b)
 
     # Real-world
+    bench_email_validation(b)
+    bench_ip_address(b)
+    bench_log_line_parse(b)
+    bench_csv_field(b)
     bench_url_parse(b)
     bench_phone_number(b)
     bench_hex_color(b)
@@ -1147,18 +1877,9 @@ def main() raises:
     bench_whitespace_normalize(b)
     bench_log_search_in_bulk(b)
 
-    # Inline flags
-    bench_inline_ignorecase(b)
-    bench_inline_multiline(b)
-
     # Engine comparison
     bench_engine_dfa_simple(b)
     bench_engine_pike_same(b)
     bench_engine_backtrack_same(b)
-
-    # Compilation scaling
-    bench_compile_char_class_wide(b)
-    bench_compile_many_groups(b)
-    bench_compile_nested_alternation(b)
 
     b.dump_report()

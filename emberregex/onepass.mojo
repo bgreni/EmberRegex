@@ -14,6 +14,8 @@ from .ast import AnchorKind
 from .charset import CharSet, BITMAP_WIDTH
 from .result import MatchResult
 from .simd_scan import simd_find_prefix
+from std.memory import memset
+from std.sys import size_of
 
 
 # Sentinel: no transition for this byte.
@@ -71,7 +73,7 @@ struct _OnePassTransition(Copyable, Movable):
 struct _OnePassState(Copyable, Movable):
     """A single state in the one-pass NFA with a 256-entry transition table."""
 
-    var transitions: List[_OnePassTransition]  # exactly 256 entries
+    var transitions: InlineArray[_OnePassTransition, 256]  # exactly 256 entries
     var is_match: Bool
     var match_num_saves: Int
     var match_save0: Int
@@ -80,9 +82,10 @@ struct _OnePassState(Copyable, Movable):
     var match_save3: Int
 
     def __init__(out self):
-        self.transitions = List[_OnePassTransition](capacity=256)
-        for _ in range(256):
-            self.transitions.append(_OnePassTransition())
+        comptime TRANS = InlineArray[_OnePassTransition, 256](
+            fill=_OnePassTransition()
+        )
+        self.transitions = materialize[TRANS]()
         self.is_match = False
         self.match_num_saves = 0
         self.match_save0 = -1
@@ -157,11 +160,11 @@ def _eps_follow(
     """Recursively follow epsilon transitions, collecting save actions."""
     if state_idx < 0 or state_idx >= len(nfa.states):
         return
-    if visited[state_idx]:
+    if visited.unsafe_get(state_idx):
         return
-    visited[state_idx] = True
+    visited.unsafe_set(state_idx, True)
 
-    ref state = nfa.states[state_idx]
+    ref state = nfa.states.unsafe_get(state_idx)
 
     if state.kind == NFAStateKind.MATCH:
         result.match_found = True
@@ -399,16 +402,16 @@ def onepass_match[
     already determined that a match exists in [start, end).
     """
     var num_slots = op.num_slots
-    var slots = List[Int](capacity=num_slots)
-    for _ in range(num_slots):
-        slots.append(-1)
+    var slots = List[Int](fill=-1, length=num_slots)
 
     var ptr = input.unsafe_ptr()
     var state = op.start
 
     for pos in range(start, end):
-        var byte_val = Int((ptr + pos).load())
-        ref trans = op.op_states[state].transitions[byte_val]
+        var byte_val = Int(ptr[pos])
+        ref trans = op.op_states.unsafe_get(state).transitions.unsafe_get(
+            byte_val
+        )
 
         if trans.next_state == _NO_TRANSITION:
             return MatchResult.no_match(op.group_count)
@@ -416,29 +419,29 @@ def onepass_match[
         # Apply save actions
         var ns = trans.num_saves
         if ns > 0:
-            slots[trans.save0] = pos
+            slots.unsafe_set(trans.save0, pos)
         if ns > 1:
-            slots[trans.save1] = pos
+            slots.unsafe_set(trans.save1, pos)
         if ns > 2:
-            slots[trans.save2] = pos
+            slots.unsafe_set(trans.save2, pos)
         if ns > 3:
-            slots[trans.save3] = pos
+            slots.unsafe_set(trans.save3, pos)
 
         state = trans.next_state
 
     # Check if the final state is accepting
-    ref final_state = op.op_states[state]
+    ref final_state = op.op_states.unsafe_get(state)
     if final_state.is_match:
         # Apply match save actions (e.g., group-close slots at end position)
         var ms = final_state.match_num_saves
         if ms > 0:
-            slots[final_state.match_save0] = end
+            slots.unsafe_set(final_state.match_save0, end)
         if ms > 1:
-            slots[final_state.match_save1] = end
+            slots.unsafe_set(final_state.match_save1, end)
         if ms > 2:
-            slots[final_state.match_save2] = end
+            slots.unsafe_set(final_state.match_save2, end)
         if ms > 3:
-            slots[final_state.match_save3] = end
+            slots.unsafe_set(final_state.match_save3, end)
 
         return MatchResult(
             matched=True,
@@ -462,7 +465,6 @@ def onepass_full_match[
 
     Uses pre-allocated buffers to avoid per-call heap allocation.
     """
-    var num_slots = bufs.num_slots
     bufs.reset()
 
     var ptr = input.unsafe_ptr()
@@ -470,7 +472,7 @@ def onepass_full_match[
     var input_len = len(input)
 
     for pos in range(input_len):
-        var byte_val = Int((ptr + pos).load())
+        var byte_val = Int(ptr[pos])
         ref trans = op.op_states.unsafe_get(state).transitions.unsafe_get(
             byte_val
         )
@@ -505,9 +507,7 @@ def onepass_full_match[
         if ms > 3:
             bufs.slots.unsafe_set(final_state.match_save3, input_len)
 
-        var result_slots = List[Int](capacity=num_slots)
-        for si in range(num_slots):
-            result_slots.append(bufs.slots.unsafe_get(si))
+        var result_slots = bufs.slots.copy()
         return MatchResult(
             matched=True,
             start=0,
@@ -528,16 +528,12 @@ struct _OnePassBufs(Copyable, Movable):
 
     def __init__(out self, num_slots: Int):
         self.num_slots = num_slots
-        self.slots = List[Int](capacity=num_slots)
-        self.best_slots = List[Int](capacity=num_slots)
-        for _ in range(num_slots):
-            self.slots.append(-1)
-            self.best_slots.append(-1)
+        self.slots = List[Int](fill=-1, length=num_slots)
+        self.best_slots = List[Int](fill=-1, length=num_slots)
 
     def reset(mut self):
-        for i in range(self.num_slots):
-            self.slots.unsafe_set(i, -1)
-            self.best_slots.unsafe_set(i, -1)
+        memset(self.slots.unsafe_ptr(), -1, len(self.slots))
+        memset(self.best_slots.unsafe_ptr(), -1, len(self.best_slots))
 
 
 def onepass_search_at[

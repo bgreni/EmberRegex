@@ -12,7 +12,7 @@ O(1) ASCII membership tests with zero runtime overhead.
 
 from std.collections import InlineArray
 
-from .constants import (
+from ..constants import (
     CHAR_A_LOWER,
     CHAR_A_UPPER,
     CHAR_NEWLINE,
@@ -22,10 +22,10 @@ from .constants import (
     CHAR_Z_LOWER,
     CHAR_Z_UPPER,
 )
-from .nfa import NFA, NFAState, NFAStateKind
-from .charset import BITMAP_WIDTH
-from .ast import AnchorKind
-from .result import MatchResult
+from ..nfa import NFA, NFAState, NFAStateKind
+from ..charset import BITMAP_WIDTH
+from ..ast import AnchorKind
+from ..result import MatchResult
 
 
 @always_inline
@@ -63,13 +63,10 @@ def _sbt_bitmap_check(
 
 @always_inline
 def _sbt_check_anchor[
-    origin: Origin, //,
+    origin: Origin,
+    //,
     anchor_type: Int,
-](
-    input: Span[Byte, origin],
-    input_len: Int,
-    pos: Int,
-) -> Bool:
+](input: Span[Byte, origin], input_len: Int, pos: Int,) -> Bool:
     """Check anchor with compile-time known anchor type."""
     comptime if anchor_type == AnchorKind.BOL:
         return pos == 0
@@ -97,8 +94,10 @@ def _sbt_check_anchor[
         return left_is_word == right_is_word
     return False
 
+
 def _sbt_try_match[
-    origin: Origin, //,
+    origin: Origin,
+    //,
     nfa: NFA,
     state_idx: Int,
     num_slots: Int,
@@ -131,18 +130,18 @@ def _sbt_try_match[
             if pos >= len(input):
                 return -1
             if UInt32(input.unsafe_get(pos)) == state.char_value:
-                return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                    input, pos + 1, slots, depth + 1
-                )
+                return _sbt_try_match[
+                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                ](input, pos + 1, slots, depth + 1)
             return -1
 
         comptime if kind == NFAStateKind.ANY:
             if pos >= len(input):
                 return -1
             if input.unsafe_get(pos) != CHAR_NEWLINE:
-                return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                    input, pos + 1, slots, depth + 1
-                )
+                return _sbt_try_match[
+                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                ](input, pos + 1, slots, depth + 1)
             return -1
 
         comptime if kind == NFAStateKind.CHARSET:
@@ -156,9 +155,9 @@ def _sbt_try_match[
                 return -1
             var ch = UInt32(input.unsafe_get(pos))
             if _sbt_bitmap_check(bitmap, negated, ch):
-                return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                    input, pos + 1, slots, depth + 1
-                )
+                return _sbt_try_match[
+                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                ](input, pos + 1, slots, depth + 1)
             return -1
 
         comptime if kind == NFAStateKind.SPLIT:
@@ -184,11 +183,17 @@ def _sbt_try_match[
                 var input_len = len(input)
                 var max_pos = pos
                 comptime if body.kind == NFAStateKind.ANY:
-                    while max_pos < input_len and input.unsafe_get(max_pos) != CHAR_NEWLINE:
+                    while (
+                        max_pos < input_len
+                        and input.unsafe_get(max_pos) != CHAR_NEWLINE
+                    ):
                         max_pos += 1
                 comptime if body.kind == NFAStateKind.CHAR:
                     comptime bv = body.char_value
-                    while max_pos < input_len and UInt32(input.unsafe_get(max_pos)) == bv:
+                    while (
+                        max_pos < input_len
+                        and UInt32(input.unsafe_get(max_pos)) == bv
+                    ):
                         max_pos += 1
                 comptime if body.kind == NFAStateKind.CHARSET:
                     comptime cs = nfa.charsets[body.charset_index]
@@ -200,9 +205,9 @@ def _sbt_try_match[
                         max_pos += 1
                 var p = max_pos
                 while p >= pos:
-                    var result = _sbt_try_match[nfa=nfa, state_idx=out2, num_slots=num_slots](
-                        input, p, slots, depth + 1
-                    )
+                    var result = _sbt_try_match[
+                        nfa=nfa, state_idx=out2, num_slots=num_slots
+                    ](input, p, slots, depth + 1)
                     if result >= 0:
                         return result
                     p -= 1
@@ -213,9 +218,9 @@ def _sbt_try_match[
                 var input_len = len(input)
                 var cur = pos
                 while True:
-                    var result = _sbt_try_match[nfa=nfa, state_idx=out2, num_slots=num_slots](
-                        input, cur, slots, depth + 1
-                    )
+                    var result = _sbt_try_match[
+                        nfa=nfa, state_idx=out2, num_slots=num_slots
+                    ](input, cur, slots, depth + 1)
                     if result >= 0:
                         return result
                     if cur >= input_len:
@@ -233,61 +238,65 @@ def _sbt_try_match[
                         comptime cs = nfa.charsets[body.charset_index]
                         comptime bitmap = cs.bitmap
                         comptime negated = cs.negated
-                        if not _sbt_bitmap_check(bitmap, negated, UInt32(input.unsafe_get(cur))):
+                        if not _sbt_bitmap_check(
+                            bitmap, negated, UInt32(input.unsafe_get(cur))
+                        ):
                             break
                         cur += 1
                 return -1
             comptime if not is_simple_loop:
                 # General SPLIT (alternation, complex bodies)
-                var result = _sbt_try_match[nfa=nfa, state_idx=out1, num_slots=num_slots](
-                    input, pos, slots, depth + 1
-                )
+                var result = _sbt_try_match[
+                    nfa=nfa, state_idx=out1, num_slots=num_slots
+                ](input, pos, slots, depth + 1)
                 if result >= 0:
                     return result
-                return _sbt_try_match[nfa=nfa, state_idx=out2, num_slots=num_slots](
-                    input, pos, slots, depth + 1
-                )
+                return _sbt_try_match[
+                    nfa=nfa, state_idx=out2, num_slots=num_slots
+                ](input, pos, slots, depth + 1)
 
         comptime if kind == NFAStateKind.SAVE:
             comptime slot = state.save_slot
             comptime if slot >= 0:
                 var old_val = slots[slot]
                 slots[slot] = pos
-                var result = _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                    input, pos, slots, depth + 1
-                )
+                var result = _sbt_try_match[
+                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                ](input, pos, slots, depth + 1)
                 if result < 0:
                     slots[slot] = old_val
                 return result
             comptime if slot < 0:
-                return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                    input, pos, slots, depth + 1
-                )
+                return _sbt_try_match[
+                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                ](input, pos, slots, depth + 1)
 
         comptime if kind == NFAStateKind.ANCHOR:
-            if _sbt_check_anchor[anchor_type=state.anchor_type](input, len(input), pos):
-                return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                    input, pos, slots, depth + 1
-                )
+            if _sbt_check_anchor[anchor_type=state.anchor_type](
+                input, len(input), pos
+            ):
+                return _sbt_try_match[
+                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                ](input, pos, slots, depth + 1)
             return -1
 
         comptime if kind == NFAStateKind.LOOKAHEAD:
             var sub_slots = slots
-            var sub_result = _sbt_try_match[nfa=nfa, state_idx=state.sub_start, num_slots=num_slots](
-                input, pos, sub_slots, depth + 1
-            )
+            var sub_result = _sbt_try_match[
+                nfa=nfa, state_idx=state.sub_start, num_slots=num_slots
+            ](input, pos, sub_slots, depth + 1)
             var matched = sub_result >= 0
             comptime if state.negated:
                 if not matched:
-                    return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                        input, pos, slots, depth + 1
-                    )
+                    return _sbt_try_match[
+                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    ](input, pos, slots, depth + 1)
                 return -1
             comptime if not state.negated:
                 if matched:
-                    return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                        input, pos, slots, depth + 1
-                    )
+                    return _sbt_try_match[
+                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    ](input, pos, slots, depth + 1)
                 return -1
 
         comptime if kind == NFAStateKind.LOOKBEHIND:
@@ -295,21 +304,21 @@ def _sbt_try_match[
             var matched = False
             if pos >= lb_len:
                 var sub_slots = slots
-                var sub_result = _sbt_try_match[nfa=nfa, state_idx=state.sub_start, num_slots=num_slots](
-                    input, pos - lb_len, sub_slots, depth + 1
-                )
+                var sub_result = _sbt_try_match[
+                    nfa=nfa, state_idx=state.sub_start, num_slots=num_slots
+                ](input, pos - lb_len, sub_slots, depth + 1)
                 matched = sub_result >= 0 and sub_result == pos
             comptime if state.negated:
                 if not matched:
-                    return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                        input, pos, slots, depth + 1
-                    )
+                    return _sbt_try_match[
+                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    ](input, pos, slots, depth + 1)
                 return -1
             comptime if not state.negated:
                 if matched:
-                    return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                        input, pos, slots, depth + 1
-                    )
+                    return _sbt_try_match[
+                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    ](input, pos, slots, depth + 1)
                 return -1
 
         comptime if kind == NFAStateKind.BACKREF:
@@ -333,8 +342,8 @@ def _sbt_try_match[
                 for i in range(ref_len):
                     if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
                         return -1
-            return _sbt_try_match[nfa=nfa, state_idx=state.out1, num_slots=num_slots](
-                input, pos + ref_len, slots, depth + 1
-            )
+            return _sbt_try_match[
+                nfa=nfa, state_idx=state.out1, num_slots=num_slots
+            ](input, pos + ref_len, slots, depth + 1)
 
     return -1

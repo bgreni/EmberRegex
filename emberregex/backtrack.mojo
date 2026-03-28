@@ -100,7 +100,7 @@ def _bt_try_match[
     elif kind == NFAStateKind.CHARSET:
         if pos >= len(input):
             return -1
-        var ch = UInt32(input.unsafe_get(pos)) # Charset contains UInt32
+        var ch = UInt32(input.unsafe_get(pos))  # Charset contains UInt32
         var cs_idx = state.charset_index
         if nfa.charsets.unsafe_get(cs_idx).contains(ch):
             return _bt_try_match(
@@ -115,11 +115,17 @@ def _bt_try_match[
         # Fast-forward to end of line, then try continuation backwards.
         if state.greedy and out1 >= 0 and out1 < len(nfa.states):
             ref any_state = nfa.states.unsafe_get(out1)
-            if any_state.kind == NFAStateKind.ANY and any_state.out1 == state_idx:
+            if (
+                any_state.kind == NFAStateKind.ANY
+                and any_state.out1 == state_idx
+            ):
                 # Greedy .* — scan forward to find max extent (stop at newline)
                 var max_pos = pos
                 var input_len = len(input)
-                while max_pos < input_len and input.unsafe_get(max_pos) != CHAR_NEWLINE:
+                while (
+                    max_pos < input_len
+                    and input.unsafe_get(max_pos) != CHAR_NEWLINE
+                ):
                     max_pos += 1
                 # Try continuation from farthest position back to current
                 var p = max_pos

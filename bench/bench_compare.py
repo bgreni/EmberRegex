@@ -21,7 +21,7 @@ REPEAT   = 5      # timeit repetitions per benchmark
 NUMBER   = 10000  # calls per repetition (sum of many runs → less variance)
 BAR_COLS = 16     # width of the speedup bar (reduced to fit 3 columns)
 
-# Must match comptime ITERS_PER_CALL in bench_extended.mojo / bench_static_ext.mojo.
+# Must match comptime ITERS_PER_CALL in bench.mojo / bench_static_ext.mojo.
 # Each Mojo call() invocation runs the function this many times; divide to get per-call µs.
 MOJO_ITERS_PER_CALL = 100
 
@@ -82,13 +82,13 @@ def _run_mojo_task(task: str) -> dict[str, float]:
 
 
 def run_mojo_benchmarks() -> dict[str, float]:
-    """Run bench_extended.mojo (CompiledRegex) via pixi."""
-    return _run_mojo_task("bench_ext")
+    """Run bench.mojo (CompiledRegex) via pixi."""
+    return _run_mojo_task("bench")
 
 
 def run_mojo_static_benchmarks() -> dict[str, float]:
     """Run bench_static_ext.mojo (StaticRegex) via pixi."""
-    return _run_mojo_task("bench_static_ext")
+    return _run_mojo_task("bench_static")
 
 
 def speedup_bar(ratio: float) -> str:
@@ -305,6 +305,9 @@ def run_python_benchmarks() -> dict[str, float]:
           lambda t=text, p=pat: p.match(t), number=NUMBER // 10)
     pat = re.compile(r"(\w+)\s\1\s\1")
     bench(py, "pathological_triple_backref", lambda p=pat: p.match("hello hello hello"))
+    pat = re.compile(r"([a-z]+[0-9]+)+x")
+    bench(py, "pathological_nested_quantifier_miss",
+          lambda p=pat: p.match("aaaaaaaaaaaaaaaa"), number=NUMBER // 10)
 
     # 11. Real-world patterns
     section("11. Real-world patterns")

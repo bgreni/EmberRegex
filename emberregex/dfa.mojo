@@ -84,8 +84,7 @@ struct LazyDFA(Copyable, Movable):
     def _make_init_state(
         mut self, nfa: NFA, at_start: Bool, after_newline: Bool
     ) -> Int:
-        var seeds = List[Int]()
-        seeds.append(nfa.start)
+        var seeds: List[Int] = [nfa.start]
         var init_states = List[Int]()
         var init_match = _epsilon_closure(
             nfa, seeds^, init_states, at_start, after_newline
@@ -113,7 +112,7 @@ struct LazyDFA(Copyable, Movable):
 
         for i in range(length):
             # Inline the cache-hit path to avoid _step call overhead
-            var byte_idx = Int(UInt8((ptr + i).load()))
+            var byte_idx = Int(UInt8(ptr[i]))
             var cached = self.states.unsafe_get(current).transitions.unsafe_get(
                 byte_idx
             )
@@ -134,7 +133,6 @@ struct LazyDFA(Copyable, Movable):
     ](mut self, nfa: NFA, input: Span[Byte, origin], start: Int) -> Int:
         """Try to match at start position. Returns end position or -1."""
         self._ensure_init(nfa)
-        var ptr = input.unsafe_ptr()
         var input_len = len(input)
 
         # Select initial state based on position context
@@ -274,8 +272,7 @@ struct LazyDFA(Copyable, Movable):
             current = cached_init.value()
         else:
             # Compute initial DFA state from the custom NFA start
-            var seeds = List[Int]()
-            seeds.append(nfa_start)
+            var seeds: List[Int] = [nfa_start]
             var closed = List[Int]()
             var has_match = _epsilon_closure(
                 nfa, seeds^, closed, at_start, after_nl
@@ -289,9 +286,7 @@ struct LazyDFA(Copyable, Movable):
                 var eol_end = _check_eol_match(nfa, closed, at_end=True)
                 var eol_nl = _check_eol_match(nfa, closed, at_end=False)
                 current = len(self.states)
-                var new_state = _DFAState(
-                    closed^, has_match, eol_end, eol_nl
-                )
+                var new_state = _DFAState(closed^, has_match, eol_end, eol_nl)
                 self.states.append(new_state^)
                 self.state_map[key^] = current
             self._sub_init_cache[cache_key] = current
@@ -358,7 +353,9 @@ struct LazyDFA(Copyable, Movable):
             # ANCHOR and MATCH states: not consuming, skip in byte step
 
         if len(next_nfa) == 0:
-            self.states[current].transitions[byte_idx] = -2  # dead
+            self.states.unsafe_get(current).transitions.unsafe_get(
+                byte_idx
+            ) = -2  # dead
             return -1
 
         # Epsilon closure of next states.
@@ -464,9 +461,7 @@ def _epsilon_closure(
     EOL anchors are kept in the state set for runtime resolution.
     Returns True if any state in the closure is a MATCH state.
     """
-    var visited = List[Bool]()
-    for _ in range(len(nfa.states)):
-        visited.append(False)
+    var visited = List[Bool](fill=False, length=len(nfa.states))
 
     var has_match = False
     var stack_top = len(seeds)
@@ -521,8 +516,7 @@ def _check_eol_match(nfa: NFA, nfa_states: List[Int], at_end: Bool) -> Bool:
     at_end=True checks both EOL and EOL_MULTILINE (end of input).
     at_end=False checks only EOL_MULTILINE (before newline).
     """
-    for i in range(len(nfa_states)):
-        var s = nfa_states.unsafe_get(i)
+    for s in nfa_states:
         var kind = nfa.states.unsafe_get(s).kind
         if kind == NFAStateKind.ANCHOR:
             var anchor_type = nfa.states.unsafe_get(s).anchor_type
@@ -572,9 +566,8 @@ def sub_nfa_is_dfa_safe(nfa: NFA, start: Int) -> Bool:
        is faster due to lower overhead.
     """
     var visited = List[Bool](fill=False, length=len(nfa.states))
-    var stack = List[Int]()
+    var stack = [start]
     var has_split = False
-    stack.append(start)
     while len(stack) > 0:
         var s = stack.pop()
         if s < 0 or s >= len(nfa.states) or visited.unsafe_get(s):

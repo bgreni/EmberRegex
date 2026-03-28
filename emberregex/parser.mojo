@@ -201,8 +201,9 @@ struct Parser[origin: Origin](Movable):
             self.pos += 1
             greedy = False
 
-        var node = ASTNode.quantifier(atom_idx, min_rep, max_rep, greedy)
-        return self.ast.add_node(node^)
+        return self.ast.add_node(
+            ASTNode.quantifier(atom_idx, min_rep, max_rep, greedy)
+        )
 
     def _try_parse_repetition(mut self) raises -> Tuple[Bool, Int, Int]:
         """Try to parse {n}, {n,}, {n,m}. Returns (success, min, max).
@@ -287,8 +288,7 @@ struct Parser[origin: Origin](Movable):
         var ch = self._peek()
         if ch == CHAR_DOT:
             self.pos += 1
-            var node = ASTNode.dot()
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.dot())
         elif ch == CHAR_LBRACKET:
             return self._parse_char_class()
         elif ch == CHAR_LPAREN:
@@ -297,12 +297,10 @@ struct Parser[origin: Origin](Movable):
             return self._parse_escape()
         elif ch == CHAR_CARET:
             self.pos += 1
-            var node = ASTNode.anchor(AnchorKind.BOL)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.anchor(AnchorKind.BOL))
         elif ch == CHAR_DOLLAR:
             self.pos += 1
-            var node = ASTNode.anchor(AnchorKind.EOL)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.anchor(AnchorKind.EOL))
         elif ch == CHAR_STAR or ch == CHAR_PLUS or ch == CHAR_QUESTION:
             raise Error(
                 String.write(
@@ -316,8 +314,7 @@ struct Parser[origin: Origin](Movable):
             raise Error(String.write(RegexError("Unmatched ')'", self.pos)))
         else:
             self.pos += 1
-            var node = ASTNode.literal(UInt32(ch))
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
     def _parse_group(mut self) raises -> Int:
         """Parse a group: (regex), (?:regex), (?=), (?!), (?<=), (?<!), (?P<name>).
@@ -345,14 +342,12 @@ struct Parser[origin: Origin](Movable):
                 self.pos += 1  # consume '='
                 var inner = self._parse_alternation()
                 self._expect(CHAR_RPAREN)
-                var node = ASTNode.lookahead(inner, False)
-                return self.ast.add_node(node^)
+                return self.ast.add_node(ASTNode.lookahead(inner, False))
             elif modifier == CHAR_BANG:
                 self.pos += 1  # consume '!'
                 var inner = self._parse_alternation()
                 self._expect(CHAR_RPAREN)
-                var node = ASTNode.lookahead(inner, True)
-                return self.ast.add_node(node^)
+                return self.ast.add_node(ASTNode.lookahead(inner, True))
             elif modifier == CHAR_LESS_THAN:
                 self.pos += 1  # consume '<'
                 if self._at_end():
@@ -366,14 +361,12 @@ struct Parser[origin: Origin](Movable):
                     self.pos += 1  # consume '='
                     var inner = self._parse_alternation()
                     self._expect(CHAR_RPAREN)
-                    var node = ASTNode.lookbehind(inner, False)
-                    return self.ast.add_node(node^)
+                    return self.ast.add_node(ASTNode.lookbehind(inner, False))
                 elif next_ch == CHAR_BANG:
                     self.pos += 1  # consume '!'
                     var inner = self._parse_alternation()
                     self._expect(CHAR_RPAREN)
-                    var node = ASTNode.lookbehind(inner, True)
-                    return self.ast.add_node(node^)
+                    return self.ast.add_node(ASTNode.lookbehind(inner, True))
                 else:
                     raise Error(
                         String.write(
@@ -430,7 +423,9 @@ struct Parser[origin: Origin](Movable):
                 raise Error(
                     String.write(
                         RegexError(
-                            "Unknown group modifier '(?" + chr(Int(modifier)) + "'",
+                            "Unknown group modifier '(?"
+                            + chr(Int(modifier))
+                            + "'",
                             self.pos - 1,
                         )
                     )
@@ -447,8 +442,7 @@ struct Parser[origin: Origin](Movable):
             # Non-capturing: just return the inner node directly
             return inner
 
-        var node = ASTNode.group(inner, group_index)
-        return self.ast.add_node(node^)
+        return self.ast.add_node(ASTNode.group(inner, group_index))
 
     def _parse_inline_flags(mut self) -> RegexFlags:
         """Parse inline flag characters (i, m, s) and return the flags."""
@@ -509,17 +503,16 @@ struct Parser[origin: Origin](Movable):
 
         # Word boundary anchors
         if ch == CHAR_B_LOWER:
-            var node = ASTNode.anchor(AnchorKind.WORD_BOUNDARY)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.anchor(AnchorKind.WORD_BOUNDARY))
         elif ch == CHAR_B_UPPER:
-            var node = ASTNode.anchor(AnchorKind.NOT_WORD_BOUNDARY)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(
+                ASTNode.anchor(AnchorKind.NOT_WORD_BOUNDARY)
+            )
 
         # Backreferences \1 through \9
         if ch >= CHAR_ONE and ch <= CHAR_NINE:
             var group_index = Int(ch - CHAR_ZERO)
-            var node = ASTNode.backreference(group_index)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.backreference(group_index))
 
         # Shorthand character classes
         if ch == CHAR_D_LOWER or ch == CHAR_D_UPPER:
@@ -536,27 +529,24 @@ struct Parser[origin: Origin](Movable):
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            var node = ASTNode.char_class(cs_idx, ch == CHAR_W_UPPER)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(
+                ASTNode.char_class(cs_idx, ch == CHAR_W_UPPER)
+            )
         elif ch == CHAR_S_LOWER or ch == CHAR_S:
             var cs = CharSet.whitespace()
             if ch == CHAR_S:
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            var node = ASTNode.char_class(cs_idx, ch == CHAR_S)
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.char_class(cs_idx, ch == CHAR_S))
 
         # Literal character escapes
         if ch == CHAR_t:
-            var node = ASTNode.literal(UInt32(CHAR_TAB))
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.literal(UInt32(CHAR_TAB)))
         elif ch == CHAR_n:
-            var node = ASTNode.literal(UInt32(CHAR_NEWLINE))
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.literal(UInt32(CHAR_NEWLINE)))
         elif ch == CHAR_r:
-            var node = ASTNode.literal(UInt32(CHAR_CR))
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.literal(UInt32(CHAR_CR)))
 
         # Metacharacter escapes
         if (
@@ -575,8 +565,7 @@ struct Parser[origin: Origin](Movable):
             or ch == CHAR_CARET
             or ch == CHAR_DOLLAR
         ):
-            var node = ASTNode.literal(UInt32(ch))
-            return self.ast.add_node(node^)
+            return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
         raise Error(
             String.write(
@@ -669,8 +658,7 @@ struct Parser[origin: Origin](Movable):
                 # Peek ahead to see if this is a range or a literal '-' at end
                 if (
                     self.pos + 1 < len(self.pattern)
-                    and self.pattern.unsafe_get(self.pos + 1)
-                    != CHAR_RBRACKET
+                    and self.pattern.unsafe_get(self.pos + 1) != CHAR_RBRACKET
                 ):
                     self.pos += 1  # consume '-'
                     var hi_ch = self._advance()
@@ -703,8 +691,7 @@ struct Parser[origin: Origin](Movable):
             cs.negate()
 
         var cs_idx = self.ast.add_charset(cs^)
-        var node = ASTNode.char_class(cs_idx, negated)
-        return self.ast.add_node(node^)
+        return self.ast.add_node(ASTNode.char_class(cs_idx, negated))
 
 
 def parse(pattern: String) raises -> AST:

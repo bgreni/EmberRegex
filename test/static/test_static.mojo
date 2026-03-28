@@ -20,7 +20,9 @@ def test_literal_no_match() raises:
 def test_literal_partial_no_match() raises:
     var re = StaticRegex["abc"]()
     assert_false(re.match("ab").matched, msg="'abc' should not match 'ab'")
-    assert_false(re.match("abcd").matched, msg="'abc' should not full-match 'abcd'")
+    assert_false(
+        re.match("abcd").matched, msg="'abc' should not full-match 'abcd'"
+    )
 
 
 def test_literal_search() raises:
@@ -225,6 +227,49 @@ def test_ip_address() raises:
     var re = StaticRegex["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"]()
     assert_true(re.match("192.168.1.1").matched)
     assert_false(re.match("abc.def.ghi.jkl").matched)
+
+
+# --- Pathological patterns (dispatched to PikeVM) ---
+
+
+def test_pathological_match() raises:
+    var re = StaticRegex["(a+)+"]()
+    assert_true(re.match("aaa").matched, msg="(a+)+ should match 'aaa'")
+    assert_false(
+        re.match("aaab").matched, msg="(a+)+ should not full-match 'aaab'"
+    )
+    assert_false(
+        re.match("").matched, msg="(a+)+ should not match empty string"
+    )
+
+
+def test_pathological_search() raises:
+    var re = StaticRegex["(a|aa)+"]()
+    var result = re.search("baaac")
+    assert_true(result.matched, msg="(a|aa)+ should find match in 'baaac'")
+    assert_equal(result.start, 1)
+
+
+def test_pathological_findall() raises:
+    var re = StaticRegex["(a+)+"]()
+    var matches = re.findall("aaa bbb aaa")
+    assert_equal(len(matches), 2)
+    assert_equal(matches[0], "aaa")
+    assert_equal(matches[1], "aaa")
+
+
+def test_pathological_replace() raises:
+    var re = StaticRegex["(a+)+"]()
+    var result = re.replace("aaa bbb aaa", "X")
+    assert_equal(result, "X bbb X")
+
+
+def test_pathological_split() raises:
+    var re = StaticRegex["(a+)+"]()
+    var parts = re.split("xaaay")
+    assert_equal(len(parts), 2)
+    assert_equal(parts[0], "x")
+    assert_equal(parts[1], "y")
 
 
 def main() raises:

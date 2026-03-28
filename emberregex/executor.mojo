@@ -27,7 +27,7 @@ from .result import MatchResult
 from .backtrack import _bt_try_match
 
 
-struct _VMBuffers(Copyable, Movable):
+struct _VMBuffers(Copyable):
     """Pre-allocated buffers for Pike VM execution.
 
     Avoids re-allocating Lists on every _execute call. The generation
@@ -51,19 +51,11 @@ struct _VMBuffers(Copyable, Movable):
         self.current_slot_data = List[Int](capacity=num_states * num_slots)
         self.next_states = List[Int](capacity=num_states)
         self.next_slot_data = List[Int](capacity=num_states * num_slots)
-        self.gen = List[Int](capacity=num_states)
-        for _s in range(num_states):
-            self.gen.append(0)
+        self.gen = List[Int](length=num_states, fill=0)
         self.gen_counter = 0
-        self.temp_slots = List[Int](capacity=num_slots)
-        for _s in range(num_slots):
-            self.temp_slots.append(-1)
-        self.best_slots = List[Int](capacity=num_slots)
-        for _s in range(num_slots):
-            self.best_slots.append(-1)
-        self.init_slots = List[Int](capacity=num_slots)
-        for _s in range(num_slots):
-            self.init_slots.append(-1)
+        self.temp_slots = List[Int](length=num_slots, fill=-1)
+        self.best_slots = List[Int](length=num_slots, fill=-1)
+        self.init_slots = List[Int](length=num_slots, fill=-1)
         self.num_states = num_states
         self.num_slots = num_slots
 
@@ -73,13 +65,11 @@ struct _VMBuffers(Copyable, Movable):
         self.current_slot_data.clear()
         self.next_states.clear()
         self.next_slot_data.clear()
-        # gen array + gen_counter: no reset needed! Just increment.
-        var ns = self.num_slots
-        for s in range(ns):
-            self.best_slots.unsafe_set(s, -1)
+        for i in range(self.num_slots):
+            self.best_slots[i] = -1
 
 
-struct PikeVM(Copyable, Movable):
+struct PikeVM(Copyable):
     """Parallel NFA simulation (Pike VM) with capture group support."""
 
     var nfa: NFA
