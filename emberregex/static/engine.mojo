@@ -26,10 +26,10 @@ from ..ast import AnchorKind
 from ..result import MatchResult
 from ..flags import RegexFlags
 from ..optimize import extract_literal_prefix, extract_first_byte_bitmap
-from ..simd_scan import simd_find_byte
+from ..simd_scan import simd_find_byte, simd_find_prefix
 from ..charset import BITMAP_WIDTH
-from .backtrack import _sbt_try_match
-from ..executor import PikeVM, _VMBuffers
+from .backtrack import _sbt_try_match, SBT_BUDGET
+from ..dfa import LazyDFA
 from std.memory import memcpy, UnsafePointer
 from std.utils.type_functions import ConditionalType
 
@@ -40,6 +40,25 @@ def _slots_to_list[n: Int](slots: InlineArray[Int, n]) -> List[Int]:
     memcpy(dest=result.unsafe_ptr(), src=slots.unsafe_ptr(), count=n)
     result._len = n
     return result^
+
+
+@always_inline
+def _sbt_run[
+    origin: Origin,
+    //,
+    nfa: NFA,
+    state_idx: Int,
+    num_slots: Int,
+](
+    input: Span[Byte, origin],
+    pos: Int,
+    mut slots: InlineArray[Int, num_slots],
+) -> Int:
+    """Run backtracker with a fresh budget allocation."""
+    var budget = SBT_BUDGET
+    return _sbt_try_match[nfa=nfa, state_idx=state_idx, num_slots=num_slots](
+        input, pos, slots, budget
+    )
 
 
 def _build_static_nfa(pattern: String) -> NFA:
@@ -170,52 +189,73 @@ def _consuming_states_overlap(nfa: NFA, a: Int, b: Int) -> Bool:
     return True
 
 
-def _loop_body_has_split(nfa: NFA, split_idx: Int) -> Bool:
-    """Return True if the loop body of a cyclic SPLIT contains another SPLIT.
+def _has_alternation_splits(nfa: NFA) -> Bool:
+    """Return True if the NFA has SPLIT states that are alternations (not quantifier loops).
 
-    Simple loops like a+ or [a-z]+ have bodies that reach back to the same
-    SPLIT with no internal SPLIT — those are deterministic quantifiers.
-    Complex loops like (a+)+ or (a|aa)+ have an internal SPLIT, meaning the
-    body can match variable-length input, creating exponential ambiguity.
-    """
-    var num_states = len(nfa.states)
-    var visited = List[Bool](length=num_states, fill=False)
-    var stack = List[Int]()
-    stack.append(nfa.states[split_idx].out1)
-    while len(stack) > 0:
-        var idx = stack.pop()
-        if idx < 0 or idx >= num_states or visited[idx]:
-            continue
-        if idx == split_idx:
-            continue  # hit the cycle endpoint — don't descend further
-        visited[idx] = True
-        var kind = nfa.states[idx].kind
-        if kind == NFAStateKind.SPLIT:
-            return True  # another SPLIT inside the loop body
-        elif kind == NFAStateKind.MATCH:
-            pass
-        else:  # CHAR, CHARSET, ANY, SAVE, ANCHOR, etc.
-            stack.append(nfa.states[idx].out1)
-    return False
-
-
-def _detect_ambiguous(nfa: NFA) -> Bool:
-    """Return True if the NFA can cause exponential backtracking.
-
-    Detects cyclic SPLITs whose loop body contains another SPLIT: catches
-    (a+)+, (a|aa)+, etc. Simple quantifiers like a+ or [a-z]+ are NOT
-    flagged — their loop bodies contain no internal SPLIT and are deterministic.
-    Bounded repetitions like \\d{1,3} are also safe despite creating chains of
-    SPLITs.
+    Quantifier loops (*, +, {n,}) create cyclic SPLITs that the backtracker's
+    simple loop optimization already handles in O(n). Only genuine alternation
+    SPLITs (from `a|b` patterns) benefit from DFA state merging. If all SPLITs
+    are quantifier loops, the backtracker is already near-optimal.
     """
     for i in range(len(nfa.states)):
         if nfa.states[i].kind != NFAStateKind.SPLIT:
             continue
-        if _forms_cycle(nfa, i):
-            # Cyclic SPLIT: only ambiguous if the loop body itself has choices
-            # (i.e., contains another SPLIT). Simple a+ / [a-z]+ are safe.
-            if _loop_body_has_split(nfa, i):
-                return True
+        # If this SPLIT doesn't form a cycle, it's an alternation — DFA helps
+        if not _forms_cycle(nfa, i):
+            return True
+    return False
+
+
+def _quantifier_has_suffix(nfa: NFA) -> Bool:
+    """Return True if any quantifier loop's exit leads to consuming states.
+
+    When a greedy quantifier (e.g. `.*`, `\\w+`) is followed by more pattern
+    (e.g. `.*x`), the backtracker must try every position from max to min on
+    failure. The DFA handles this in a single forward pass. Detecting this
+    pattern lets us prefer DFA for these cases.
+    """
+    var num_states = len(nfa.states)
+    for i in range(num_states):
+        if nfa.states[i].kind != NFAStateKind.SPLIT:
+            continue
+        if not _forms_cycle(nfa, i):
+            continue
+        # This is a quantifier loop. Check if the exit branch (out2 for
+        # greedy, out1 for lazy) leads to consuming states before MATCH.
+        var exit_idx = (
+            nfa.states[i].out2 if nfa.states[i].greedy else nfa.states[i].out1
+        )
+        if _reaches_consuming_before_match(nfa, exit_idx):
+            return True
+    return False
+
+
+def _reaches_consuming_before_match(nfa: NFA, start: Int) -> Bool:
+    """Return True if following epsilon transitions from start reaches a
+    consuming state (CHAR/CHARSET/ANY) before hitting MATCH."""
+    var num_states = len(nfa.states)
+    var visited = List[Bool](length=num_states, fill=False)
+    var stack = List[Int]()
+    stack.append(start)
+    while len(stack) > 0:
+        var idx = stack.pop()
+        if idx < 0 or idx >= num_states or visited[idx]:
+            continue
+        visited[idx] = True
+        var kind = nfa.states[idx].kind
+        if (
+            kind == NFAStateKind.CHAR
+            or kind == NFAStateKind.CHARSET
+            or kind == NFAStateKind.ANY
+        ):
+            return True
+        if kind == NFAStateKind.MATCH:
+            continue  # reached MATCH without consuming — this path is fine
+        if kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[idx].out1)
+            stack.append(nfa.states[idx].out2)
+        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            stack.append(nfa.states[idx].out1)
     return False
 
 
@@ -243,83 +283,128 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
     comptime _prefix_len = len(Self._prefix)
     comptime _first_byte_bitmap = extract_first_byte_bitmap(Self.nfa)
     comptime _first_byte_useful = _is_bitmap_useful(Self._first_byte_bitmap)
-    # comptime _is_pathological = _detect_ambiguous(Self.nfa)
-    comptime _is_pathological = False
-    comptime _num_nfa_states = len(Self.nfa.states)
+    comptime _use_dfa = Self.nfa.can_use_dfa and Self._group_count == 0 and not Self.nfa.has_lazy and (
+        _has_alternation_splits(Self.nfa) or _quantifier_has_suffix(Self.nfa)
+    )
 
-    # For pathological patterns: a cached PikeVM built once in __init__.
-    # For non-pathological patterns: always None (zero runtime overhead for the
-    # match path since comptime if prunes those branches entirely).
-    #
-    # Using ConditionalType the field itself will become zero sized
-    # for non-pathological patterns, eliminating any memory footprint
-    var _vm: ConditionalType[
+    var _dfa_nfa: ConditionalType[
         Trait=ImplicitlyDestructible & Copyable,
-        If=Self._is_pathological,
-        Then=PikeVM,
+        If=Self._use_dfa,
+        Then=NFA,
+        Else=NoneType,
+    ]
+
+    var _dfa: ConditionalType[
+        Trait=ImplicitlyDestructible & Copyable,
+        If=Self._use_dfa,
+        Then=LazyDFA,
         Else=NoneType,
     ]
 
     def __init__(out self):
-        """Initialize — build the PikeVM cache for pathological patterns.
-
-        For pathological patterns we rebuild the NFA at runtime rather than
-        using materialize[]. materialize[] embeds List._data pointers into the
-        binary's static data section; freeing those pointers in PikeVM's
-        destructor causes an invalid-free crash. Re-parsing is safe because
-        the pattern is a compile-time literal (already validated via Self.nfa).
-        """
-        comptime if Self._is_pathological:
-            # Would to just materialize Self.nfa here but seems blocked on
-            # modular/5493
-            var vm = PikeVM(_build_static_nfa(String(Self.pattern)))
-            self._vm = rebind_var[type_of(self._vm)](vm^)
+        comptime if Self._use_dfa:
+            var nfa = _build_static_nfa(String(Self.pattern))
+            self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
+            var dfa = LazyDFA()
+            self._dfa = rebind_var[type_of(self._dfa)](dfa^)
         else:
-            self._vm = rebind_var[type_of(self._vm)](None)
+            self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](None)
+            self._dfa = rebind_var[type_of(self._dfa)](None)
 
-    def match(self, input: String) -> MatchResult:
+    def match(mut self, input: String) -> MatchResult:
         """Match the entire input against the pattern."""
-        comptime if Self._is_pathological:
-            var bufs = _VMBuffers(Self._num_nfa_states, Self._num_slots)
-            ref vm = rebind[PikeVM](self._vm)
-            return vm.full_match_with_bufs(input, bufs)
-        else:
-            var slots = ALL_NEG_ONES[Self._num_slots]
-            var end = _sbt_try_match[
-                nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input.as_bytes(), 0, slots, 0)
-            if end >= 0 and end == len(input):
+        comptime if Self._use_dfa:
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
+            if dfa.full_match(dfa_nfa, input):
                 return MatchResult(
                     matched=True,
                     start=0,
-                    end=end,
-                    group_count=Self._group_count,
-                    slots=_slots_to_list(slots),
+                    end=len(input),
+                    group_count=0,
+                    slots=List[Int](),
                 )
-            return MatchResult.no_match(Self._group_count)
+            return MatchResult.no_match(0)
+        var slots = ALL_NEG_ONES[Self._num_slots]
+        var end = _sbt_run[
+            nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
+        ](input.as_bytes(), 0, slots)
+        if end >= 0 and end == len(input):
+            return MatchResult(
+                matched=True,
+                start=0,
+                end=end,
+                group_count=Self._group_count,
+                slots=_slots_to_list(slots),
+            )
         return MatchResult.no_match(Self._group_count)
 
-    def search(self, input: String) -> MatchResult:
+    def search(mut self, input: String) -> MatchResult:
         """Search for the first occurrence of the pattern in the input."""
-        comptime if Self._is_pathological:
-            var bufs = _VMBuffers(Self._num_nfa_states, Self._num_slots)
-            ref vm = rebind[PikeVM](self._vm)
-            return vm.search_with_bufs(input, bufs)
-        else:
-            return self._search_safe(input)
-        return MatchResult.no_match(Self._group_count)
+        comptime if Self._use_dfa:
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
+            var input_bytes = input.as_bytes()
+            var input_len = len(input)
+            var pos = 0
+            while pos <= input_len:
+                comptime if Self._prefix_len > 0:
+                    comptime first_byte = Self._prefix[0]
+                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
+                    if candidate < 0:
+                        return MatchResult.no_match(0)
+                    pos = candidate
+                    comptime if Self._prefix_len > 1:
+                        var full_prefix = pos + Self._prefix_len <= input_len
+                        comptime for j in range(1, Self._prefix_len):
+                            comptime pb = Self._prefix[j]
+                            if full_prefix:
+                                full_prefix = (
+                                    input_bytes.unsafe_get(pos + j) == pb
+                                )
+                        if not full_prefix:
+                            pos += 1
+                            continue
+                    var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                    if match_end >= 0:
+                        return MatchResult(
+                            matched=True,
+                            start=pos,
+                            end=match_end,
+                            group_count=0,
+                            slots=List[Int](),
+                        )
+                    pos += 1
+                comptime if Self._prefix_len == 0:
+                    var range = dfa.search_forward(
+                        dfa_nfa,
+                        input_bytes,
+                        pos,
+                        Self._first_byte_bitmap,
+                        Self._first_byte_useful,
+                    )
+                    if range[0] >= 0:
+                        return MatchResult(
+                            matched=True,
+                            start=range[0],
+                            end=range[1],
+                            group_count=0,
+                            slots=List[Int](),
+                        )
+                    return MatchResult.no_match(0)
+            return MatchResult.no_match(0)
+        return self._search_impl(input)
 
-    def _search_safe(self, input: String) -> MatchResult:
-        """search() implementation for non-pathological patterns."""
+    def _search_impl(mut self, input: String) -> MatchResult:
         var input_bytes = input.as_bytes()
         var input_len = len(input)
 
         # BOL anchor: only try position 0
         comptime if Self._start_anchor == AnchorKind.BOL:
             var slots = ALL_NEG_ONES[Self._num_slots]
-            var end = _sbt_try_match[
+            var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots, 0)
+            ](input_bytes, 0, slots)
             if end >= 0:
                 return MatchResult(
                     matched=True,
@@ -340,7 +425,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
 
     def _search_general[
         origin: Origin, //
-    ](self, input: Span[Byte, origin], input_len: Int) -> MatchResult:
+    ](mut self, input: Span[Byte, origin], input_len: Int) -> MatchResult:
         """General search, accelerated by SIMD prefix scan or first-byte bitmap.
         """
         var pos = 0
@@ -374,9 +459,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                             pos += 1
                             continue
             var slots = ALL_NEG_ONES[Self._num_slots]
-            var end = _sbt_try_match[
+            var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input, pos, slots, 0)
+            ](input, pos, slots)
             if end >= 0:
                 return MatchResult(
                     matched=True,
@@ -390,7 +475,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
 
     def _search_bol_multiline[
         origin: Origin, //
-    ](self, input: Span[Byte, origin], input_len: Int) -> MatchResult:
+    ](mut self, input: Span[Byte, origin], input_len: Int) -> MatchResult:
         """Search skipping to valid BOL_MULTILINE positions."""
         var pos = 0
         while pos <= input_len:
@@ -410,9 +495,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         pos += 1
                         continue
             var slots = ALL_NEG_ONES[Self._num_slots]
-            var end = _sbt_try_match[
+            var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input, pos, slots, 0)
+            ](input, pos, slots)
             if end >= 0:
                 return MatchResult(
                     matched=True,
@@ -428,236 +513,295 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
             pos = nl + 1
         return MatchResult.no_match(Self._group_count)
 
-    def findall(self, input: String) -> List[String]:
+    def findall(mut self, input: String) -> List[String]:
         """Find all non-overlapping matches and return their text."""
-        comptime if Self._is_pathological:
-            var results = List[String]()
-            var bufs = _VMBuffers(Self._num_nfa_states, Self._num_slots)
-            var input_bytes = input.as_bytes()
-            var input_len = len(input)
-            var pos = 0
-            ref vm = rebind[PikeVM](self._vm)
-            while pos <= input_len:
-                bufs.reset()
-                var result = vm._execute_with_bufs(input_bytes, pos, bufs)
-                if not result.matched:
-                    pos += 1
-                    continue
-                if result.group_count > 0 and result.group_matched(1):
-                    results.append(result.group_str(input, 1))
-                else:
-                    results.append(
-                        String(input[byte = result.start : result.end])
-                    )
-                if result.end > pos:
-                    pos = result.end
-                else:
-                    pos += 1
-            return results^
-        else:
+        comptime if Self._use_dfa:
             var results = List[String]()
             var input_bytes = input.as_bytes()
             var input_len = len(input)
-            var slots = ALL_NEG_ONES[Self._num_slots]
             var pos = 0
-            while pos <= input_len:
-                comptime if Self._prefix_len > 0:
-                    comptime first_byte = Self._prefix[0]
-                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                    if candidate < 0:
-                        break
-                    pos = candidate
-                    comptime if Self._prefix_len > 1:
-                        var full_prefix = pos + Self._prefix_len <= input_len
-                        comptime for j in range(1, Self._prefix_len):
-                            comptime pb = Self._prefix[j]
-                            if full_prefix:
-                                full_prefix = (
-                                    input_bytes.unsafe_get(pos + j) == pb
-                                )
-                        if not full_prefix:
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
+
+            # BOL: only position 0
+            comptime if Self._start_anchor == AnchorKind.BOL:
+                var match_end = dfa.match_at(dfa_nfa, input_bytes, 0)
+                if match_end >= 0:
+                    results.append(String(input[byte=0:match_end]))
+                return results^
+
+            # BOL_MULTILINE: skip to BOL positions via SIMD newline scan
+            comptime if Self._start_anchor == AnchorKind.BOL_MULTILINE:
+                while pos <= input_len:
+                    var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                    if match_end >= 0:
+                        results.append(String(input[byte=pos:match_end]))
+                        if match_end > pos:
+                            pos = match_end
+                        else:
                             pos += 1
-                            continue
-                comptime if Self._prefix_len == 0:
-                    comptime if Self._first_byte_useful:
-                        if pos < input_len:
-                            var b = input_bytes.unsafe_get(pos)
-                            var byte_idx = Int(b) >> 3
-                            var bit_idx = UInt8(Int(b) & 7)
-                            if (
-                                Self._first_byte_bitmap[byte_idx]
-                                & (UInt8(1) << bit_idx)
-                            ) == 0:
+                    # Skip to next BOL position
+                    var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                    if nl < 0:
+                        break
+                    pos = nl + 1
+                return results^
+
+            # General case
+            comptime if Self._start_anchor != AnchorKind.BOL and Self._start_anchor != AnchorKind.BOL_MULTILINE:
+                while pos <= input_len:
+                    comptime if Self._prefix_len > 0:
+                        comptime first_byte = Self._prefix[0]
+                        var candidate = simd_find_byte(
+                            input_bytes, first_byte, pos
+                        )
+                        if candidate < 0:
+                            break
+                        pos = candidate
+                        comptime if Self._prefix_len > 1:
+                            var full_prefix = (
+                                pos + Self._prefix_len <= input_len
+                            )
+                            comptime for j in range(1, Self._prefix_len):
+                                comptime pb = Self._prefix[j]
+                                if full_prefix:
+                                    full_prefix = (
+                                        input_bytes.unsafe_get(pos + j) == pb
+                                    )
+                            if not full_prefix:
                                 pos += 1
                                 continue
-                slots = ALL_NEG_ONES[Self._num_slots]
-                var end = _sbt_try_match[
-                    nfa=Self.nfa,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                ](input_bytes, pos, slots, 0)
-                if end < 0:
-                    pos += 1
-                    continue
-                # Group 1 if available, else full match
-                comptime if Self._num_slots >= 4:
-                    if (
-                        Self._group_count > 0
-                        and slots[2] >= 0
-                        and slots[3] >= 0
-                    ):
-                        results.append(
-                            String(input[byte = slots[2] : slots[3]])
+                        var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                        if match_end >= 0:
+                            results.append(String(input[byte=pos:match_end]))
+                            if match_end > pos:
+                                pos = match_end
+                            else:
+                                pos += 1
+                            continue
+                        pos += 1
+                    comptime if Self._prefix_len == 0:
+                        var range = dfa.search_forward(
+                            dfa_nfa,
+                            input_bytes,
+                            pos,
+                            Self._first_byte_bitmap,
+                            Self._first_byte_useful,
                         )
-                    else:
-                        results.append(String(input[byte=pos:end]))
-                comptime if Self._num_slots < 4:
-                    results.append(String(input[byte=pos:end]))
-                if end > pos:
-                    pos = end
-                else:
-                    pos += 1
-            return results^
-        return List[String]()
+                        if range[0] < 0:
+                            break
+                        var start = range[0]
+                        var end = range[1]
+                        results.append(String(input[byte=start:end]))
+                        if end > start:
+                            pos = end
+                        else:
+                            pos = start + 1
+                return results^
+        return self._findall_impl(input)
 
-    def replace(self, input: String, replacement: String) -> String:
+    def _findall_impl(mut self, input: String) -> List[String]:
+        """findall() implementation for the backtracker path."""
+        var results = List[String]()
+        var input_bytes = input.as_bytes()
+        var input_len = len(input)
+
+        # BOL anchor: only position 0
+        comptime if Self._start_anchor == AnchorKind.BOL:
+            var slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_run[
+                nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
+            ](input_bytes, 0, slots)
+            if end >= 0:
+                self._findall_append(results, input, 0, end, slots)
+            return results^
+
+        comptime if Self._start_anchor != AnchorKind.BOL:
+            comptime if Self._start_anchor == AnchorKind.BOL_MULTILINE:
+                # Skip to BOL positions using SIMD newline scan
+                var pos = 0
+                while pos <= input_len:
+                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var end = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                    ](input_bytes, pos, slots)
+                    if end >= 0:
+                        self._findall_append(results, input, pos, end, slots)
+                        if end > pos:
+                            pos = end
+                        else:
+                            pos += 1
+                        # After a match, still need to skip to next BOL
+                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                        if nl < 0:
+                            break
+                        pos = nl + 1
+                        continue
+                    # Skip to next BOL position
+                    var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                    if nl < 0:
+                        break
+                    pos = nl + 1
+                return results^
+
+            comptime if Self._start_anchor != AnchorKind.BOL_MULTILINE:
+                var pos = 0
+                while pos <= input_len:
+                    comptime if Self._prefix_len > 0:
+                        comptime first_byte = Self._prefix[0]
+                        var candidate = simd_find_byte(
+                            input_bytes, first_byte, pos
+                        )
+                        if candidate < 0:
+                            break
+                        pos = candidate
+                        comptime if Self._prefix_len > 1:
+                            var full_prefix = (
+                                pos + Self._prefix_len <= input_len
+                            )
+                            comptime for j in range(1, Self._prefix_len):
+                                comptime pb = Self._prefix[j]
+                                if full_prefix:
+                                    full_prefix = (
+                                        input_bytes.unsafe_get(pos + j) == pb
+                                    )
+                            if not full_prefix:
+                                pos += 1
+                                continue
+                    comptime if Self._prefix_len == 0:
+                        comptime if Self._first_byte_useful:
+                            if pos < input_len:
+                                var b = input_bytes.unsafe_get(pos)
+                                var byte_idx = Int(b) >> 3
+                                var bit_idx = UInt8(Int(b) & 7)
+                                if (
+                                    Self._first_byte_bitmap[byte_idx]
+                                    & (UInt8(1) << bit_idx)
+                                ) == 0:
+                                    pos += 1
+                                    continue
+                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var end = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                    ](input_bytes, pos, slots)
+                    if end < 0:
+                        pos += 1
+                        continue
+                    self._findall_append(results, input, pos, end, slots)
+                    if end > pos:
+                        pos = end
+                    else:
+                        pos += 1
+                return results^
+
+        return results^
+
+    @always_inline
+    def _findall_append[
+        n: Int
+    ](
+        self,
+        mut results: List[String],
+        input: String,
+        pos: Int,
+        end: Int,
+        slots: InlineArray[Int, n],
+    ):
+        comptime if Self._num_slots >= 4:
+            if Self._group_count > 0 and slots[2] >= 0 and slots[3] >= 0:
+                results.append(String(input[byte = slots[2] : slots[3]]))
+            else:
+                results.append(String(input[byte=pos:end]))
+        comptime if Self._num_slots < 4:
+            results.append(String(input[byte=pos:end]))
+
+    def replace(mut self, input: String, replacement: String) -> String:
         """Replace all non-overlapping matches with replacement string.
 
         Supports \\1-\\9 backreferences in replacement.
         """
-        comptime if Self._is_pathological:
-            var output = String()
-            var bufs = _VMBuffers(Self._num_nfa_states, Self._num_slots)
-            var input_bytes = input.as_bytes()
-            var input_len = len(input)
-            var prev_end = 0
-            var pos = 0
-            ref vm = rebind[PikeVM](self._vm)
-            while pos <= input_len:
-                bufs.reset()
-                var result = vm._execute_with_bufs(input_bytes, pos, bufs)
-                if not result.matched:
-                    pos += 1
-                    continue
-                if result.start > prev_end:
-                    output += String(input[byte = prev_end : result.start])
-                output += self._expand_replacement(
-                    input_bytes, result, replacement
-                )
-                if result.end > pos:
-                    prev_end = result.end
-                    pos = result.end
-                else:
-                    prev_end = pos + 1
-                    pos += 1
-            if prev_end < input_len:
-                output += String(input[byte=prev_end:input_len])
-            return output^
-        else:
-            var output = String()
-            var input_bytes = input.as_bytes()
-            var input_len = len(input)
-            var prev_end = 0
-            var pos = 0
-            var slots = ALL_NEG_ONES[Self._num_slots]
-            while pos <= input_len:
-                comptime if Self._prefix_len > 0:
-                    comptime first_byte = Self._prefix[0]
-                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                    if candidate < 0:
-                        break
-                    pos = candidate
-                    comptime if Self._prefix_len > 1:
-                        var full_prefix = pos + Self._prefix_len <= input_len
-                        comptime for j in range(1, Self._prefix_len):
-                            comptime pb = Self._prefix[j]
-                            if full_prefix:
-                                full_prefix = (
-                                    input_bytes.unsafe_get(pos + j) == pb
-                                )
-                        if not full_prefix:
+        var output = String()
+        var input_bytes = input.as_bytes()
+        var input_len = len(input)
+        var prev_end = 0
+        var pos = 0
+        var slots = ALL_NEG_ONES[Self._num_slots]
+        while pos <= input_len:
+            comptime if Self._prefix_len > 0:
+                comptime first_byte = Self._prefix[0]
+                var candidate = simd_find_byte(input_bytes, first_byte, pos)
+                if candidate < 0:
+                    break
+                pos = candidate
+                comptime if Self._prefix_len > 1:
+                    var full_prefix = pos + Self._prefix_len <= input_len
+                    comptime for j in range(1, Self._prefix_len):
+                        comptime pb = Self._prefix[j]
+                        if full_prefix:
+                            full_prefix = input_bytes.unsafe_get(pos + j) == pb
+                    if not full_prefix:
+                        pos += 1
+                        continue
+            comptime if Self._prefix_len == 0:
+                comptime if Self._first_byte_useful:
+                    if pos < input_len:
+                        var b = input_bytes.unsafe_get(pos)
+                        var byte_idx = Int(b) >> 3
+                        var bit_idx = UInt8(Int(b) & 7)
+                        if (
+                            Self._first_byte_bitmap[byte_idx]
+                            & (UInt8(1) << bit_idx)
+                        ) == 0:
                             pos += 1
                             continue
-                comptime if Self._prefix_len == 0:
-                    comptime if Self._first_byte_useful:
-                        if pos < input_len:
-                            var b = input_bytes.unsafe_get(pos)
-                            var byte_idx = Int(b) >> 3
-                            var bit_idx = UInt8(Int(b) & 7)
-                            if (
-                                Self._first_byte_bitmap[byte_idx]
-                                & (UInt8(1) << bit_idx)
-                            ) == 0:
-                                pos += 1
-                                continue
-                slots = ALL_NEG_ONES[Self._num_slots]
-                var end = _sbt_try_match[
-                    nfa=Self.nfa,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                ](input_bytes, pos, slots, 0)
-                if end < 0:
-                    pos += 1
-                    continue
-                # Add text before match
-                if pos > prev_end:
-                    output += String(input[byte=prev_end:pos])
-                # Expand replacement with backreferences
-                var match_result = MatchResult(
-                    matched=True,
-                    start=pos,
-                    end=end,
-                    group_count=Self._group_count,
-                    slots=_slots_to_list(slots),
-                )
-                output += self._expand_replacement(
-                    input_bytes, match_result, replacement
-                )
-                if end > pos:
-                    prev_end = end
-                    pos = end
-                else:
-                    prev_end = pos + 1
-                    pos += 1
-            # Remaining text
-            if prev_end < input_len:
-                output += String(input[byte=prev_end:input_len])
-            return output^
-        return String()
+            slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_run[
+                nfa=Self.nfa,
+                state_idx=Self._start,
+                num_slots=Self._num_slots,
+            ](input_bytes, pos, slots)
+            if end < 0:
+                pos += 1
+                continue
+            # Add text before match
+            if pos > prev_end:
+                output += String(input[byte=prev_end:pos])
+            # Expand replacement with backreferences
+            var match_result = MatchResult(
+                matched=True,
+                start=pos,
+                end=end,
+                group_count=Self._group_count,
+                slots=_slots_to_list(slots),
+            )
+            output += self._expand_replacement(
+                input_bytes, match_result, replacement
+            )
+            if end > pos:
+                prev_end = end
+                pos = end
+            else:
+                prev_end = pos + 1
+                pos += 1
+        # Remaining text
+        if prev_end < input_len:
+            output += String(input[byte=prev_end:input_len])
+        return output^
 
-    def split(self, input: String) -> List[String]:
+    def split(mut self, input: String) -> List[String]:
         """Split input by matches of the pattern."""
-        comptime if Self._is_pathological:
-            var parts = List[String]()
-            var bufs = _VMBuffers(Self._num_nfa_states, Self._num_slots)
-            var input_bytes = input.as_bytes()
-            var input_len = len(input)
-            var pos = 0
-            var prev_end = 0
-            ref vm = rebind[PikeVM](self._vm)
-            while pos <= input_len:
-                bufs.reset()
-                var result = vm._execute_with_bufs(input_bytes, pos, bufs)
-                if not result.matched:
-                    pos += 1
-                    continue
-                parts.append(String(input[byte = prev_end : result.start]))
-                if result.end > pos:
-                    prev_end = result.end
-                    pos = result.end
-                else:
-                    prev_end = pos + 1
-                    pos += 1
-            if prev_end <= input_len:
-                parts.append(String(input[byte=prev_end:input_len]))
-            return parts^
-        else:
+        comptime if Self._use_dfa:
             var parts = List[String]()
             var input_bytes = input.as_bytes()
             var input_len = len(input)
             var pos = 0
             var prev_end = 0
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
             while pos <= input_len:
                 comptime if Self._prefix_len > 0:
                     comptime first_byte = Self._prefix[0]
@@ -676,39 +820,93 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         if not full_prefix:
                             pos += 1
                             continue
+                    var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                    if match_end >= 0:
+                        parts.append(String(input[byte=prev_end:pos]))
+                        if match_end > pos:
+                            prev_end = match_end
+                            pos = match_end
+                        else:
+                            prev_end = pos + 1
+                            pos += 1
+                        continue
+                    pos += 1
                 comptime if Self._prefix_len == 0:
-                    comptime if Self._first_byte_useful:
-                        if pos < input_len:
-                            var b = input_bytes.unsafe_get(pos)
-                            var byte_idx = Int(b) >> 3
-                            var bit_idx = UInt8(Int(b) & 7)
-                            if (
-                                Self._first_byte_bitmap[byte_idx]
-                                & (UInt8(1) << bit_idx)
-                            ) == 0:
-                                pos += 1
-                                continue
-                slots = ALL_NEG_ONES[Self._num_slots]
-                var end = _sbt_try_match[
-                    nfa=Self.nfa,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                ](input_bytes, pos, slots, 0)
-                if end < 0:
-                    pos += 1
-                    continue
-                parts.append(String(input[byte=prev_end:pos]))
-                if end > pos:
-                    prev_end = end
-                    pos = end
-                else:
-                    prev_end = pos + 1
-                    pos += 1
-            # Remaining text
+                    var range = dfa.search_forward(
+                        dfa_nfa,
+                        input_bytes,
+                        pos,
+                        Self._first_byte_bitmap,
+                        Self._first_byte_useful,
+                    )
+                    if range[0] < 0:
+                        break
+                    var start = range[0]
+                    var end = range[1]
+                    parts.append(String(input[byte=prev_end:start]))
+                    if end > start:
+                        prev_end = end
+                        pos = end
+                    else:
+                        prev_end = start + 1
+                        pos = start + 1
             if prev_end <= input_len:
                 parts.append(String(input[byte=prev_end:input_len]))
             return parts^
-        return List[String]()
+        var parts = List[String]()
+        var input_bytes = input.as_bytes()
+        var input_len = len(input)
+        var pos = 0
+        var prev_end = 0
+        var slots = ALL_NEG_ONES[Self._num_slots]
+        while pos <= input_len:
+            comptime if Self._prefix_len > 0:
+                comptime first_byte = Self._prefix[0]
+                var candidate = simd_find_byte(input_bytes, first_byte, pos)
+                if candidate < 0:
+                    break
+                pos = candidate
+                comptime if Self._prefix_len > 1:
+                    var full_prefix = pos + Self._prefix_len <= input_len
+                    comptime for j in range(1, Self._prefix_len):
+                        comptime pb = Self._prefix[j]
+                        if full_prefix:
+                            full_prefix = input_bytes.unsafe_get(pos + j) == pb
+                    if not full_prefix:
+                        pos += 1
+                        continue
+            comptime if Self._prefix_len == 0:
+                comptime if Self._first_byte_useful:
+                    if pos < input_len:
+                        var b = input_bytes.unsafe_get(pos)
+                        var byte_idx = Int(b) >> 3
+                        var bit_idx = UInt8(Int(b) & 7)
+                        if (
+                            Self._first_byte_bitmap[byte_idx]
+                            & (UInt8(1) << bit_idx)
+                        ) == 0:
+                            pos += 1
+                            continue
+            slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_run[
+                nfa=Self.nfa,
+                state_idx=Self._start,
+                num_slots=Self._num_slots,
+            ](input_bytes, pos, slots)
+            if end < 0:
+                pos += 1
+                continue
+            parts.append(String(input[byte=prev_end:pos]))
+            if end > pos:
+                prev_end = end
+                pos = end
+            else:
+                prev_end = pos + 1
+                pos += 1
+        # Remaining text
+        if prev_end <= input_len:
+            parts.append(String(input[byte=prev_end:input_len]))
+        return parts^
 
     def _expand_replacement[
         origin: Origin, //

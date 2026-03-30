@@ -404,11 +404,10 @@ struct Parser[origin: Origin](Movable):
                     return self.ast.add_node(node^)
                 elif not self._at_end() and self._peek() == CHAR_COLON:
                     self.pos += 1  # consume ':'
-                    # (?ims:...) — scoped flags, treat as non-capturing group
-                    # Flags are set globally for now (scoped flags would need
-                    # per-node flag tracking)
-                    self.inline_flags = RegexFlags(
-                        self.inline_flags.value | inline_flags.value
+                    var inner = self._parse_alternation()
+                    self._expect(CHAR_RPAREN)
+                    return self.ast.add_node(
+                        ASTNode.scoped_flags(inner, inline_flags)
                     )
                 else:
                     raise Error(
@@ -626,8 +625,12 @@ struct Parser[origin: Origin](Movable):
                     )
                     continue
                 elif esc == CHAR_W_UPPER:
-                    # \W inside class — hard to represent, skip detailed handling
                     self.pos += 1
+                    cs.add_range(0, 47)
+                    cs.add_range(58, 64)
+                    cs.add_range(91, 94)
+                    cs.add_range(96, 96)
+                    cs.add_range(123, 255)
                     continue
                 elif esc == CHAR_S_LOWER:
                     self.pos += 1
@@ -640,6 +643,9 @@ struct Parser[origin: Origin](Movable):
                     continue
                 elif esc == CHAR_S:
                     self.pos += 1
+                    cs.add_range(0, 8)
+                    cs.add_range(14, 31)
+                    cs.add_range(33, 255)
                     continue
                 elif esc == CHAR_t:
                     self.pos += 1
@@ -673,6 +679,15 @@ struct Parser[origin: Origin](Movable):
                                 )
                             )
                         hi_ch = self._advance()
+                    if UInt32(hi_ch) < UInt32(ch):
+                        raise Error(
+                            String.write(
+                                RegexError(
+                                    "Invalid character range",
+                                    self.pos - 2,
+                                )
+                            )
+                        )
                     cs.add_range(UInt32(ch), UInt32(hi_ch))
                 else:
                     cs.add_range(UInt32(ch), UInt32(ch))

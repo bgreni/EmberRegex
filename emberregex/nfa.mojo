@@ -459,6 +459,10 @@ def _build_fragment(
         frag.add_out(br_idx, 1)
         return frag^
 
+    elif node.kind == ASTNodeKind.SCOPED_FLAGS:
+        var scoped_flags = RegexFlags(flags.value | node.flags_val)
+        return _build_fragment(nfa, ast, node.children[0], scoped_flags)
+
     raise Error("Unknown AST node kind: " + String(node.kind))
 
 

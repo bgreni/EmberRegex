@@ -3,3 +3,6 @@
 !.pixi/config.toml
 **__pycache__**
 playground.mojo
+.claude
+.agents
+skills-lock.json

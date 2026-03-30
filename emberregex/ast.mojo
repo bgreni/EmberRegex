@@ -24,6 +24,7 @@ struct ASTNodeKind(Copyable, Movable):
     comptime LOOKAHEAD = 8
     comptime LOOKBEHIND = 9
     comptime BACKREFERENCE = 10
+    comptime SCOPED_FLAGS = 11
 
 
 struct AnchorKind:
@@ -50,6 +51,7 @@ struct ASTNode(Copyable, Movable):
     var children: List[Int]  # Indices into AST node pool
     var negated: Bool
     var anchor_type: Int  # For ANCHOR
+    var flags_val: Int  # For SCOPED_FLAGS
 
     def __init__(out self, kind: Int):
         self.kind = kind
@@ -62,6 +64,7 @@ struct ASTNode(Copyable, Movable):
         self.children = List[Int]()
         self.negated = False
         self.anchor_type = -1
+        self.flags_val = 0
 
     @staticmethod
     def literal(ch: UInt32, out node: ASTNode):
@@ -126,6 +129,12 @@ struct ASTNode(Copyable, Movable):
     def backreference(group_index: Int, out node: ASTNode):
         node = ASTNode(ASTNodeKind.BACKREFERENCE)
         node.group_index = group_index
+
+    @staticmethod
+    def scoped_flags(child: Int, flags: RegexFlags, out node: ASTNode):
+        node = ASTNode(ASTNodeKind.SCOPED_FLAGS)
+        node.children = [child]
+        node.flags_val = flags.value
 
 
 struct AST(Movable):

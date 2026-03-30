@@ -272,5 +272,17 @@ def test_pathological_split() raises:
     assert_equal(parts[1], "y")
 
 
+def test_dfa_optional_chain() raises:
+    var re = StaticRegex["a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaa"]()
+    assert_true(re.match("aaaaaaaaaaaaaaaa").matched)
+    assert_false(re.match("aaaaaaaaaaaaaaab").matched)
+
+
+def test_dfa_simple_no_capture() raises:
+    var re = StaticRegex["[a-z]+"]()
+    assert_true(re.match("hello").matched)
+    assert_true(re.search("123abc456").matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
