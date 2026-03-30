@@ -25,7 +25,7 @@ from .charset import CharSet
 from .ast import AnchorKind
 from .result import MatchResult
 from .backtrack import _bt_try_match
-
+from std.memory import memset
 
 struct _VMBuffers(Copyable):
     """Pre-allocated buffers for Pike VM execution.
@@ -65,8 +65,7 @@ struct _VMBuffers(Copyable):
         self.current_slot_data.clear()
         self.next_states.clear()
         self.next_slot_data.clear()
-        for i in range(self.num_slots):
-            self.best_slots[i] = -1
+        memset(self.best_slots.unsafe_ptr(), -1, self.num_slots)
 
 
 struct PikeVM(Copyable):
@@ -240,7 +239,6 @@ struct PikeVM(Copyable):
             bufs.current_slot_data = bufs.next_slot_data^
             bufs.next_slot_data = tmp_slot_data^
             bufs.next_slot_data.clear()
-            _ = curr_gen
             curr_gen = next_gen
 
             pos += 1
