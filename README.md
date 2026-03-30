@@ -277,12 +277,26 @@ Additional search accelerations applied regardless of engine:
 - **Position-skip optimization** — when the DFA dies at position P after starting at S, skips directly to P rather than trying every position in between.
 - **BOL/MULTILINE position skip** — patterns anchored at `^` with MULTILINE only try positions after each `\n`, reducing O(n) to O(lines).
 
-## Development
+## Development & Benchmarks
 
 ```bash
-pixi run test       # run all 147 tests
-pixi run bench      # basic benchmark suite
-pixi run bench_ext  # extended benchmark suite
+# Run tests
+pixi run test
+
+# Run Mojo engine benchmarks
+pixi run bench          # CompiledRegex benchmark suite
+pixi run bench_static   # StaticRegex benchmark suite
+
+# Run Python vs EmberRegex comparison
+pixi run compare
+pixi run -e pdf compare_pdf  # generate PDF report (requires reportlab)
+
+# Run PCRE2 JIT vs StaticRegex comparison (compiles C benchmark via CMake)
+pixi run -e pcre compare_pcre2
+pixi run -e pcre-pdf compare_pcre2_pdf  # generate PDF report
+
+# Format code
+pixi run format
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for details on how the internals work.

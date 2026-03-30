@@ -23,6 +23,15 @@ reportlab = "*"
 [feature.pdf.tasks]
 compare_pdf = { cmd = "python3 bench/gen_pdf.py" }
 
+[feature.pcre.dependencies]
+cmake = "*"
+
+[feature.pcre.tasks]
+compare_pcre2 = { cmd = "python3 bench/bench_compare_pcre2.py" }
+compare_pcre2_pdf = { cmd = "python3 bench/bench_compare_pcre2.py --pdf" }
+
 [environments]
 default = { features = [], solve-group = "default" }
 pdf = { features = ["pdf"], solve-group = "default" }
+pcre = { features = ["pcre"], solve-group = "default" }
+pcre-pdf = { features = ["pcre", "pdf"], solve-group = "default" }

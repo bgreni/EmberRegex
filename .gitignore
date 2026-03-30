@@ -6,3 +6,6 @@ playground.mojo
 .claude
 .agents
 skills-lock.json
+comparisons/pcre2_build/
+comparisons/bench_pcre2
+FEATURES.md

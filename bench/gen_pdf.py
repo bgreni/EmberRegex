@@ -14,7 +14,7 @@ import os
 
 # Allow importing bench_compare from same directory
 sys.path.insert(0, os.path.dirname(__file__))
-from bench_compare import run_python_benchmarks, run_mojo_benchmarks
+from bench_compare import run_python_benchmarks, run_mojo_benchmarks, run_mojo_static_benchmarks
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -132,9 +132,10 @@ SECTION_BG  = colors.HexColor("#eceff1")
 def build_table_data(
     py: dict[str, float],
     mojo: dict[str, float],
+    static_mojo: dict[str, float],
 ) -> tuple[list, list]:
     """Return (table_rows, style_commands)."""
-    rows = [["Benchmark", "EmberRegex (µs)", "Python (µs)", "Ratio"]]
+    rows = [["Benchmark", "Static (µs)", "Ember (µs)", "Python (µs)", "Py/Static", "Py/Ember"]]
     styles = [
         # Header row
         ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
@@ -165,7 +166,7 @@ def build_table_data(
     for name in names:
         section = assignment[name]
         if section != last_section:
-            rows.append([section, "", "", ""])
+            rows.append([section, "", "", "", "", ""])
             styles += [
                 ("BACKGROUND", (0, row_idx), (-1, row_idx), SECTION_BG),
                 ("FONTNAME",   (0, row_idx), (-1, row_idx), "Helvetica-Bold"),
@@ -179,32 +180,44 @@ def build_table_data(
 
         py_us = py[name]
         mojo_us = mojo.get(name)
+        static_us = static_mojo.get(name)
 
-        if mojo_us is None:
-            rows.append([name, "—", f"{py_us:.3f}", "—"])
-        else:
+        r_static = "—"
+        r_ember = "—"
+        s_str = "—"
+        m_str = "—"
+
+        if static_us is not None:
+            s_str = f"{static_us:.3f}"
+            ratio = py_us / static_us
+            r_static = f"{ratio:.1f}x"
+            if ratio >= 1.0:
+                styles += [("TEXTCOLOR", (4, row_idx), (4, row_idx), GREEN),
+                           ("FONTNAME",  (4, row_idx), (4, row_idx), "Helvetica-Bold")]
+            else:
+                styles += [("BACKGROUND", (4, row_idx), (4, row_idx), LIGHT_RED),
+                           ("TEXTCOLOR",  (4, row_idx), (4, row_idx), RED),
+                           ("FONTNAME",   (4, row_idx), (4, row_idx), "Helvetica-Bold")]
+
+        if mojo_us is not None:
+            m_str = f"{mojo_us:.3f}"
             ratio = py_us / mojo_us
-            ratio_str = f"{ratio:.1f}x"
-            rows.append([name, f"{mojo_us:.3f}", f"{py_us:.3f}", ratio_str])
-
+            r_ember = f"{ratio:.1f}x"
             if ratio >= 1.0:
                 faster += 1
-                styles += [
-                    ("TEXTCOLOR", (3, row_idx), (3, row_idx), GREEN),
-                    ("FONTNAME",  (3, row_idx), (3, row_idx), "Helvetica-Bold"),
-                ]
+                styles += [("TEXTCOLOR", (5, row_idx), (5, row_idx), GREEN),
+                           ("FONTNAME",  (5, row_idx), (5, row_idx), "Helvetica-Bold")]
             else:
                 slower += 1
-                styles += [
-                    ("BACKGROUND", (0, row_idx), (-1, row_idx), LIGHT_RED),
-                    ("TEXTCOLOR",  (3, row_idx), (3, row_idx), RED),
-                    ("FONTNAME",   (3, row_idx), (3, row_idx), "Helvetica-Bold"),
-                ]
+                styles += [("BACKGROUND", (5, row_idx), (5, row_idx), LIGHT_RED),
+                           ("TEXTCOLOR",  (5, row_idx), (5, row_idx), RED),
+                           ("FONTNAME",   (5, row_idx), (5, row_idx), "Helvetica-Bold")]
 
+        rows.append([name, s_str, m_str, f"{py_us:.3f}", r_static, r_ember])
         row_idx += 1
 
     # Summary row
-    rows.append([f"EmberRegex faster: {faster}  |  slower: {slower}", "", "", ""])
+    rows.append([f"EmberRegex faster: {faster}  |  slower: {slower}", "", "", "", "", ""])
     styles += [
         ("BACKGROUND", (0, row_idx), (-1, row_idx), HEADER_BG),
         ("TEXTCOLOR",  (0, row_idx), (-1, row_idx), colors.white),
@@ -223,6 +236,7 @@ def generate_pdf(output_path: str):
     print("Running benchmarks...")
     py   = run_python_benchmarks()
     mojo = run_mojo_benchmarks()
+    static_mojo = run_mojo_static_benchmarks()
 
     print("Getting machine specs...")
     specs = get_machine_specs()
@@ -288,8 +302,8 @@ def generate_pdf(output_path: str):
 
     # Benchmark table
     page_width = A4[0] - 3 * cm  # account for margins
-    col_widths = [7.5 * cm, 2.8 * cm, 2.8 * cm, 2.0 * cm]
-    table_rows, table_styles = build_table_data(py, mojo)
+    col_widths = [6.0 * cm, 2.6 * cm, 2.6 * cm, 2.6 * cm, 2.1 * cm, 2.1 * cm]
+    table_rows, table_styles = build_table_data(py, mojo, static_mojo)
     table = Table(table_rows, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle(table_styles))
     elements.append(table)
