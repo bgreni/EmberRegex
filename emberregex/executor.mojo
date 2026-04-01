@@ -27,6 +27,7 @@ from .result import MatchResult
 from .backtrack import _bt_try_match
 from std.memory import memset
 
+
 struct _VMBuffers(Copyable):
     """Pre-allocated buffers for Pike VM execution.
 
