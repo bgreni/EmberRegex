@@ -35,6 +35,21 @@ def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
     return prefix^
 
 
+def is_pure_literal(nfa: NFA) -> Bool:
+    """Return True if the entire pattern is a fixed literal string with no
+    alternation, quantifiers, anchors, or other constructs."""
+    var state_idx = nfa.start
+    while state_idx >= 0 and state_idx < len(nfa.states):
+        var kind = nfa.states[state_idx].kind
+        if kind == NFAStateKind.CHAR:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            state_idx = nfa.states[state_idx].out1
+        else:
+            return kind == NFAStateKind.MATCH
+    return False
+
+
 def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
     """Extract a 256-bit bitmap of possible first bytes from the NFA.
 

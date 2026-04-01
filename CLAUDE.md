@@ -69,6 +69,7 @@ After engine selection, `extract_literal_prefix` (`optimize.mojo`) walks the NFA
 - `UInt8(1) << bit_idx` requires `bit_idx: UInt8` — explicit cast needed.
 - After transferring a field with `^` in a `mut self` method, reinitialize the field before the method returns or the struct will be partially uninitialized.
 - Structs need the explicit `Movable` trait to use the `^` transfer operator.
+- **Never use `String[byte=a:b]` slicing** — it has poor performance. Always fetch a byte span first with `input.as_bytes()` and slice that. To construct a String from a span use `String(unsafe_from_utf8=span[a:b])`.
 
 
 ## Investigating code behaviour

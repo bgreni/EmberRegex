@@ -41,6 +41,28 @@ def simd_find_byte[
     return -1
 
 
+def simd_find_literal[
+    W: Int, origin: Origin, //
+](input: Span[Byte, origin], lit: SIMD[DType.uint8, W], start: Int) -> Int:
+    """Find the first occurrence of the W-byte literal `lit` in input.
+
+    Uses simd_find_byte to locate first-byte candidates, then does a
+    single W-wide SIMD load+compare at each candidate instead of W
+    scalar checks.
+    """
+    var input_len = len(input)
+    var pos = start
+    var ptr = input.unsafe_ptr()
+
+    while pos <= input_len - W:
+        var chunk = (ptr + pos).load[width=W]()
+        if chunk == lit:
+            return pos
+        pos += 1
+
+    return -1
+
+
 def simd_find_prefix[
     origin: Origin, //
 ](input: Span[Byte, origin], prefix: List[UInt8], start: Int,) -> Int:

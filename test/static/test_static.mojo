@@ -2,6 +2,7 @@
 
 from emberregex import StaticRegex, MatchResult
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
+from std.sys import simd_width_of
 
 
 # --- Literal matching ---
@@ -282,6 +283,50 @@ def test_dfa_simple_no_capture() raises:
     var re = StaticRegex["[a-z]+"]()
     assert_true(re.match("hello").matched)
     assert_true(re.search("123abc456").matched)
+
+
+def _do_simd_literal_test[LIT: String, W: Int]() raises:
+    var re = StaticRegex[LIT]()
+    var s = String(LIT)
+
+    assert_true(re.match(s).matched)
+    assert_false(re.match("").matched)
+
+    var hay = "XXX" + s + "YYY"
+    var r = re.search(hay)
+    assert_true(r.matched)
+    assert_equal(r.start, 3)
+    assert_false(re.search("XXXXXXXXXXXXXXXX").matched)
+
+    var two = String(s) + s
+    var all = re.findall(two)
+    assert_equal(len(all), 2)
+    assert_equal(all[0], s)
+    assert_equal(all[1], s)
+
+    assert_equal(re.replace(s, "R"), "R")
+    assert_equal(re.replace("X" + s + "Y", "R"), "XRY")
+
+
+def test_simd_width_literal() raises:
+    comptime W = simd_width_of[DType.uint8]()
+    _do_simd_literal_test["a" * W, W]()
+
+
+# def test_simd_literal_width_1() raises:
+#     _do_simd_literal_test["a", 1]()
+
+
+# def test_simd_literal_width_2() raises:
+#     _do_simd_literal_test["ab", 2]()
+
+
+# def test_simd_literal_width_4() raises:
+#     _do_simd_literal_test["abcd", 4]()
+
+
+# def test_simd_literal_width_8() raises:
+#     _do_simd_literal_test["abcdefgh", 8]()
 
 
 def main() raises:

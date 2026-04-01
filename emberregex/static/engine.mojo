@@ -25,8 +25,13 @@ from ..nfa import build_nfa, NFA, NFAStateKind
 from ..ast import AnchorKind
 from ..result import MatchResult
 from ..flags import RegexFlags
-from ..optimize import extract_literal_prefix, extract_first_byte_bitmap
-from ..simd_scan import simd_find_byte, simd_find_prefix
+from ..optimize import (
+    extract_literal_prefix,
+    extract_first_byte_bitmap,
+    is_pure_literal,
+)
+from ..simd_scan import simd_find_byte, simd_find_prefix, simd_find_literal
+from std.sys import simd_width_of
 from ..charset import BITMAP_WIDTH
 from .backtrack import _sbt_try_match, SBT_BUDGET
 from ..dfa import LazyDFA
@@ -264,7 +269,18 @@ def _reaches_consuming_before_match(nfa: NFA, start: Int) -> Bool:
 comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
 
 
-struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
+def __literal_can_be_optimized(width: Int) -> Bool:
+    # power of two smaller than double the platform simd width
+    return (
+        (simd_width_of[Byte.dtype]() * 2) >= width > 0
+        and (width & (width - 1)) == 0
+    )
+
+
+comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
+
+
+struct StaticRegex[pattern: String](Copyable, Movable):
     """A compile-time regex where parsing and NFA construction happen during
     compilation.
 
@@ -274,7 +290,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
     eliminating runtime dispatch and achieving near hand-written performance.
     """
 
-    comptime nfa = _build_static_nfa(String(Self.pattern))
+    comptime nfa = _build_static_nfa(Self.pattern)
     comptime _group_count = Self.nfa.group_count
     comptime _num_slots = 2 * Self.nfa.group_count
     comptime _start = Self.nfa.start
@@ -285,6 +301,10 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
     comptime _first_byte_useful = _is_bitmap_useful(Self._first_byte_bitmap)
     comptime _use_dfa = Self.nfa.can_use_dfa and Self._group_count == 0 and not Self.nfa.has_lazy and (
         _has_alternation_splits(Self.nfa) or _quantifier_has_suffix(Self.nfa)
+    )
+    comptime _is_pure_literal = is_pure_literal(Self.nfa)
+    comptime _use_simd_literal = Self._is_pure_literal and __literal_can_be_optimized(
+        Self._prefix_len
     )
 
     var _dfa_nfa: ConditionalType[
@@ -301,19 +321,44 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
         Else=NoneType,
     ]
 
+    var _simd_lit: ConditionalType[
+        Trait=ImplicitlyDestructible & Copyable,
+        If=Self._use_simd_literal,
+        Then=TypeForPrefixLength[Self._prefix_len],
+        Else=NoneType,
+    ]
+
     def __init__(out self):
         comptime if Self._use_dfa:
-            var nfa = _build_static_nfa(String(Self.pattern))
+            var nfa = _build_static_nfa(Self.pattern)
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
             var dfa = LazyDFA()
             self._dfa = rebind_var[type_of(self._dfa)](dfa^)
         else:
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](None)
             self._dfa = rebind_var[type_of(self._dfa)](None)
+        comptime if Self._use_simd_literal:
+            comptime vec = Self._prefix.unsafe_ptr().load[width=Self._prefix_len]()
+            self._simd_lit = rebind_var[type_of(self._simd_lit)](vec)
+        else:
+            self._simd_lit = rebind_var[type_of(self._simd_lit)](None)
 
     def match(mut self, input: String) -> MatchResult:
         """Match the entire input against the pattern."""
-        comptime if Self._use_dfa:
+        comptime if Self._use_simd_literal:
+            ref lit = rebind[TypeForPrefixLength[Self._prefix_len]](self._simd_lit)
+            if len(input) == Self._prefix_len:
+                var chunk = input.unsafe_ptr().load[width=Self._prefix_len]()
+                if chunk == lit:
+                    return MatchResult(
+                        matched=True,
+                        start=0,
+                        end=Self._prefix_len,
+                        group_count=0,
+                        slots=List[Int](),
+                    )
+            return MatchResult.no_match(0)
+        elif Self._use_dfa:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
             if dfa.full_match(dfa_nfa, input):
@@ -341,7 +386,20 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
 
     def search(mut self, input: String) -> MatchResult:
         """Search for the first occurrence of the pattern in the input."""
-        comptime if Self._use_dfa:
+        comptime if Self._use_simd_literal:
+            ref lit = rebind[TypeForPrefixLength[Self._prefix_len]](self._simd_lit)
+            var input_bytes = input.as_bytes()
+            var pos = simd_find_literal(input_bytes, lit, 0)
+            if pos < 0:
+                return MatchResult.no_match(0)
+            return MatchResult(
+                matched=True,
+                start=pos,
+                end=pos + Self._prefix_len,
+                group_count=0,
+                slots=List[Int](),
+            )
+        elif Self._use_dfa:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
             var input_bytes = input.as_bytes()
@@ -375,7 +433,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                             slots=List[Int](),
                         )
                     pos += 1
-                comptime if Self._prefix_len == 0:
+                elif Self._prefix_len == 0:
                     var range = dfa.search_forward(
                         dfa_nfa,
                         input_bytes,
@@ -415,13 +473,11 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                 )
             return MatchResult.no_match(Self._group_count)
 
-        comptime if Self._start_anchor != AnchorKind.BOL:
+        else:
             comptime if Self._start_anchor == AnchorKind.BOL_MULTILINE:
                 return self._search_bol_multiline(input_bytes, input_len)
-            comptime if Self._start_anchor != AnchorKind.BOL_MULTILINE:
+            else:
                 return self._search_general(input_bytes, input_len)
-
-        return MatchResult.no_match(Self._group_count)
 
     def _search_general[
         origin: Origin, //
@@ -446,7 +502,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                     if not full_prefix:
                         pos += 1
                         continue
-            comptime if Self._prefix_len == 0:
+            elif Self._prefix_len == 0:
                 comptime if Self._first_byte_useful:
                     if pos < input_len:
                         var b = input.unsafe_get(pos)
@@ -515,7 +571,23 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
 
     def findall(mut self, input: String) -> List[String]:
         """Find all non-overlapping matches and return their text."""
-        comptime if Self._use_dfa:
+        comptime if Self._use_simd_literal:
+            ref lit = rebind[TypeForPrefixLength[Self._prefix_len]](self._simd_lit)
+            var results = List[String]()
+            var input_bytes = input.as_bytes()
+            var pos = 0
+            while True:
+                pos = simd_find_literal(input_bytes, lit, pos)
+                if pos < 0:
+                    break
+                results.append(
+                    String(
+                        unsafe_from_utf8=input_bytes[pos : pos + Self._prefix_len]
+                    )
+                )
+                pos += Self._prefix_len
+            return results^
+        elif Self._use_dfa:
             var results = List[String]()
             var input_bytes = input.as_bytes()
             var input_len = len(input)
@@ -527,7 +599,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
             comptime if Self._start_anchor == AnchorKind.BOL:
                 var match_end = dfa.match_at(dfa_nfa, input_bytes, 0)
                 if match_end >= 0:
-                    results.append(String(input[byte=0:match_end]))
+                    results.append(
+                        String(unsafe_from_utf8=input_bytes[0:match_end])
+                    )
                 return results^
 
             # BOL_MULTILINE: skip to BOL positions via SIMD newline scan
@@ -535,7 +609,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                 while pos <= input_len:
                     var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                     if match_end >= 0:
-                        results.append(String(input[byte=pos:match_end]))
+                        results.append(
+                            String(unsafe_from_utf8=input_bytes[pos:match_end])
+                        )
                         if match_end > pos:
                             pos = match_end
                         else:
@@ -573,7 +649,11 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                                 continue
                         var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                         if match_end >= 0:
-                            results.append(String(input[byte=pos:match_end]))
+                            results.append(
+                                String(
+                                    unsafe_from_utf8=input_bytes[pos:match_end]
+                                )
+                            )
                             if match_end > pos:
                                 pos = match_end
                             else:
@@ -592,7 +672,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                             break
                         var start = range[0]
                         var end = range[1]
-                        results.append(String(input[byte=start:end]))
+                        results.append(
+                            String(unsafe_from_utf8=input_bytes[start:end])
+                        )
                         if end > start:
                             pos = end
                         else:
@@ -616,7 +698,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                 self._findall_append(results, input, 0, end, slots)
             return results^
 
-        comptime if Self._start_anchor != AnchorKind.BOL:
+        else:
             comptime if Self._start_anchor == AnchorKind.BOL_MULTILINE:
                 # Skip to BOL positions using SIMD newline scan
                 var pos = 0
@@ -697,7 +779,6 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                     else:
                         pos += 1
                 return results^
-
         return results^
 
     @always_inline
@@ -711,86 +792,109 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
         end: Int,
         slots: InlineArray[Int, n],
     ):
+        var input_bytes = input.as_bytes()
         comptime if Self._num_slots >= 4:
             if Self._group_count > 0 and slots[2] >= 0 and slots[3] >= 0:
-                results.append(String(input[byte = slots[2] : slots[3]]))
+                results.append(
+                    String(unsafe_from_utf8=input_bytes[slots[2] : slots[3]])
+                )
             else:
-                results.append(String(input[byte=pos:end]))
+                results.append(String(unsafe_from_utf8=input_bytes[pos:end]))
         comptime if Self._num_slots < 4:
-            results.append(String(input[byte=pos:end]))
+            results.append(String(unsafe_from_utf8=input_bytes[pos:end]))
 
     def replace(mut self, input: String, replacement: String) -> String:
         """Replace all non-overlapping matches with replacement string.
 
         Supports \\1-\\9 backreferences in replacement.
         """
-        var output = String()
-        var input_bytes = input.as_bytes()
-        var input_len = len(input)
-        var prev_end = 0
-        var pos = 0
-        var slots = ALL_NEG_ONES[Self._num_slots]
-        while pos <= input_len:
-            comptime if Self._prefix_len > 0:
-                comptime first_byte = Self._prefix[0]
-                var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                if candidate < 0:
+
+        comptime if Self._use_simd_literal:
+            ref lit = rebind[TypeForPrefixLength[Self._prefix_len]](self._simd_lit)
+            var output = String()
+            var input_bytes = input.as_bytes()
+            var input_len = len(input_bytes)
+            var prev_end = 0
+            while prev_end < input_len:
+                var pos = simd_find_literal(input_bytes, lit, prev_end)
+                if pos < 0:
                     break
-                pos = candidate
-                comptime if Self._prefix_len > 1:
-                    var full_prefix = pos + Self._prefix_len <= input_len
-                    comptime for j in range(1, Self._prefix_len):
-                        comptime pb = Self._prefix[j]
-                        if full_prefix:
-                            full_prefix = input_bytes.unsafe_get(pos + j) == pb
-                    if not full_prefix:
-                        pos += 1
-                        continue
-            comptime if Self._prefix_len == 0:
-                comptime if Self._first_byte_useful:
-                    if pos < input_len:
-                        var b = input_bytes.unsafe_get(pos)
-                        var byte_idx = Int(b) >> 3
-                        var bit_idx = UInt8(Int(b) & 7)
-                        if (
-                            Self._first_byte_bitmap[byte_idx]
-                            & (UInt8(1) << bit_idx)
-                        ) == 0:
+                if pos > prev_end:
+                    output += String(unsafe_from_utf8=input_bytes[prev_end:pos])
+                output += replacement
+                prev_end = pos + Self._prefix_len
+            if prev_end < input_len:
+                output += String(
+                    unsafe_from_utf8=input_bytes[prev_end:input_len]
+                )
+            return output^
+        else:
+            var output = String()
+            var input_bytes = input.as_bytes()
+            var input_len = len(input)
+            var prev_end = 0
+            var pos = 0
+            while pos <= input_len:
+                comptime if Self._prefix_len > 0:
+                    comptime first_byte = Self._prefix[0]
+                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
+                    if candidate < 0:
+                        break
+                    pos = candidate
+                    comptime if Self._prefix_len > 1:
+                        var full_prefix = pos + Self._prefix_len <= input_len
+                        comptime for j in range(1, Self._prefix_len):
+                            comptime pb = Self._prefix[j]
+                            if full_prefix:
+                                full_prefix = input_bytes.unsafe_get(pos + j) == pb
+                        if not full_prefix:
                             pos += 1
                             continue
-            slots = ALL_NEG_ONES[Self._num_slots]
-            var end = _sbt_run[
-                nfa=Self.nfa,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](input_bytes, pos, slots)
-            if end < 0:
-                pos += 1
-                continue
-            # Add text before match
-            if pos > prev_end:
-                output += String(input[byte=prev_end:pos])
-            # Expand replacement with backreferences
-            var match_result = MatchResult(
-                matched=True,
-                start=pos,
-                end=end,
-                group_count=Self._group_count,
-                slots=_slots_to_list(slots),
-            )
-            output += self._expand_replacement(
-                input_bytes, match_result, replacement
-            )
-            if end > pos:
-                prev_end = end
-                pos = end
-            else:
-                prev_end = pos + 1
-                pos += 1
-        # Remaining text
-        if prev_end < input_len:
-            output += String(input[byte=prev_end:input_len])
-        return output^
+                comptime if Self._prefix_len == 0:
+                    comptime if Self._first_byte_useful:
+                        if pos < input_len:
+                            var b = input_bytes.unsafe_get(pos)
+                            var byte_idx = Int(b) >> 3
+                            var bit_idx = UInt8(Int(b) & 7)
+                            if (
+                                Self._first_byte_bitmap[byte_idx]
+                                & (UInt8(1) << bit_idx)
+                            ) == 0:
+                                pos += 1
+                                continue
+                var slots = ALL_NEG_ONES[Self._num_slots]
+                var end = _sbt_run[
+                    nfa=Self.nfa,
+                    state_idx=Self._start,
+                    num_slots=Self._num_slots,
+                ](input_bytes, pos, slots)
+                if end < 0:
+                    pos += 1
+                    continue
+                # Add text before match
+                if pos > prev_end:
+                    output += String(unsafe_from_utf8=input_bytes[prev_end:pos])
+                # Expand replacement with backreferences
+                var match_result = MatchResult(
+                    matched=True,
+                    start=pos,
+                    end=end,
+                    group_count=Self._group_count,
+                    slots=_slots_to_list(slots),
+                )
+                output += self._expand_replacement(
+                    input_bytes, match_result, replacement
+                )
+                if end > pos:
+                    prev_end = end
+                    pos = end
+                else:
+                    prev_end = pos + 1
+                    pos += 1
+            # Remaining text
+            if prev_end < input_len:
+                output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+            return output^
 
     def split(mut self, input: String) -> List[String]:
         """Split input by matches of the pattern."""
@@ -822,7 +926,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                             continue
                     var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                     if match_end >= 0:
-                        parts.append(String(input[byte=prev_end:pos]))
+                        parts.append(
+                            String(unsafe_from_utf8=input_bytes[prev_end:pos])
+                        )
                         if match_end > pos:
                             prev_end = match_end
                             pos = match_end
@@ -843,7 +949,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         break
                     var start = range[0]
                     var end = range[1]
-                    parts.append(String(input[byte=prev_end:start]))
+                    parts.append(
+                        String(unsafe_from_utf8=input_bytes[prev_end:start])
+                    )
                     if end > start:
                         prev_end = end
                         pos = end
@@ -851,14 +959,15 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         prev_end = start + 1
                         pos = start + 1
             if prev_end <= input_len:
-                parts.append(String(input[byte=prev_end:input_len]))
+                parts.append(
+                    String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+                )
             return parts^
         var parts = List[String]()
         var input_bytes = input.as_bytes()
         var input_len = len(input)
         var pos = 0
         var prev_end = 0
-        var slots = ALL_NEG_ONES[Self._num_slots]
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
                 comptime first_byte = Self._prefix[0]
@@ -887,7 +996,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                         ) == 0:
                             pos += 1
                             continue
-            slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa,
                 state_idx=Self._start,
@@ -896,7 +1005,7 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
             if end < 0:
                 pos += 1
                 continue
-            parts.append(String(input[byte=prev_end:pos]))
+            parts.append(String(unsafe_from_utf8=input_bytes[prev_end:pos]))
             if end > pos:
                 prev_end = end
                 pos = end
@@ -905,7 +1014,9 @@ struct StaticRegex[pattern: StringLiteral](Copyable, Movable):
                 pos += 1
         # Remaining text
         if prev_end <= input_len:
-            parts.append(String(input[byte=prev_end:input_len]))
+            parts.append(
+                String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+            )
         return parts^
 
     def _expand_replacement[

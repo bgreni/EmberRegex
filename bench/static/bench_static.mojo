@@ -22,6 +22,7 @@ from std.benchmark import (
 )
 from std.benchmark.compiler import keep
 from emberregex import StaticRegex
+from std.sys import simd_width_of
 
 comptime ITERS_PER_CALL = 100
 
@@ -1623,6 +1624,55 @@ def bench_engine_backtrack_same(mut b: Bench) raises:
 
 
 # ---------------------------------------------------------------------------
+# SIMD-width pure literal fast path
+# ---------------------------------------------------------------------------
+
+comptime _BENCH_SIMD_W = simd_width_of[DType.uint8]()
+
+
+def bench_static_simd_literal_match(mut b: Bench) raises:
+    comptime SIMD_LIT = "a" * _BENCH_SIMD_W
+
+    var re = StaticRegex[SIMD_LIT]()
+    var input = String(SIMD_LIT)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("simd_literal_match"))
+
+
+def bench_static_simd_literal_search(mut b: Bench) raises:
+    comptime SIMD_LIT = "a" * _BENCH_SIMD_W
+
+    var re = StaticRegex[SIMD_LIT]()
+    var haystack = make_lines(100)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(haystack)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("simd_literal_search"))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1632,6 +1682,10 @@ def main() raises:
     config.verbose_timing = True
     config.show_progress = True
     var b = Bench(config^)
+
+    # SIMD-width pure literal fast path
+    bench_static_simd_literal_match(b)
+    bench_static_simd_literal_search(b)
 
     # DFA-equivalent matching (static_ prefix IDs)
     bench_static_dfa_literal_match(b)
