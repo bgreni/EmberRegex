@@ -407,22 +407,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var pos = 0
             while pos <= input_len:
                 comptime if Self._prefix_len > 0:
-                    comptime first_byte = Self._prefix[0]
-                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                    if candidate < 0:
+                    pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+                    if pos < 0:
                         return MatchResult.no_match(0)
-                    pos = candidate
-                    comptime if Self._prefix_len > 1:
-                        var full_prefix = pos + Self._prefix_len <= input_len
-                        comptime for j in range(1, Self._prefix_len):
-                            comptime pb = Self._prefix[j]
-                            if full_prefix:
-                                full_prefix = (
-                                    input_bytes.unsafe_get(pos + j) == pb
-                                )
-                        if not full_prefix:
-                            pos += 1
-                            continue
                     var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                     if match_end >= 0:
                         return MatchResult(
@@ -487,33 +474,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var pos = 0
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
-                # SIMD scan for first byte, then inline-verify remaining prefix.
-                comptime first_byte = Self._prefix[0]
-                var candidate = simd_find_byte(input, first_byte, pos)
-                if candidate < 0:
+                pos = self._find_prefix_candidate(input, input_len, pos)
+                if pos < 0:
                     return MatchResult.no_match(Self._group_count)
-                pos = candidate
-                comptime if Self._prefix_len > 1:
-                    var full_prefix = pos + Self._prefix_len <= input_len
-                    comptime for j in range(1, Self._prefix_len):
-                        comptime pb = Self._prefix[j]
-                        if full_prefix:
-                            full_prefix = input.unsafe_get(pos + j) == pb
-                    if not full_prefix:
-                        pos += 1
-                        continue
             elif Self._prefix_len == 0:
                 comptime if Self._first_byte_useful:
-                    if pos < input_len:
-                        var b = input.unsafe_get(pos)
-                        var byte_idx = Int(b) >> 3
-                        var bit_idx = UInt8(Int(b) & 7)
-                        if (
-                            Self._first_byte_bitmap[byte_idx]
-                            & (UInt8(1) << bit_idx)
-                        ) == 0:
-                            pos += 1
-                            continue
+                    if self._bitmap_skip(input, input_len, pos):
+                        pos += 1
+                        continue
             var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
@@ -536,20 +504,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var pos = 0
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
-                comptime first_byte = Self._prefix[0]
-                var candidate = simd_find_byte(input, first_byte, pos)
-                if candidate < 0:
+                pos = self._find_prefix_candidate(input, input_len, pos)
+                if pos < 0:
                     return MatchResult.no_match(Self._group_count)
-                pos = candidate
-                comptime if Self._prefix_len > 1:
-                    var full_prefix = pos + Self._prefix_len <= input_len
-                    comptime for j in range(1, Self._prefix_len):
-                        comptime pb = Self._prefix[j]
-                        if full_prefix:
-                            full_prefix = input.unsafe_get(pos + j) == pb
-                    if not full_prefix:
-                        pos += 1
-                        continue
             var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
@@ -627,26 +584,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             comptime if Self._start_anchor != AnchorKind.BOL and Self._start_anchor != AnchorKind.BOL_MULTILINE:
                 while pos <= input_len:
                     comptime if Self._prefix_len > 0:
-                        comptime first_byte = Self._prefix[0]
-                        var candidate = simd_find_byte(
-                            input_bytes, first_byte, pos
-                        )
-                        if candidate < 0:
+                        pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+                        if pos < 0:
                             break
-                        pos = candidate
-                        comptime if Self._prefix_len > 1:
-                            var full_prefix = (
-                                pos + Self._prefix_len <= input_len
-                            )
-                            comptime for j in range(1, Self._prefix_len):
-                                comptime pb = Self._prefix[j]
-                                if full_prefix:
-                                    full_prefix = (
-                                        input_bytes.unsafe_get(pos + j) == pb
-                                    )
-                            if not full_prefix:
-                                pos += 1
-                                continue
                         var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                         if match_end >= 0:
                             results.append(
@@ -732,38 +672,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._prefix_len > 0:
-                        comptime first_byte = Self._prefix[0]
-                        var candidate = simd_find_byte(
-                            input_bytes, first_byte, pos
-                        )
-                        if candidate < 0:
+                        pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+                        if pos < 0:
                             break
-                        pos = candidate
-                        comptime if Self._prefix_len > 1:
-                            var full_prefix = (
-                                pos + Self._prefix_len <= input_len
-                            )
-                            comptime for j in range(1, Self._prefix_len):
-                                comptime pb = Self._prefix[j]
-                                if full_prefix:
-                                    full_prefix = (
-                                        input_bytes.unsafe_get(pos + j) == pb
-                                    )
-                            if not full_prefix:
-                                pos += 1
-                                continue
                     comptime if Self._prefix_len == 0:
                         comptime if Self._first_byte_useful:
-                            if pos < input_len:
-                                var b = input_bytes.unsafe_get(pos)
-                                var byte_idx = Int(b) >> 3
-                                var bit_idx = UInt8(Int(b) & 7)
-                                if (
-                                    Self._first_byte_bitmap[byte_idx]
-                                    & (UInt8(1) << bit_idx)
-                                ) == 0:
-                                    pos += 1
-                                    continue
+                            if self._bitmap_skip(input_bytes, input_len, pos):
+                                pos += 1
+                                continue
                     var slots = ALL_NEG_ONES[Self._num_slots]
                     var end = _sbt_run[
                         nfa=Self.nfa,
@@ -836,32 +752,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var pos = 0
             while pos <= input_len:
                 comptime if Self._prefix_len > 0:
-                    comptime first_byte = Self._prefix[0]
-                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                    if candidate < 0:
+                    pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+                    if pos < 0:
                         break
-                    pos = candidate
-                    comptime if Self._prefix_len > 1:
-                        var full_prefix = pos + Self._prefix_len <= input_len
-                        comptime for j in range(1, Self._prefix_len):
-                            comptime pb = Self._prefix[j]
-                            if full_prefix:
-                                full_prefix = input_bytes.unsafe_get(pos + j) == pb
-                        if not full_prefix:
-                            pos += 1
-                            continue
                 comptime if Self._prefix_len == 0:
                     comptime if Self._first_byte_useful:
-                        if pos < input_len:
-                            var b = input_bytes.unsafe_get(pos)
-                            var byte_idx = Int(b) >> 3
-                            var bit_idx = UInt8(Int(b) & 7)
-                            if (
-                                Self._first_byte_bitmap[byte_idx]
-                                & (UInt8(1) << bit_idx)
-                            ) == 0:
-                                pos += 1
-                                continue
+                        if self._bitmap_skip(input_bytes, input_len, pos):
+                            pos += 1
+                            continue
                 var slots = ALL_NEG_ONES[Self._num_slots]
                 var end = _sbt_run[
                     nfa=Self.nfa,
@@ -908,22 +806,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             ref dfa = rebind[LazyDFA](self._dfa)
             while pos <= input_len:
                 comptime if Self._prefix_len > 0:
-                    comptime first_byte = Self._prefix[0]
-                    var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                    if candidate < 0:
+                    pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+                    if pos < 0:
                         break
-                    pos = candidate
-                    comptime if Self._prefix_len > 1:
-                        var full_prefix = pos + Self._prefix_len <= input_len
-                        comptime for j in range(1, Self._prefix_len):
-                            comptime pb = Self._prefix[j]
-                            if full_prefix:
-                                full_prefix = (
-                                    input_bytes.unsafe_get(pos + j) == pb
-                                )
-                        if not full_prefix:
-                            pos += 1
-                            continue
                     var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                     if match_end >= 0:
                         parts.append(
@@ -970,32 +855,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var prev_end = 0
         while pos <= input_len:
             comptime if Self._prefix_len > 0:
-                comptime first_byte = Self._prefix[0]
-                var candidate = simd_find_byte(input_bytes, first_byte, pos)
-                if candidate < 0:
+                pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+                if pos < 0:
                     break
-                pos = candidate
-                comptime if Self._prefix_len > 1:
-                    var full_prefix = pos + Self._prefix_len <= input_len
-                    comptime for j in range(1, Self._prefix_len):
-                        comptime pb = Self._prefix[j]
-                        if full_prefix:
-                            full_prefix = input_bytes.unsafe_get(pos + j) == pb
-                    if not full_prefix:
-                        pos += 1
-                        continue
             comptime if Self._prefix_len == 0:
                 comptime if Self._first_byte_useful:
-                    if pos < input_len:
-                        var b = input_bytes.unsafe_get(pos)
-                        var byte_idx = Int(b) >> 3
-                        var bit_idx = UInt8(Int(b) & 7)
-                        if (
-                            Self._first_byte_bitmap[byte_idx]
-                            & (UInt8(1) << bit_idx)
-                        ) == 0:
-                            pos += 1
-                            continue
+                    if self._bitmap_skip(input_bytes, input_len, pos):
+                        pos += 1
+                        continue
             var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa,
@@ -1018,6 +885,49 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 String(unsafe_from_utf8=input_bytes[prev_end:input_len])
             )
         return parts^
+
+    @always_inline
+    def _find_prefix_candidate[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, start: Int) -> Int:
+        """Find the next position >= start where the full literal prefix matches.
+
+        Returns the position or -1 if no match exists. Only meaningful when
+        Self._prefix_len > 0.
+        """
+        var pos = start
+        comptime first_byte = Self._prefix[0]
+        while True:
+            var candidate = simd_find_byte(input, first_byte, pos)
+            if candidate < 0:
+                return -1
+            pos = candidate
+            comptime if Self._prefix_len > 1:
+                var full_prefix = pos + Self._prefix_len <= input_len
+                comptime for j in range(1, Self._prefix_len):
+                    comptime pb = Self._prefix[j]
+                    if full_prefix:
+                        full_prefix = input.unsafe_get(pos + j) == pb
+                if not full_prefix:
+                    pos += 1
+                    continue
+            return pos
+
+    @always_inline
+    def _bitmap_skip[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Bool:
+        """Return True if `pos` should be skipped based on the first-byte bitmap.
+
+        Only meaningful when Self._first_byte_useful is True.
+        """
+        if pos < input_len:
+            var b = input.unsafe_get(pos)
+            var byte_idx = Int(b) >> 3
+            var bit_idx = UInt8(Int(b) & 7)
+            if (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) == 0:
+                return True
+        return False
 
     def _expand_replacement[
         origin: Origin, //
