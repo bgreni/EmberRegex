@@ -60,9 +60,9 @@ def _sbt_run[
     a false negative and a fallback engine should be used.
     """
     var budget = SBT_BUDGET
-    var result = _sbt_try_match[nfa=nfa, state_idx=state_idx, num_slots=num_slots](
-        input, pos, slots, budget
-    )
+    var result = _sbt_try_match[
+        nfa=nfa, state_idx=state_idx, num_slots=num_slots
+    ](input, pos, slots, budget)
     if budget < 0:
         raise Error("SBT_BUDGET_EXHAUSTED")
     return result
@@ -438,7 +438,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 self._simd_lit
             )
             if input.byte_length() == Self._strategy.prefix_len:
-                var chunk = input.unsafe_ptr().load[width=Self._strategy.prefix_len]()
+                var chunk = input.unsafe_ptr().load[
+                    width=Self._strategy.prefix_len
+                ]()
                 if chunk == lit:
                     return MatchResult[Self._num_slots](
                         matched=True,
@@ -918,9 +920,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var pos = 0
         while pos <= input_len:
             comptime if Self._strategy.prefix_len > 0:
-                pos = self._find_prefix_candidate(
-                    input_bytes, input_len, pos
-                )
+                pos = self._find_prefix_candidate(input_bytes, input_len, pos)
                 if pos < 0:
                     break
             elif Self._strategy.prefix_len == 0:
@@ -958,9 +958,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 pos += 1
         # Remaining text
         if prev_end < input_len:
-            output += String(
-                unsafe_from_utf8=input_bytes[prev_end:input_len]
-            )
+            output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
         return output^
 
     def split(mut self, input: String) -> List[String]:
@@ -1138,7 +1136,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                     comptime for k in range(1, last_off):
                                         comptime pb = Self._prefix[k]
                                         if ok:
-                                            ok = (ptr + pos + 2 * W + j + k)[] == pb
+                                            ok = (
+                                                ptr + pos + 2 * W + j + k
+                                            )[] == pb
                                     if ok:
                                         return pos + 2 * W + j
                     if e3.reduce_or():
@@ -1151,7 +1151,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                     comptime for k in range(1, last_off):
                                         comptime pb = Self._prefix[k]
                                         if ok:
-                                            ok = (ptr + pos + 3 * W + j + k)[] == pb
+                                            ok = (
+                                                ptr + pos + 3 * W + j + k
+                                            )[] == pb
                                     if ok:
                                         return pos + 3 * W + j
                 pos += 4 * W
@@ -1286,7 +1288,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 else:
                     results.append(
                         String(
-                            unsafe_from_utf8=input_bytes[result.start : result.end]
+                            unsafe_from_utf8=input_bytes[
+                                result.start : result.end
+                            ]
                         )
                     )
             else:
@@ -1321,9 +1325,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 output += String(
                     unsafe_from_utf8=input_bytes[prev_end : result.start]
                 )
-            output += self._expand_replacement(
-                input_bytes, result, replacement
-            )
+            output += self._expand_replacement(input_bytes, result, replacement)
             if result.end > pos:
                 prev_end = result.end
                 pos = result.end

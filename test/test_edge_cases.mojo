@@ -115,7 +115,8 @@ def test_word_boundary_at_string_end() raises:
 
 
 def test_word_boundary_underscore() raises:
-    """Underscore is a word char, so no boundary between letters and underscore."""
+    """Underscore is a word char, so no boundary between letters and underscore.
+    """
     var re = StaticRegex["\\bword\\b"]()
     assert_true(re.search("word!").matched)
     assert_false(re.search("word_").matched)

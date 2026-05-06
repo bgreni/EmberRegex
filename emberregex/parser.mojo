@@ -305,9 +305,7 @@ struct Parser[origin: Origin](Movable):
         for _ in range(count):
             if self._at_end():
                 raise Error(
-                    String.write(
-                        RegexError("Expected hex digit", self.pos)
-                    )
+                    String.write(RegexError("Expected hex digit", self.pos))
                 )
             var ch = self._advance()
             if ch >= CHAR_ZERO and ch <= CHAR_NINE:
@@ -525,7 +523,8 @@ struct Parser[origin: Origin](Movable):
         return self.ast.add_node(ASTNode.group(inner, group_index))
 
     def _parse_one_flag(mut self) -> Int:
-        """Consume one flag character and return its bitmask, or 0 if not a flag."""
+        """Consume one flag character and return its bitmask, or 0 if not a flag.
+        """
         var ch = self._peek()
         if ch == CHAR_I_LOWER:
             self.pos += 1
@@ -658,7 +657,10 @@ struct Parser[origin: Origin](Movable):
                 raise Error(
                     String.write(
                         RegexError(
-                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            (
+                                "Unicode code point > U+00FF not supported in"
+                                " byte-mode matching"
+                            ),
                             self.pos - 5,
                         )
                     )
@@ -670,7 +672,10 @@ struct Parser[origin: Origin](Movable):
                 raise Error(
                     String.write(
                         RegexError(
-                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            (
+                                "Unicode code point > U+00FF not supported in"
+                                " byte-mode matching"
+                            ),
                             self.pos - 9,
                         )
                     )
@@ -767,7 +772,9 @@ struct Parser[origin: Origin](Movable):
         if self._at_end():
             raise Error(
                 String.write(
-                    RegexError("Trailing backslash in character class", self.pos - 1)
+                    RegexError(
+                        "Trailing backslash in character class", self.pos - 1
+                    )
                 )
             )
         var esc = self._advance()
@@ -787,7 +794,10 @@ struct Parser[origin: Origin](Movable):
                 raise Error(
                     String.write(
                         RegexError(
-                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            (
+                                "Unicode code point > U+00FF not supported in"
+                                " byte-mode matching"
+                            ),
                             self.pos - 5,
                         )
                     )
@@ -799,7 +809,10 @@ struct Parser[origin: Origin](Movable):
                 raise Error(
                     String.write(
                         RegexError(
-                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            (
+                                "Unicode code point > U+00FF not supported in"
+                                " byte-mode matching"
+                            ),
                             self.pos - 9,
                         )
                     )
@@ -833,7 +846,9 @@ struct Parser[origin: Origin](Movable):
 
         while not self._at_end() and self._peek() != CHAR_RBRACKET:
             # Check for shorthand classes first (they add multiple ranges)
-            if self._peek() == CHAR_BACKSLASH and self.pos + 1 < len(self.pattern):
+            if self._peek() == CHAR_BACKSLASH and self.pos + 1 < len(
+                self.pattern
+            ):
                 var esc = self.pattern.unsafe_get(self.pos + 1)
                 if esc == CHAR_D_LOWER:
                     self.pos += 2
@@ -849,7 +864,9 @@ struct Parser[origin: Origin](Movable):
                     cs.add_range(UInt32(CHAR_A_LOWER), UInt32(CHAR_Z_LOWER))
                     cs.add_range(UInt32(CHAR_A_UPPER), UInt32(CHAR_Z_UPPER))
                     cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
-                    cs.add_range(UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE))
+                    cs.add_range(
+                        UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE)
+                    )
                     continue
                 elif esc == CHAR_W_UPPER:
                     self.pos += 2

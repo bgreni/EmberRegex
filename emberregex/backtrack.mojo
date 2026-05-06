@@ -109,7 +109,10 @@ def _exit_is_eol_then_match(nfa: NFA, out2: Int) -> Bool:
     ref s = nfa.states[out2]
     if s.kind != NFAStateKind.ANCHOR:
         return False
-    if s.anchor_type != AnchorKind.EOL and s.anchor_type != AnchorKind.EOL_MULTILINE:
+    if (
+        s.anchor_type != AnchorKind.EOL
+        and s.anchor_type != AnchorKind.EOL_MULTILINE
+    ):
         return False
     var nxt = s.out1
     if nxt < 0 or nxt >= len(nfa.states):
@@ -252,8 +255,7 @@ def _sbt_try_match[
                     # the anchor check into the loop so we don't recurse for
                     # every position checked.
                     comptime is_multiline_eol = (
-                        nfa.states[out2].anchor_type
-                        == AnchorKind.EOL_MULTILINE
+                        nfa.states[out2].anchor_type == AnchorKind.EOL_MULTILINE
                     )
                     var p = max_pos
                     while p >= pos:

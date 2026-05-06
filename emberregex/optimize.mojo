@@ -66,10 +66,7 @@ def _match_unreachable_without_byte(nfa: NFA, byte: Int) -> Bool:
             continue
         var kind = nfa.states[s].kind
         # Block CHAR states matching the candidate byte
-        if (
-            kind == NFAStateKind.CHAR
-            and Int(nfa.states[s].char_value) == byte
-        ):
+        if kind == NFAStateKind.CHAR and Int(nfa.states[s].char_value) == byte:
             continue
         visited[s] = True
         if kind == NFAStateKind.MATCH:

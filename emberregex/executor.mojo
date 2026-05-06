@@ -455,7 +455,8 @@ def _bt_try_match[
     mut slots: List[Int],
     depth: Int,
 ) -> Int:
-    """Generic backtracking matcher used by the Pike VM for lookahead/lookbehind."""
+    """Generic backtracking matcher used by the Pike VM for lookahead/lookbehind.
+    """
     if depth > 10000:
         return -1
     if state_idx < 0 or state_idx >= len(nfa.states):
@@ -472,7 +473,9 @@ def _bt_try_match[
             return -1
         var ch = input.unsafe_get(pos)
         if UInt32(ch) == state.char_value:
-            return _bt_try_match(nfa, input, state.out1, pos + 1, slots, depth + 1)
+            return _bt_try_match(
+                nfa, input, state.out1, pos + 1, slots, depth + 1
+            )
         return -1
 
     elif kind == NFAStateKind.ANY:
@@ -480,7 +483,9 @@ def _bt_try_match[
             return -1
         var ch = input.unsafe_get(pos)
         if ch != CHAR_NEWLINE:
-            return _bt_try_match(nfa, input, state.out1, pos + 1, slots, depth + 1)
+            return _bt_try_match(
+                nfa, input, state.out1, pos + 1, slots, depth + 1
+            )
         return -1
 
     elif kind == NFAStateKind.CHARSET:
@@ -489,7 +494,9 @@ def _bt_try_match[
         var ch = UInt32(input.unsafe_get(pos))
         var cs_idx = state.charset_index
         if nfa.charsets.unsafe_get(cs_idx).contains(ch):
-            return _bt_try_match(nfa, input, state.out1, pos + 1, slots, depth + 1)
+            return _bt_try_match(
+                nfa, input, state.out1, pos + 1, slots, depth + 1
+            )
         return -1
 
     elif kind == NFAStateKind.SPLIT:
@@ -497,14 +504,22 @@ def _bt_try_match[
         var out2 = state.out2
         if state.greedy and out1 >= 0 and out1 < len(nfa.states):
             ref any_state = nfa.states.unsafe_get(out1)
-            if any_state.kind == NFAStateKind.ANY and any_state.out1 == state_idx:
+            if (
+                any_state.kind == NFAStateKind.ANY
+                and any_state.out1 == state_idx
+            ):
                 var max_pos = pos
                 var input_len = len(input)
-                while max_pos < input_len and input.unsafe_get(max_pos) != CHAR_NEWLINE:
+                while (
+                    max_pos < input_len
+                    and input.unsafe_get(max_pos) != CHAR_NEWLINE
+                ):
                     max_pos += 1
                 var p = max_pos
                 while p >= pos:
-                    var result = _bt_try_match(nfa, input, out2, p, slots, depth + 1)
+                    var result = _bt_try_match(
+                        nfa, input, out2, p, slots, depth + 1
+                    )
                     if result >= 0:
                         return result
                     p -= 1
@@ -520,7 +535,9 @@ def _bt_try_match[
         if slot >= 0 and slot < len(slots):
             old_val = slots.unsafe_get(slot)
             slots.unsafe_set(slot, pos)
-        var result = _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
+        var result = _bt_try_match(
+            nfa, input, state.out1, pos, slots, depth + 1
+        )
         if result < 0 and slot >= 0 and slot < len(slots):
             slots.unsafe_set(slot, old_val)
         return result
@@ -532,7 +549,9 @@ def _bt_try_match[
 
     elif kind == NFAStateKind.LOOKAHEAD:
         var sub_slots = slots.copy()
-        var sub_result = _bt_try_match(nfa, input, state.sub_start, pos, sub_slots, depth + 1)
+        var sub_result = _bt_try_match(
+            nfa, input, state.sub_start, pos, sub_slots, depth + 1
+        )
         if (sub_result >= 0) != state.negated:
             return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
         return -1
@@ -573,7 +592,9 @@ def _bt_try_match[
             for i in range(ref_len):
                 if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
                     return -1
-        return _bt_try_match(nfa, input, state.out1, pos + ref_len, slots, depth + 1)
+        return _bt_try_match(
+            nfa, input, state.out1, pos + ref_len, slots, depth + 1
+        )
 
     return -1
 
