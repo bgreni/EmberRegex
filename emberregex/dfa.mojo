@@ -108,7 +108,7 @@ struct LazyDFA(Copyable, Movable):
         self._ensure_init(nfa)
         var current = self._init_start  # full_match starts at pos 0
         var ptr = input.unsafe_ptr()
-        var length = len(input)
+        var length = input.byte_length()
 
         for i in range(length):
             # Inline the cache-hit path to avoid _step call overhead

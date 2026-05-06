@@ -15,6 +15,7 @@ from .constants import (
     CHAR_BANG,
     CHAR_B_LOWER,
     CHAR_B_UPPER,
+    CHAR_C_LOWER,
     CHAR_CARET,
     CHAR_COLON,
     CHAR_COMMA,
@@ -24,7 +25,11 @@ from .constants import (
     CHAR_D_LOWER,
     CHAR_D_UPPER,
     CHAR_EQUALS,
+    CHAR_F_LOWER,
+    CHAR_F_UPPER,
     CHAR_GREATER_THAN,
+    CHAR_G_LOWER,
+    CHAR_HASH,
     CHAR_I_LOWER,
     CHAR_LBRACE,
     CHAR_LBRACKET,
@@ -47,9 +52,12 @@ from .constants import (
     CHAR_STAR,
     CHAR_S_LOWER,
     CHAR_TAB,
+    CHAR_U_LOWER,
+    CHAR_U_UPPER,
     CHAR_UNDERSCORE,
     CHAR_W_LOWER,
     CHAR_W_UPPER,
+    CHAR_X_LOWER,
     CHAR_ZERO,
     CHAR_Z_LOWER,
     CHAR_Z_UPPER,
@@ -141,11 +149,14 @@ struct Parser[origin: Origin](Movable):
     def _parse_concat(mut self) raises -> Int:
         """concat = quantified+"""
         var parts = List[Int]()
-        while (
-            not self._at_end()
-            and self._peek() != CHAR_PIPE
-            and self._peek() != CHAR_RPAREN
-        ):
+        while True:
+            self._skip_verbose()
+            if (
+                self._at_end()
+                or self._peek() == CHAR_PIPE
+                or self._peek() == CHAR_RPAREN
+            ):
+                break
             parts.append(self._parse_quantified())
 
         if len(parts) == 0:
@@ -161,6 +172,8 @@ struct Parser[origin: Origin](Movable):
     def _parse_quantified(mut self) raises -> Int:
         """quantified = atom ('*' | '+' | '?' | '{n,m}')?  '?'?"""
         var atom_idx = self._parse_atom()
+
+        self._skip_verbose()
 
         if self._at_end():
             return atom_idx
@@ -277,6 +290,63 @@ struct Parser[origin: Origin](Movable):
     def _is_digit(ch: Byte) -> Bool:
         return ch >= CHAR_ZERO and ch <= CHAR_NINE
 
+    @staticmethod
+    def _is_flag_char(ch: Byte) -> Bool:
+        return (
+            ch == CHAR_I_LOWER
+            or ch == CHAR_M_LOWER
+            or ch == CHAR_S_LOWER
+            or ch == CHAR_X_LOWER
+        )
+
+    def _parse_hex_digits(mut self, count: Int) raises -> UInt32:
+        """Parse exactly `count` hex digits and return their value."""
+        var value: UInt32 = 0
+        for _ in range(count):
+            if self._at_end():
+                raise Error(
+                    String.write(
+                        RegexError("Expected hex digit", self.pos)
+                    )
+                )
+            var ch = self._advance()
+            if ch >= CHAR_ZERO and ch <= CHAR_NINE:
+                value = value * 16 + UInt32(ch - CHAR_ZERO)
+            elif ch >= CHAR_A_LOWER and ch <= CHAR_F_LOWER:
+                value = value * 16 + UInt32(ch - CHAR_A_LOWER + 10)
+            elif ch >= CHAR_A_UPPER and ch <= CHAR_F_UPPER:
+                value = value * 16 + UInt32(ch - CHAR_A_UPPER + 10)
+            else:
+                raise Error(
+                    String.write(
+                        RegexError(
+                            "Invalid hex digit '" + chr(Int(ch)) + "'",
+                            self.pos - 1,
+                        )
+                    )
+                )
+        return value
+
+    def _skip_verbose(mut self):
+        """Skip whitespace and # comments when verbose mode is active."""
+        if not self.inline_flags.verbose():
+            return
+        while not self._at_end():
+            var ch = self._peek()
+            if ch == CHAR_HASH:
+                # Skip until end of line
+                while not self._at_end() and self._peek() != CHAR_NEWLINE:
+                    self.pos += 1
+            elif (
+                ch == CHAR_SPACE
+                or ch == CHAR_TAB
+                or ch == CHAR_NEWLINE
+                or ch == CHAR_CR
+            ):
+                self.pos += 1
+            else:
+                break
+
     def _parse_atom(mut self) raises -> Int:
         """atom = CHAR | '.' | '[' charset ']' | '(' regex ')' | '\\\\' ESCAPE | '^' | '$'
         """
@@ -386,28 +456,39 @@ struct Parser[origin: Origin](Movable):
                 self.ast.group_count += 1
                 group_index = self.ast.group_count
                 self.ast.group_names[name^] = group_index
-            elif (
-                modifier == CHAR_I_LOWER
-                or modifier == CHAR_M_LOWER
-                or modifier == CHAR_S_LOWER
-            ):
-                # Inline flags: (?i), (?m), (?s) or (?i:...) etc.
-                var inline_flags = self._parse_inline_flags()
+            elif modifier == CHAR_HASH:
+                # Inline comment: (?#...) — skip until closing ')'
+                self.pos += 1  # consume '#'
+                while not self._at_end() and self._peek() != CHAR_RPAREN:
+                    self.pos += 1
+                self._expect(CHAR_RPAREN)
+                var node = ASTNode.concat(List[Int]())
+                return self.ast.add_node(node^)
+            elif Self._is_flag_char(modifier) or modifier == CHAR_MINUS:
+                # Inline flags: (?i), (?m), (?s), (?x), (?i-m), (?-i), etc.
+                var add_flags, remove_flags = self._parse_inline_flags()
                 if not self._at_end() and self._peek() == CHAR_RPAREN:
-                    # (?ims) — set flags globally
+                    # (?flags) or (?-flags) — apply globally
                     self.pos += 1  # consume ')'
                     self.inline_flags = RegexFlags(
-                        self.inline_flags.value | inline_flags.value
+                        (self.inline_flags.value | add_flags.value)
+                        & ~remove_flags.value
                     )
-                    # Return empty concat node
                     var node = ASTNode.concat(List[Int]())
                     return self.ast.add_node(node^)
                 elif not self._at_end() and self._peek() == CHAR_COLON:
                     self.pos += 1  # consume ':'
+                    # Temporarily apply verbose change during inner parse
+                    var saved_flags = self.inline_flags
+                    self.inline_flags = RegexFlags(
+                        (self.inline_flags.value | add_flags.value)
+                        & ~remove_flags.value
+                    )
                     var inner = self._parse_alternation()
+                    self.inline_flags = saved_flags
                     self._expect(CHAR_RPAREN)
                     return self.ast.add_node(
-                        ASTNode.scoped_flags(inner, inline_flags)
+                        ASTNode.scoped_flags(inner, add_flags, remove_flags)
                     )
                 else:
                     raise Error(
@@ -443,23 +524,48 @@ struct Parser[origin: Origin](Movable):
 
         return self.ast.add_node(ASTNode.group(inner, group_index))
 
-    def _parse_inline_flags(mut self) -> RegexFlags:
-        """Parse inline flag characters (i, m, s) and return the flags."""
-        var flags = RegexFlags()
+    def _parse_one_flag(mut self) -> Int:
+        """Consume one flag character and return its bitmask, or 0 if not a flag."""
+        var ch = self._peek()
+        if ch == CHAR_I_LOWER:
+            self.pos += 1
+            return RegexFlags.IGNORECASE
+        elif ch == CHAR_M_LOWER:
+            self.pos += 1
+            return RegexFlags.MULTILINE
+        elif ch == CHAR_S_LOWER:
+            self.pos += 1
+            return RegexFlags.DOTALL
+        elif ch == CHAR_X_LOWER:
+            self.pos += 1
+            return RegexFlags.VERBOSE
+        return 0
+
+    def _parse_inline_flags(mut self) -> Tuple[RegexFlags, RegexFlags]:
+        """Parse inline flag chars (i, m, s, x) with optional removal via '-'.
+
+        Returns (add_flags, remove_flags).
+        """
+        var add_val = 0
+        var remove_val = 0
+
+        # Collect flags to add
         while not self._at_end():
-            var ch = self._peek()
-            if ch == CHAR_I_LOWER:
-                flags = RegexFlags(flags.value | RegexFlags.IGNORECASE)
-                self.pos += 1
-            elif ch == CHAR_M_LOWER:
-                flags = RegexFlags(flags.value | RegexFlags.MULTILINE)
-                self.pos += 1
-            elif ch == CHAR_S_LOWER:
-                flags = RegexFlags(flags.value | RegexFlags.DOTALL)
-                self.pos += 1
-            else:
+            var bit = self._parse_one_flag()
+            if bit == 0:
                 break
-        return flags^
+            add_val |= bit
+
+        # Collect flags to remove after '-'
+        if not self._at_end() and self._peek() == CHAR_MINUS:
+            self.pos += 1  # consume '-'
+            while not self._at_end():
+                var bit = self._parse_one_flag()
+                if bit == 0:
+                    break
+                remove_val |= bit
+
+        return (RegexFlags(add_val), RegexFlags(remove_val))
 
     def _parse_group_name(mut self) raises -> String:
         """Parse a group name (letters, digits, underscores)."""
@@ -508,10 +614,80 @@ struct Parser[origin: Origin](Movable):
                 ASTNode.anchor(AnchorKind.NOT_WORD_BOUNDARY)
             )
 
+        # Null character \0
+        if ch == CHAR_ZERO:
+            return self.ast.add_node(ASTNode.literal(UInt32(0)))
+
         # Backreferences \1 through \9
         if ch >= CHAR_ONE and ch <= CHAR_NINE:
             var group_index = Int(ch - CHAR_ZERO)
             return self.ast.add_node(ASTNode.backreference(group_index))
+
+        # Named / numeric backreferences: \g<name> or \g<N>
+        if ch == CHAR_G_LOWER:
+            self._expect(CHAR_LESS_THAN)
+            if not self._at_end() and Self._is_digit(self._peek()):
+                var n = self._parse_int()
+                self._expect(CHAR_GREATER_THAN)
+                return self.ast.add_node(ASTNode.backreference(n))
+            var name = self._parse_group_name()
+            self._expect(CHAR_GREATER_THAN)
+            var maybe_idx = self.ast.group_names.get(name)
+            if maybe_idx:
+                return self.ast.add_node(
+                    ASTNode.backreference(maybe_idx.value())
+                )
+            raise Error(
+                String.write(
+                    RegexError(
+                        "Unknown group name '" + name + "' in \\g<>",
+                        self.pos - name.byte_length() - 2,
+                    )
+                )
+            )
+
+        # Hex escape: \xHH
+        if ch == CHAR_X_LOWER:
+            var cp = self._parse_hex_digits(2)
+            return self.ast.add_node(ASTNode.literal(cp))
+
+        # Unicode escapes: \uHHHH and \UHHHHHHHH
+        if ch == CHAR_U_LOWER:
+            var cp = self._parse_hex_digits(4)
+            if cp > 255:
+                raise Error(
+                    String.write(
+                        RegexError(
+                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            self.pos - 5,
+                        )
+                    )
+                )
+            return self.ast.add_node(ASTNode.literal(cp))
+        if ch == CHAR_U_UPPER:
+            var cp = self._parse_hex_digits(8)
+            if cp > 255:
+                raise Error(
+                    String.write(
+                        RegexError(
+                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            self.pos - 9,
+                        )
+                    )
+                )
+            return self.ast.add_node(ASTNode.literal(cp))
+
+        # Control character: \cX  (value = X & 0x1F)
+        if ch == CHAR_C_LOWER:
+            if self._at_end():
+                raise Error(
+                    String.write(
+                        RegexError("Expected character after \\c", self.pos - 1)
+                    )
+                )
+            var ctrl = self._advance()
+            var cp = UInt32(ctrl) & 0x1F
+            return self.ast.add_node(ASTNode.literal(cp))
 
         # Shorthand character classes
         if ch == CHAR_D_LOWER or ch == CHAR_D_UPPER:
@@ -575,6 +751,71 @@ struct Parser[origin: Origin](Movable):
             )
         )
 
+    def _parse_cc_codepoint(mut self) raises -> UInt32:
+        """Parse one code-point value inside a char class (after consuming the
+        leading char or backslash).  Does NOT handle shorthand classes like
+        \\d/\\w/\\s — those must be detected before calling this helper.
+
+        Consumes only single-codepoint escapes and literal bytes.
+        Returns the code-point value as UInt32.
+        """
+        var ch = self._advance()
+        if ch != CHAR_BACKSLASH:
+            return UInt32(ch)
+
+        # It is an escape
+        if self._at_end():
+            raise Error(
+                String.write(
+                    RegexError("Trailing backslash in character class", self.pos - 1)
+                )
+            )
+        var esc = self._advance()
+        if esc == CHAR_t:
+            return UInt32(CHAR_TAB)
+        elif esc == CHAR_n:
+            return UInt32(CHAR_NEWLINE)
+        elif esc == CHAR_r:
+            return UInt32(CHAR_CR)
+        elif esc == CHAR_ZERO:
+            return 0
+        elif esc == CHAR_X_LOWER:
+            return self._parse_hex_digits(2)
+        elif esc == CHAR_U_LOWER:
+            var cp = self._parse_hex_digits(4)
+            if cp > 255:
+                raise Error(
+                    String.write(
+                        RegexError(
+                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            self.pos - 5,
+                        )
+                    )
+                )
+            return cp
+        elif esc == CHAR_U_UPPER:
+            var cp = self._parse_hex_digits(8)
+            if cp > 255:
+                raise Error(
+                    String.write(
+                        RegexError(
+                            "Unicode code point > U+00FF not supported in byte-mode matching",
+                            self.pos - 9,
+                        )
+                    )
+                )
+            return cp
+        elif esc == CHAR_C_LOWER:
+            if self._at_end():
+                raise Error(
+                    String.write(
+                        RegexError("Expected character after \\c", self.pos - 1)
+                    )
+                )
+            return UInt32(self._advance()) & 0x1F
+        # Any other escaped char is taken literally (metacharacter or letter)
+        return UInt32(esc)
+
     def _parse_char_class(mut self) raises -> Int:
         """Parse a character class: [abc], [a-z], [^abc], etc."""
         self.pos += 1  # consume '['
@@ -591,41 +832,27 @@ struct Parser[origin: Origin](Movable):
             self.pos += 1
 
         while not self._at_end() and self._peek() != CHAR_RBRACKET:
-            var ch = self._advance()
-            if ch == CHAR_BACKSLASH:
-                # Escape inside char class
-                if self._at_end():
-                    raise Error(
-                        String.write(
-                            RegexError(
-                                "Trailing backslash in character class",
-                                self.pos - 1,
-                            )
-                        )
-                    )
-                var esc = self._peek()
-                # Shorthand classes inside char class
+            # Check for shorthand classes first (they add multiple ranges)
+            if self._peek() == CHAR_BACKSLASH and self.pos + 1 < len(self.pattern):
+                var esc = self.pattern.unsafe_get(self.pos + 1)
                 if esc == CHAR_D_LOWER:
-                    self.pos += 1
+                    self.pos += 2
                     cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
                     continue
                 elif esc == CHAR_D_UPPER:
-                    # \D inside a class is complex — skip for now, just add ranges
-                    self.pos += 1
+                    self.pos += 2
                     cs.add_range(0, UInt32(CHAR_ZERO) - 1)
                     cs.add_range(UInt32(CHAR_NINE) + 1, 127)
                     continue
                 elif esc == CHAR_W_LOWER:
-                    self.pos += 1
+                    self.pos += 2
                     cs.add_range(UInt32(CHAR_A_LOWER), UInt32(CHAR_Z_LOWER))
                     cs.add_range(UInt32(CHAR_A_UPPER), UInt32(CHAR_Z_UPPER))
                     cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
-                    cs.add_range(
-                        UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE)
-                    )
+                    cs.add_range(UInt32(CHAR_UNDERSCORE), UInt32(CHAR_UNDERSCORE))
                     continue
                 elif esc == CHAR_W_UPPER:
-                    self.pos += 1
+                    self.pos += 2
                     cs.add_range(0, 47)
                     cs.add_range(58, 64)
                     cs.add_range(91, 94)
@@ -633,7 +860,7 @@ struct Parser[origin: Origin](Movable):
                     cs.add_range(123, 255)
                     continue
                 elif esc == CHAR_S_LOWER:
-                    self.pos += 1
+                    self.pos += 2
                     cs.add_range(UInt32(CHAR_SPACE), UInt32(CHAR_SPACE))
                     cs.add_range(UInt32(CHAR_TAB), UInt32(CHAR_TAB))
                     cs.add_range(UInt32(CHAR_NEWLINE), UInt32(CHAR_NEWLINE))
@@ -642,57 +869,33 @@ struct Parser[origin: Origin](Movable):
                     cs.add_range(0x0C, 0x0C)
                     continue
                 elif esc == CHAR_S:
-                    self.pos += 1
+                    self.pos += 2
                     cs.add_range(0, 8)
                     cs.add_range(14, 31)
                     cs.add_range(33, 255)
                     continue
-                elif esc == CHAR_t:
-                    self.pos += 1
-                    ch = CHAR_TAB
-                elif esc == CHAR_n:
-                    self.pos += 1
-                    ch = CHAR_NEWLINE
-                elif esc == CHAR_r:
-                    self.pos += 1
-                    ch = CHAR_CR
-                else:
-                    ch = self._advance()
 
-            # Check for range: a-z
-            if not self._at_end() and self._peek() == CHAR_MINUS:
-                # Peek ahead to see if this is a range or a literal '-' at end
-                if (
-                    self.pos + 1 < len(self.pattern)
-                    and self.pattern.unsafe_get(self.pos + 1) != CHAR_RBRACKET
-                ):
-                    self.pos += 1  # consume '-'
-                    var hi_ch = self._advance()
-                    if hi_ch == CHAR_BACKSLASH:
-                        if self._at_end():
-                            raise Error(
-                                String.write(
-                                    RegexError(
-                                        "Trailing backslash in character class",
-                                        self.pos - 1,
-                                    )
-                                )
-                            )
-                        hi_ch = self._advance()
-                    if UInt32(hi_ch) < UInt32(ch):
-                        raise Error(
-                            String.write(
-                                RegexError(
-                                    "Invalid character range",
-                                    self.pos - 2,
-                                )
-                            )
+            # Single code-point (literal or single-char escape)
+            var lo = self._parse_cc_codepoint()
+
+            # Check for range: lo-hi
+            if (
+                not self._at_end()
+                and self._peek() == CHAR_MINUS
+                and self.pos + 1 < len(self.pattern)
+                and self.pattern.unsafe_get(self.pos + 1) != CHAR_RBRACKET
+            ):
+                self.pos += 1  # consume '-'
+                var hi = self._parse_cc_codepoint()
+                if hi < lo:
+                    raise Error(
+                        String.write(
+                            RegexError("Invalid character range", self.pos - 2)
                         )
-                    cs.add_range(UInt32(ch), UInt32(hi_ch))
-                else:
-                    cs.add_range(UInt32(ch), UInt32(ch))
+                    )
+                cs.add_range(lo, hi)
             else:
-                cs.add_range(UInt32(ch), UInt32(ch))
+                cs.add_range(lo, lo)
 
         if self._at_end():
             raise Error(

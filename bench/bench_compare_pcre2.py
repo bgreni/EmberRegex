@@ -126,7 +126,7 @@ def run_mojo_static_benchmarks() -> dict[str, float]:
         return {}
 
     result = subprocess.run(
-        [pixi_cmd, "run", "bench_static"],
+        [pixi_cmd, "run", "bench"],
         capture_output=True, text=True,
         cwd=REPO_ROOT,
     )
@@ -398,7 +398,7 @@ def main() -> None:
     pcre2 = run_pcre2_benchmarks()
 
     print(f"\n{'═' * width}")
-    print(f"  Running StaticRegex benchmarks (pixi run bench_static)...")
+    print(f"  Running StaticRegex benchmarks (pixi run bench)...")
     print(f"{'═' * width}")
     static = run_mojo_static_benchmarks()
 

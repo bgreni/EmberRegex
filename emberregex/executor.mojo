@@ -24,7 +24,7 @@ from .nfa import NFA, NFAState, NFAStateKind
 from .charset import CharSet
 from .ast import AnchorKind
 from .result import MatchResult
-from .backtrack import _bt_try_match
+from std.collections import InlineArray
 from std.memory import memset
 
 
@@ -69,8 +69,13 @@ struct _VMBuffers(Copyable):
         memset(self.best_slots.unsafe_ptr(), -1, self.num_slots)
 
 
-struct PikeVM(Copyable):
-    """Parallel NFA simulation (Pike VM) with capture group support."""
+struct PikeVM[num_slots: Int](Copyable):
+    """Parallel NFA simulation (Pike VM) with capture group support.
+
+    Parameterised on `num_slots` (= 2 * group_count) so the returned
+    `MatchResult` carries an `InlineArray` whose length is fixed at compile
+    time. The NFA's runtime `group_count` must equal `num_slots // 2`.
+    """
 
     var nfa: NFA
 
@@ -79,24 +84,24 @@ struct PikeVM(Copyable):
 
     def full_match_with_bufs(
         self, input: String, mut bufs: _VMBuffers
-    ) -> MatchResult:
+    ) -> MatchResult[Self.num_slots]:
         """Match the entire input string against the pattern."""
         var result = self._execute_with_bufs(input.as_bytes(), 0, bufs)
-        if result.matched and result.end == len(input):
+        if result.matched and result.end == input.byte_length():
             return result^
-        return MatchResult.no_match(self.nfa.group_count)
+        return MatchResult[Self.num_slots].no_match()
 
     def search_with_bufs(
         self, input: String, mut bufs: _VMBuffers
-    ) -> MatchResult:
+    ) -> MatchResult[Self.num_slots]:
         """Search for the first match anywhere in the input."""
         var i = 0
-        while i <= len(input):
+        while i <= input.byte_length():
             var result = self._execute_with_bufs(input.as_bytes(), i, bufs)
             if result.matched:
                 return result^
             i += 1
-        return MatchResult.no_match(self.nfa.group_count)
+        return MatchResult[Self.num_slots].no_match()
 
     def _execute_with_bufs[
         origin: Origin, //
@@ -106,7 +111,7 @@ struct PikeVM(Copyable):
         start_pos: Int,
         mut bufs: _VMBuffers,
         max_pos: Int = -1,
-    ) -> MatchResult:
+    ) -> MatchResult[Self.num_slots]:
         """Core NFA simulation using pre-allocated buffers.
 
         If max_pos >= 0, limits processing to positions < max_pos.
@@ -115,9 +120,8 @@ struct PikeVM(Copyable):
         if max_pos >= 0 and max_pos < input_len:
             input_len = max_pos
         var num_states = bufs.num_states
-        var num_slots = bufs.num_slots
         if num_states == 0:
-            return MatchResult.no_match(self.nfa.group_count)
+            return MatchResult[Self.num_slots].no_match()
 
         var ptr = input.unsafe_ptr()
         bufs.reset()
@@ -135,7 +139,6 @@ struct PikeVM(Copyable):
             input,
             input_len,
             start_pos,
-            num_slots,
         )
 
         var best_match_end = -1
@@ -154,11 +157,11 @@ struct PikeVM(Copyable):
                     if not matched or pos > best_match_end:
                         matched = True
                         best_match_end = pos
-                        for s in range(num_slots):
+                        for s in range(Self.num_slots):
                             bufs.best_slots.unsafe_set(
                                 s,
                                 bufs.current_slot_data.unsafe_get(
-                                    i * num_slots + s
+                                    i * Self.num_slots + s
                                 ),
                             )
 
@@ -181,8 +184,8 @@ struct PikeVM(Copyable):
                 var out1 = state.out1
 
                 # Copy current slots to temp buffer
-                var base = i * num_slots
-                for s in range(num_slots):
+                var base = i * Self.num_slots
+                for s in range(Self.num_slots):
                     bufs.temp_slots.unsafe_set(
                         s, bufs.current_slot_data.unsafe_get(base + s)
                     )
@@ -199,7 +202,6 @@ struct PikeVM(Copyable):
                             input,
                             input_len,
                             pos + 1,
-                            num_slots,
                         )
                 elif kind == NFAStateKind.ANY:
                     if ch != UInt32(CHAR_NEWLINE):
@@ -213,7 +215,6 @@ struct PikeVM(Copyable):
                             input,
                             input_len,
                             pos + 1,
-                            num_slots,
                         )
                 elif kind == NFAStateKind.CHARSET:
                     var cs_idx = state.charset_index
@@ -228,7 +229,6 @@ struct PikeVM(Copyable):
                             input,
                             input_len,
                             pos + 1,
-                            num_slots,
                         )
 
             # Swap current <-> next
@@ -240,7 +240,6 @@ struct PikeVM(Copyable):
             bufs.current_slot_data = bufs.next_slot_data^
             bufs.next_slot_data = tmp_slot_data^
             bufs.next_slot_data.clear()
-            curr_gen = next_gen
 
             pos += 1
 
@@ -258,27 +257,25 @@ struct PikeVM(Copyable):
                 if not matched or pos > best_match_end:
                     matched = True
                     best_match_end = pos
-                    for s in range(num_slots):
+                    for s in range(Self.num_slots):
                         bufs.best_slots.unsafe_set(
                             s,
                             bufs.current_slot_data.unsafe_get(
-                                i * num_slots + s
+                                i * Self.num_slots + s
                             ),
                         )
 
         if matched:
-            # Copy best_slots out before returning
-            var result_slots = List[Int]()
-            for s in range(num_slots):
-                result_slots.append(bufs.best_slots.unsafe_get(s))
-            return MatchResult(
+            var result_slots = InlineArray[Int, Self.num_slots](fill=-1)
+            for s in range(Self.num_slots):
+                result_slots[s] = bufs.best_slots.unsafe_get(s)
+            return MatchResult[Self.num_slots](
                 matched=True,
                 start=start_pos,
                 end=best_match_end,
-                group_count=self.nfa.group_count,
                 slots=result_slots^,
             )
-        return MatchResult.no_match(self.nfa.group_count)
+        return MatchResult[Self.num_slots].no_match()
 
     def _add_state[
         origin: Origin, //
@@ -293,7 +290,6 @@ struct PikeVM(Copyable):
         input: Span[Byte, origin],
         input_len: Int,
         pos: Int,
-        num_slots: Int,
     ):
         """Add a state, following epsilon transitions (SPLIT, SAVE, ANCHOR).
 
@@ -329,7 +325,6 @@ struct PikeVM(Copyable):
                     input,
                     input_len,
                     pos,
-                    num_slots,
                 )
                 state_idx = state.out2
                 continue
@@ -338,7 +333,7 @@ struct PikeVM(Copyable):
                 gen.unsafe_set(state_idx, gen_val)
                 var slot = state.save_slot
                 var out1 = state.out1
-                if slot >= 0 and slot < num_slots:
+                if slot >= 0 and slot < Self.num_slots:
                     var old_val = slots.unsafe_get(slot)
                     slots.unsafe_set(slot, pos)
                     # Cannot tail-call — must restore slot after subtree.
@@ -352,7 +347,6 @@ struct PikeVM(Copyable):
                         input,
                         input_len,
                         pos,
-                        num_slots,
                     )
                     slots.unsafe_set(slot, old_val)
                 else:
@@ -395,7 +389,7 @@ struct PikeVM(Copyable):
                 # Consuming state (CHAR, CHARSET, ANY, MATCH) — commit to flat array
                 gen.unsafe_set(state_idx, gen_val)
                 state_list.append(state_idx)
-                for s in range(num_slots):
+                for s in range(Self.num_slots):
                     slot_data.append(slots.unsafe_get(s))
                 return
 
@@ -449,3 +443,186 @@ struct PikeVM(Copyable):
             or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
             or ch == CHAR_UNDERSCORE
         )
+
+
+def _bt_try_match[
+    origin: Origin, //
+](
+    nfa: NFA,
+    input: Span[Byte, origin],
+    state_idx: Int,
+    pos: Int,
+    mut slots: List[Int],
+    depth: Int,
+) -> Int:
+    """Generic backtracking matcher used by the Pike VM for lookahead/lookbehind."""
+    if depth > 10000:
+        return -1
+    if state_idx < 0 or state_idx >= len(nfa.states):
+        return -1
+
+    ref state = nfa.states.unsafe_get(state_idx)
+    var kind = state.kind
+
+    if kind == NFAStateKind.MATCH:
+        return pos
+
+    elif kind == NFAStateKind.CHAR:
+        if pos >= len(input):
+            return -1
+        var ch = input.unsafe_get(pos)
+        if UInt32(ch) == state.char_value:
+            return _bt_try_match(nfa, input, state.out1, pos + 1, slots, depth + 1)
+        return -1
+
+    elif kind == NFAStateKind.ANY:
+        if pos >= len(input):
+            return -1
+        var ch = input.unsafe_get(pos)
+        if ch != CHAR_NEWLINE:
+            return _bt_try_match(nfa, input, state.out1, pos + 1, slots, depth + 1)
+        return -1
+
+    elif kind == NFAStateKind.CHARSET:
+        if pos >= len(input):
+            return -1
+        var ch = UInt32(input.unsafe_get(pos))
+        var cs_idx = state.charset_index
+        if nfa.charsets.unsafe_get(cs_idx).contains(ch):
+            return _bt_try_match(nfa, input, state.out1, pos + 1, slots, depth + 1)
+        return -1
+
+    elif kind == NFAStateKind.SPLIT:
+        var out1 = state.out1
+        var out2 = state.out2
+        if state.greedy and out1 >= 0 and out1 < len(nfa.states):
+            ref any_state = nfa.states.unsafe_get(out1)
+            if any_state.kind == NFAStateKind.ANY and any_state.out1 == state_idx:
+                var max_pos = pos
+                var input_len = len(input)
+                while max_pos < input_len and input.unsafe_get(max_pos) != CHAR_NEWLINE:
+                    max_pos += 1
+                var p = max_pos
+                while p >= pos:
+                    var result = _bt_try_match(nfa, input, out2, p, slots, depth + 1)
+                    if result >= 0:
+                        return result
+                    p -= 1
+                return -1
+        var result = _bt_try_match(nfa, input, out1, pos, slots, depth + 1)
+        if result >= 0:
+            return result
+        return _bt_try_match(nfa, input, out2, pos, slots, depth + 1)
+
+    elif kind == NFAStateKind.SAVE:
+        var slot = state.save_slot
+        var old_val = -1
+        if slot >= 0 and slot < len(slots):
+            old_val = slots.unsafe_get(slot)
+            slots.unsafe_set(slot, pos)
+        var result = _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
+        if result < 0 and slot >= 0 and slot < len(slots):
+            slots.unsafe_set(slot, old_val)
+        return result
+
+    elif kind == NFAStateKind.ANCHOR:
+        if _bt_check_anchor(state.anchor_type, input, len(input), pos):
+            return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
+        return -1
+
+    elif kind == NFAStateKind.LOOKAHEAD:
+        var sub_slots = slots.copy()
+        var sub_result = _bt_try_match(nfa, input, state.sub_start, pos, sub_slots, depth + 1)
+        if (sub_result >= 0) != state.negated:
+            return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
+        return -1
+
+    elif kind == NFAStateKind.LOOKBEHIND:
+        var lb_len = state.lookbehind_len
+        var matched = False
+        if pos >= lb_len:
+            var sub_slots = slots.copy()
+            var sub_result = _bt_try_match(
+                nfa, input, state.sub_start, pos - lb_len, sub_slots, depth + 1
+            )
+            matched = sub_result >= 0 and sub_result == pos
+        if matched != state.negated:
+            return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
+        return -1
+
+    elif kind == NFAStateKind.BACKREF:
+        var group = state.backref_group
+        var slot_start = 2 * group - 2
+        var slot_end = 2 * group - 1
+        if slot_start >= len(slots) or slot_end >= len(slots):
+            return -1
+        var gs = slots[slot_start]
+        var ge = slots[slot_end]
+        if gs < 0 or ge < 0:
+            return -1
+        var ref_len = ge - gs
+        if pos + ref_len > len(input):
+            return -1
+        if state.icase:
+            for i in range(ref_len):
+                if _bt_to_lower(input.unsafe_get(gs + i)) != _bt_to_lower(
+                    input.unsafe_get(pos + i)
+                ):
+                    return -1
+        else:
+            for i in range(ref_len):
+                if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
+                    return -1
+        return _bt_try_match(nfa, input, state.out1, pos + ref_len, slots, depth + 1)
+
+    return -1
+
+
+def _bt_check_anchor[
+    origin: Origin, //
+](
+    anchor_type: Int,
+    input: Span[Byte, origin],
+    input_len: Int,
+    pos: Int,
+) -> Bool:
+    if anchor_type == AnchorKind.BOL:
+        return pos == 0
+    elif anchor_type == AnchorKind.BOL_MULTILINE:
+        return pos == 0 or input.unsafe_get(pos - 1) == CHAR_NEWLINE
+    elif anchor_type == AnchorKind.EOL:
+        return pos == input_len
+    elif anchor_type == AnchorKind.EOL_MULTILINE:
+        return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
+    elif anchor_type == AnchorKind.WORD_BOUNDARY:
+        var left_is_word = False
+        var right_is_word = False
+        if pos > 0:
+            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
+        if pos < input_len:
+            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
+        return left_is_word != right_is_word
+    elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
+        var left_is_word = False
+        var right_is_word = False
+        if pos > 0:
+            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
+        if pos < input_len:
+            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
+        return left_is_word == right_is_word
+    return False
+
+
+def _bt_is_word_char(ch: Byte) -> Bool:
+    return (
+        (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
+        or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
+        or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
+        or ch == CHAR_UNDERSCORE
+    )
+
+
+def _bt_to_lower(ch: Byte) -> Byte:
+    if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
+        return ch + 32
+    return ch

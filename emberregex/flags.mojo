@@ -8,6 +8,7 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
     comptime IGNORECASE = 1  # (?i) - case-insensitive matching
     comptime MULTILINE = 2  # (?m) - ^ and $ match line boundaries
     comptime DOTALL = 4  # (?s) - dot matches newline
+    comptime VERBOSE = 8  # (?x) - ignore whitespace and # comments
 
     var value: Int
 
@@ -37,3 +38,6 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
 
     def dotall(self) -> Bool:
         return self.has(Self.DOTALL)
+
+    def verbose(self) -> Bool:
+        return self.has(Self.VERBOSE)

@@ -43,11 +43,71 @@ def is_pure_literal(nfa: NFA) -> Bool:
         var kind = nfa.states[state_idx].kind
         if kind == NFAStateKind.CHAR:
             state_idx = nfa.states[state_idx].out1
-        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+        elif kind == NFAStateKind.SAVE:
             state_idx = nfa.states[state_idx].out1
         else:
             return kind == NFAStateKind.MATCH
     return False
+
+
+def _match_unreachable_without_byte(nfa: NFA, byte: Int) -> Bool:
+    """BFS from start, treating CHAR(byte) states as blocked.
+
+    Returns True if no MATCH state is reachable from start when every
+    CHAR state matching `byte` is removed from the NFA.
+    """
+    var num_states = len(nfa.states)
+    var visited = List[Bool](length=num_states, fill=False)
+    var stack = List[Int]()
+    stack.append(nfa.start)
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= num_states or visited[s]:
+            continue
+        var kind = nfa.states[s].kind
+        # Block CHAR states matching the candidate byte
+        if (
+            kind == NFAStateKind.CHAR
+            and Int(nfa.states[s].char_value) == byte
+        ):
+            continue
+        visited[s] = True
+        if kind == NFAStateKind.MATCH:
+            return False
+        if kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[s].out1)
+            stack.append(nfa.states[s].out2)
+        else:
+            # CHAR/ANY/CHARSET/SAVE/ANCHOR/LOOKAHEAD/LOOKBEHIND/BACKREF
+            # all have a single out1 successor in the control-flow graph.
+            stack.append(nfa.states[s].out1)
+    return True
+
+
+def extract_required_byte(nfa: NFA) -> Int:
+    """Return a byte value that must appear in the input for any match,
+    or -1 if no such byte can be determined.
+
+    A byte b is required when every path from the NFA start state to a
+    MATCH state must traverse at least one CHAR state whose char_value
+    equals b. When found, callers can SIMD-scan for b and fast-fail if
+    absent.
+    """
+    var num_states = len(nfa.states)
+    # Collect candidate bytes from CHAR states (skip non-ASCII codepoints)
+    var seen = SIMD[DType.uint8, BITMAP_WIDTH](0)
+    for i in range(num_states):
+        ref st = nfa.states[i]
+        if st.kind == NFAStateKind.CHAR and st.char_value < 256:
+            var ch = Int(st.char_value)
+            seen[ch >> 3] = seen[ch >> 3] | (UInt8(1) << UInt8(ch & 7))
+    # Test each candidate byte
+    for b in range(256):
+        if (seen[b >> 3] & (UInt8(1) << UInt8(b & 7))) == 0:
+            continue
+        if _match_unreachable_without_byte(nfa, b):
+            return b
+    return -1
 
 
 def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
@@ -99,48 +159,10 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
                 )
         elif kind == NFAStateKind.CHARSET:
             var cs_idx = nfa.states[s].charset_index
-            if nfa.charsets[cs_idx].negated:
-                # Negated charset: matches all bytes NOT in the ranges
-                var tmp = SIMD[DType.uint8, BITMAP_WIDTH](0)
-                for i in range(len(nfa.charsets[cs_idx].ranges)):
-                    var lo = Int(nfa.charsets[cs_idx].ranges[i].lo)
-                    var hi = Int(nfa.charsets[cs_idx].ranges[i].hi)
-                    if lo > 255:
-                        continue
-                    if hi > 255:
-                        hi = 255
-                    var start_byte = lo >> 3
-                    var end_byte = hi >> 3
-                    var start_mask = UInt8(0xFF) << UInt8(lo & 7)
-                    var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
-                    if start_byte == end_byte:
-                        tmp[start_byte] |= start_mask & end_mask
-                    else:
-                        tmp[start_byte] |= start_mask
-                        for b in range(start_byte + 1, end_byte):
-                            tmp[b] = 0xFF
-                        tmp[end_byte] |= end_mask
-                # Invert and merge
-                bitmap = bitmap | (tmp ^ SIMD[DType.uint8, BITMAP_WIDTH](0xFF))
-            else:
-                for i in range(len(nfa.charsets[cs_idx].ranges)):
-                    var lo = Int(nfa.charsets[cs_idx].ranges[i].lo)
-                    var hi = Int(nfa.charsets[cs_idx].ranges[i].hi)
-                    if lo > 255:
-                        continue
-                    if hi > 255:
-                        hi = 255
-                    var start_byte = lo >> 3
-                    var end_byte = hi >> 3
-                    var start_mask = UInt8(0xFF) << UInt8(lo & 7)
-                    var end_mask = UInt8(0xFF) >> UInt8(7 - (hi & 7))
-                    if start_byte == end_byte:
-                        bitmap[start_byte] |= start_mask & end_mask
-                    else:
-                        bitmap[start_byte] |= start_mask
-                        for b in range(start_byte + 1, end_byte):
-                            bitmap[b] = 0xFF
-                        bitmap[end_byte] |= end_mask
+            # Use the pre-built bitmap field — it is a SIMD value that
+            # survives comptime evaluation correctly, whereas the ranges
+            # List is not reliably accessible at comptime.
+            bitmap = bitmap | nfa.charsets[cs_idx].bitmap
         elif kind == NFAStateKind.ANY:
             # ANY matches everything except \n — almost all bytes
             return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)

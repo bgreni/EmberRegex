@@ -131,10 +131,16 @@ struct ASTNode(Copyable, Movable):
         node.group_index = group_index
 
     @staticmethod
-    def scoped_flags(child: Int, flags: RegexFlags, out node: ASTNode):
+    def scoped_flags(
+        child: Int,
+        flags_add: RegexFlags,
+        flags_remove: RegexFlags,
+        out node: ASTNode,
+    ):
         node = ASTNode(ASTNodeKind.SCOPED_FLAGS)
         node.children = [child]
-        node.flags_val = flags.value
+        node.flags_val = flags_add.value
+        node.charset_index = flags_remove.value  # repurposed: flags to remove
 
 
 struct AST(Movable):

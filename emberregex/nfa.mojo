@@ -163,6 +163,10 @@ struct NFA(Copyable):
     var needs_backtrack: Bool
     var can_use_dfa: Bool
     var start_anchor: Int  # AnchorKind at pattern start, or -1
+    var start_after_leading_anchor: Int
+    """State index reached after the leading ANCHOR (when start_anchor != -1).
+    Used by callers that have already verified the anchor condition externally
+    so they can skip the redundant in-engine check."""
 
     def __init__(out self):
         self.states = List[NFAState]()
@@ -173,6 +177,7 @@ struct NFA(Copyable):
         self.needs_backtrack = False
         self.can_use_dfa = True
         self.start_anchor = -1
+        self.start_after_leading_anchor = -1
 
     def add_state(mut self, var state: NFAState) -> Int:
         var idx = len(self.states)
@@ -233,19 +238,33 @@ def build_nfa(var ast: AST, flags: RegexFlags = RegexFlags()) raises -> NFA:
 
 
 def _detect_start_anchor(mut nfa: NFA):
-    """Walk epsilon transitions from nfa.start to find a leading anchor."""
+    """Walk epsilon transitions from nfa.start to find a leading anchor.
+
+    Also records `start_after_leading_anchor` when the path is only SAVE or
+    no-op SPLIT (out2 == -1) states. Callers that have already verified the
+    anchor condition can enter the engine at that state and skip the
+    redundant in-engine check. A real alternation SPLIT (both arms valid)
+    forfeits this optimization because skipping past a SPLIT would drop one
+    of the arms.
+    """
     var idx = nfa.start
+    var ambiguous_split = False
     var visited = 0  # simple depth limit
     while idx >= 0 and idx < len(nfa.states) and visited < 20:
         visited += 1
         var kind = nfa.states[idx].kind
         if kind == NFAStateKind.ANCHOR:
             nfa.start_anchor = nfa.states[idx].anchor_type
+            if not ambiguous_split:
+                nfa.start_after_leading_anchor = nfa.states[idx].out1
             return
         elif kind == NFAStateKind.SAVE:
             idx = nfa.states[idx].out1
         elif kind == NFAStateKind.SPLIT:
-            # Follow greedy (out1) path
+            # Only no-op SPLITs (out2 == -1, e.g. from empty inline-flag groups
+            # like `(?m)`) are safe to walk past — they have a single live arm.
+            if nfa.states[idx].out2 != -1:
+                ambiguous_split = True
             idx = nfa.states[idx].out1
         else:
             return  # consuming state or other — no anchor
@@ -282,6 +301,7 @@ def _build_fragment(
         if flags.dotall():
             var cs = CharSet()
             cs.add_range(0, 0x10FFFF)
+            cs.build_bitmap()
             var cs_idx = len(nfa.charsets)
             nfa.charsets.append(cs^)
             var state_idx = nfa.add_state(NFAState.charset_state(cs_idx))
@@ -460,7 +480,9 @@ def _build_fragment(
         return frag^
 
     elif node.kind == ASTNodeKind.SCOPED_FLAGS:
-        var scoped_flags = RegexFlags(flags.value | node.flags_val)
+        var add_val = node.flags_val
+        var remove_val = node.charset_index  # repurposed field
+        var scoped_flags = RegexFlags((flags.value | add_val) & ~remove_val)
         return _build_fragment(nfa, ast, node.children[0], scoped_flags)
 
     raise Error("Unknown AST node kind: " + String(node.kind))

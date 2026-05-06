@@ -1,7 +1,7 @@
-"""EmberRegex vs Python re — three-way benchmark comparison.
+"""EmberRegex vs Python re — benchmark comparison.
 
-Runs the Python re suite, the Mojo CompiledRegex extended suite, and the Mojo
-StaticRegex extended suite, then prints a comparison table with speedup ratios.
+Runs the Python re suite and the Mojo StaticRegex benchmark suite, then
+prints a comparison table with speedup ratios.
 
 Run with:  python3 bench/bench_compare.py
            pixi run compare
@@ -19,9 +19,9 @@ import shutil
 
 REPEAT   = 5      # timeit repetitions per benchmark
 NUMBER   = 10000  # calls per repetition (sum of many runs → less variance)
-BAR_COLS = 16     # width of the speedup bar (reduced to fit 3 columns)
+BAR_COLS = 20     # width of the speedup bar
 
-# Must match comptime ITERS_PER_CALL in bench.mojo / bench_static_ext.mojo.
+# Must match comptime ITERS_PER_CALL in bench_static.mojo.
 # Each Mojo call() invocation runs the function this many times; divide to get per-call µs.
 MOJO_ITERS_PER_CALL = 100
 
@@ -81,14 +81,9 @@ def _run_mojo_task(task: str) -> dict[str, float]:
     return timings
 
 
-def run_mojo_benchmarks() -> dict[str, float]:
-    """Run bench.mojo (CompiledRegex) via pixi."""
-    return _run_mojo_task("bench")
-
-
 def run_mojo_static_benchmarks() -> dict[str, float]:
-    """Run bench_static_ext.mojo (StaticRegex) via pixi."""
-    return _run_mojo_task("bench_static")
+    """Run bench_static.mojo (StaticRegex) via pixi."""
+    return _run_mojo_task("bench")
 
 
 def speedup_bar(ratio: float) -> str:
@@ -110,14 +105,9 @@ def _ratio_str(ratio: float) -> str:
 
 def print_comparison(
     py: dict[str, float],
-    compiled: dict[str, float],
     static: dict[str, float],
 ):
-    """Print the three-column comparison table.
-
-    Ratio 1: Python / Compiled  — how much faster CompiledRegex is vs Python re
-    Ratio 2: Compiled / Static  — how much faster StaticRegex is vs CompiledRegex
-    """
+    """Print the two-column comparison table."""
     all_names = list(py.keys())
     if not all_names:
         print("  No Python results collected.")
@@ -127,77 +117,50 @@ def print_comparison(
 
     header = (
         f"  {'Benchmark':<{col_name}}  {'Python':>9}  "
-        f"{'Compiled':>9}  {'Static':>8}  "
-        f"{'Py/Comp':>7}  {'Comp/Stat':>9}  Bar (Comp/Stat, 10x=full)"
+        f"{'Static':>9}  {'Py/Stat':>7}  Bar (10x=full)"
     )
-    sep = "  " + "─" * (col_name + 70)
+    sep = "  " + "─" * (col_name + 50)
 
     print()
     print(header)
     print(sep)
 
-    comp_faster = comp_slower = comp_missing = 0
-    stat_faster = stat_slower = stat_missing = 0
+    faster = slower = missing = 0
 
     for name in all_names:
         py_us   = py[name]
-        comp_us = compiled.get(name)
         stat_us = static.get(name)
 
-        comp_str = f"{comp_us:>9.3f}" if comp_us is not None else f"{'—':>9}"
-        stat_str = f"{stat_us:>8.3f}" if stat_us is not None else f"{'—':>8}"
+        stat_str = f"{stat_us:>9.3f}" if stat_us is not None else f"{'—':>9}"
 
-        # Ratio 1: Python / Compiled
-        if comp_us is not None and comp_us > 0:
-            py_comp_ratio = py_us / comp_us
-            py_comp_str = _ratio_str(py_comp_ratio)
-            if py_comp_ratio >= 1.0:
-                comp_faster += 1
+        if stat_us is not None and stat_us > 0:
+            ratio = py_us / stat_us
+            ratio_str = _ratio_str(ratio)
+            bar = speedup_bar(ratio)
+            if ratio >= 1.0:
+                faster += 1
             else:
-                comp_slower += 1
+                slower += 1
         else:
-            py_comp_str = f"{'—':>14}"
-            if comp_us is None:
-                comp_missing += 1
-
-        # Ratio 2: Compiled / Static
-        if comp_us is not None and comp_us > 0 and stat_us is not None and stat_us > 0:
-            comp_stat_ratio = comp_us / stat_us
-            comp_stat_str = _ratio_str(comp_stat_ratio)
-            bar = speedup_bar(comp_stat_ratio)
-            if comp_stat_ratio >= 1.0:
-                stat_faster += 1
-            else:
-                stat_slower += 1
-        else:
-            comp_stat_str = f"{'—':>16}"
+            ratio_str = f"{'—':>14}"
             bar = speedup_bar(0)
             if stat_us is None:
-                stat_missing += 1
+                missing += 1
 
         print(
             f"  {name:<{col_name}}  {py_us:>9.3f}  "
-            f"{comp_str}  {stat_str}  "
-            f"{py_comp_str}  {comp_stat_str}  {bar}"
+            f"{stat_str}  {ratio_str}  {bar}"
         )
 
     print(sep)
-    have_comp = compiled is not None and len(compiled) > 0
-    have_stat = static is not None and len(static) > 0
-    if have_comp:
-        print(
-            f"  Python vs Compiled  — faster: {comp_faster}  |  slower: {comp_slower}"
-            + (f"  |  no data: {comp_missing}" if comp_missing else "")
-        )
-    if have_stat:
-        print(
-            f"  Compiled vs Static  — faster: {stat_faster}  |  slower: {stat_slower}"
-            + (f"  |  no data: {stat_missing}" if stat_missing else "")
-        )
+    print(
+        f"  Python vs Static  — faster: {faster}  |  slower: {slower}"
+        + (f"  |  no data: {missing}" if missing else "")
+    )
 
 
 # ---------------------------------------------------------------------------
-# Python re benchmark suite  (names must match bench_extended.mojo BenchIds)
+# Python re benchmark suite  (names must match bench_static.mojo BenchIds)
 # ---------------------------------------------------------------------------
 
 def run_python_benchmarks() -> dict[str, float]:
@@ -355,17 +318,6 @@ def run_python_benchmarks() -> dict[str, float]:
     bench(py, "engine_backtrack_with_backref",
           lambda: re.match(r"([a-z]+)\d+\1", "abc123abc"))
 
-    # 14. Compilation
-    # re.purge() flushes the internal pattern cache so we measure actual
-    # compilation work, not a dict lookup returning the cached object.
-    section("14. Compilation")
-    bench(py, "compile_wide_char_class",
-          lambda: (re.purge(), re.compile(r"[a-zA-Z0-9!@#$%^&*()\-_+=]+")))
-    bench(py, "compile_8_groups",
-          lambda: (re.purge(), re.compile(r"(\w+) (\w+) (\w+) (\w+) (\w+) (\w+) (\w+) (\w+)")))
-    bench(py, "compile_nested_alternation",
-          lambda: (re.purge(), re.compile(r"(?:a|b|c)(?:d|e|f)(?:g|h|i)(?:j|k|l)(?:m|n|o)(?:p|q|r)")))
-
     return py
 
 
@@ -375,35 +327,24 @@ def run_python_benchmarks() -> dict[str, float]:
 
 def main():
     print(f"\n{'═'*72}")
-    print(f"  EmberRegex vs Python {sys.version.split()[0]} re — Three-way comparison")
-    print(f"  Columns: Python re  |  CompiledRegex  |  StaticRegex")
-    print(f"  Py/Comp   = Python ÷ Compiled   (>1x means Compiled wins vs Python)")
-    print(f"  Comp/Stat = Compiled ÷ Static   (>1x means Static wins vs Compiled)")
+    print(f"  EmberRegex StaticRegex vs Python {sys.version.split()[0]} re")
+    print(f"  Columns: Python re  |  StaticRegex")
+    print(f"  Py/Stat = Python ÷ Static   (>1x means Static wins vs Python)")
     print(f"{'═'*72}")
 
     print(f"\n  Running Python benchmarks...")
     py = run_python_benchmarks()
 
     print(f"\n{'═'*72}")
-    print(f"  Running CompiledRegex benchmarks (bench_ext)...")
-    print(f"{'═'*72}")
-    compiled = run_mojo_benchmarks()
-
-    print(f"\n{'═'*72}")
-    print(f"  Running StaticRegex benchmarks (bench_static_ext)...")
+    print(f"  Running StaticRegex benchmarks...")
     print(f"{'═'*72}")
     static = run_mojo_static_benchmarks()
 
-    have_any = compiled or static
-    if have_any:
+    if static:
         print(f"\n{'═'*72}")
         print(f"  Results  (µs per op, best of {REPEAT}×{NUMBER} Python iters / {REPEAT}×{MOJO_ITERS_PER_CALL} Mojo iters per call)")
         print(f"{'═'*72}")
-        print_comparison(py, compiled, static)
-        if not compiled:
-            print("\n  [note] CompiledRegex data unavailable.")
-        if not static:
-            print("\n  [note] StaticRegex data unavailable.")
+        print_comparison(py, static)
     else:
         print("\n  Could not obtain Mojo results; Python-only results shown above.")
 

@@ -3,27 +3,11 @@
 > [!WARNING]
 > ⚠️ This project is basically entirely vibe coded.
 
-A high-performance regular expression library for [Mojo](https://www.modular.com/mojo).
+A high-performance compile-time regular expression library for [Mojo](https://www.modular.com/mojo).
 
-EmberRegex automatically selects the fastest matching engine for each pattern — a lazy DFA for simple patterns, a one-pass NFA for patterns with captures, a Pike VM for more complex captures, and a backtracking engine when backreferences are needed.
-
-For patterns known at compile time, `StaticRegex` parses the pattern and builds the NFA during compilation, then specializes the entire match engine per NFA state — eliminating runtime dispatch entirely.
+EmberRegex is focused on patterns known at compile time. `StaticRegex` parses the pattern and builds the NFA during compilation, then specializes the entire match engine per NFA state — eliminating runtime dispatch entirely. Invalid patterns produce a compile error rather than a runtime exception.
 
 ## Quick Start
-
-```mojo
-from emberregex import compile
-
-def main() raises:
-    var re = compile("[a-z]+")
-    var result = re.search("hello world")
-    if result:
-        print(result)  # MatchResult(start=0, end=5)
-```
-
-### Compile-Time Regex
-
-When the pattern is a string literal, use `StaticRegex` to move all parsing and NFA construction to compile time:
 
 ```mojo
 from emberregex import StaticRegex
@@ -33,8 +17,6 @@ def main():
     var result = re.match("555-1234")
     print(result.matched)  # True
 ```
-
-`StaticRegex` exposes the same API as `CompiledRegex` (`match`, `search`, `findall`, `replace`, `split`). Invalid patterns produce a compile error rather than a runtime exception.
 
 ## Installation
 
@@ -47,30 +29,14 @@ mojo -I /path/to/emberregex your_file.mojo
 
 ## API Reference
 
-### Compiling Patterns
-
-```mojo
-from emberregex import compile, try_compile, RegexFlags
-
-# compile() raises on invalid patterns
-var re = compile("\\d{3}-\\d{4}")
-
-# try_compile() returns Optional — safe for comptime initialization
-var maybe_re = try_compile("[invalid")  # returns None
-
-# Pass flags explicitly
-var re_i = compile("hello", RegexFlags(RegexFlags.IGNORECASE))
-
-# Or use inline flags in the pattern
-var re_i2 = compile("(?i)hello")
-```
+`StaticRegex[pattern]` takes the pattern as a compile-time string literal. All parsing and NFA construction happen during compilation.
 
 ### Matching
 
 `match()` tests whether the **entire** input matches the pattern:
 
 ```mojo
-var re = compile("\\d{3}-\\d{4}")
+var re = StaticRegex["\\d{3}-\\d{4}"]()
 
 var result = re.match("555-1234")
 print(result.matched)  # True
@@ -84,7 +50,7 @@ print(result2.matched)  # False (not a full match)
 `search()` finds the **first** occurrence of the pattern anywhere in the input:
 
 ```mojo
-var re = compile("\\d+")
+var re = StaticRegex["\\d+"]()
 var result = re.search("abc 42 def 99")
 if result:
     print(result.start, result.end)  # 4 6
@@ -95,12 +61,12 @@ if result:
 `findall()` returns all non-overlapping matches as a list of strings. If the pattern has a capture group, it returns group 1 instead of the full match:
 
 ```mojo
-var re = compile("\\d+")
+var re = StaticRegex["\\d+"]()
 var matches = re.findall("12 apples, 3 bananas, 456 cherries")
 # matches: ["12", "3", "456"]
 
 # With a capture group, findall returns group 1
-var re2 = compile("<(\\w+)>")
+var re2 = StaticRegex["<(\\w+)>"]()
 var tags = re2.findall("<html><body><p>")
 # tags: ["html", "body", "p"]
 ```
@@ -110,12 +76,12 @@ var tags = re2.findall("<html><body><p>")
 `replace()` substitutes all matches with a replacement string. Backreferences `\1`-`\9` and named backreferences `\g<name>` are supported:
 
 ```mojo
-var re = compile("(\\w+)@(\\w+)")
+var re = StaticRegex["(\\w+)@(\\w+)"]()
 var result = re.replace("alice@home bob@work", "\\1 at \\2")
 # result: "alice at home bob at work"
 
 # Named group backreferences
-var re2 = compile("(?P<first>\\w+) (?P<last>\\w+)")
+var re2 = StaticRegex["(?P<first>\\w+) (?P<last>\\w+)"]()
 var result2 = re2.replace("Jane Doe", "\\g<last>, \\g<first>")
 # result2: "Doe, Jane"
 ```
@@ -125,9 +91,34 @@ var result2 = re2.replace("Jane Doe", "\\g<last>, \\g<first>")
 `split()` divides the input at each match of the pattern:
 
 ```mojo
-var re = compile("[,;\\s]+")
+var re = StaticRegex["[,;\\s]+"]()
 var parts = re.split("one, two; three   four")
 # parts: ["one", "two", "three", "four"]
+```
+
+### Flags
+
+Pass flags as a second parameter, or use inline flag syntax in the pattern:
+
+```mojo
+from emberregex import StaticRegex, RegexFlags
+
+# Explicit flag
+var re = StaticRegex["hello", RegexFlags(RegexFlags.IGNORECASE)]()
+re.match("HELLO").matched  # True
+
+# Inline flag (equivalent)
+var re2 = StaticRegex["(?i)hello"]()
+re2.match("HeLLo").matched  # True
+
+# Multiline: ^ and $ match at \n boundaries
+var re3 = StaticRegex["(?m)^\\w+"]()
+var lines = re3.findall("foo\nbar\nbaz")
+# lines: ["foo", "bar", "baz"]
+
+# Dotall: . matches \n
+var re4 = StaticRegex["(?s)a.b"]()
+re4.match("a\nb").matched  # True
 ```
 
 ## Capture Groups
@@ -135,7 +126,7 @@ var parts = re.split("one, two; three   four")
 Use parentheses to capture submatches. Groups are 1-indexed:
 
 ```mojo
-var re = compile("(\\d{4})-(\\d{2})-(\\d{2})")
+var re = StaticRegex["(\\d{4})-(\\d{2})-(\\d{2})"]()
 var result = re.search("date: 2026-03-22")
 if result:
     var year = result.group_str("date: 2026-03-22", 1)   # "2026"
@@ -148,8 +139,7 @@ if result:
 Use `(?:...)` when you need grouping without capturing:
 
 ```mojo
-var re = compile("(?:https?|ftp)://\\S+")
-# Groups for alternation without creating a capture group
+var re = StaticRegex["(?:https?|ftp)://\\S+"]()
 ```
 
 ### Named Groups
@@ -157,7 +147,7 @@ var re = compile("(?:https?|ftp)://\\S+")
 Use `(?P<name>...)` to name capture groups:
 
 ```mojo
-var re = compile("(?P<proto>https?)://(?P<host>[^/]+)")
+var re = StaticRegex["(?P<proto>https?)://(?P<host>[^/]+)"]()
 var result = re.search("visit https://example.com/page")
 if result:
     var proto = result.group_str("visit https://example.com/page", 1)  # "https"
@@ -169,7 +159,7 @@ if result:
 The `MatchResult` type is returned by `match()` and `search()`:
 
 | Method | Returns | Description |
-|---|---|---|
+| --- | --- | --- |
 | `result.matched` | `Bool` | Whether the pattern matched |
 | `result.start` | `Int` | Start byte offset of the match |
 | `result.end` | `Int` | End byte offset of the match |
@@ -180,41 +170,12 @@ The `MatchResult` type is returned by `match()` and `search()`:
 
 `MatchResult` is truthy when matched, so you can use it directly in `if` statements.
 
-## Flags
-
-Flags can be passed as a parameter to `compile()` or inlined in the pattern:
-
-| Flag | Inline | Effect |
-|---|---|---|
-| `RegexFlags.IGNORECASE` | `(?i)` | Case-insensitive matching |
-| `RegexFlags.MULTILINE` | `(?m)` | `^` and `$` match at line boundaries |
-| `RegexFlags.DOTALL` | `(?s)` | `.` matches newline characters |
-
-```mojo
-# Explicit flag
-var re = compile("hello", RegexFlags(RegexFlags.IGNORECASE))
-re.match("HELLO").matched  # True
-
-# Inline flag
-var re2 = compile("(?i)hello")
-re2.match("HeLLo").matched  # True
-
-# Multiline: ^ and $ match at \n boundaries
-var re3 = compile("(?m)^\\w+")
-var lines = re3.findall("foo\nbar\nbaz")
-# lines: ["foo", "bar", "baz"]
-
-# Dotall: . matches \n
-var re4 = compile("(?s)a.b")
-re4.match("a\nb").matched  # True
-```
-
 ## Supported Syntax
 
 ### Characters and Classes
 
 | Syntax | Description |
-|---|---|
+| --- | --- |
 | `.` | Any character except newline (unless DOTALL) |
 | `\d`, `\D` | Digit / non-digit |
 | `\w`, `\W` | Word character `[a-zA-Z0-9_]` / non-word |
@@ -228,7 +189,7 @@ re4.match("a\nb").matched  # True
 ### Quantifiers
 
 | Syntax | Description |
-|---|---|
+| --- | --- |
 | `*` | Zero or more (greedy) |
 | `+` | One or more (greedy) |
 | `?` | Zero or one (greedy) |
@@ -240,7 +201,7 @@ re4.match("a\nb").matched  # True
 ### Anchors and Assertions
 
 | Syntax | Description |
-|---|---|
+| --- | --- |
 | `^` | Start of string (or line with MULTILINE) |
 | `$` | End of string (or line with MULTILINE) |
 | `\b` | Word boundary |
@@ -253,7 +214,7 @@ re4.match("a\nb").matched  # True
 ### Groups and Backreferences
 
 | Syntax | Description |
-|---|---|
+| --- | --- |
 | `(...)` | Capture group |
 | `(?:...)` | Non-capturing group |
 | `(?P<name>...)` | Named capture group |
@@ -262,11 +223,12 @@ re4.match("a\nb").matched  # True
 
 ## Performance
 
-EmberRegex selects the optimal engine automatically:
+`StaticRegex` parses the pattern and builds the NFA at compile time. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct `@always_inline` function instantiation, the compiler eliminates dead branches, and all recursive calls collapse into a single inlined function with zero runtime dispatch.
 
-- **`StaticRegex`** for compile-time patterns — parsing and NFA construction happen during compilation. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct `@always_inline` function instantiation, the compiler eliminates dead branches, and all recursive calls collapse into a single inlined function with zero runtime dispatch.
-- **Lazy DFA** for patterns without captures — O(n) single-pass matching with no capture overhead. Simple line anchors (`^`, `$`, multiline variants) are handled directly by the DFA rather than disabling it. Up to 20x faster than Python's `re` on throughput-heavy patterns.
-- **One-pass NFA** for DFA-compatible patterns with captures — single linear scan extracts captures with no thread management overhead. Used as a fast-path in hybrid search (DFA finds boundaries, one-pass extracts captures).
+At runtime, EmberRegex automatically selects the fastest engine for the pattern:
+
+- **Lazy DFA** for patterns without captures — O(n) single-pass matching with no capture overhead. Simple line anchors (`^`, `$`, multiline variants) are handled directly by the DFA.
+- **One-pass NFA** for DFA-compatible patterns with captures — single linear scan extracts captures with no thread management overhead.
 - **Pike VM** for patterns with captures that aren't one-pass eligible — parallel NFA simulation.
 - **Backtracking** only when backreferences require it.
 
@@ -283,11 +245,10 @@ Additional search accelerations applied regardless of engine:
 # Run tests
 pixi run test
 
-# Run Mojo engine benchmarks
-pixi run bench          # CompiledRegex benchmark suite
-pixi run bench_static   # StaticRegex benchmark suite
+# Run StaticRegex benchmarks
+pixi run bench
 
-# Run Python vs EmberRegex comparison
+# Run Python vs StaticRegex comparison
 pixi run compare
 pixi run -e pdf compare_pdf  # generate PDF report (requires reportlab)
 
