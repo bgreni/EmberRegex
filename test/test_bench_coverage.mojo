@@ -1,0 +1,348 @@
+"""Correctness tests mirroring the benchmark suite in `bench/bench.mojo`.
+
+Each benchmark pattern in `bench.mojo` should have a matching test here that
+asserts the bench's input actually matches (or doesn't match) as expected.
+Without this, a benchmark could silently time the no-match path and produce
+meaningless numbers. When you add a new bench, add a corresponding test here.
+"""
+
+from emberregex import StaticRegex
+from std.testing import assert_true, assert_false, assert_equal, TestSuite
+
+
+# ---------------------------------------------------------------------------
+# DFA-equivalent matching
+# ---------------------------------------------------------------------------
+
+
+def test_bench_dfa_literal_match() raises:
+    var re = StaticRegex["abcdefghij"]()
+    assert_true(re.match("abcdefghij").matched)
+
+
+def test_bench_dfa_quantifier_bounded() raises:
+    var re = StaticRegex["[a-z]{5,10}[0-9]{3,5}"]()
+    assert_true(re.match("abcdefg1234").matched)
+    assert_false(re.match("abc1234").matched)
+
+
+def test_bench_explicit_case_range() raises:
+    var re = StaticRegex["[a-zA-Z]+"]()
+    assert_true(re.match("HeLLoWoRLdFoOBaR").matched)
+
+
+def test_bench_ignorecase() raises:
+    var re = StaticRegex["(?i)[a-z]+"]()
+    assert_true(re.match("HeLLoWoRLdFoOBaR").matched)
+
+
+def test_bench_simd_literal_search() raises:
+    # The bench `simd_literal_search` searches make_lines(100) ++ \n ++ "a"*SIMD_W.
+    # Verify the literal is findable; we use a small fixed literal here.
+    var re = StaticRegex["aaaaaaaaaaaaaaaa"]()  # 16 a's
+    var haystack = "line 0 some text\nline 1 some text\naaaaaaaaaaaaaaaa"
+    var r = re.search(haystack)
+    assert_true(r.matched)
+
+
+def test_bench_dotstar_1K() raises:
+    var re = StaticRegex[".*x"]()
+    var input = "a" * 1000 + "x"
+    assert_true(re.match(input).matched)
+
+
+def test_bench_nested_quantifier() raises:
+    var re = StaticRegex["([a-z]+[0-9]+)+x"]()
+    assert_true(re.match("abc123def456ghi789x").matched)
+
+
+# ---------------------------------------------------------------------------
+# Captures
+# ---------------------------------------------------------------------------
+
+
+def test_bench_static_nested_groups() raises:
+    var re = StaticRegex["((\\w+)(-(\\w+))*)@(\\w+)"]()
+    var input = "foo-bar-baz@host"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "foo-bar-baz")
+    assert_equal(r.group_str(input, 5), "host")
+
+
+def test_bench_search_date_capture() raises:
+    var re = StaticRegex["(\\d{4})-(\\d{2})-(\\d{2})"]()
+    var input = "x" * 200 + "2026-03-21" + "y" * 200
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 200)
+    assert_equal(r.group_str(input, 1), "2026")
+    assert_equal(r.group_str(input, 2), "03")
+    assert_equal(r.group_str(input, 3), "21")
+
+
+# ---------------------------------------------------------------------------
+# Real-world patterns
+# ---------------------------------------------------------------------------
+
+
+def test_bench_log_parse() raises:
+    var re = StaticRegex[
+        "(\\d{4}-\\d{2}-\\d{2}) (\\d{2}:\\d{2}:\\d{2}) \\[(\\w+)\\] (.*)"
+    ]()
+    var input = "2026-03-21 14:30:05 [ERROR] Connection timeout after 30s"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "2026-03-21")
+    assert_equal(r.group_str(input, 2), "14:30:05")
+    assert_equal(r.group_str(input, 3), "ERROR")
+    assert_equal(r.group_str(input, 4), "Connection timeout after 30s")
+
+
+def test_bench_csv_fields() raises:
+    var re = StaticRegex["[^,]+"]()
+    var input = "field1,field2,field3,field4,field5,field6,field7,field8"
+    var results = re.findall(input)
+    assert_equal(len(results), 8)
+    assert_equal(results[0], "field1")
+    assert_equal(results[7], "field8")
+
+
+def test_bench_url_parse() raises:
+    var re = StaticRegex["(https?|ftp)://([^/\\s]+)(/[^\\s]*)?"]()
+    var input = "https://www.example.com/path/to/page?q=1&r=2"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "https")
+    assert_equal(r.group_str(input, 2), "www.example.com")
+    assert_equal(r.group_str(input, 3), "/path/to/page?q=1&r=2")
+
+
+def test_bench_phone() raises:
+    var re = StaticRegex["\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}"]()
+    assert_true(re.match("(555) 123-4567").matched)
+    assert_true(re.match("555-123-4567").matched)
+    assert_true(re.match("555.123.4567").matched)
+
+
+def test_bench_hex_color() raises:
+    var re = StaticRegex["#[0-9a-fA-F]{6}"]()
+    assert_true(re.match("#1a2B3c").matched)
+    assert_false(re.match("#xyz123").matched)
+
+
+def test_bench_semver() raises:
+    var re = StaticRegex["(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?"]()
+    var input = "12.34.56-beta.1"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "12")
+    assert_equal(r.group_str(input, 2), "34")
+    assert_equal(r.group_str(input, 3), "56")
+    assert_equal(r.group_str(input, 4), "beta.1")
+
+
+def test_bench_key_value_findall() raises:
+    var re = StaticRegex["(\\w+)=(\\S+)"]()
+    var input = "host=localhost port=5432 db=mydb user=admin timeout=30"
+    var results = re.findall(input)
+    # findall returns the first capture group when groups are present
+    assert_equal(len(results), 5)
+    assert_equal(results[0], "host")
+    assert_equal(results[4], "timeout")
+
+
+def test_bench_html_tag_findall() raises:
+    var re = StaticRegex["<(\\w+)[^>]*>"]()
+    var input = (
+        "<html><head><title>Test</title></head><body><div"
+        ' class="x"><p>Hello</p><a href="#">Link</a></div></body></html>'
+    )
+    var results = re.findall(input)
+    # html, head, title, body, div, p, a — 7 opening tags
+    assert_equal(len(results), 7)
+
+
+def test_bench_log_search_bulk() raises:
+    var re = StaticRegex["\\[ERROR\\].*"]()
+    var input = (
+        "2026-03-21 14:30:05 [INFO] line 0\n"
+        "2026-03-21 14:30:05 [INFO] line 1\n"
+        "2026-03-21 14:30:05 [ERROR] Something broke\n"
+        "2026-03-21 14:30:05 [INFO] line 3"
+    )
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(re.findall(input)[0], "[ERROR] Something broke")
+
+
+# ---------------------------------------------------------------------------
+# Throughput
+# ---------------------------------------------------------------------------
+
+
+def test_bench_throughput_class_10KB() raises:
+    var re = StaticRegex["[xyz]+"]()
+    var input = "a" * 9990 + "xyzxyzxyz"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 9990)
+    assert_equal(r.end, 9999)
+
+
+# ---------------------------------------------------------------------------
+# Named groups
+# ---------------------------------------------------------------------------
+
+
+def test_bench_named_group_date() raises:
+    var re = StaticRegex[
+        "(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"
+    ]()
+    var input = "2026-03-21"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "2026")
+    assert_equal(r.group_str(input, 2), "03")
+    assert_equal(r.group_str(input, 3), "21")
+
+
+def test_bench_named_group_email() raises:
+    var re = StaticRegex["(?P<a>\\w+)@(?P<b>\\w+)\\.(?P<c>\\w+)"]()
+    var input = "user@example.com"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "user")
+    assert_equal(r.group_str(input, 2), "example")
+    assert_equal(r.group_str(input, 3), "com")
+
+
+# ---------------------------------------------------------------------------
+# Alternation scaling
+# ---------------------------------------------------------------------------
+
+
+def test_bench_alternation_4() raises:
+    var re = StaticRegex["alpha|beta|gamma|delta"]()
+    assert_true(re.match("delta").matched)
+    assert_true(re.match("alpha").matched)
+    assert_false(re.match("epsilon").matched)
+
+
+def test_bench_alternation_16() raises:
+    var re = StaticRegex[
+        "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
+        "|iota|kappa|lambda|mu|nu|xi|omicron|pi"
+    ]()
+    assert_true(re.match("pi").matched)
+    assert_true(re.match("alpha").matched)
+    assert_true(re.match("omicron").matched)
+
+
+def test_bench_alternation_16_miss() raises:
+    var re = StaticRegex[
+        "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
+        "|iota|kappa|lambda|mu|nu|xi|omicron|pi"
+    ]()
+    assert_false(re.match("sigma").matched)
+
+
+# ---------------------------------------------------------------------------
+# Findall scaling
+# ---------------------------------------------------------------------------
+
+
+def test_bench_findall_dense_dot() raises:
+    var re = StaticRegex["."]()
+    var input = "a" * 50
+    assert_equal(len(re.findall(input)), 50)
+
+
+# ---------------------------------------------------------------------------
+# Split scaling
+# ---------------------------------------------------------------------------
+
+
+def test_bench_split_many_parts() raises:
+    var re = StaticRegex["[,;|]+"]()
+    var parts = List[String]()
+    for _ in range(10):
+        parts.append("word")
+    var input = String(",").join(parts)
+    var result = re.split(input)
+    assert_equal(len(result), 10)
+    assert_equal(result[0], "word")
+    assert_equal(result[9], "word")
+
+
+# ---------------------------------------------------------------------------
+# Pathological
+# ---------------------------------------------------------------------------
+
+
+def test_bench_pathological_dotstar_anchored() raises:
+    var re = StaticRegex["^.*x$"]()
+    var input = "a" * 100 + "x"
+    assert_true(re.match(input).matched)
+
+
+def test_bench_pathological_dotstar_miss() raises:
+    var re = StaticRegex[".*x"]()
+    var input = "a" * 100
+    assert_false(re.match(input).matched)
+
+
+def test_bench_pathological_triple_backref() raises:
+    var re = StaticRegex["(\\w+)\\s\\1\\s\\1"]()
+    assert_true(re.match("hello hello hello").matched)
+    assert_false(re.match("hello hello world").matched)
+
+
+def test_bench_pathological_nested_quantifier_miss() raises:
+    var re = StaticRegex["([a-z]+[0-9]+)+x"]()
+    assert_false(re.match("aaaaaaaaaaaaaaaa").matched)
+
+
+# ---------------------------------------------------------------------------
+# Inline flags
+# ---------------------------------------------------------------------------
+
+
+def test_bench_inline_multiline_search() raises:
+    var re = StaticRegex["(?m)^error.*$"]()
+    var input = "info: ok\nwarn: hmm\nerror: bad\ninfo: ok"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 19)
+
+
+# ---------------------------------------------------------------------------
+# Engine comparison
+# ---------------------------------------------------------------------------
+
+
+def test_bench_engine_dfa_no_capture() raises:
+    var re = StaticRegex["[a-z]+\\d+[a-z]+"]()
+    assert_true(re.match("abc123def").matched)
+
+
+def test_bench_engine_pike_with_capture() raises:
+    var re = StaticRegex["([a-z]+)(\\d+)([a-z]+)"]()
+    var input = "abc123def"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "abc")
+    assert_equal(r.group_str(input, 2), "123")
+    assert_equal(r.group_str(input, 3), "def")
+
+
+def test_bench_engine_backtrack_with_backref() raises:
+    var re = StaticRegex["([a-z]+)\\d+\\1"]()
+    var input = "abc123abc"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "abc")
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()

@@ -29,6 +29,7 @@ from .optimize import (
     extract_literal_prefix,
     extract_first_byte_bitmap,
     extract_required_byte,
+    extract_match_sandwich,
     is_pure_literal,
 )
 from .simd_scan import simd_find_byte, simd_find_prefix, simd_find_literal
@@ -297,6 +298,8 @@ struct MatchStrategy:
 
     var use_simd_literal: Bool
     var use_dfa: Bool
+    var use_sandwich_match: Bool
+    var sandwich_suffix_len: Int
     var start_anchor: Int
     var prefix_len: Int
     var first_byte_useful: Bool
@@ -307,6 +310,8 @@ struct MatchStrategy:
         out self,
         use_simd_literal: Bool,
         use_dfa: Bool,
+        use_sandwich_match: Bool,
+        sandwich_suffix_len: Int,
         start_anchor: Int,
         prefix_len: Int,
         first_byte_useful: Bool,
@@ -315,6 +320,8 @@ struct MatchStrategy:
     ):
         self.use_simd_literal = use_simd_literal
         self.use_dfa = use_dfa
+        self.use_sandwich_match = use_sandwich_match
+        self.sandwich_suffix_len = sandwich_suffix_len
         self.start_anchor = start_anchor
         self.prefix_len = prefix_len
         self.first_byte_useful = first_byte_useful
@@ -327,6 +334,8 @@ def _compute_strategy(
     prefix: List[UInt8],
     first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH],
     group_count: Int,
+    sandwich_valid: Bool,
+    sandwich_suffix_len: Int,
 ) -> MatchStrategy:
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
@@ -342,6 +351,11 @@ def _compute_strategy(
         and group_count == 0
         and __literal_can_be_optimized(prefix_len)
     )
+    var use_sandwich_match = (
+        sandwich_valid
+        and group_count == 0
+        and not use_simd_literal
+    )
     # Required-byte fast-fail: only useful when neither the pure-literal scan
     # nor the literal-prefix scan already filters by some byte. Both of those
     # paths SIMD-scan for a known byte sequence and short-circuit on absence,
@@ -354,6 +368,8 @@ def _compute_strategy(
     return MatchStrategy(
         use_simd_literal=use_simd_literal,
         use_dfa=use_dfa,
+        use_sandwich_match=use_sandwich_match,
+        sandwich_suffix_len=sandwich_suffix_len,
         start_anchor=nfa.start_anchor,
         prefix_len=prefix_len,
         first_byte_useful=first_byte_useful,
@@ -378,8 +394,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     comptime _start = Self.nfa.start
     comptime _prefix = extract_literal_prefix(Self.nfa)
     comptime _first_byte_bitmap = extract_first_byte_bitmap(Self.nfa)
+    comptime _sandwich = extract_match_sandwich(Self.nfa)
     comptime _strategy = _compute_strategy(
-        Self.nfa, Self._prefix, Self._first_byte_bitmap, Self._group_count
+        Self.nfa,
+        Self._prefix,
+        Self._first_byte_bitmap,
+        Self._group_count,
+        Self._sandwich.valid,
+        len(Self._sandwich.suffix),
     )
 
     var _dfa_nfa: ConditionalType[
@@ -433,7 +455,28 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 < 0
             ):
                 return MatchResult[Self._num_slots].no_match()
-        comptime if Self._strategy.use_simd_literal:
+        comptime if Self._strategy.use_sandwich_match:
+            comptime prefix_len = Self._strategy.prefix_len
+            comptime suffix_len = Self._strategy.sandwich_suffix_len
+            var input_len = input.byte_length()
+            if input_len < prefix_len + suffix_len:
+                return MatchResult[Self._num_slots].no_match()
+            var ptr = input.unsafe_ptr()
+            comptime for i in range(prefix_len):
+                comptime pb = Self._prefix[i]
+                if ptr[i] != pb:
+                    return MatchResult[Self._num_slots].no_match()
+            comptime for i in range(suffix_len):
+                comptime sb = Self._sandwich.suffix[i]
+                if ptr[input_len - suffix_len + i] != sb:
+                    return MatchResult[Self._num_slots].no_match()
+            return MatchResult[Self._num_slots](
+                matched=True,
+                start=0,
+                end=input_len,
+                slots=InlineArray[Int, Self._num_slots](fill=-1),
+            )
+        elif Self._strategy.use_simd_literal:
             ref lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
             )

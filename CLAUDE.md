@@ -77,6 +77,15 @@ Engine selection happens at compile time via `comptime if` branches:
 - **Use `elif`/`else` with `comptime if` for exclusive branches** — when a `comptime if` is followed by another `comptime if` testing a mutually exclusive condition (e.g. `comptime if X:` … `comptime if not X:`), use `elif` or `else` instead. The successive branches are still evaluated at compile time. Only use separate `comptime if` blocks when the conditions are truly independent.
 
 
+## Benchmarks must have matching tests
+
+Every pattern in `bench/bench.mojo` must be exercised by a test that asserts
+the bench's input actually matches (or doesn't match) as expected. Otherwise a
+benchmark can silently time the no-match path and produce meaningless numbers.
+When you add a new bench, add a corresponding test in
+`test/test_bench_coverage.mojo` (or extend an existing test file if a test
+already covers the same pattern + input + verb).
+
 ## Investigating code behaviour
 
 Instead of writing a million temp files that I need to accept access to each time. Just use playground.mojo as code scratch pad when you want to investigate the behavior of something.

@@ -14,7 +14,8 @@ def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
 
     Follows the unique path from the start state, collecting CHAR states.
     Stops at any branch (SPLIT), variable-width match (ANY, CHARSET),
-    or end of pattern.
+    or end of pattern. No-op SPLITs (out2 == -1, e.g. from empty inline
+    flag groups like `(?s)`) are treated as epsilon transitions.
     """
     var prefix = List[UInt8]()
     var state_idx = nfa.start
@@ -28,6 +29,9 @@ def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
             state_idx = nfa.states[state_idx].out1
         elif kind == NFAStateKind.ANCHOR:
             # Skip anchors, follow through
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SPLIT and nfa.states[state_idx].out2 == -1:
+            # No-op SPLIT — single live arm, follow it
             state_idx = nfa.states[state_idx].out1
         else:
             # SPLIT, ANY, CHARSET, MATCH, LOOKAHEAD, etc. — stop
@@ -107,6 +111,97 @@ def extract_required_byte(nfa: NFA) -> Int:
     return -1
 
 
+@fieldwise_init
+struct MatchSandwich(Copyable, Movable):
+    """Description of a `prefix + greedy any-byte loop + suffix` pattern.
+
+    When `valid` is True, a full-input match() can be answered in
+    O(prefix + suffix) by verifying input.startswith(prefix) and
+    input.endswith(suffix), skipping the per-byte DFA walk.
+    """
+
+    var valid: Bool
+    var suffix: List[UInt8]
+
+
+def _is_full_byte_charset(nfa: NFA, state_idx: Int) -> Bool:
+    """True if state_idx is a CHARSET state whose bitmap matches every byte."""
+    if state_idx < 0 or state_idx >= len(nfa.states):
+        return False
+    if nfa.states[state_idx].kind != NFAStateKind.CHARSET:
+        return False
+    var cs_idx = nfa.states[state_idx].charset_index
+    ref cs = nfa.charsets[cs_idx]
+    if cs.negated:
+        return False
+    return cs.bitmap.eq(UInt8(0xFF)).reduce_and()
+
+
+def extract_match_sandwich(nfa: NFA) -> MatchSandwich:
+    """Detect pattern of the form `literal-prefix + greedy any-byte loop + literal-suffix`.
+
+    The literal prefix is whatever `extract_literal_prefix` already collects;
+    after that we must see a greedy SPLIT whose loop body is a CHARSET that
+    accepts every byte (i.e. `(?s).` produces a CHARSET with a full bitmap),
+    looping back to the SPLIT, with the SPLIT's exit branch leading through
+    only literal CHAR / SAVE / ANCHOR states to MATCH.
+
+    When valid, full-input match() reduces to startswith(prefix) and
+    endswith(suffix) checks.
+    """
+    var info = MatchSandwich(False, List[UInt8]())
+    var state_idx = nfa.start
+
+    # Walk the prefix: skip SAVE/ANCHOR and no-op SPLITs; collect CHAR.
+    # Stop when we reach the loop SPLIT (the real two-armed greedy SPLIT
+    # produced by `*` or `+`).
+    while state_idx >= 0 and state_idx < len(nfa.states):
+        var kind = nfa.states[state_idx].kind
+        if kind == NFAStateKind.CHAR:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SPLIT and nfa.states[state_idx].out2 == -1:
+            state_idx = nfa.states[state_idx].out1
+        else:
+            break
+
+    if state_idx < 0 or state_idx >= len(nfa.states):
+        return info^
+    if nfa.states[state_idx].kind != NFAStateKind.SPLIT:
+        return info^
+    if not nfa.states[state_idx].greedy:
+        return info^
+
+    var split_idx = state_idx
+    var loop_body = nfa.states[split_idx].out1
+    var continuation = nfa.states[split_idx].out2
+
+    if not _is_full_byte_charset(nfa, loop_body):
+        return info^
+    if nfa.states[loop_body].out1 != split_idx:
+        return info^
+
+    # Walk the suffix: CHAR collects, SAVE/ANCHOR/no-op SPLIT pass through,
+    # MATCH ends successfully.
+    state_idx = continuation
+    while state_idx >= 0 and state_idx < len(nfa.states):
+        var kind = nfa.states[state_idx].kind
+        if kind == NFAStateKind.CHAR:
+            info.suffix.append(UInt8(nfa.states[state_idx].char_value))
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SPLIT and nfa.states[state_idx].out2 == -1:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.MATCH:
+            info.valid = True
+            return info^
+        else:
+            return info^
+    return info^
+
+
 def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
     """Extract a 256-bit bitmap of possible first bytes from the NFA.
 
@@ -159,7 +254,10 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
             # Use the pre-built bitmap field — it is a SIMD value that
             # survives comptime evaluation correctly, whereas the ranges
             # List is not reliably accessible at comptime.
-            bitmap = bitmap | nfa.charsets[cs_idx].bitmap
+            var cs_bitmap = nfa.charsets[cs_idx].bitmap
+            if nfa.charsets[cs_idx].negated:
+                cs_bitmap = ~cs_bitmap
+            bitmap = bitmap | cs_bitmap
         elif kind == NFAStateKind.ANY:
             # ANY matches everything except \n — almost all bytes
             return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)

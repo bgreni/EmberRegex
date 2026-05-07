@@ -434,7 +434,7 @@ def bench_static_split(mut b: Bench) raises:
 def bench_static_ignorecase(mut b: Bench) raises:
     var re_plain = StaticRegex["[a-zA-Z]+"]()
     var re_icase = StaticRegex["(?i)[a-z]+"]()
-    var input = "HeLLo WoRLd FoO BaR"
+    var input = "HeLLoWoRLdFoOBaR"
 
     @always_inline
     @parameter
@@ -1655,7 +1655,7 @@ def bench_static_simd_literal_search(mut b: Bench) raises:
     comptime SIMD_LIT = "a" * _BENCH_SIMD_W
 
     var re = StaticRegex[SIMD_LIT]()
-    var haystack = make_lines(100)
+    var haystack = make_lines(100) + "\n" + String(SIMD_LIT)
 
     @always_inline
     @parameter
