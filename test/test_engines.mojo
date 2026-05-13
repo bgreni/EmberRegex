@@ -45,6 +45,22 @@ def test_simd_width_literal() raises:
     _do_simd_literal_test["a" * W, W]()
 
 
+# def test_simd_literal_width_1() raises:
+#     _do_simd_literal_test["a", 1]()
+
+
+# def test_simd_literal_width_2() raises:
+#     _do_simd_literal_test["ab", 2]()
+
+
+# def test_simd_literal_width_4() raises:
+#     _do_simd_literal_test["abcd", 4]()
+
+
+# def test_simd_literal_width_8() raises:
+#     _do_simd_literal_test["abcdefgh", 8]()
+
+
 def test_pathological_match() raises:
     var re = StaticRegex["(a+)+"]()
     assert_true(re.match("aaa").matched)
