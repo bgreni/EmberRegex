@@ -133,6 +133,7 @@ def _sbt_try_match[
     nfa: NFA,
     state_idx: Int,
     num_slots: Int,
+    anchored_end: Bool = False,
 ](
     input: Span[Byte, origin],
     pos: Int,
@@ -144,6 +145,12 @@ def _sbt_try_match[
     Each instantiation of [nfa, state_idx] produces a specialized function
     that handles exactly one NFA state kind with all fields baked in.
     Charset membership uses bitmaps extracted at compile time.
+
+    When `anchored_end` is True, MATCH only accepts at end of input
+    (fullmatch semantics). This must be enforced inside the engine rather
+    than by filtering the result: a leftmost-first engine may prefer a
+    shorter alternative (e.g. `(a|ab)` on "ab" returns end 1), so a
+    post-hoc `end == len` check would reject valid full matches.
 
     The budget pointer tracks remaining work units. Each call decrements it.
     When exhausted, returns -1 (no match). This bounds pathological patterns
@@ -160,14 +167,22 @@ def _sbt_try_match[
         comptime kind = state.kind
 
         comptime if kind == NFAStateKind.MATCH:
-            return pos
+            comptime if anchored_end:
+                if pos == len(input):
+                    return pos
+                return -1
+            else:
+                return pos
 
         elif kind == NFAStateKind.CHAR:
             if pos >= len(input):
                 return -1
             if UInt32(input.unsafe_get(pos)) == state.char_value:
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos + 1, slots, budget)
             return -1
 
@@ -176,7 +191,10 @@ def _sbt_try_match[
                 return -1
             if input.unsafe_get(pos) != CHAR_NEWLINE:
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos + 1, slots, budget)
             return -1
 
@@ -192,7 +210,10 @@ def _sbt_try_match[
             var ch = UInt32(input.unsafe_get(pos))
             if _sbt_bitmap_check(bitmap, negated, ch):
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos + 1, slots, budget)
             return -1
 
@@ -247,9 +268,22 @@ def _sbt_try_match[
                         bitmap, negated, UInt32(input.unsafe_get(max_pos))
                     ):
                         max_pos += 1
-                comptime if exit_is_match:
+                comptime if exit_is_match and anchored_end:
+                    # Anchored MATCH only accepts at end of input; the loop
+                    # can reach any position in [pos, max_pos].
+                    if max_pos == input_len:
+                        return max_pos
+                    return -1
+                elif exit_is_match:
                     # Greedy `body* MATCH` — max_pos is the longest match.
                     return max_pos
+                elif exit_is_eol_then_match and anchored_end:
+                    # With MATCH anchored to end of input, the EOL anchor is
+                    # trivially true there, so success reduces to reaching
+                    # input_len.
+                    if max_pos == input_len:
+                        return max_pos
+                    return -1
                 elif exit_is_eol_then_match:
                     # Greedy `body* ANCHOR(EOL/EOL_MULTILINE) MATCH` — fold
                     # the anchor check into the loop so we don't recurse for
@@ -276,7 +310,10 @@ def _sbt_try_match[
                         if budget < 0:
                             return -1
                         var result = _sbt_try_match[
-                            nfa=nfa, state_idx=out2, num_slots=num_slots
+                            nfa=nfa,
+                            state_idx=out2,
+                            num_slots=num_slots,
+                            anchored_end=anchored_end,
                         ](input, p, slots, budget)
                         if result >= 0:
                             return result
@@ -291,7 +328,10 @@ def _sbt_try_match[
                     if budget < 0:
                         return -1
                     var result = _sbt_try_match[
-                        nfa=nfa, state_idx=out2, num_slots=num_slots
+                        nfa=nfa,
+                        state_idx=out2,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
                     ](input, cur, slots, budget)
                     if result >= 0:
                         return result
@@ -319,12 +359,18 @@ def _sbt_try_match[
             else:
                 # General SPLIT (alternation, complex bodies)
                 var result = _sbt_try_match[
-                    nfa=nfa, state_idx=out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos, slots, budget)
                 if result >= 0:
                     return result
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=out2, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=out2,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos, slots, budget)
 
         elif kind == NFAStateKind.SAVE:
@@ -333,14 +379,20 @@ def _sbt_try_match[
                 var old_val = slots[slot]
                 slots[slot] = pos
                 var result = _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos, slots, budget)
                 if result < 0:
                     slots[slot] = old_val
                 return result
             else:
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos, slots, budget)
 
         elif kind == NFAStateKind.ANCHOR:
@@ -348,26 +400,38 @@ def _sbt_try_match[
                 input, len(input), pos
             ):
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
                 ](input, pos, slots, budget)
             return -1
 
         elif kind == NFAStateKind.LOOKAHEAD:
             var sub_slots = slots
             var sub_result = _sbt_try_match[
-                nfa=nfa, state_idx=state.sub_start, num_slots=num_slots
+                nfa=nfa,
+                state_idx=state.sub_start,
+                num_slots=num_slots,
+                anchored_end=False,
             ](input, pos, sub_slots, budget)
             var matched = sub_result >= 0
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
                     ](input, pos, slots, budget)
                 return -1
             else:
                 if matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
                     ](input, pos, slots, budget)
                 return -1
 
@@ -377,19 +441,28 @@ def _sbt_try_match[
             if pos >= lb_len:
                 var sub_slots = slots
                 var sub_result = _sbt_try_match[
-                    nfa=nfa, state_idx=state.sub_start, num_slots=num_slots
+                    nfa=nfa,
+                    state_idx=state.sub_start,
+                    num_slots=num_slots,
+                    anchored_end=False,
                 ](input, pos - lb_len, sub_slots, budget)
                 matched = sub_result >= 0 and sub_result == pos
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
                     ](input, pos, slots, budget)
                 return -1
             else:
                 if matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
                     ](input, pos, slots, budget)
                 return -1
 
@@ -415,7 +488,10 @@ def _sbt_try_match[
                     if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
                         return -1
             return _sbt_try_match[
-                nfa=nfa, state_idx=state.out1, num_slots=num_slots
+                nfa=nfa,
+                state_idx=state.out1,
+                num_slots=num_slots,
+                anchored_end=anchored_end,
             ](input, pos + ref_len, slots, budget)
 
     return -1

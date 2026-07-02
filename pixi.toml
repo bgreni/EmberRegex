@@ -14,7 +14,7 @@ compare = { cmd = "python3 bench/bench_compare.py" }
 format = "mojo format emberregex test bench"
 
 [dependencies]
-mojo = ">=1.0.0b2.dev2026050205,<2"
+mojo = ">=1.0.0b3.dev2026070206,<2"
 
 [feature.pdf.dependencies]
 reportlab = "*"

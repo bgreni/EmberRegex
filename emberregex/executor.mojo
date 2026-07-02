@@ -85,8 +85,15 @@ struct PikeVM[num_slots: Int](Copyable):
     def full_match_with_bufs(
         self, input: String, mut bufs: _VMBuffers
     ) -> MatchResult[Self.num_slots]:
-        """Match the entire input string against the pattern."""
-        var result = self._execute_with_bufs(input.as_bytes(), 0, bufs)
+        """Match the entire input string against the pattern.
+
+        Runs the VM in fullmatch mode: MATCH only accepts at end of input,
+        so alternatives that would win a leftmost-first search with a
+        shorter match (e.g. `a` in `a|ab`) don't mask a valid full match.
+        """
+        var result = self._execute_with_bufs(
+            input.as_bytes(), 0, bufs, full=True
+        )
         if result.matched and result.end == input.byte_length():
             return result^
         return MatchResult[Self.num_slots].no_match()
@@ -111,10 +118,13 @@ struct PikeVM[num_slots: Int](Copyable):
         start_pos: Int,
         mut bufs: _VMBuffers,
         max_pos: Int = -1,
+        full: Bool = False,
     ) -> MatchResult[Self.num_slots]:
         """Core NFA simulation using pre-allocated buffers.
 
         If max_pos >= 0, limits processing to positions < max_pos.
+        If full is True, MATCH only accepts at end of input (fullmatch);
+        otherwise the VM implements leftmost-first (Python re) semantics.
         """
         var input_len = len(input)
         if max_pos >= 0 and max_pos < input_len:
@@ -147,14 +157,40 @@ struct PikeVM[num_slots: Int](Copyable):
         var pos = start_pos
         while True:
             # Check for match states
-            for i in range(len(bufs.current_states)):
-                if (
-                    self.nfa.states.unsafe_get(
-                        bufs.current_states.unsafe_get(i)
-                    ).kind
-                    == NFAStateKind.MATCH
-                ):
-                    if not matched or pos > best_match_end:
+            if full:
+                # Fullmatch: MATCH only accepts at end of input; the first
+                # (highest-priority) thread that reached it wins.
+                if pos >= input_len:
+                    for i in range(len(bufs.current_states)):
+                        if (
+                            self.nfa.states.unsafe_get(
+                                bufs.current_states.unsafe_get(i)
+                            ).kind
+                            == NFAStateKind.MATCH
+                        ):
+                            matched = True
+                            best_match_end = pos
+                            for s in range(Self.num_slots):
+                                bufs.best_slots.unsafe_set(
+                                    s,
+                                    bufs.current_slot_data.unsafe_get(
+                                        i * Self.num_slots + s
+                                    ),
+                                )
+                            break
+            else:
+                # Leftmost-first (Python re semantics): the first thread in
+                # priority order to reach MATCH beats every lower-priority
+                # thread, so record it and cut those threads. Surviving
+                # higher-priority threads may still override with a match
+                # they reach later (e.g. the greedy arm of `a*`).
+                for i in range(len(bufs.current_states)):
+                    if (
+                        self.nfa.states.unsafe_get(
+                            bufs.current_states.unsafe_get(i)
+                        ).kind
+                        == NFAStateKind.MATCH
+                    ):
                         matched = True
                         best_match_end = pos
                         for s in range(Self.num_slots):
@@ -164,10 +200,9 @@ struct PikeVM[num_slots: Int](Copyable):
                                     i * Self.num_slots + s
                                 ),
                             )
-
-            # For patterns with lazy quantifiers, stop at first match
-            if matched and self.nfa.has_lazy:
-                break
+                        bufs.current_states.resize(i, 0)
+                        bufs.current_slot_data.resize(i * Self.num_slots, 0)
+                        break
 
             if pos >= input_len:
                 break
@@ -245,25 +280,6 @@ struct PikeVM[num_slots: Int](Copyable):
 
             if len(bufs.current_states) == 0:
                 break
-
-        # Final check
-        for i in range(len(bufs.current_states)):
-            if (
-                self.nfa.states.unsafe_get(
-                    bufs.current_states.unsafe_get(i)
-                ).kind
-                == NFAStateKind.MATCH
-            ):
-                if not matched or pos > best_match_end:
-                    matched = True
-                    best_match_end = pos
-                    for s in range(Self.num_slots):
-                        bufs.best_slots.unsafe_set(
-                            s,
-                            bufs.current_slot_data.unsafe_get(
-                                i * Self.num_slots + s
-                            ),
-                        )
 
         if matched:
             var result_slots = InlineArray[Int, Self.num_slots](fill=-1)

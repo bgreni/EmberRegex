@@ -32,7 +32,7 @@ from .optimize import (
     extract_match_sandwich,
     is_pure_literal,
 )
-from .simd_scan import simd_find_byte, simd_find_prefix, simd_find_literal
+from .simd_scan import simd_find_byte, simd_find_literal
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import _sbt_try_match, SBT_BUDGET
@@ -50,6 +50,7 @@ def _sbt_run[
     nfa: NFA,
     state_idx: Int,
     num_slots: Int,
+    anchored_end: Bool = False,
 ](
     input: Span[Byte, origin],
     pos: Int,
@@ -62,7 +63,10 @@ def _sbt_run[
     """
     var budget = SBT_BUDGET
     var result = _sbt_try_match[
-        nfa=nfa, state_idx=state_idx, num_slots=num_slots
+        nfa=nfa,
+        state_idx=state_idx,
+        num_slots=num_slots,
+        anchored_end=anchored_end,
     ](input, pos, slots, budget)
     if budget < 0:
         raise Error("SBT_BUDGET_EXHAUSTED")
@@ -352,9 +356,7 @@ def _compute_strategy(
         and __literal_can_be_optimized(prefix_len)
     )
     var use_sandwich_match = (
-        sandwich_valid
-        and group_count == 0
-        and not use_simd_literal
+        sandwich_valid and group_count == 0 and not use_simd_literal
     )
     # Required-byte fast-fail: only useful when neither the pure-literal scan
     # nor the literal-prefix scan already filters by some byte. Both of those
@@ -405,21 +407,21 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     )
 
     var _dfa_nfa: ConditionalType[
-        Trait=ImplicitlyDestructible & Copyable,
+        Trait=ImplicitlyDeletable & Copyable,
         If=Self._strategy.use_dfa,
         Then=NFA,
         Else=NoneType,
     ]
 
     var _dfa: ConditionalType[
-        Trait=ImplicitlyDestructible & Copyable,
+        Trait=ImplicitlyDeletable & Copyable,
         If=Self._strategy.use_dfa,
         Then=LazyDFA,
         Else=NoneType,
     ]
 
     var _simd_lit: ConditionalType[
-        Trait=ImplicitlyDestructible & Copyable,
+        Trait=ImplicitlyDeletable & Copyable,
         If=Self._strategy.use_simd_literal,
         Then=TypeForPrefixLength[Self._strategy.prefix_len],
         Else=NoneType,
@@ -444,17 +446,12 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             self._simd_lit = rebind_var[type_of(self._simd_lit)](None)
 
     def match(mut self, input: String) -> MatchResult[Self._num_slots]:
-        """Match the entire input against the pattern."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return MatchResult[Self._num_slots].no_match()
+        """Match the entire input against the pattern.
+
+        No required-byte pre-scan here: match() is anchored at position 0
+        and usually fails within a few bytes, so an O(n) scan of the whole
+        input for a required byte only adds work.
+        """
         comptime if Self._strategy.use_sandwich_match:
             comptime prefix_len = Self._strategy.prefix_len
             comptime suffix_len = Self._strategy.sandwich_suffix_len
@@ -495,20 +492,30 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         elif Self._strategy.use_dfa:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
-            if dfa.full_match(dfa_nfa, input):
-                return MatchResult[Self._num_slots](
-                    matched=True,
-                    start=0,
-                    end=input.byte_length(),
-                    slots=InlineArray[Int, Self._num_slots](fill=-1),
-                )
-            return MatchResult[Self._num_slots].no_match()
+            try:
+                if dfa.full_match(dfa_nfa, input):
+                    return MatchResult[Self._num_slots](
+                        matched=True,
+                        start=0,
+                        end=input.byte_length(),
+                        slots=InlineArray[Int, Self._num_slots](fill=-1),
+                    )
+                return MatchResult[Self._num_slots].no_match()
+            except:
+                # DFA state-cache overflow — fall back to the Pike VM
+                return self._pike_match(input)
         try:
             var slots = ALL_NEG_ONES[Self._num_slots]
+            # anchored_end: MATCH only accepts at end of input, so
+            # alternatives that prefer a shorter match (e.g. `(a|ab)` on
+            # "ab") can't mask a valid full match.
             var end = _sbt_run[
-                nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
+                nfa=Self.nfa,
+                state_idx=Self._start,
+                num_slots=Self._num_slots,
+                anchored_end=True,
             ](input.as_bytes(), 0, slots)
-            if end >= 0 and end == input.byte_length():
+            if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
                     start=0,
@@ -551,39 +558,47 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
-            while pos <= input_len:
-                comptime if Self._strategy.prefix_len > 0:
-                    pos = self._find_prefix_candidate(
-                        input_bytes, input_len, pos
-                    )
-                    if pos < 0:
+            try:
+                while pos <= input_len:
+                    comptime if Self._strategy.prefix_len > 0:
+                        pos = self._find_prefix_candidate(
+                            input_bytes, input_len, pos
+                        )
+                        if pos < 0:
+                            return MatchResult[Self._num_slots].no_match()
+                        var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                        if match_end >= 0:
+                            return MatchResult[Self._num_slots](
+                                matched=True,
+                                start=pos,
+                                end=match_end,
+                                slots=InlineArray[Int, Self._num_slots](
+                                    fill=-1
+                                ),
+                            )
+                        pos += 1
+                    elif Self._strategy.prefix_len == 0:
+                        var range = dfa.search_forward(
+                            dfa_nfa,
+                            input_bytes,
+                            pos,
+                            Self._first_byte_bitmap,
+                            Self._strategy.first_byte_useful,
+                        )
+                        if range[0] >= 0:
+                            return MatchResult[Self._num_slots](
+                                matched=True,
+                                start=range[0],
+                                end=range[1],
+                                slots=InlineArray[Int, Self._num_slots](
+                                    fill=-1
+                                ),
+                            )
                         return MatchResult[Self._num_slots].no_match()
-                    var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
-                    if match_end >= 0:
-                        return MatchResult[Self._num_slots](
-                            matched=True,
-                            start=pos,
-                            end=match_end,
-                            slots=InlineArray[Int, Self._num_slots](fill=-1),
-                        )
-                    pos += 1
-                elif Self._strategy.prefix_len == 0:
-                    var range = dfa.search_forward(
-                        dfa_nfa,
-                        input_bytes,
-                        pos,
-                        Self._first_byte_bitmap,
-                        Self._strategy.first_byte_useful,
-                    )
-                    if range[0] >= 0:
-                        return MatchResult[Self._num_slots](
-                            matched=True,
-                            start=range[0],
-                            end=range[1],
-                            slots=InlineArray[Int, Self._num_slots](fill=-1),
-                        )
-                    return MatchResult[Self._num_slots].no_match()
-            return MatchResult[Self._num_slots].no_match()
+                return MatchResult[Self._num_slots].no_match()
+            except:
+                # DFA state-cache overflow — fall back to the Pike VM
+                return self._pike_search(input)
         try:
             return self._search_impl(input)
         except:
@@ -737,43 +752,19 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
 
-            # BOL: only position 0
-            comptime if Self._strategy.start_anchor == AnchorKind.BOL:
-                var match_end = dfa.match_at(dfa_nfa, input_bytes, 0)
-                if match_end >= 0:
-                    results.append(
-                        String(unsafe_from_utf8=input_bytes[0:match_end])
-                    )
-                return results^
-
-            # BOL_MULTILINE: skip to BOL positions via SIMD newline scan
-            elif Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
-                while pos <= input_len:
-                    var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+            try:
+                # BOL: only position 0
+                comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+                    var match_end = dfa.match_at(dfa_nfa, input_bytes, 0)
                     if match_end >= 0:
                         results.append(
-                            String(unsafe_from_utf8=input_bytes[pos:match_end])
+                            String(unsafe_from_utf8=input_bytes[0:match_end])
                         )
-                        if match_end > pos:
-                            pos = match_end
-                        else:
-                            pos += 1
-                    # Skip to next BOL position
-                    var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
-                    if nl < 0:
-                        break
-                    pos = nl + 1
-                return results^
+                    return results^
 
-            # General case
-            elif Self._strategy.start_anchor != AnchorKind.BOL and Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
-                while pos <= input_len:
-                    comptime if Self._strategy.prefix_len > 0:
-                        pos = self._find_prefix_candidate(
-                            input_bytes, input_len, pos
-                        )
-                        if pos < 0:
-                            break
+                # BOL_MULTILINE: skip to BOL positions via SIMD newline scan
+                elif Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
+                    while pos <= input_len:
                         var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                         if match_end >= 0:
                             results.append(
@@ -785,28 +776,70 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                 pos = match_end
                             else:
                                 pos += 1
-                            continue
-                        pos += 1
-                    elif Self._strategy.prefix_len == 0:
-                        var range = dfa.search_forward(
-                            dfa_nfa,
-                            input_bytes,
-                            pos,
-                            Self._first_byte_bitmap,
-                            Self._strategy.first_byte_useful,
-                        )
-                        if range[0] < 0:
+                            # If the match ended right after a newline, pos
+                            # is already a BOL — don't skip past it.
+                            if (
+                                pos <= input_len
+                                and input_bytes.unsafe_get(pos - 1)
+                                == CHAR_NEWLINE
+                            ):
+                                continue
+                        # Skip to next BOL position
+                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                        if nl < 0:
                             break
-                        var start = range[0]
-                        var end = range[1]
-                        results.append(
-                            String(unsafe_from_utf8=input_bytes[start:end])
-                        )
-                        if end > start:
-                            pos = end
-                        else:
-                            pos = start + 1
-                return results^
+                        pos = nl + 1
+                    return results^
+
+                # General case
+                elif Self._strategy.start_anchor != AnchorKind.BOL and Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+                    while pos <= input_len:
+                        comptime if Self._strategy.prefix_len > 0:
+                            pos = self._find_prefix_candidate(
+                                input_bytes, input_len, pos
+                            )
+                            if pos < 0:
+                                break
+                            var match_end = dfa.match_at(
+                                dfa_nfa, input_bytes, pos
+                            )
+                            if match_end >= 0:
+                                results.append(
+                                    String(
+                                        unsafe_from_utf8=input_bytes[
+                                            pos:match_end
+                                        ]
+                                    )
+                                )
+                                if match_end > pos:
+                                    pos = match_end
+                                else:
+                                    pos += 1
+                                continue
+                            pos += 1
+                        elif Self._strategy.prefix_len == 0:
+                            var range = dfa.search_forward(
+                                dfa_nfa,
+                                input_bytes,
+                                pos,
+                                Self._first_byte_bitmap,
+                                Self._strategy.first_byte_useful,
+                            )
+                            if range[0] < 0:
+                                break
+                            var start = range[0]
+                            var end = range[1]
+                            results.append(
+                                String(unsafe_from_utf8=input_bytes[start:end])
+                            )
+                            if end > start:
+                                pos = end
+                            else:
+                                pos = start + 1
+                    return results^
+            except:
+                # DFA state-cache overflow — fall back to the Pike VM
+                return self._pike_findall(input)
         try:
             return self._findall_impl(input)
         except:
@@ -845,7 +878,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             pos = end
                         else:
                             pos += 1
-                        # After a match, still need to skip to next BOL
+                        # If the match ended right after a newline, pos is
+                        # already a BOL — don't skip past it.
+                        if (
+                            pos <= input_len
+                            and input_bytes.unsafe_get(pos - 1) == CHAR_NEWLINE
+                        ):
+                            continue
+                        # Otherwise skip to the next BOL
                         var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                         if nl < 0:
                             break
@@ -1014,47 +1054,53 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var prev_end = 0
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
-            while pos <= input_len:
-                comptime if Self._strategy.prefix_len > 0:
-                    pos = self._find_prefix_candidate(
-                        input_bytes, input_len, pos
-                    )
-                    if pos < 0:
-                        break
-                    var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
-                    if match_end >= 0:
-                        parts.append(
-                            String(unsafe_from_utf8=input_bytes[prev_end:pos])
+            try:
+                while pos <= input_len:
+                    comptime if Self._strategy.prefix_len > 0:
+                        pos = self._find_prefix_candidate(
+                            input_bytes, input_len, pos
                         )
-                        if match_end > pos:
-                            prev_end = match_end
-                            pos = match_end
+                        if pos < 0:
+                            break
+                        var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                        if match_end >= 0:
+                            parts.append(
+                                String(
+                                    unsafe_from_utf8=input_bytes[prev_end:pos]
+                                )
+                            )
+                            if match_end > pos:
+                                prev_end = match_end
+                                pos = match_end
+                            else:
+                                prev_end = pos + 1
+                                pos += 1
+                            continue
+                        pos += 1
+                    elif Self._strategy.prefix_len == 0:
+                        var range = dfa.search_forward(
+                            dfa_nfa,
+                            input_bytes,
+                            pos,
+                            Self._first_byte_bitmap,
+                            Self._strategy.first_byte_useful,
+                        )
+                        if range[0] < 0:
+                            break
+                        var start = range[0]
+                        var end = range[1]
+                        parts.append(
+                            String(unsafe_from_utf8=input_bytes[prev_end:start])
+                        )
+                        if end > start:
+                            prev_end = end
+                            pos = end
                         else:
-                            prev_end = pos + 1
-                            pos += 1
-                        continue
-                    pos += 1
-                elif Self._strategy.prefix_len == 0:
-                    var range = dfa.search_forward(
-                        dfa_nfa,
-                        input_bytes,
-                        pos,
-                        Self._first_byte_bitmap,
-                        Self._strategy.first_byte_useful,
-                    )
-                    if range[0] < 0:
-                        break
-                    var start = range[0]
-                    var end = range[1]
-                    parts.append(
-                        String(unsafe_from_utf8=input_bytes[prev_end:start])
-                    )
-                    if end > start:
-                        prev_end = end
-                        pos = end
-                    else:
-                        prev_end = start + 1
-                        pos = start + 1
+                            prev_end = start + 1
+                            pos = start + 1
+            except:
+                # DFA state-cache overflow — fall back to the Pike VM
+                return self._pike_split(input)
             if prev_end <= input_len:
                 parts.append(
                     String(unsafe_from_utf8=input_bytes[prev_end:input_len])
@@ -1324,7 +1370,10 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         while pos <= input_len:
             var result = vm._execute_with_bufs(input_bytes, pos, bufs)
             if not result.matched:
-                break
+                # The VM is anchored at pos; a failure here says nothing
+                # about later start positions.
+                pos += 1
+                continue
             comptime if Self._group_count > 0:
                 if result.group_matched(1):
                     results.append(result.group_str(input_bytes, 1))

@@ -620,6 +620,17 @@ struct Parser[origin: Origin](Movable):
         # Backreferences \1 through \9
         if ch >= CHAR_ONE and ch <= CHAR_NINE:
             var group_index = Int(ch - CHAR_ZERO)
+            if group_index > self.ast.group_count:
+                raise Error(
+                    String.write(
+                        RegexError(
+                            "Invalid backreference \\"
+                            + String(group_index)
+                            + ": group does not exist",
+                            self.pos - 2,
+                        )
+                    )
+                )
             return self.ast.add_node(ASTNode.backreference(group_index))
 
         # Named / numeric backreferences: \g<name> or \g<N>
@@ -628,6 +639,17 @@ struct Parser[origin: Origin](Movable):
             if not self._at_end() and Self._is_digit(self._peek()):
                 var n = self._parse_int()
                 self._expect(CHAR_GREATER_THAN)
+                if n < 1 or n > self.ast.group_count:
+                    raise Error(
+                        String.write(
+                            RegexError(
+                                "Invalid backreference \\g<"
+                                + String(n)
+                                + ">: group does not exist",
+                                self.pos - 1,
+                            )
+                        )
+                    )
                 return self.ast.add_node(ASTNode.backreference(n))
             var name = self._parse_group_name()
             self._expect(CHAR_GREATER_THAN)
@@ -857,7 +879,7 @@ struct Parser[origin: Origin](Movable):
                 elif esc == CHAR_D_UPPER:
                     self.pos += 2
                     cs.add_range(0, UInt32(CHAR_ZERO) - 1)
-                    cs.add_range(UInt32(CHAR_NINE) + 1, 127)
+                    cs.add_range(UInt32(CHAR_NINE) + 1, 255)
                     continue
                 elif esc == CHAR_W_LOWER:
                     self.pos += 2
@@ -903,6 +925,32 @@ struct Parser[origin: Origin](Movable):
                 and self.pattern.unsafe_get(self.pos + 1) != CHAR_RBRACKET
             ):
                 self.pos += 1  # consume '-'
+                # A shorthand class (\d, \w, \s, ...) is not a valid range
+                # endpoint; _parse_cc_codepoint would silently read it as a
+                # literal letter (e.g. [a-\d] becoming [a-d]).
+                if self._peek() == CHAR_BACKSLASH and self.pos + 1 < len(
+                    self.pattern
+                ):
+                    var esc = self.pattern.unsafe_get(self.pos + 1)
+                    if (
+                        esc == CHAR_D_LOWER
+                        or esc == CHAR_D_UPPER
+                        or esc == CHAR_W_LOWER
+                        or esc == CHAR_W_UPPER
+                        or esc == CHAR_S_LOWER
+                        or esc == CHAR_S
+                    ):
+                        raise Error(
+                            String.write(
+                                RegexError(
+                                    (
+                                        "Bad character range: shorthand class"
+                                        " cannot be a range endpoint"
+                                    ),
+                                    self.pos,
+                                )
+                            )
+                        )
                 var hi = self._parse_cc_codepoint()
                 if hi < lo:
                     raise Error(

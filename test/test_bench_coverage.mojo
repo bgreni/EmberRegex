@@ -196,9 +196,7 @@ def test_bench_throughput_class_10KB() raises:
 
 
 def test_bench_named_group_date() raises:
-    var re = StaticRegex[
-        "(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"
-    ]()
+    var re = StaticRegex["(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"]()
     var input = "2026-03-21"
     var r = re.match(input)
     assert_true(r.matched)

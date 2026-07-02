@@ -7,6 +7,7 @@ match must start with.
 
 from .nfa import NFA, NFAStateKind
 from .charset import BITMAP_WIDTH
+from .ast import AnchorKind
 
 
 def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
@@ -144,7 +145,7 @@ def extract_match_sandwich(nfa: NFA) -> MatchSandwich:
     after that we must see a greedy SPLIT whose loop body is a CHARSET that
     accepts every byte (i.e. `(?s).` produces a CHARSET with a full bitmap),
     looping back to the SPLIT, with the SPLIT's exit branch leading through
-    only literal CHAR / SAVE / ANCHOR states to MATCH.
+    only literal CHAR / SAVE states (plus a trailing $) to MATCH.
 
     When valid, full-input match() reduces to startswith(prefix) and
     endswith(suffix) checks.
@@ -152,14 +153,28 @@ def extract_match_sandwich(nfa: NFA) -> MatchSandwich:
     var info = MatchSandwich(False, List[UInt8]())
     var state_idx = nfa.start
 
-    # Walk the prefix: skip SAVE/ANCHOR and no-op SPLITs; collect CHAR.
+    # Walk the prefix: skip SAVE and no-op SPLITs; collect CHAR.
     # Stop when we reach the loop SPLIT (the real two-armed greedy SPLIT
     # produced by `*` or `+`).
+    #
+    # Anchors are only skipped when the sandwich check itself guarantees
+    # them: a leading ^ (BOL/BOL_MULTILINE before any CHAR) is implied by
+    # the full-input match starting at 0. Any other anchor (word boundary,
+    # $ mid-prefix, ^ after a CHAR) cannot be verified by a startswith/
+    # endswith check, so the sandwich is invalid.
+    var consumed_prefix_char = False
     while state_idx >= 0 and state_idx < len(nfa.states):
         var kind = nfa.states[state_idx].kind
         if kind == NFAStateKind.CHAR:
+            consumed_prefix_char = True
             state_idx = nfa.states[state_idx].out1
-        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+        elif kind == NFAStateKind.SAVE:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.ANCHOR:
+            var at = nfa.states[state_idx].anchor_type
+            var is_bol = at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE
+            if not is_bol or consumed_prefix_char:
+                return info^
             state_idx = nfa.states[state_idx].out1
         elif kind == NFAStateKind.SPLIT and nfa.states[state_idx].out2 == -1:
             state_idx = nfa.states[state_idx].out1
@@ -182,15 +197,29 @@ def extract_match_sandwich(nfa: NFA) -> MatchSandwich:
     if nfa.states[loop_body].out1 != split_idx:
         return info^
 
-    # Walk the suffix: CHAR collects, SAVE/ANCHOR/no-op SPLIT pass through,
+    # Walk the suffix: CHAR collects, SAVE/no-op SPLIT pass through,
     # MATCH ends successfully.
+    #
+    # Only a trailing $ (EOL/EOL_MULTILINE with no CHAR after it) is safe
+    # to skip — it is implied by the match ending at input end. Any other
+    # anchor invalidates the sandwich (see prefix walk above).
     state_idx = continuation
+    var seen_trailing_eol = False
     while state_idx >= 0 and state_idx < len(nfa.states):
         var kind = nfa.states[state_idx].kind
         if kind == NFAStateKind.CHAR:
+            if seen_trailing_eol:
+                return info^
             info.suffix.append(UInt8(nfa.states[state_idx].char_value))
             state_idx = nfa.states[state_idx].out1
-        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+        elif kind == NFAStateKind.SAVE:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.ANCHOR:
+            var at = nfa.states[state_idx].anchor_type
+            var is_eol = at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE
+            if not is_eol:
+                return info^
+            seen_trailing_eol = True
             state_idx = nfa.states[state_idx].out1
         elif kind == NFAStateKind.SPLIT and nfa.states[state_idx].out2 == -1:
             state_idx = nfa.states[state_idx].out1
@@ -260,6 +289,11 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
             bitmap = bitmap | cs_bitmap
         elif kind == NFAStateKind.ANY:
             # ANY matches everything except \n — almost all bytes
+            return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
+        elif kind == NFAStateKind.BACKREF:
+            # A backreference can match empty (empty or unset group), in
+            # which case the continuation supplies the first byte. Be
+            # conservative: allow any first byte.
             return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
         elif kind == NFAStateKind.MATCH:
             # Empty pattern — can match at any position

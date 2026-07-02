@@ -5,6 +5,8 @@ Each AST node maps to a small NFA fragment with a start state and
 a list of dangling output arrows (patch list).
 """
 
+from std.math import max, min
+
 from .constants import CHAR_A_LOWER, CHAR_A_UPPER, CHAR_Z_LOWER, CHAR_Z_UPPER
 from .ast import AST, ASTNode, ASTNodeKind, AnchorKind
 from .charset import CharSet, CharRange
@@ -42,7 +44,6 @@ struct NFAState(Copyable, Movable):
     var lookbehind_len: Int  # For LOOKBEHIND: fixed length to look back
     var backref_group: Int  # For BACKREF: group index (1-based)
     var icase: Bool  # For BACKREF: case-insensitive comparison (baked in at construction)
-    var sub_dfa_safe: Bool  # For LOOKAHEAD/LOOKBEHIND: sub-expr can use DFA
 
     def __init__(out self, kind: Int):
         self.kind = kind
@@ -58,7 +59,6 @@ struct NFAState(Copyable, Movable):
         self.lookbehind_len = -1
         self.backref_group = -1
         self.icase = False
-        self.sub_dfa_safe = False
 
     @staticmethod
     def char_state(ch: UInt32) -> NFAState:
@@ -160,7 +160,6 @@ struct NFA(Copyable):
     var start: Int
     var group_count: Int
     var has_lazy: Bool
-    var needs_backtrack: Bool
     var can_use_dfa: Bool
     var start_anchor: Int  # AnchorKind at pattern start, or -1
     var start_after_leading_anchor: Int
@@ -174,7 +173,6 @@ struct NFA(Copyable):
         self.start = 0
         self.group_count = 0
         self.has_lazy = False
-        self.needs_backtrack = False
         self.can_use_dfa = True
         self.start_anchor = -1
         self.start_after_leading_anchor = -1
@@ -471,7 +469,6 @@ def _build_fragment(
         return frag^
 
     elif node.kind == ASTNodeKind.BACKREFERENCE:
-        nfa.needs_backtrack = True
         var br_state = NFAState.backref_state(node.group_index)
         br_state.icase = flags.ignorecase()
         var br_idx = nfa.add_state(br_state^)
@@ -739,20 +736,24 @@ def _to_upper(ch: UInt32) -> UInt32:
 
 
 def _add_case_folding(mut cs: CharSet):
-    """Add case-folded ASCII ranges to a charset for IGNORECASE."""
+    """Add case-folded ASCII ranges to a charset for IGNORECASE.
+
+    Only the intersection of each range with [A-Z] / [a-z] is folded.
+    Folding the raw endpoints instead would widen ranges that partially
+    overlap the letter blocks (e.g. [?-B] must fold to [?-B][ab], not
+    to [?-b] which drags in C-Z and punctuation).
+    """
     var new_ranges = List[CharRange]()
     for r in cs.ranges:
-        var lo = r.lo
-        var hi = r.hi
-        # Add lowercase versions
-        var lo_lower = _to_lower(lo)
-        var hi_lower = _to_lower(hi)
-        if lo_lower != lo or hi_lower != hi:
-            new_ranges.append(CharRange(lo_lower, hi_lower))
-        # Add uppercase versions
-        var lo_upper = _to_upper(lo)
-        var hi_upper = _to_upper(hi)
-        if lo_upper != lo or hi_upper != hi:
-            new_ranges.append(CharRange(lo_upper, hi_upper))
+        # Uppercase letters within the range -> add lowercase counterparts
+        var lo_u = max(r.lo, UInt32(CHAR_A_UPPER))
+        var hi_u = min(r.hi, UInt32(CHAR_Z_UPPER))
+        if lo_u <= hi_u:
+            new_ranges.append(CharRange(lo_u + 32, hi_u + 32))
+        # Lowercase letters within the range -> add uppercase counterparts
+        var lo_l = max(r.lo, UInt32(CHAR_A_LOWER))
+        var hi_l = min(r.hi, UInt32(CHAR_Z_LOWER))
+        if lo_l <= hi_l:
+            new_ranges.append(CharRange(lo_l - 32, hi_l - 32))
 
     cs.ranges.extend(new_ranges^)
