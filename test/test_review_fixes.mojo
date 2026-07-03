@@ -257,6 +257,59 @@ def test_bad_range_with_shorthand_rejected() raises:
         _ = parse("[a-\\w]")
 
 
+# --- DFA engine now reports leftmost-first (Python) ends ------------------
+# The DFA finds the leftmost start; the backtracker resolves the end so
+# capture-free alternations agree with Python and with the other engines.
+
+
+def test_dfa_search_leftmost_first_end() raises:
+    var re = StaticRegex["a|ab"]()
+    assert_true(re._strategy.use_dfa)
+    var r = re.search("ab")
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 1)  # Python picks the first alternative "a"
+
+
+def test_dfa_findall_leftmost_first_tokenization() raises:
+    var re = StaticRegex["a|ab"]()
+    var all = re.findall("abab")
+    # Python: ['a', 'a'] — matching "a" at 0 then rescanning from 1
+    assert_equal(len(all), 2)
+    assert_equal(all[0], "a")
+    assert_equal(all[1], "a")
+
+
+def test_dfa_split_leftmost_first() raises:
+    var re = StaticRegex["-|--"]()
+    assert_true(re._strategy.use_dfa)
+    var parts = re.split("a--b")
+    # Python: ['a', '', 'b'] — two single-dash delimiters, not one "--"
+    assert_equal(len(parts), 3)
+    assert_equal(parts[0], "a")
+    assert_equal(parts[1], "")
+    assert_equal(parts[2], "b")
+
+
+def test_dfa_search_empty_first_alternative() raises:
+    var re = StaticRegex["(?:|a)"]()
+    var r = re.search("a")
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 0)  # Python prefers the empty first alternative
+
+
+def test_dfa_longest_alternative_still_reachable() raises:
+    # When the longer alternative is listed first, it wins — same as Python.
+    var re = StaticRegex["ab|a"]()
+    var r = re.search("ab")
+    assert_true(r.matched)
+    assert_equal(r.end, 2)
+    # And fullmatch is unaffected by end disambiguation either way.
+    var re2 = StaticRegex["a|ab"]()
+    assert_true(re2.match("ab").matched)
+
+
 # --- DFA state-cap now falls back to Pike instead of "no match" -----------
 
 

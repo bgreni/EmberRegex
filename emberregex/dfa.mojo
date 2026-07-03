@@ -133,7 +133,11 @@ struct LazyDFA(Copyable, Movable):
     def match_at[
         origin: Origin, //
     ](mut self, nfa: NFA, input: Span[Byte, origin], start: Int) raises -> Int:
-        """Try to match at start position. Returns end position or -1."""
+        """Try to match at start position. Returns end position or -1.
+
+        The returned end is leftmost-longest; callers that need Python's
+        leftmost-first end must re-resolve it (see StaticRegex._lf_end_at).
+        """
         self._ensure_init(nfa)
         var input_len = len(input)
 
@@ -182,6 +186,9 @@ struct LazyDFA(Copyable, Movable):
         bitmap_useful: Bool,
     ) raises -> Tuple[Int, Int]:
         """Search for first match from start. Returns (match_start, match_end).
+
+        match_start is the leftmost possible start; match_end is
+        leftmost-longest (see match_at).
         """
         self._ensure_init(nfa)
         var input_len = len(input)

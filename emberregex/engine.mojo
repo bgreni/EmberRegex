@@ -571,7 +571,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             return MatchResult[Self._num_slots](
                                 matched=True,
                                 start=pos,
-                                end=match_end,
+                                end=self._lf_end_at(
+                                    input_bytes, pos, match_end
+                                ),
                                 slots=InlineArray[Int, Self._num_slots](
                                     fill=-1
                                 ),
@@ -589,7 +591,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             return MatchResult[Self._num_slots](
                                 matched=True,
                                 start=range[0],
-                                end=range[1],
+                                end=self._lf_end_at(
+                                    input_bytes, range[0], range[1]
+                                ),
                                 slots=InlineArray[Int, Self._num_slots](
                                     fill=-1
                                 ),
@@ -757,8 +761,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 comptime if Self._strategy.start_anchor == AnchorKind.BOL:
                     var match_end = dfa.match_at(dfa_nfa, input_bytes, 0)
                     if match_end >= 0:
+                        var end = self._lf_end_at(input_bytes, 0, match_end)
                         results.append(
-                            String(unsafe_from_utf8=input_bytes[0:match_end])
+                            String(unsafe_from_utf8=input_bytes[0:end])
                         )
                     return results^
 
@@ -767,6 +772,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                     while pos <= input_len:
                         var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                         if match_end >= 0:
+                            match_end = self._lf_end_at(
+                                input_bytes, pos, match_end
+                            )
                             results.append(
                                 String(
                                     unsafe_from_utf8=input_bytes[pos:match_end]
@@ -804,6 +812,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                 dfa_nfa, input_bytes, pos
                             )
                             if match_end >= 0:
+                                match_end = self._lf_end_at(
+                                    input_bytes, pos, match_end
+                                )
                                 results.append(
                                     String(
                                         unsafe_from_utf8=input_bytes[
@@ -828,7 +839,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             if range[0] < 0:
                                 break
                             var start = range[0]
-                            var end = range[1]
+                            var end = self._lf_end_at(
+                                input_bytes, start, range[1]
+                            )
                             results.append(
                                 String(unsafe_from_utf8=input_bytes[start:end])
                             )
@@ -1064,6 +1077,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             break
                         var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
                         if match_end >= 0:
+                            match_end = self._lf_end_at(
+                                input_bytes, pos, match_end
+                            )
                             parts.append(
                                 String(
                                     unsafe_from_utf8=input_bytes[prev_end:pos]
@@ -1088,7 +1104,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                         if range[0] < 0:
                             break
                         var start = range[0]
-                        var end = range[1]
+                        var end = self._lf_end_at(input_bytes, start, range[1])
                         parts.append(
                             String(unsafe_from_utf8=input_bytes[prev_end:start])
                         )
@@ -1340,6 +1356,41 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         if chunk_start < rep_len:
             output += String(unsafe_from_utf8=rep_bytes[chunk_start:rep_len])
         return output^
+
+    def _lf_end_at[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], start: Int, dfa_end: Int) -> Int:
+        """Resolve the leftmost-first (Python re) end of the match at `start`.
+
+        The lazy DFA reports leftmost-longest ends — a subset construction
+        cannot track alternative priority, so `a|ab` on "ab" yields end 2
+        where Python yields 1. The DFA is still authoritative for *finding*
+        the leftmost start; this runs the backtracker once, anchored there,
+        to disambiguate the end with the same semantics as every other
+        engine. Costs one anchored run per reported match.
+
+        Falls back to the Pike VM if the backtracker budget is exhausted,
+        and to the DFA's own end as a last resort (still a valid match,
+        just longest-biased).
+        """
+        try:
+            var slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_run[
+                nfa=Self.nfa,
+                state_idx=Self._start,
+                num_slots=Self._num_slots,
+            ](input, start, slots)
+            if end >= 0:
+                return end
+        except:
+            var nfa = _build_static_nfa(Self.pattern)
+            var num_states = len(nfa.states)
+            var vm = PikeVM[Self._num_slots](nfa^)
+            var bufs = _VMBuffers(num_states, Self._num_slots)
+            var result = vm._execute_with_bufs(input, start, bufs)
+            if result.matched:
+                return result.end
+        return dfa_end
 
     def _pike_match(self, input: String) -> MatchResult[Self._num_slots]:
         """PikeVM fallback for match when backtracker exhausts budget."""
