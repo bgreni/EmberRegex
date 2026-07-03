@@ -37,6 +37,15 @@ from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import _sbt_try_match, SBT_BUDGET
 from .dfa import LazyDFA
+from .static_dfa import (
+    EagerDFA,
+    build_eager_dfa,
+    edfa_table_arr,
+    edfa_flags_arr,
+    edfa_full_match,
+    edfa_match_at,
+    edfa_search_forward,
+)
 from .executor import PikeVM, _VMBuffers
 from std.collections import InlineArray
 from std.memory import UnsafePointer
@@ -291,6 +300,16 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
 
 
+def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
+    """True when the pattern should run on a DFA engine (eager or lazy)."""
+    return (
+        nfa.can_use_dfa
+        and group_count == 0
+        and not nfa.has_lazy
+        and (_has_alternation_splits(nfa) or _quantifier_has_suffix(nfa))
+    )
+
+
 struct MatchStrategy:
     """Compile-time engine selection flags for a given NFA.
 
@@ -298,10 +317,14 @@ struct MatchStrategy:
     which execution path (SIMD literal, DFA, backtracker) is taken and which
     search-acceleration heuristics (prefix scan, first-byte bitmap, anchor
     skipping) apply.
+
+    `use_dfa` means "a DFA engine runs this pattern"; `use_eager_dfa`
+    selects the comptime-determinized table over the runtime LazyDFA.
     """
 
     var use_simd_literal: Bool
     var use_dfa: Bool
+    var use_eager_dfa: Bool
     var use_sandwich_match: Bool
     var sandwich_suffix_len: Int
     var start_anchor: Int
@@ -314,6 +337,7 @@ struct MatchStrategy:
         out self,
         use_simd_literal: Bool,
         use_dfa: Bool,
+        use_eager_dfa: Bool,
         use_sandwich_match: Bool,
         sandwich_suffix_len: Int,
         start_anchor: Int,
@@ -324,6 +348,7 @@ struct MatchStrategy:
     ):
         self.use_simd_literal = use_simd_literal
         self.use_dfa = use_dfa
+        self.use_eager_dfa = use_eager_dfa
         self.use_sandwich_match = use_sandwich_match
         self.sandwich_suffix_len = sandwich_suffix_len
         self.start_anchor = start_anchor
@@ -340,15 +365,11 @@ def _compute_strategy(
     group_count: Int,
     sandwich_valid: Bool,
     sandwich_suffix_len: Int,
+    eager_dfa_valid: Bool,
 ) -> MatchStrategy:
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
-    var use_dfa = (
-        nfa.can_use_dfa
-        and group_count == 0
-        and not nfa.has_lazy
-        and (_has_alternation_splits(nfa) or _quantifier_has_suffix(nfa))
-    )
+    var use_dfa = _dfa_candidate(nfa, group_count)
     var pure_literal = is_pure_literal(nfa)
     var use_simd_literal = (
         pure_literal
@@ -370,6 +391,7 @@ def _compute_strategy(
     return MatchStrategy(
         use_simd_literal=use_simd_literal,
         use_dfa=use_dfa,
+        use_eager_dfa=use_dfa and eager_dfa_valid,
         use_sandwich_match=use_sandwich_match,
         sandwich_suffix_len=sandwich_suffix_len,
         start_anchor=nfa.start_anchor,
@@ -397,6 +419,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     comptime _prefix = extract_literal_prefix(Self.nfa)
     comptime _first_byte_bitmap = extract_first_byte_bitmap(Self.nfa)
     comptime _sandwich = extract_match_sandwich(Self.nfa)
+    comptime _edfa = build_eager_dfa(
+        Self.nfa, _dfa_candidate(Self.nfa, Self._group_count)
+    )
     comptime _strategy = _compute_strategy(
         Self.nfa,
         Self._prefix,
@@ -404,18 +429,25 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         Self._group_count,
         Self._sandwich.valid,
         len(Self._sandwich.suffix),
+        Self._edfa.valid,
     )
+    # LazyDFA only backs DFA patterns whose comptime determinization
+    # overflowed EDFA_STATE_CAP.
+    comptime _use_lazy_dfa = Self._strategy.use_dfa and not Self._strategy.use_eager_dfa
+    comptime _EDFA_TN = Self._edfa.num_states * 256
+    comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN](Self._edfa)
+    comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
 
     var _dfa_nfa: ConditionalType[
         Trait=ImplicitlyDeletable & Copyable,
-        If=Self._strategy.use_dfa,
+        If=Self._use_lazy_dfa,
         Then=NFA,
         Else=NoneType,
     ]
 
     var _dfa: ConditionalType[
         Trait=ImplicitlyDeletable & Copyable,
-        If=Self._strategy.use_dfa,
+        If=Self._use_lazy_dfa,
         Then=LazyDFA,
         Else=NoneType,
     ]
@@ -428,7 +460,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     ]
 
     def __init__(out self):
-        comptime if Self._strategy.use_dfa:
+        comptime if Self._use_lazy_dfa:
             var nfa = _build_static_nfa(Self.pattern)
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
             # self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](materialize[_build_static_nfa(Self.pattern)]())
@@ -444,6 +476,63 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             self._simd_lit = rebind_var[type_of(self._simd_lit)](vec)
         else:
             self._simd_lit = rebind_var[type_of(self._simd_lit)](None)
+
+    # --- DFA engine dispatch: comptime table walk or runtime LazyDFA ------
+    # Only the lazy branches can raise (DFA_STATE_CAP -> Pike VM fallback);
+    # the eager table is complete by construction.
+
+    @always_inline
+    def _dfa_full_match(mut self, input: String) raises -> Bool:
+        comptime if Self._strategy.use_eager_dfa:
+            return edfa_full_match[
+                d=Self._edfa,
+                table=Self._EDFA_TABLE,
+                flags=Self._EDFA_FLAGS,
+            ](input.as_bytes())
+        else:
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
+            return dfa.full_match(dfa_nfa, input)
+
+    @always_inline
+    def _dfa_match_at[
+        origin: Origin, //
+    ](mut self, input: Span[Byte, origin], start: Int) raises -> Int:
+        comptime if Self._strategy.use_eager_dfa:
+            return edfa_match_at[
+                d=Self._edfa,
+                table=Self._EDFA_TABLE,
+                flags=Self._EDFA_FLAGS,
+            ](input, start)
+        else:
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
+            return dfa.match_at(dfa_nfa, input, start)
+
+    @always_inline
+    def _dfa_search_forward[
+        origin: Origin, //
+    ](mut self, input: Span[Byte, origin], start: Int) raises -> Tuple[
+        Int, Int
+    ]:
+        comptime if Self._strategy.use_eager_dfa:
+            return edfa_search_forward[
+                d=Self._edfa,
+                table=Self._EDFA_TABLE,
+                flags=Self._EDFA_FLAGS,
+                first_byte_bitmap=Self._first_byte_bitmap,
+                bitmap_useful=Self._strategy.first_byte_useful,
+            ](input, start)
+        else:
+            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
+            ref dfa = rebind[LazyDFA](self._dfa)
+            return dfa.search_forward(
+                dfa_nfa,
+                input,
+                start,
+                Self._first_byte_bitmap,
+                Self._strategy.first_byte_useful,
+            )
 
     def match(mut self, input: String) -> MatchResult[Self._num_slots]:
         """Match the entire input against the pattern.
@@ -490,10 +579,8 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                     )
             return MatchResult[Self._num_slots].no_match()
         elif Self._strategy.use_dfa:
-            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
-            ref dfa = rebind[LazyDFA](self._dfa)
             try:
-                if dfa.full_match(dfa_nfa, input):
+                if self._dfa_full_match(input):
                     return MatchResult[Self._num_slots](
                         matched=True,
                         start=0,
@@ -553,8 +640,6 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 slots=InlineArray[Int, Self._num_slots](fill=-1),
             )
         elif Self._strategy.use_dfa:
-            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
-            ref dfa = rebind[LazyDFA](self._dfa)
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
@@ -566,7 +651,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                         )
                         if pos < 0:
                             return MatchResult[Self._num_slots].no_match()
-                        var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                        var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
                             return MatchResult[Self._num_slots](
                                 matched=True,
@@ -580,13 +665,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             )
                         pos += 1
                     elif Self._strategy.prefix_len == 0:
-                        var range = dfa.search_forward(
-                            dfa_nfa,
-                            input_bytes,
-                            pos,
-                            Self._first_byte_bitmap,
-                            Self._strategy.first_byte_useful,
-                        )
+                        var range = self._dfa_search_forward(input_bytes, pos)
                         if range[0] >= 0:
                             return MatchResult[Self._num_slots](
                                 matched=True,
@@ -753,13 +832,11 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
-            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
-            ref dfa = rebind[LazyDFA](self._dfa)
 
             try:
                 # BOL: only position 0
                 comptime if Self._strategy.start_anchor == AnchorKind.BOL:
-                    var match_end = dfa.match_at(dfa_nfa, input_bytes, 0)
+                    var match_end = self._dfa_match_at(input_bytes, 0)
                     if match_end >= 0:
                         var end = self._lf_end_at(input_bytes, 0, match_end)
                         results.append(
@@ -770,7 +847,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 # BOL_MULTILINE: skip to BOL positions via SIMD newline scan
                 elif Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
                     while pos <= input_len:
-                        var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                        var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
                             match_end = self._lf_end_at(
                                 input_bytes, pos, match_end
@@ -808,9 +885,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             )
                             if pos < 0:
                                 break
-                            var match_end = dfa.match_at(
-                                dfa_nfa, input_bytes, pos
-                            )
+                            var match_end = self._dfa_match_at(input_bytes, pos)
                             if match_end >= 0:
                                 match_end = self._lf_end_at(
                                     input_bytes, pos, match_end
@@ -829,12 +904,8 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                 continue
                             pos += 1
                         elif Self._strategy.prefix_len == 0:
-                            var range = dfa.search_forward(
-                                dfa_nfa,
-                                input_bytes,
-                                pos,
-                                Self._first_byte_bitmap,
-                                Self._strategy.first_byte_useful,
+                            var range = self._dfa_search_forward(
+                                input_bytes, pos
                             )
                             if range[0] < 0:
                                 break
@@ -1065,8 +1136,6 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var input_len = input.byte_length()
             var pos = 0
             var prev_end = 0
-            ref dfa_nfa = rebind[NFA](self._dfa_nfa)
-            ref dfa = rebind[LazyDFA](self._dfa)
             try:
                 while pos <= input_len:
                     comptime if Self._strategy.prefix_len > 0:
@@ -1075,7 +1144,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                         )
                         if pos < 0:
                             break
-                        var match_end = dfa.match_at(dfa_nfa, input_bytes, pos)
+                        var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
                             match_end = self._lf_end_at(
                                 input_bytes, pos, match_end
@@ -1094,13 +1163,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             continue
                         pos += 1
                     elif Self._strategy.prefix_len == 0:
-                        var range = dfa.search_forward(
-                            dfa_nfa,
-                            input_bytes,
-                            pos,
-                            Self._first_byte_bitmap,
-                            Self._strategy.first_byte_useful,
-                        )
+                        var range = self._dfa_search_forward(input_bytes, pos)
                         if range[0] < 0:
                             break
                         var start = range[0]
