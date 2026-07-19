@@ -99,6 +99,45 @@ def test_bench_log_parse() raises:
     assert_equal(r.group_str(input, 4), "Connection timeout after 30s")
 
 
+def test_bench_email_search_2KB() raises:
+    # Mirrors bench_static_email_search_2KB: haystack of make_lines-style
+    # text (whose words are false candidates for the identifier charset
+    # before '@') with the only email buried near the end.
+    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var lines = String("")
+    for i in range(80):
+        lines += "line " + String(i) + " some text here\n"
+    var input = lines + " contact us at first.last@example.com today"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(
+        String(unsafe_from_utf8=input.as_bytes()[r.start : r.end]),
+        "first.last@example.com",
+    )
+    assert_false(re.search(lines).matched)
+
+
+def test_bench_email_search_long_tokens() raises:
+    # Mirrors bench_static_email_search_long_tokens: long non-matching
+    # identifier tokens, one real email at the end. Exercises the
+    # search-run-skip path.
+    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var tok = String("abcdefghij0123456789abcdefghij0123456789")
+    var parts = List[String]()
+    for _ in range(40):
+        parts.append(tok)
+    var input = String(" ").join(parts) + " user@example.com"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(
+        String(unsafe_from_utf8=input.as_bytes()[r.start : r.end]),
+        "user@example.com",
+    )
+    # No email at all: the skip must not produce a false match.
+    var only_tokens = String(" ").join(parts)
+    assert_false(re.search(only_tokens).matched)
+
+
 def test_bench_csv_fields() raises:
     var re = StaticRegex["[^,]+"]()
     var input = "field1,field2,field3,field4,field5,field6,field7,field8"
@@ -227,6 +266,22 @@ def test_bench_alternation_4() raises:
     assert_false(re.match("epsilon").matched)
 
 
+def test_bench_alternation_4_search_2KB() raises:
+    # Mirrors bench_alternation_4_search_2KB: haystack of make_lines-style
+    # text ("line N some text here") whose only match is a trailing
+    # " delta".
+    var re = StaticRegex["alpha|beta|gamma|delta"]()
+    var lines = String("")
+    for i in range(80):
+        lines += "line " + String(i) + " some text here\n"
+    var input = lines + " delta"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.end, input.byte_length())
+    assert_equal(r.start, input.byte_length() - 5)
+    assert_false(re.search(lines).matched)
+
+
 def test_bench_alternation_16() raises:
     var re = StaticRegex[
         "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
@@ -340,6 +395,54 @@ def test_bench_engine_backtrack_with_backref() raises:
     var r = re.match(input)
     assert_true(r.matched)
     assert_equal(r.group_str(input, 1), "abc")
+
+
+def test_bench_dotstar_search() raises:
+    # bench static_dotstar_search_1K: "a"*1000 + "x" + "bbb"
+    var re = StaticRegex[".*x"]()
+    var input = "a" * 1000 + "x" + "bbb"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 1001)
+
+
+def test_bench_bol_alternation_miss() raises:
+    # bench static_bol_alternation_miss_10KB: "x"*10_000 must not match.
+    var re = StaticRegex["^(?:ab|cd)"]()
+    assert_false(re.search("x" * 10_000).matched)
+    assert_true(re.search("abx").matched)
+
+
+def test_bench_replace_alternation() raises:
+    # bench static_replace_alternation: every cat/dog becomes pet.
+    var re = StaticRegex["cat|dog"]()
+    assert_equal(
+        re.replace("a cat and a dog here", "pet"), "a pet and a pet here"
+    )
+
+
+def test_bench_ignorecase_search() raises:
+    # bench static_ignorecase_search_2KB: filler misses, tail hits.
+    var re = StaticRegex["(?i)error"]()
+    var filler = "the everyday sentence keeps several e letters here "
+    assert_false(re.search(filler).matched)
+    var input = filler + "an ERRor appeared"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, filler.byte_length() + 3)
+
+
+def test_bench_teddy_prefix_search() raises:
+    # bench static_teddy_prefix_search_2KB: filler misses, tail hits.
+    var re = StaticRegex["(?:GET|POST|PUT) /\\w+"]()
+    var filler = "ts=12 host=web01 status=200 bytes=512 ref=none agent=x "
+    assert_false(re.search(filler).matched)
+    var input = filler + "POST /submit"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, filler.byte_length())
+    assert_equal(r.end, input.byte_length())
 
 
 def main() raises:

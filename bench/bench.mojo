@@ -550,6 +550,117 @@ def bench_static_dotstar(mut b: Bench) raises:
     b.bench_function[go](BenchId("static_dotstar_1K"))
 
 
+def bench_static_dotstar_search(mut b: Bench) raises:
+    # DFA search whose end needs no _lf_end_at re-run (single greedy loop,
+    # branch-free suffix — the comptime skip).
+    var re = StaticRegex[".*x"]()
+    var input = "a" * 1000 + "x" + "bbb"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.end)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_dotstar_search_1K"))
+
+
+def bench_static_bol_alternation_miss(mut b: Bench) raises:
+    # BOL-anchored DFA pattern on a long non-matching input: the search
+    # fast path answers from one anchored attempt instead of scanning.
+    var re = StaticRegex["^(?:ab|cd)"]()
+    var input = "x" * 10_000
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_bol_alternation_miss_10KB"))
+
+
+def bench_static_replace_alternation(mut b: Bench) raises:
+    # replace() on a DFA-lane pattern (Teddy literal alternation).
+    var re = StaticRegex["cat|dog"]()
+    var input = repeat_with_sep("a cat and a dog here", " ", 30)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.replace(input, "pet")
+                keep(r.byte_length())
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_replace_alternation"))
+
+
+def bench_static_ignorecase_search(mut b: Bench) raises:
+    # Caseless filter prefix: rare-byte |0x20 probes instead of a
+    # first-byte {e,E} bitmap crawl over 'e'-dense prose.
+    var re = StaticRegex["(?i)error"]()
+    var filler = "the everyday sentence keeps several e letters here "
+    var input = String("")
+    for _ in range(40):
+        input += filler
+    input += "an ERRor appeared"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.start)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_ignorecase_search_2KB"))
+
+
+def bench_static_teddy_prefix_search(mut b: Bench) raises:
+    # Teddy alternation-prefix prefilter over a request-log haystack.
+    var re = StaticRegex["(?:GET|POST|PUT) /\\w+"]()
+    var filler = "ts=12 host=web01 status=200 bytes=512 ref=none agent=x "
+    var input = String("")
+    for _ in range(35):
+        input += filler
+    input += "POST /submit"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.start)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_teddy_prefix_search_2KB"))
+
+
 def bench_static_nested_quantifier(mut b: Bench) raises:
     var re = StaticRegex["([a-z]+[0-9]+)+x"]()
     var input = "abc123def456ghi789x"
@@ -591,6 +702,57 @@ def bench_static_email(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("static_realworld_email"))
+
+
+def bench_static_email_search_2KB(mut b: Bench) raises:
+    # Sheng + nibble-accel engine: the identifier charset before '@' is a
+    # self-looping DFA state accelerated via shufti/truffle. Ordinary
+    # words in the haystack are false candidates (identifier-charset runs
+    # that don't reach '@'), stressing the accelerated-scan/bounce-back
+    # cycle over a haystack much larger than the SIMD width.
+    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var input = make_lines(80) + " contact us at first.last@example.com today"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_email_search_2KB"))
+
+
+def bench_static_email_search_long_tokens(mut b: Bench) raises:
+    # Search-skip: a haystack of long (~40 char) identifier tokens that are
+    # all non-matching (no '@'). Without the start-run skip each token is
+    # re-attempted at every position (O(len^2) accel scans); the skip
+    # jumps past a token in one scan once its first attempt fails.
+    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var tok = String("abcdefghij0123456789abcdefghij0123456789")
+    var parts = List[String]()
+    for _ in range(40):
+        parts.append(tok)
+    var input = String(" ").join(parts) + " user@example.com"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_email_search_long_tokens"))
 
 
 def bench_static_ip_address(mut b: Bench) raises:
@@ -1074,6 +1236,27 @@ def bench_alternation_4(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("alternation_4"))
+
+
+def bench_alternation_4_search_2KB(mut b: Bench) raises:
+    # Teddy engine: multi-literal search over a long haystack with the
+    # only match at the end.
+    var re = StaticRegex["alpha|beta|gamma|delta"]()
+    var input = make_lines(80) + " delta"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("alternation_4_search_2KB"))
 
 
 def bench_alternation_16(mut b: Bench) raises:
@@ -1725,10 +1908,17 @@ def main() raises:
     # Pathological (static_ prefix IDs)
     bench_static_optional_8(b)
     bench_static_dotstar(b)
+    bench_static_dotstar_search(b)
+    bench_static_bol_alternation_miss(b)
+    bench_static_replace_alternation(b)
+    bench_static_ignorecase_search(b)
+    bench_static_teddy_prefix_search(b)
     bench_static_nested_quantifier(b)
 
     # Real-world (static_ prefix IDs)
     bench_static_email(b)
+    bench_static_email_search_2KB(b)
+    bench_static_email_search_long_tokens(b)
     bench_static_ip_address(b)
     bench_static_log_parse(b)
     bench_static_csv_field(b)
@@ -1766,6 +1956,7 @@ def main() raises:
 
     # Alternation scaling
     bench_alternation_4(b)
+    bench_alternation_4_search_2KB(b)
     bench_alternation_16(b)
     bench_alternation_miss(b)
 

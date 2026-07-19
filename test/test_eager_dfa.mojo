@@ -12,7 +12,10 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 def test_eager_selected_for_alternation() raises:
     comptime S = StaticRegex["cat|dog|bird"]
     assert_true(S._strategy.use_dfa)
-    assert_true(S._strategy.use_eager_dfa)
+    # Pure literal alternations are Teddy-claimed on byte-shuffle targets
+    # (the eager DFA isn't built for them at all); elsewhere they run on
+    # the eager table.
+    assert_true(S._strategy.use_teddy or S._strategy.use_eager_dfa)
 
 
 def test_eager_selected_for_quantifier_with_suffix() raises:
@@ -44,7 +47,7 @@ def test_eager_search_and_match() raises:
 
 def test_eager_findall_and_split() raises:
     var re = StaticRegex["cat|dog"]()
-    assert_true(re._strategy.use_eager_dfa)
+    assert_true(re._strategy.use_teddy or re._strategy.use_eager_dfa)
     var all = re.findall("a cat, a dog, a cat")
     assert_equal(len(all), 3)
     assert_equal(all[0], "cat")
@@ -61,6 +64,32 @@ def test_eager_bol_anchor() raises:
     assert_true(re._strategy.use_eager_dfa)
     assert_true(re.search("abxx").matched)
     assert_false(re.search("xxab").matched)
+
+
+def test_eager_bol_multiline_search() raises:
+    # DFA search's BOL_MULTILINE fast path: attempts only line starts.
+    var re = StaticRegex["(?m)^(?:a|b)c"]()
+    assert_true(re._strategy.use_eager_dfa)
+    var r = re.search("xx\nbc x")
+    assert_true(r.matched)
+    assert_equal(r.start, 3)
+    assert_equal(r.end, 5)
+    assert_false(re.search("xx bc").matched)
+
+
+def test_lf_end_skip_guard() raises:
+    # `.*x` (single greedy loop, branch-free suffix): the comptime
+    # _lf_end_at skip fires and the DFA end must equal Python's.
+    var re1 = StaticRegex[".*x"]()
+    var r1 = re1.search("axbxc")
+    assert_equal(r1.start, 0)
+    assert_equal(r1.end, 4)
+    # `a*(?:ab)*` (two loops): leftmost-first end (2) differs from the
+    # longest end (3) on "aab" — the skip must NOT fire here.
+    var re2 = StaticRegex["a*(?:ab)*"]()
+    var r2 = re2.search("aab")
+    assert_equal(r2.start, 0)
+    assert_equal(r2.end, 2)
 
 
 def test_eager_eol_anchor() raises:
@@ -85,10 +114,10 @@ def test_eager_multiline_anchors() raises:
 
 
 def test_eager_leftmost_first_end_resolution() raises:
-    # The eager DFA reports leftmost-longest ends; _lf_end_at must still
-    # re-resolve to Python's leftmost-first semantics.
+    # The DFA lane reports leftmost-longest ends; _lf_end_at must still
+    # re-resolve to Python's leftmost-first semantics (Teddy included).
     var re = StaticRegex["a|ab"]()
-    assert_true(re._strategy.use_eager_dfa)
+    assert_true(re._strategy.use_teddy or re._strategy.use_eager_dfa)
     var r = re.search("ab")
     assert_true(r.matched)
     assert_equal(r.end, 1)

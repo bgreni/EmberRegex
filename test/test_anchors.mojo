@@ -75,5 +75,43 @@ def test_word_boundary_empty_string() raises:
     assert_false(re.search("").matched)
 
 
+# Half-anchored alternations: an anchor on only one arm must not restrict
+# where the other arms can match (regression for start_anchor detection
+# walking through alternation SPLITs). Expected values are CPython outputs.
+
+
+def test_half_anchored_alternation_search() raises:
+    var re = StaticRegex["(^a|b)c"]()
+    var r = re.search("xxxxxbc")
+    assert_true(r.matched)
+    assert_equal(r.start, 5)
+    assert_equal(r.end, 7)
+
+
+def test_half_anchored_alternation_findall() raises:
+    var re = StaticRegex["^a|b"]()
+    var all = re.findall("xbxb")
+    assert_equal(len(all), 2)
+    assert_equal(all[0], "b")
+    assert_equal(all[1], "b")
+
+
+def test_half_anchored_alternation_multiline() raises:
+    var re = StaticRegex["(?m)(^a|b)c"]()
+    var r = re.search("xx bc xx")
+    assert_true(r.matched)
+    assert_equal(r.start, 3)
+    assert_equal(r.end, 5)
+
+
+def test_half_anchored_alternation_dfa_search() raises:
+    # No capture group: takes the DFA lane and its anchor fast paths.
+    var re = StaticRegex["^a|b"]()
+    var r = re.search("xxb")
+    assert_true(r.matched)
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 3)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

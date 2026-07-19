@@ -21,24 +21,44 @@ from .constants import (
     CHAR_ZERO,
 )
 from .parser import parse
-from .nfa import build_nfa, NFA, NFAStateKind
+from .nfa import build_nfa, forms_cycle, NFA, NFAStateKind
 from .ast import AnchorKind
 from .result import MatchResult
 from .flags import RegexFlags
 from .optimize import (
+    extract_alt_prefix,
+    extract_filter_prefix,
+    extract_literal_alternation,
     extract_literal_prefix,
+    extract_literal_suffix,
     extract_first_byte_bitmap,
     extract_required_byte,
     extract_match_sandwich,
     is_pure_literal,
+    select_probe_offsets,
+    FilterPrefix,
+    LiteralAlt,
 )
-from .simd_scan import simd_find_byte, simd_find_literal
+from .teddy import (
+    teddy_find_prefix,
+    teddy_full_match,
+    teddy_match_at,
+    teddy_search_forward,
+)
+from .simd_scan import (
+    clear_first_lane,
+    first_lane_index,
+    lane_bits,
+    simd_find_byte,
+    simd_find_literal,
+)
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import _sbt_try_match, SBT_BUDGET
 from .dfa import LazyDFA
 from .static_dfa import (
     EagerDFA,
+    _pivot_prefilter,
     build_eager_dfa,
     edfa_table_arr,
     edfa_flags_arr,
@@ -46,10 +66,23 @@ from .static_dfa import (
     edfa_match_at,
     edfa_search_forward,
 )
+from .sheng import (
+    sheng_full_match,
+    sheng_masks_arr,
+    sheng_match_at,
+    sheng_search_forward,
+    sheng_viable,
+)
+from .simd_kernels import (
+    HAS_FAST_BYTE_SHUFFLE,
+    _class_contains,
+    build_class_masks,
+    find_in_class,
+    stops_from_bitmap,
+)
 from .executor import PikeVM, _VMBuffers
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.utils.type_functions import ConditionalType
 
 
 @always_inline
@@ -67,8 +100,14 @@ def _sbt_run[
 ) raises -> Int:
     """Run backtracker with a fresh budget allocation.
 
-    Raises if the budget is exhausted, signaling that the result may be
-    a false negative and a fallback engine should be used.
+    Raises if the budget is exhausted (work bound) or the recursion depth
+    cap was hit (stack bound — see SBT_MAX_DEPTH), signaling that the
+    result may be a false negative and a fallback engine should be used.
+
+    Do NOT scale the budget with input length: for non-simple loops the
+    recursion depth tracks consumed bytes, so a larger budget converts
+    the Pike fallback into a stack overflow (measured: `(?:ab)+` on a
+    50KB input crashes under -D ASSERT=all).
     """
     var budget = SBT_BUDGET
     var result = _sbt_try_match[
@@ -101,115 +140,6 @@ def _is_bitmap_useful(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Bool:
     return bitmap.ne(UInt8(0xFF)).reduce_or()
 
 
-def _forms_cycle(nfa: NFA, split_idx: Int) -> Bool:
-    """Return True if following out1 from split_idx eventually loops back to it.
-
-    This detects SPLIT states that are part of quantifier loops (*, +, {n,}).
-    Used to identify patterns like (a+)+ where the loop body itself contains
-    ambiguous overlap.
-    """
-    var num_states = len(nfa.states)
-    var visited = List[Bool](length=num_states, fill=False)
-    var stack = List[Int]()
-    # Follow out1 — the loop-body branch — not out2 (the exit branch)
-    stack.append(nfa.states[split_idx].out1)
-    while len(stack) > 0:
-        var idx = stack.pop()
-        if idx < 0 or idx >= num_states or visited[idx]:
-            continue
-        if idx == split_idx:
-            return True
-        visited[idx] = True
-        var kind = nfa.states[idx].kind
-        if kind == NFAStateKind.SPLIT:
-            stack.append(nfa.states[idx].out1)
-            stack.append(nfa.states[idx].out2)
-        elif kind == NFAStateKind.MATCH:
-            pass  # dead end
-        else:  # CHAR, CHARSET, ANY, SAVE, ANCHOR, etc.
-            stack.append(nfa.states[idx].out1)
-    return False
-
-
-def _eps_consuming_states(nfa: NFA, start: Int) -> List[Int]:
-    """Collect consuming state indices reachable from start via epsilon transitions only.
-    """
-    var num_states = len(nfa.states)
-    var result = List[Int]()
-    var visited = List[Bool](length=num_states, fill=False)
-    var stack = List[Int]()
-    stack.append(start)
-    while len(stack) > 0:
-        var idx = stack.pop()
-        if idx < 0 or idx >= num_states or visited[idx]:
-            continue
-        visited[idx] = True
-        var kind = nfa.states[idx].kind
-        if (
-            kind == NFAStateKind.CHAR
-            or kind == NFAStateKind.CHARSET
-            or kind == NFAStateKind.ANY
-        ):
-            result.append(idx)
-        elif kind == NFAStateKind.SPLIT:
-            stack.append(nfa.states[idx].out1)
-            stack.append(nfa.states[idx].out2)
-        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
-            stack.append(nfa.states[idx].out1)
-        # MATCH / LOOKAHEAD / LOOKBEHIND / BACKREF: stop here
-    return result^
-
-
-def _consuming_states_overlap(nfa: NFA, a: Int, b: Int) -> Bool:
-    """Conservative check: can consuming states a and b match the same byte?"""
-    ref sa = nfa.states[a]
-    ref sb = nfa.states[b]
-    var ka = sa.kind
-    var kb = sb.kind
-    if ka == NFAStateKind.ANY and kb == NFAStateKind.ANY:
-        return True
-    if ka == NFAStateKind.ANY:
-        if kb == NFAStateKind.CHAR:
-            return sa.char_value != UInt32(
-                CHAR_NEWLINE
-            ) or sb.char_value != UInt32(CHAR_NEWLINE)
-        return True  # conservative for CHARSET
-    if kb == NFAStateKind.ANY:
-        if ka == NFAStateKind.CHAR:
-            return sa.char_value != UInt32(
-                CHAR_NEWLINE
-            ) or sb.char_value != UInt32(CHAR_NEWLINE)
-        return True
-    if ka == NFAStateKind.CHAR and kb == NFAStateKind.CHAR:
-        return sa.char_value == sb.char_value
-    if ka == NFAStateKind.CHAR and kb == NFAStateKind.CHARSET:
-        ref cs = nfa.charsets[sb.charset_index]
-        var ch = UInt32(sa.char_value)
-        if ch >= 256:
-            return cs.negated
-        var byte_idx = Int(ch) >> 3
-        var bit_idx = Int(ch) & 7
-        var in_set = (cs.bitmap[byte_idx] & (UInt8(1) << UInt8(bit_idx))) != 0
-        return cs.negated != in_set
-    if ka == NFAStateKind.CHARSET and kb == NFAStateKind.CHAR:
-        ref cs = nfa.charsets[sa.charset_index]
-        var ch = UInt32(sb.char_value)
-        if ch >= 256:
-            return cs.negated
-        var byte_idx = Int(ch) >> 3
-        var bit_idx = Int(ch) & 7
-        var in_set = (cs.bitmap[byte_idx] & (UInt8(1) << UInt8(bit_idx))) != 0
-        return cs.negated != in_set
-    # CHARSET vs CHARSET: check bitmap intersection for non-negated sets
-    if ka == NFAStateKind.CHARSET and kb == NFAStateKind.CHARSET:
-        ref ca = nfa.charsets[sa.charset_index]
-        ref cb = nfa.charsets[sb.charset_index]
-        if not ca.negated and not cb.negated:
-            return (ca.bitmap & cb.bitmap).reduce_or() != 0
-        return True  # conservative for negated charsets
-    return True
-
-
 def _has_alternation_splits(nfa: NFA) -> Bool:
     """Return True if the NFA has SPLIT states that are alternations (not quantifier loops).
 
@@ -227,7 +157,7 @@ def _has_alternation_splits(nfa: NFA) -> Bool:
         if nfa.states[i].out2 == -1:
             continue
         # If this SPLIT doesn't form a cycle, it's an alternation — DFA helps
-        if not _forms_cycle(nfa, i):
+        if not forms_cycle(nfa, i):
             return True
     return False
 
@@ -244,7 +174,7 @@ def _quantifier_has_suffix(nfa: NFA) -> Bool:
     for i in range(num_states):
         if nfa.states[i].kind != NFAStateKind.SPLIT:
             continue
-        if not _forms_cycle(nfa, i):
+        if not forms_cycle(nfa, i):
             continue
         # This is a quantifier loop. Check if the exit branch (out2 for
         # greedy, out1 for lazy) leads to consuming states before MATCH.
@@ -285,9 +215,89 @@ def _reaches_consuming_before_match(nfa: NFA, start: Int) -> Bool:
     return False
 
 
+def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
+    """Comptime: True when the DFA's leftmost-longest end always equals the
+    backtracker's leftmost-first end, letting _lf_end_at skip its re-run.
+
+    Sound shape: every SPLIT is greedy and part of at most ONE quantifier
+    cycle (no alternation-like SPLITs), and the cycle's exit path reaches
+    MATCH through consuming states and anchors only. With one greedy loop
+    and a branch-free suffix, the backtracker's first success uses the
+    maximal repetition count, which is also the longest end.
+
+    Two loops already break the equality: for `a*(?:ab)*` on "aab" the
+    leftmost-first end is 2 (greedy a* wins) but the longest end is 3.
+    """
+    if nfa.has_lazy:
+        return False
+    var num_states = len(nfa.states)
+    var cycle_split = -1
+    for i in range(num_states):
+        if nfa.states[i].kind != NFAStateKind.SPLIT:
+            continue
+        if nfa.states[i].out2 == -1:
+            continue  # single-armed epsilon SPLIT
+        if not nfa.states[i].greedy:
+            return False
+        if not forms_cycle(nfa, i):
+            return False  # alternation: arm priority affects the end
+        if cycle_split >= 0:
+            return False  # more than one quantifier loop
+        cycle_split = i
+    if cycle_split < 0:
+        return True  # branch-free pattern: only one possible end
+    var idx = nfa.states[cycle_split].out2
+    var steps = 0
+    while idx >= 0 and idx < num_states:
+        steps += 1
+        if steps > num_states:
+            return False
+        var kind = nfa.states[idx].kind
+        if kind == NFAStateKind.MATCH:
+            return True
+        if (
+            kind == NFAStateKind.CHAR
+            or kind == NFAStateKind.CHARSET
+            or kind == NFAStateKind.ANY
+            or kind == NFAStateKind.ANCHOR
+            or kind == NFAStateKind.SAVE
+        ):
+            idx = nfa.states[idx].out1
+        elif kind == NFAStateKind.SPLIT and nfa.states[idx].out2 == -1:
+            idx = nfa.states[idx].out1
+        else:
+            return False
+    return False
+
+
 # Sometimes this produces better IR since the __init__ gets folded into
 # a constant.
 comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
+
+# Longest tail verified by the match() suffix fast-fail. The check is a
+# necessary condition only, so truncating to the last bytes stays sound.
+comptime MATCH_SUFFIX_CHECK_MAX = 8
+
+
+def _match_suffix_for_fastfail(
+    nfa: NFA, use_sandwich: Bool, use_simd_literal: Bool
+) -> List[UInt8]:
+    """Comptime: guaranteed literal suffix checked before match() engine
+    dispatch, truncated to its last MATCH_SUFFIX_CHECK_MAX bytes.
+
+    Empty (check disabled) when a literal path already verifies the tail
+    bytes itself: the sandwich match, the SIMD literal compare, or the
+    backtracker on a pure literal (which fails on the first mismatching
+    byte anyway)."""
+    if use_sandwich or use_simd_literal or is_pure_literal(nfa):
+        return List[UInt8]()
+    var suffix = extract_literal_suffix(nfa)
+    if len(suffix) > MATCH_SUFFIX_CHECK_MAX:
+        var out = List[UInt8]()
+        for i in range(len(suffix) - MATCH_SUFFIX_CHECK_MAX, len(suffix)):
+            out.append(suffix[i])
+        return out^
+    return suffix^
 
 
 def __literal_can_be_optimized(width: Int) -> Bool:
@@ -300,6 +310,28 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
 
 
+@always_inline
+def _probe_eq[
+    W: Int, //, caseless: Bool, target: UInt8
+](v: SIMD[DType.uint8, W]) -> SIMD[DType.bool, W]:
+    """Chunk compare for one filter-prefix position. Caseless positions
+    fold via |0x20 — valid because their targets are lowercase ASCII
+    letters, whose only |0x20 preimages are the two cases."""
+    comptime if caseless:
+        return (v | 0x20).eq(target)
+    else:
+        return v.eq(target)
+
+
+@always_inline
+def _probe_eq1[caseless: Bool, target: UInt8](b: Byte) -> Bool:
+    """Scalar companion of _probe_eq."""
+    comptime if caseless:
+        return (b | 0x20) == target
+    else:
+        return b == target
+
+
 def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
     """True when the pattern should run on a DFA engine (eager or lazy)."""
     return (
@@ -310,6 +342,7 @@ def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
     )
 
 
+@fieldwise_init
 struct MatchStrategy:
     """Compile-time engine selection flags for a given NFA.
 
@@ -319,43 +352,25 @@ struct MatchStrategy:
     skipping) apply.
 
     `use_dfa` means "a DFA engine runs this pattern"; `use_eager_dfa`
-    selects the comptime-determinized table over the runtime LazyDFA.
+    selects the comptime-determinized table over the runtime LazyDFA;
+    `use_sheng` further selects the shuffle walker over the table walk
+    for small eager DFAs on targets with a native byte shuffle.
     """
 
     var use_simd_literal: Bool
     var use_dfa: Bool
     var use_eager_dfa: Bool
+    var use_sheng: Bool
+    var use_teddy: Bool
+    var use_teddy_prefix: Bool
     var use_sandwich_match: Bool
     var sandwich_suffix_len: Int
     var start_anchor: Int
     var prefix_len: Int
+    var fprefix_len: Int
     var first_byte_useful: Bool
     var required_byte: Int
     var post_leading_anchor_start: Int
-
-    def __init__(
-        out self,
-        use_simd_literal: Bool,
-        use_dfa: Bool,
-        use_eager_dfa: Bool,
-        use_sandwich_match: Bool,
-        sandwich_suffix_len: Int,
-        start_anchor: Int,
-        prefix_len: Int,
-        first_byte_useful: Bool,
-        required_byte: Int,
-        post_leading_anchor_start: Int,
-    ):
-        self.use_simd_literal = use_simd_literal
-        self.use_dfa = use_dfa
-        self.use_eager_dfa = use_eager_dfa
-        self.use_sandwich_match = use_sandwich_match
-        self.sandwich_suffix_len = sandwich_suffix_len
-        self.start_anchor = start_anchor
-        self.prefix_len = prefix_len
-        self.first_byte_useful = first_byte_useful
-        self.required_byte = required_byte
-        self.post_leading_anchor_start = post_leading_anchor_start
 
 
 def _compute_strategy(
@@ -366,6 +381,11 @@ def _compute_strategy(
     sandwich_valid: Bool,
     sandwich_suffix_len: Int,
     eager_dfa_valid: Bool,
+    sheng_ok: Bool,
+    lit_alt_valid: Bool,
+    pivot_ok: Bool,
+    fprefix_len: Int,
+    alt_prefix_valid: Bool,
 ) -> MatchStrategy:
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
@@ -379,12 +399,28 @@ def _compute_strategy(
     var use_sandwich_match = (
         sandwich_valid and group_count == 0 and not use_simd_literal
     )
-    # Required-byte fast-fail: only useful when neither the pure-literal scan
-    # nor the literal-prefix scan already filters by some byte. Both of those
-    # paths SIMD-scan for a known byte sequence and short-circuit on absence,
-    # so the redundant check would just add work.
+    # Pure literal alternations skip the automaton entirely (Teddy);
+    # Sheng masks aren't built for them.
+    var use_teddy = use_dfa and lit_alt_valid and HAS_FAST_BYTE_SHUFFLE
+    # Alternation-of-literals *prefix* (`(?:GET|POST) /...`): Teddy scans
+    # for chain candidates, the selected engine verifies at each.
+    var use_teddy_prefix = (
+        alt_prefix_valid and HAS_FAST_BYTE_SHUFFLE and not use_teddy
+    )
+    # Required-byte fast-fail: only useful when no other scan already
+    # filters by some byte. The pure-literal scan, the filter-prefix scan,
+    # the Teddy-prefix scan, and the pivot prefilter all SIMD-scan for
+    # known bytes and short-circuit on absence, so the redundant check
+    # would just add work. BOL-anchored patterns skip it too: their search
+    # attempts only position 0, so a whole-input pre-scan is pure overhead.
     var required_byte: Int
-    if use_simd_literal or prefix_len > 0:
+    if (
+        use_simd_literal
+        or fprefix_len > 0
+        or nfa.start_anchor == AnchorKind.BOL
+        or pivot_ok
+        or use_teddy_prefix
+    ):
         required_byte = -1
     else:
         required_byte = extract_required_byte(nfa)
@@ -392,10 +428,14 @@ def _compute_strategy(
         use_simd_literal=use_simd_literal,
         use_dfa=use_dfa,
         use_eager_dfa=use_dfa and eager_dfa_valid,
+        use_sheng=use_dfa and eager_dfa_valid and sheng_ok and not use_teddy,
+        use_teddy=use_teddy,
+        use_teddy_prefix=use_teddy_prefix,
         use_sandwich_match=use_sandwich_match,
         sandwich_suffix_len=sandwich_suffix_len,
         start_anchor=nfa.start_anchor,
         prefix_len=prefix_len,
+        fprefix_len=fprefix_len,
         first_byte_useful=first_byte_useful,
         required_byte=required_byte,
         post_leading_anchor_start=nfa.start_after_leading_anchor,
@@ -417,10 +457,17 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     comptime _num_slots = 2 * Self.nfa.group_count
     comptime _start = Self.nfa.start
     comptime _prefix = extract_literal_prefix(Self.nfa)
+    comptime _fpre = extract_filter_prefix(Self.nfa)
+    comptime _alt_prefix = extract_alt_prefix(Self.nfa)
     comptime _first_byte_bitmap = extract_first_byte_bitmap(Self.nfa)
     comptime _sandwich = extract_match_sandwich(Self.nfa)
+    comptime _lit_alt = extract_literal_alternation(Self.nfa)
+    # Teddy-claimed patterns (pure literal alternations on shuffle targets)
+    # never run the DFA engines, so skip their comptime determinization.
     comptime _edfa = build_eager_dfa(
-        Self.nfa, _dfa_candidate(Self.nfa, Self._group_count)
+        Self.nfa,
+        _dfa_candidate(Self.nfa, Self._group_count)
+        and not (Self._lit_alt.valid and HAS_FAST_BYTE_SHUFFLE),
     )
     comptime _strategy = _compute_strategy(
         Self.nfa,
@@ -430,34 +477,42 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         Self._sandwich.valid,
         len(Self._sandwich.suffix),
         Self._edfa.valid,
+        sheng_viable(Self._edfa) and HAS_FAST_BYTE_SHUFFLE,
+        Self._lit_alt.valid,
+        _pivot_prefilter(Self._edfa)[0] >= 0,
+        len(Self._fpre.bytes),
+        Self._alt_prefix.valid,
     )
     # LazyDFA only backs DFA patterns whose comptime determinization
-    # overflowed EDFA_STATE_CAP.
-    comptime _use_lazy_dfa = Self._strategy.use_dfa and not Self._strategy.use_eager_dfa
+    # overflowed EDFA_STATE_CAP — and that Teddy didn't claim.
+    comptime _use_lazy_dfa = (
+        Self._strategy.use_dfa
+        and not Self._strategy.use_eager_dfa
+        and not Self._strategy.use_teddy
+    )
     comptime _EDFA_TN = Self._edfa.num_states * 256
     comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN](Self._edfa)
     comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
+    comptime _SHENG_MASKS = sheng_masks_arr(
+        Self._edfa, Self._strategy.use_sheng
+    )
+    comptime _match_suffix = _match_suffix_for_fastfail(
+        Self.nfa,
+        Self._strategy.use_sandwich_match,
+        Self._strategy.use_simd_literal,
+    )
+    # A start-of-match candidate scanner exists: the filter prefix or the
+    # Teddy alternation-prefix. Search paths fetch candidates from
+    # _scan_candidate and verify with the selected engine.
+    comptime _use_scan_filter = (
+        Self._strategy.fprefix_len > 0 or Self._strategy.use_teddy_prefix
+    )
 
-    var _dfa_nfa: ConditionalType[
-        Trait=ImplicitlyDeletable & Copyable,
-        If=Self._use_lazy_dfa,
-        Then=NFA,
-        Else=NoneType,
-    ]
-
-    var _dfa: ConditionalType[
-        Trait=ImplicitlyDeletable & Copyable,
-        If=Self._use_lazy_dfa,
-        Then=LazyDFA,
-        Else=NoneType,
-    ]
-
-    var _simd_lit: ConditionalType[
-        Trait=ImplicitlyDeletable & Copyable,
-        If=Self._strategy.use_simd_literal,
-        Then=TypeForPrefixLength[Self._strategy.prefix_len],
-        Else=NoneType,
-    ]
+    var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
+    var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
+    var _simd_lit: TypeForPrefixLength[
+        Self._strategy.prefix_len
+    ] if Self._strategy.use_simd_literal else NoneType
 
     def __init__(out self):
         comptime if Self._use_lazy_dfa:
@@ -483,7 +538,15 @@ struct StaticRegex[pattern: String](Copyable, Movable):
 
     @always_inline
     def _dfa_full_match(mut self, input: String) raises -> Bool:
-        comptime if Self._strategy.use_eager_dfa:
+        comptime if Self._strategy.use_teddy:
+            return teddy_full_match[alt=Self._lit_alt](input.as_bytes())
+        elif Self._strategy.use_sheng:
+            return sheng_full_match[
+                d=Self._edfa,
+                masks=Self._SHENG_MASKS,
+                flags=Self._EDFA_FLAGS,
+            ](input.as_bytes())
+        elif Self._strategy.use_eager_dfa:
             return edfa_full_match[
                 d=Self._edfa,
                 table=Self._EDFA_TABLE,
@@ -498,7 +561,15 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     def _dfa_match_at[
         origin: Origin, //
     ](mut self, input: Span[Byte, origin], start: Int) raises -> Int:
-        comptime if Self._strategy.use_eager_dfa:
+        comptime if Self._strategy.use_teddy:
+            return teddy_match_at[alt=Self._lit_alt](input, start)
+        elif Self._strategy.use_sheng:
+            return sheng_match_at[
+                d=Self._edfa,
+                masks=Self._SHENG_MASKS,
+                flags=Self._EDFA_FLAGS,
+            ](input, start)
+        elif Self._strategy.use_eager_dfa:
             return edfa_match_at[
                 d=Self._edfa,
                 table=Self._EDFA_TABLE,
@@ -515,7 +586,17 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     ](mut self, input: Span[Byte, origin], start: Int) raises -> Tuple[
         Int, Int
     ]:
-        comptime if Self._strategy.use_eager_dfa:
+        comptime if Self._strategy.use_teddy:
+            return teddy_search_forward[alt=Self._lit_alt](input, start)
+        elif Self._strategy.use_sheng:
+            return sheng_search_forward[
+                d=Self._edfa,
+                masks=Self._SHENG_MASKS,
+                flags=Self._EDFA_FLAGS,
+                first_byte_bitmap=Self._first_byte_bitmap,
+                bitmap_useful=Self._strategy.first_byte_useful,
+            ](input, start)
+        elif Self._strategy.use_eager_dfa:
             return edfa_search_forward[
                 d=Self._edfa,
                 table=Self._EDFA_TABLE,
@@ -541,6 +622,24 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         and usually fails within a few bytes, so an O(n) scan of the whole
         input for a required byte only adds work.
         """
+        # Suffix fast-fail: match() must consume the entire input, so when
+        # the pattern has a guaranteed literal suffix the input must end
+        # with it — an O(suffix) check that short-circuits misses that
+        # would otherwise walk the whole input (e.g. `.*x` on a 5K input
+        # with no `x`).
+        comptime suffix_n = len(Self._match_suffix)
+        comptime if suffix_n > 0:
+            var suffix_bytes = input.as_bytes()
+            var suffix_input_len = len(suffix_bytes)
+            if suffix_input_len < suffix_n:
+                return MatchResult[Self._num_slots].no_match()
+            comptime for i in range(suffix_n):
+                comptime sb = Self._match_suffix[i]
+                if (
+                    suffix_bytes.unsafe_get(suffix_input_len - suffix_n + i)
+                    != sb
+                ):
+                    return MatchResult[Self._num_slots].no_match()
         comptime if Self._strategy.use_sandwich_match:
             comptime prefix_len = Self._strategy.prefix_len
             comptime suffix_len = Self._strategy.sandwich_suffix_len
@@ -563,7 +662,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 slots=InlineArray[Int, Self._num_slots](fill=-1),
             )
         elif Self._strategy.use_simd_literal:
-            ref lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
+            var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
             )
             if input.byte_length() == Self._strategy.prefix_len:
@@ -626,7 +725,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             ):
                 return MatchResult[Self._num_slots].no_match()
         comptime if Self._strategy.use_simd_literal:
-            ref lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
+            var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
             )
             var input_bytes = input.as_bytes()
@@ -642,15 +741,26 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         elif Self._strategy.use_dfa:
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
-            var pos = 0
             try:
-                while pos <= input_len:
-                    comptime if Self._strategy.prefix_len > 0:
-                        pos = self._find_prefix_candidate(
-                            input_bytes, input_len, pos
+                # BOL anchor: matches can only start at position 0, so one
+                # anchored attempt replaces the whole scan (mirrors the
+                # backtracker lane and the findall() DFA lane).
+                comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+                    var match_end = self._dfa_match_at(input_bytes, 0)
+                    if match_end >= 0:
+                        return MatchResult[Self._num_slots](
+                            matched=True,
+                            start=0,
+                            end=self._lf_end_at(input_bytes, 0, match_end),
+                            slots=InlineArray[Int, Self._num_slots](fill=-1),
                         )
-                        if pos < 0:
-                            return MatchResult[Self._num_slots].no_match()
+                    return MatchResult[Self._num_slots].no_match()
+
+                # BOL_MULTILINE: matches start only at position 0 or right
+                # after a newline — attempt those and SIMD-skip between them.
+                elif Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
+                    var pos = 0
+                    while pos <= input_len:
                         var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
                             return MatchResult[Self._num_slots](
@@ -663,22 +773,53 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                     fill=-1
                                 ),
                             )
-                        pos += 1
-                    elif Self._strategy.prefix_len == 0:
-                        var range = self._dfa_search_forward(input_bytes, pos)
-                        if range[0] >= 0:
-                            return MatchResult[Self._num_slots](
-                                matched=True,
-                                start=range[0],
-                                end=self._lf_end_at(
-                                    input_bytes, range[0], range[1]
-                                ),
-                                slots=InlineArray[Int, Self._num_slots](
-                                    fill=-1
-                                ),
+                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                        if nl < 0:
+                            break
+                        pos = nl + 1
+                    return MatchResult[Self._num_slots].no_match()
+
+                else:
+                    var pos = 0
+                    while pos <= input_len:
+                        comptime if Self._use_scan_filter:
+                            pos = self._scan_candidate(
+                                input_bytes, input_len, pos
                             )
-                        return MatchResult[Self._num_slots].no_match()
-                return MatchResult[Self._num_slots].no_match()
+                            if pos < 0:
+                                return MatchResult[Self._num_slots].no_match()
+                            var match_end = self._dfa_match_at(
+                                input_bytes, pos
+                            )
+                            if match_end >= 0:
+                                return MatchResult[Self._num_slots](
+                                    matched=True,
+                                    start=pos,
+                                    end=self._lf_end_at(
+                                        input_bytes, pos, match_end
+                                    ),
+                                    slots=InlineArray[Int, Self._num_slots](
+                                        fill=-1
+                                    ),
+                                )
+                            pos += 1
+                        else:
+                            var range = self._dfa_search_forward(
+                                input_bytes, pos
+                            )
+                            if range[0] >= 0:
+                                return MatchResult[Self._num_slots](
+                                    matched=True,
+                                    start=range[0],
+                                    end=self._lf_end_at(
+                                        input_bytes, range[0], range[1]
+                                    ),
+                                    slots=InlineArray[Int, Self._num_slots](
+                                        fill=-1
+                                    ),
+                                )
+                            return MatchResult[Self._num_slots].no_match()
+                    return MatchResult[Self._num_slots].no_match()
             except:
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_search(input)
@@ -723,15 +864,13 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         """
         var pos = 0
         while pos <= input_len:
-            comptime if Self._strategy.prefix_len > 0:
-                pos = self._find_prefix_candidate(input, input_len, pos)
+            comptime if Self._use_scan_filter:
+                pos = self._scan_candidate(input, input_len, pos)
                 if pos < 0:
                     return MatchResult[Self._num_slots].no_match()
-            elif Self._strategy.prefix_len == 0:
+            else:
                 comptime if Self._strategy.first_byte_useful:
-                    if self._bitmap_skip(input, input_len, pos):
-                        pos += 1
-                        continue
+                    pos = self._next_candidate_pos(input, input_len, pos)
             var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
@@ -763,8 +902,8 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         comptime skip_anchor = Self._strategy.post_leading_anchor_start >= 0
         var pos = 0
         while pos <= input_len:
-            comptime if Self._strategy.prefix_len > 0:
-                pos = self._find_prefix_candidate(input, input_len, pos)
+            comptime if Self._use_scan_filter:
+                pos = self._scan_candidate(input, input_len, pos)
                 if pos < 0:
                     return MatchResult[Self._num_slots].no_match()
             comptime if skip_anchor:
@@ -808,7 +947,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             ):
                 return List[String]()
         comptime if Self._strategy.use_simd_literal:
-            ref lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
+            var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
             )
             var results = List[String]()
@@ -879,8 +1018,8 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 # General case
                 elif Self._strategy.start_anchor != AnchorKind.BOL and Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
                     while pos <= input_len:
-                        comptime if Self._strategy.prefix_len > 0:
-                            pos = self._find_prefix_candidate(
+                        comptime if Self._use_scan_filter:
+                            pos = self._scan_candidate(
                                 input_bytes, input_len, pos
                             )
                             if pos < 0:
@@ -903,7 +1042,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                     pos += 1
                                 continue
                             pos += 1
-                        elif Self._strategy.prefix_len == 0:
+                        else:
                             var range = self._dfa_search_forward(
                                 input_bytes, pos
                             )
@@ -985,17 +1124,17 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             elif Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
                 var pos = 0
                 while pos <= input_len:
-                    comptime if Self._strategy.prefix_len > 0:
-                        pos = self._find_prefix_candidate(
+                    comptime if Self._use_scan_filter:
+                        pos = self._scan_candidate(
                             input_bytes, input_len, pos
                         )
                         if pos < 0:
                             break
-                    elif Self._strategy.prefix_len == 0:
+                    else:
                         comptime if Self._strategy.first_byte_useful:
-                            if self._bitmap_skip(input_bytes, input_len, pos):
-                                pos += 1
-                                continue
+                            pos = self._next_candidate_pos(
+                                input_bytes, input_len, pos
+                            )
                     var slots = ALL_NEG_ONES[Self._num_slots]
                     var end = _sbt_run[
                         nfa=Self.nfa,
@@ -1042,12 +1181,15 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         """
 
         comptime if Self._strategy.use_simd_literal:
-            ref lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
+            var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
             )
             var output = String()
             var input_bytes = input.as_bytes()
             var input_len = len(input_bytes)
+            var literal_replacement = (
+                simd_find_byte(replacement.as_bytes(), CHAR_BACKSLASH, 0) < 0
+            )
             var prev_end = 0
             while prev_end < input_len:
                 var pos = simd_find_literal(input_bytes, lit, prev_end)
@@ -1055,26 +1197,96 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                     break
                 if pos > prev_end:
                     output += String(unsafe_from_utf8=input_bytes[prev_end:pos])
-                var match_result = MatchResult[Self._num_slots](
-                    matched=True,
-                    start=pos,
-                    end=pos + Self._strategy.prefix_len,
-                    slots=InlineArray[Int, Self._num_slots](fill=-1),
-                )
-                output += self._expand_replacement(
-                    input_bytes, match_result, replacement
-                )
+                if literal_replacement:
+                    output += replacement
+                else:
+                    var match_result = MatchResult[Self._num_slots](
+                        matched=True,
+                        start=pos,
+                        end=pos + Self._strategy.prefix_len,
+                        slots=InlineArray[Int, Self._num_slots](fill=-1),
+                    )
+                    output += self._expand_replacement(
+                        input_bytes, match_result, replacement
+                    )
                 prev_end = pos + Self._strategy.prefix_len
             if prev_end < input_len:
                 output += String(
                     unsafe_from_utf8=input_bytes[prev_end:input_len]
                 )
             return output^
+        elif Self._strategy.use_dfa:
+            try:
+                return self._replace_dfa(input, replacement)
+            except:
+                return self._pike_replace(input, replacement)
         else:
             try:
                 return self._replace_impl(input, replacement)
             except:
                 return self._pike_replace(input, replacement)
+
+    def _replace_dfa(
+        mut self, input: String, replacement: String
+    ) raises -> String:
+        """replace() implementation for the DFA lane (Teddy/Sheng/eager/
+        lazy), mirroring the split() DFA loop: literal-prefix candidate scan
+        when the pattern has one, search_forward otherwise. Anchored
+        patterns resolve through the DFA's start-state contexts."""
+        var output = String()
+        var input_bytes = input.as_bytes()
+        var input_len = input.byte_length()
+        # Replacements without backslashes need no per-match backreference
+        # expansion (which allocates an intermediate String per match).
+        var literal_replacement = (
+            simd_find_byte(replacement.as_bytes(), CHAR_BACKSLASH, 0) < 0
+        )
+        var prev_end = 0
+        var pos = 0
+        while pos <= input_len:
+            var start: Int
+            var dfa_end: Int
+            comptime if Self._use_scan_filter:
+                pos = self._scan_candidate(input_bytes, input_len, pos)
+                if pos < 0:
+                    break
+                start = pos
+                dfa_end = self._dfa_match_at(input_bytes, pos)
+                if dfa_end < 0:
+                    pos += 1
+                    continue
+            else:
+                var rng = self._dfa_search_forward(input_bytes, pos)
+                if rng[0] < 0:
+                    break
+                start = rng[0]
+                dfa_end = rng[1]
+            var end = self._lf_end_at(input_bytes, start, dfa_end)
+            if start > prev_end:
+                output += String(unsafe_from_utf8=input_bytes[prev_end:start])
+            if literal_replacement:
+                output += replacement
+            else:
+                var match_result = MatchResult[Self._num_slots](
+                    matched=True,
+                    start=start,
+                    end=end,
+                    slots=InlineArray[Int, Self._num_slots](fill=-1),
+                )
+                output += self._expand_replacement(
+                    input_bytes, match_result, replacement
+                )
+            if end > start:
+                prev_end = end
+                pos = end
+            else:
+                # Empty match: keep the byte at start in the next segment
+                # (mirrors _replace_impl).
+                prev_end = start
+                pos = start + 1
+        if prev_end < input_len:
+            output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+        return output^
 
     def _replace_impl(
         mut self, input: String, replacement: String
@@ -1083,18 +1295,21 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var output = String()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
+        # Replacements without backslashes need no per-match backreference
+        # expansion (which allocates an intermediate String per match).
+        var literal_replacement = (
+            simd_find_byte(replacement.as_bytes(), CHAR_BACKSLASH, 0) < 0
+        )
         var prev_end = 0
         var pos = 0
         while pos <= input_len:
-            comptime if Self._strategy.prefix_len > 0:
-                pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+            comptime if Self._use_scan_filter:
+                pos = self._scan_candidate(input_bytes, input_len, pos)
                 if pos < 0:
                     break
-            elif Self._strategy.prefix_len == 0:
+            else:
                 comptime if Self._strategy.first_byte_useful:
-                    if self._bitmap_skip(input_bytes, input_len, pos):
-                        pos += 1
-                        continue
+                    pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa,
@@ -1107,21 +1322,27 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             # Add text before match
             if pos > prev_end:
                 output += String(unsafe_from_utf8=input_bytes[prev_end:pos])
-            # Expand replacement with backreferences
-            var match_result = MatchResult[Self._num_slots](
-                matched=True,
-                start=pos,
-                end=end,
-                slots=slots,
-            )
-            output += self._expand_replacement(
-                input_bytes, match_result, replacement
-            )
+            if literal_replacement:
+                output += replacement
+            else:
+                # Expand replacement with backreferences
+                var match_result = MatchResult[Self._num_slots](
+                    matched=True,
+                    start=pos,
+                    end=end,
+                    slots=slots,
+                )
+                output += self._expand_replacement(
+                    input_bytes, match_result, replacement
+                )
             if end > pos:
                 prev_end = end
                 pos = end
             else:
-                prev_end = pos + 1
+                # Empty match: nothing was consumed, so the byte at pos still
+                # belongs to the next inter-match segment (Python re.sub:
+                # sub('a?', '-', 'xyz') == '-x-y-z-').
+                prev_end = pos
                 pos += 1
         # Remaining text
         if prev_end < input_len:
@@ -1138,8 +1359,8 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var prev_end = 0
             try:
                 while pos <= input_len:
-                    comptime if Self._strategy.prefix_len > 0:
-                        pos = self._find_prefix_candidate(
+                    comptime if Self._use_scan_filter:
+                        pos = self._scan_candidate(
                             input_bytes, input_len, pos
                         )
                         if pos < 0:
@@ -1158,11 +1379,13 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                                 prev_end = match_end
                                 pos = match_end
                             else:
-                                prev_end = pos + 1
+                                # Unreachable with a literal prefix (matches
+                                # are never empty); keep the invariant anyway.
+                                prev_end = pos
                                 pos += 1
                             continue
                         pos += 1
-                    elif Self._strategy.prefix_len == 0:
+                    else:
                         var range = self._dfa_search_forward(input_bytes, pos)
                         if range[0] < 0:
                             break
@@ -1175,7 +1398,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             prev_end = end
                             pos = end
                         else:
-                            prev_end = start + 1
+                            # Empty match: the byte at start still belongs to
+                            # the next segment (Python re.split keeps it).
+                            prev_end = start
                             pos = start + 1
             except:
                 # DFA state-cache overflow — fall back to the Pike VM
@@ -1198,15 +1423,13 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var pos = 0
         var prev_end = 0
         while pos <= input_len:
-            comptime if Self._strategy.prefix_len > 0:
-                pos = self._find_prefix_candidate(input_bytes, input_len, pos)
+            comptime if Self._use_scan_filter:
+                pos = self._scan_candidate(input_bytes, input_len, pos)
                 if pos < 0:
                     break
-            elif Self._strategy.prefix_len == 0:
+            else:
                 comptime if Self._strategy.first_byte_useful:
-                    if self._bitmap_skip(input_bytes, input_len, pos):
-                        pos += 1
-                        continue
+                    pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = ALL_NEG_ONES[Self._num_slots]
             var end = _sbt_run[
                 nfa=Self.nfa,
@@ -1221,7 +1444,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 prev_end = end
                 pos = end
             else:
-                prev_end = pos + 1
+                # Empty match: the byte at pos still belongs to the next
+                # segment (Python re.split keeps it).
+                prev_end = pos
                 pos += 1
         # Remaining text
         if prev_end <= input_len:
@@ -1231,153 +1456,240 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         return parts^
 
     @always_inline
+    def _scan_candidate[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
+        """Next possible match-start position >= pos according to the
+        comptime-selected scanner (filter prefix or Teddy alternation
+        prefix), or -1 when none remains. Only meaningful when
+        Self._use_scan_filter."""
+        comptime if Self._strategy.fprefix_len > 0:
+            return self._find_prefix_candidate(input, input_len, pos)
+        else:
+            return teddy_find_prefix[alt=Self._alt_prefix](input, pos)
+
+    @always_inline
     def _find_prefix_candidate[
         origin: Origin, //
     ](self, input: Span[Byte, origin], input_len: Int, start: Int) -> Int:
-        """Find the next position >= start where the full literal prefix matches.
+        """Find the next position >= start where the full filter prefix
+        matches (exact bytes; caseless positions accept either case via
+        the |0x20 fold). Returns the position or -1. Only meaningful when
+        Self._strategy.fprefix_len > 0.
 
-        Returns the position or -1 if no match exists. Only meaningful when
-        Self._strategy.prefix_len > 0.
-
-        For prefixes of length >= 2, uses a 4x-unrolled two-byte SIMD filter
-        (Muła's vectorized memmem): each iteration processes 4*W bytes,
-        loading 4 first-byte chunks, OR-combining their equality masks for
-        a single early-out, and only loading the last-byte chunks +
-        verifying surviving lanes when at least one chunk has a candidate.
-        Rejects single-byte coincidences (e.g. `[INFO]` when scanning for
-        `[ERROR]`) without per-candidate restart of `simd_find_byte`.
+        For filters of length >= 2, uses a 4x-unrolled two-byte SIMD
+        filter (Muła's vectorized memmem) probing the two *rarest* filter
+        positions (background-frequency heuristic, memchr-style; caseless
+        positions rank as the sum of both cases): each iteration processes
+        4*W bytes, loading 4 chunks at the rarer probe offset,
+        OR-combining their equality masks for a single early-out. When any
+        chunk has a candidate, the hit path loads all 4 chunks at the
+        second probe offset and combines both masks branch-free with a
+        single reduction, so inputs where one probe byte is common stay
+        near full scan speed.
         """
-        comptime first_byte = Self._prefix[0]
-        comptime if Self._strategy.prefix_len == 1:
-            return simd_find_byte(input, first_byte, start)
+        comptime fpn = Self._strategy.fprefix_len
+        comptime if fpn == 1:
+            comptime b0 = Self._fpre.bytes[0]
+            comptime if not Self._fpre.caseless[0]:
+                return simd_find_byte(input, b0, start)
+            else:
+                comptime W = simd_width_of[DType.uint8]()
+                var ptr = input.unsafe_ptr()
+                var pos = start
+                while pos + W <= input_len:
+                    var chunk = (ptr + pos).load[width=W]()
+                    var bits = lane_bits((chunk | 0x20).eq(b0))
+                    if bits != 0:
+                        return pos + first_lane_index(bits)
+                    pos += W
+                while pos < input_len:
+                    if (input.unsafe_get(pos) | 0x20) == b0:
+                        return pos
+                    pos += 1
+                return -1
         else:
             comptime W = simd_width_of[DType.uint8]()
-            comptime last_off = Self._strategy.prefix_len - 1
-            comptime last_byte = Self._prefix[last_off]
+            comptime probes = select_probe_offsets(
+                Self._fpre.bytes, Self._fpre.caseless
+            )
+            comptime off_a = probes[0]
+            comptime off_b = probes[1]
+            comptime byte_a = Self._fpre.bytes[off_a]
+            comptime byte_b = Self._fpre.bytes[off_b]
+            comptime ca = Self._fpre.caseless[off_a]
+            comptime cb = Self._fpre.caseless[off_b]
+            # Loop guards use the full filter extent, not off_b: a candidate
+            # in the last lane is verified across all fprefix_len bytes.
+            comptime last_off = fpn - 1
             var ptr = input.unsafe_ptr()
             var pos = start
 
             # 4x-unrolled SIMD body: 4*W bytes per iter
             while pos + 4 * W + last_off <= input_len:
-                var b0 = (ptr + pos).load[width=W]()
-                var b1 = (ptr + pos + W).load[width=W]()
-                var b2 = (ptr + pos + 2 * W).load[width=W]()
-                var b3 = (ptr + pos + 3 * W).load[width=W]()
-                var e0 = b0.eq(first_byte)
-                var e1 = b1.eq(first_byte)
-                var e2 = b2.eq(first_byte)
-                var e3 = b3.eq(first_byte)
+                var b0 = (ptr + pos + off_a).load[width=W]()
+                var b1 = (ptr + pos + W + off_a).load[width=W]()
+                var b2 = (ptr + pos + 2 * W + off_a).load[width=W]()
+                var b3 = (ptr + pos + 3 * W + off_a).load[width=W]()
+                var e0 = _probe_eq[caseless=ca, target=byte_a](b0)
+                var e1 = _probe_eq[caseless=ca, target=byte_a](b1)
+                var e2 = _probe_eq[caseless=ca, target=byte_a](b2)
+                var e3 = _probe_eq[caseless=ca, target=byte_a](b3)
                 if (e0 | e1 | e2 | e3).reduce_or():
-                    if e0.reduce_or():
-                        var l0 = (ptr + pos + last_off).load[width=W]()
-                        var m0 = e0 & l0.eq(last_byte)
-                        if m0.reduce_or():
-                            for j in range(W):
-                                if m0[j]:
-                                    var ok = True
-                                    comptime for k in range(1, last_off):
-                                        comptime pb = Self._prefix[k]
-                                        if ok:
-                                            ok = (ptr + pos + j + k)[] == pb
-                                    if ok:
-                                        return pos + j
-                    if e1.reduce_or():
-                        var l1 = (ptr + pos + W + last_off).load[width=W]()
-                        var m1 = e1 & l1.eq(last_byte)
-                        if m1.reduce_or():
-                            for j in range(W):
-                                if m1[j]:
-                                    var ok = True
-                                    comptime for k in range(1, last_off):
-                                        comptime pb = Self._prefix[k]
-                                        if ok:
-                                            ok = (ptr + pos + W + j + k)[] == pb
-                                    if ok:
-                                        return pos + W + j
-                    if e2.reduce_or():
-                        var l2 = (ptr + pos + 2 * W + last_off).load[width=W]()
-                        var m2 = e2 & l2.eq(last_byte)
-                        if m2.reduce_or():
-                            for j in range(W):
-                                if m2[j]:
-                                    var ok = True
-                                    comptime for k in range(1, last_off):
-                                        comptime pb = Self._prefix[k]
-                                        if ok:
-                                            ok = (
-                                                ptr + pos + 2 * W + j + k
-                                            )[] == pb
-                                    if ok:
-                                        return pos + 2 * W + j
-                    if e3.reduce_or():
-                        var l3 = (ptr + pos + 3 * W + last_off).load[width=W]()
-                        var m3 = e3 & l3.eq(last_byte)
-                        if m3.reduce_or():
-                            for j in range(W):
-                                if m3[j]:
-                                    var ok = True
-                                    comptime for k in range(1, last_off):
-                                        comptime pb = Self._prefix[k]
-                                        if ok:
-                                            ok = (
-                                                ptr + pos + 3 * W + j + k
-                                            )[] == pb
-                                    if ok:
-                                        return pos + 3 * W + j
+                    var l0 = (ptr + pos + off_b).load[width=W]()
+                    var l1 = (ptr + pos + W + off_b).load[width=W]()
+                    var l2 = (ptr + pos + 2 * W + off_b).load[width=W]()
+                    var l3 = (ptr + pos + 3 * W + off_b).load[width=W]()
+                    var m0 = e0 & _probe_eq[caseless=cb, target=byte_b](l0)
+                    var m1 = e1 & _probe_eq[caseless=cb, target=byte_b](l1)
+                    var m2 = e2 & _probe_eq[caseless=cb, target=byte_b](l2)
+                    var m3 = e3 & _probe_eq[caseless=cb, target=byte_b](l3)
+                    if (m0 | m1 | m2 | m3).reduce_or():
+                        var r = self._first_verified_lane(input, pos, m0)
+                        if r >= 0:
+                            return r
+                        r = self._first_verified_lane(input, pos + W, m1)
+                        if r >= 0:
+                            return r
+                        r = self._first_verified_lane(input, pos + 2 * W, m2)
+                        if r >= 0:
+                            return r
+                        r = self._first_verified_lane(input, pos + 3 * W, m3)
+                        if r >= 0:
+                            return r
                 pos += 4 * W
 
             # Single-chunk SIMD body for the bytes between the unrolled body
             # and the tail
             while pos + W + last_off <= input_len:
-                var block_first = (ptr + pos).load[width=W]()
-                var first_mask = block_first.eq(first_byte)
-                if first_mask.reduce_or():
-                    var block_last = (ptr + pos + last_off).load[width=W]()
-                    var mask = first_mask & block_last.eq(last_byte)
+                var block_a = (ptr + pos + off_a).load[width=W]()
+                var mask_a = _probe_eq[caseless=ca, target=byte_a](block_a)
+                if mask_a.reduce_or():
+                    var block_b = (ptr + pos + off_b).load[width=W]()
+                    var mask = mask_a & _probe_eq[caseless=cb, target=byte_b](
+                        block_b
+                    )
                     if mask.reduce_or():
-                        for j in range(W):
-                            if mask[j]:
-                                var ok = True
-                                comptime for k in range(1, last_off):
-                                    comptime pb = Self._prefix[k]
-                                    if ok:
-                                        ok = (ptr + pos + j + k)[] == pb
-                                if ok:
-                                    return pos + j
+                        var r = self._first_verified_lane(input, pos, mask)
+                        if r >= 0:
+                            return r
                 pos += W
 
-            # Tail: scalar fallback for remaining bytes (< W + last_off)
-            while True:
-                var candidate = simd_find_byte(input, first_byte, pos)
-                if candidate < 0:
-                    return -1
-                pos = candidate
-                if pos + Self._strategy.prefix_len > input_len:
-                    return -1
-                var ok = True
-                comptime for j in range(1, Self._strategy.prefix_len):
-                    comptime pb = Self._prefix[j]
+            # Tail (< W + last_off remaining positions). With an exact
+            # first byte, hop between its occurrences via simd_find_byte
+            # (a scalar per-position verify measured 1.9x slower on
+            # 100B-input searches, where the tail dominates); a caseless
+            # first byte falls back to the per-position verify.
+            comptime c0 = Self._fpre.caseless[0]
+            comptime if not c0:
+                comptime fb = Self._fpre.bytes[0]
+                while True:
+                    var candidate = simd_find_byte(input, fb, pos)
+                    if candidate < 0:
+                        return -1
+                    pos = candidate
+                    if pos + fpn > input_len:
+                        return -1
+                    var ok = True
+                    comptime for j in range(1, fpn):
+                        comptime cj = Self._fpre.caseless[j]
+                        comptime bj = Self._fpre.bytes[j]
+                        if ok:
+                            ok = _probe_eq1[caseless=cj, target=bj](
+                                input.unsafe_get(pos + j)
+                            )
                     if ok:
-                        ok = input.unsafe_get(pos + j) == pb
-                if ok:
-                    return pos
-                pos += 1
+                        return pos
+                    pos += 1
+            else:
+                while pos + fpn <= input_len:
+                    var ok = True
+                    comptime for j in range(fpn):
+                        comptime cj = Self._fpre.caseless[j]
+                        comptime bj = Self._fpre.bytes[j]
+                        if ok:
+                            ok = _probe_eq1[caseless=cj, target=bj](
+                                input.unsafe_get(pos + j)
+                            )
+                    if ok:
+                        return pos
+                    pos += 1
+                return -1
 
     @always_inline
-    def _bitmap_skip[
+    def _verify_prefix_middle[
         origin: Origin, //
-    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Bool:
-        """Return True if `pos` should be skipped based on the first-byte bitmap.
+    ](self, input: Span[Byte, origin], pos: Int) -> Bool:
+        """Verify the filter-prefix bytes the probe masks didn't check
+        (every offset except the two probe offsets)."""
+        comptime probes = select_probe_offsets(
+            Self._fpre.bytes, Self._fpre.caseless
+        )
+        var ptr = input.unsafe_ptr()
+        var ok = True
+        comptime for k in range(Self._strategy.fprefix_len):
+            comptime if k != probes[0] and k != probes[1]:
+                comptime pb = Self._fpre.bytes[k]
+                comptime pc = Self._fpre.caseless[k]
+                if ok:
+                    ok = _probe_eq1[caseless=pc, target=pb]((ptr + pos + k)[])
+        return ok
 
-        Only meaningful when Self._strategy.first_byte_useful is True.
+    @always_inline
+    def _first_verified_lane[
+        W: Int, origin: Origin, //
+    ](
+        self, input: Span[Byte, origin], base: Int, m: SIMD[DType.bool, W]
+    ) -> Int:
+        """First lane of the candidate mask that passes full prefix
+        verification, as an absolute input position, or -1."""
+        var bits = lane_bits(m)
+        while bits != 0:
+            var j = first_lane_index(bits)
+            if self._verify_prefix_middle(input, base + j):
+                return base + j
+            bits = clear_first_lane(bits)
+        return -1
+
+    @always_inline
+    def _next_candidate_pos[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
+        """Next position >= pos whose byte is in the pattern's first-byte
+        set, or input_len when none remains (the end position is still
+        attempted, mirroring the DFA search prefilter's contract).
+
+        Vectorized shufti/truffle class scan where the target has a native
+        byte shuffle; scalar bitmap walk elsewhere. Only meaningful when
+        Self._strategy.first_byte_useful is True.
         """
-        if pos < input_len:
-            var b = input.unsafe_get(pos)
-            var byte_idx = Int(b) >> 3
-            var bit_idx = UInt8(Int(b) & 7)
-            if (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) == 0:
-                return True
-        return False
+        comptime if HAS_FAST_BYTE_SHUFFLE:
+            comptime km = build_class_masks(
+                stops_from_bitmap(Self._first_byte_bitmap)
+            )
+            # Scalar peek first (same rationale as the DFA search
+            # prefilters): on dense-candidate text the byte at pos already
+            # qualifies almost every call, and the peek resolves that in a
+            # few instructions versus the vector kernel's fixed cost.
+            if pos < input_len and not _class_contains[
+                kind = km[0], t0 = km[1], t1 = km[2]
+            ](input.unsafe_get(pos)):
+                return find_in_class[kind = km[0], t0 = km[1], t1 = km[2]](
+                    input, pos + 1
+                )
+            return pos
+        else:
+            var p = pos
+            while p < input_len:
+                var b = input.unsafe_get(p)
+                var byte_idx = Int(b) >> 3
+                var bit_idx = UInt8(Int(b) & 7)
+                if (
+                    Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)
+                ) != 0:
+                    return p
+                p += 1
+            return input_len
 
     def _expand_replacement[
         origin: Origin, //
@@ -1435,25 +1747,33 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         Falls back to the Pike VM if the backtracker budget is exhausted,
         and to the DFA's own end as a last resort (still a valid match,
         just longest-biased).
+
+        When the pattern's shape guarantees leftmost-longest ==
+        leftmost-first (single greedy loop, branch-free suffix — see
+        _dfa_end_is_leftmost_first), the re-run is skipped at compile time
+        and the DFA's end is returned directly.
         """
-        try:
-            var slots = ALL_NEG_ONES[Self._num_slots]
-            var end = _sbt_run[
-                nfa=Self.nfa,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](input, start, slots)
-            if end >= 0:
-                return end
-        except:
-            var nfa = _build_static_nfa(Self.pattern)
-            var num_states = len(nfa.states)
-            var vm = PikeVM[Self._num_slots](nfa^)
-            var bufs = _VMBuffers(num_states, Self._num_slots)
-            var result = vm._execute_with_bufs(input, start, bufs)
-            if result.matched:
-                return result.end
-        return dfa_end
+        comptime if _dfa_end_is_leftmost_first(Self.nfa):
+            return dfa_end
+        else:
+            try:
+                var slots = ALL_NEG_ONES[Self._num_slots]
+                var end = _sbt_run[
+                    nfa=Self.nfa,
+                    state_idx=Self._start,
+                    num_slots=Self._num_slots,
+                ](input, start, slots)
+                if end >= 0:
+                    return end
+            except:
+                var nfa = _build_static_nfa(Self.pattern)
+                var num_states = len(nfa.states)
+                var vm = PikeVM[Self._num_slots](nfa^)
+                var bufs = _VMBuffers(num_states, Self._num_slots)
+                var result = vm._execute_with_bufs(input, start, bufs)
+                if result.matched:
+                    return result.end
+            return dfa_end
 
     def _pike_match(self, input: String) -> MatchResult[Self._num_slots]:
         """PikeVM fallback for match when backtracker exhausts budget."""
@@ -1536,7 +1856,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 prev_end = result.end
                 pos = result.end
             else:
-                prev_end = pos + 1
+                # Empty match: keep the byte at pos in the next segment
+                # (mirrors _replace_impl).
+                prev_end = pos
                 pos += 1
         if prev_end < input_len:
             output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
@@ -1565,7 +1887,8 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 prev_end = result.end
                 pos = result.end
             else:
-                prev_end = pos + 1
+                # Empty match: keep the byte at pos in the next segment.
+                prev_end = pos
                 pos += 1
         if prev_end <= input_len:
             parts.append(

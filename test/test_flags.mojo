@@ -115,5 +115,64 @@ def test_combined_all_three() raises:
     assert_true(re.search("HELLO\nWORLD").matched)
 
 
+def test_scoped_ignorecase_charset() raises:
+    # Scoped (?i:...) must case-fold character classes, not just literals.
+    var re = StaticRegex["(?i:[a-z])"]()
+    assert_true(re.match("A").matched)
+    assert_true(re.match("a").matched)
+    # Folding applies only inside the scoped group.
+    var re2 = StaticRegex["(?i:[a-z])[a-z]"]()
+    assert_true(re2.match("Aa").matched)
+    assert_false(re2.match("AA").matched)
+
+
+def test_scoped_remove_ignorecase_charset() raises:
+    # (?-i:...) must remove folding from charsets under a global (?i).
+    var re = StaticRegex["(?i)x(?-i:[a-z])"]()
+    assert_true(re.match("Xa").matched)
+    assert_false(re.match("XA").matched)
+
+
+def test_caseless_prefix_search() raises:
+    # (?i) literals form a caseless filter prefix (rare-byte probes with
+    # the |0x20 fold). Expected values are CPython outputs.
+    var re = StaticRegex["(?i)error"]()
+    var r = re.search("no issues found... an ERRor was logged")
+    assert_equal(r.start, 22)
+    assert_equal(r.end, 27)
+    assert_false(re.search("xyz").matched)
+    var all = re.findall("Error error ERROR")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "Error")
+    assert_equal(all[2], "ERROR")
+    assert_equal(re.replace("Error and eRRoR here", "X"), "X and X here")
+
+
+def test_caseless_prefix_scoped_and_mixed() raises:
+    # Exact and caseless positions mix; scoped (?i:) folds only its span.
+    var re = StaticRegex["abc(?i:def)"]()
+    var r = re.search("zzabcDeFzz")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 8)
+    assert_false(re.search("zzaBcdefzz").matched)
+    # Charset-of-one extends the filter prefix.
+    var re2 = StaticRegex["delt[a]"]()
+    var r2 = re2.search("the delta value")
+    assert_equal(r2.start, 4)
+    assert_equal(r2.end, 9)
+    var re3 = StaticRegex["(?i)error\\d+"]()
+    var r3 = re3.search("zzz ERROR42 zzz")
+    assert_equal(r3.start, 4)
+    assert_equal(r3.end, 11)
+
+
+def test_ignorecase_negated_charset() raises:
+    # Negation applies after folding: (?i)[^a-z] rejects 'A' (Python re).
+    var re = StaticRegex["(?i)[^a-z]"]()
+    assert_false(re.match("A").matched)
+    assert_false(re.match("a").matched)
+    assert_true(re.match("5").matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

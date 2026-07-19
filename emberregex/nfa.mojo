@@ -205,16 +205,12 @@ def build_nfa(var ast: AST, flags: RegexFlags = RegexFlags()) raises -> NFA:
     """
     var nfa = NFA()
 
-    # Transfer charsets from AST to NFA
+    # Transfer charsets from AST to NFA. IGNORECASE folding happens per
+    # CHAR_CLASS node in _build_fragment with the *effective* flags, so
+    # scoped groups ((?i:...) / (?-i:...)) apply to charsets too.
     nfa.charsets = ast.charsets^
     ast.charsets = []
     nfa.group_count = ast.group_count
-
-    # For IGNORECASE, add case-folded ranges to existing charsets.
-    if flags.ignorecase():
-        for ref c in nfa.charsets:
-            _add_case_folding(c)
-            c.build_bitmap()
 
     if ast.root == -1:
         # Empty pattern — just a match state
@@ -235,6 +231,36 @@ def build_nfa(var ast: AST, flags: RegexFlags = RegexFlags()) raises -> NFA:
     return nfa^
 
 
+def forms_cycle(nfa: NFA, split_idx: Int) -> Bool:
+    """Return True if either arm of split_idx eventually loops back to it.
+
+    This detects SPLIT states that are part of quantifier loops (*, +,
+    {n,}). Greedy loops carry the body in out1, lazy loops in out2, so
+    both arms are seeded.
+    """
+    var num_states = len(nfa.states)
+    var visited = List[Bool](length=num_states, fill=False)
+    var stack = List[Int]()
+    stack.append(nfa.states[split_idx].out1)
+    stack.append(nfa.states[split_idx].out2)
+    while len(stack) > 0:
+        var idx = stack.pop()
+        if idx < 0 or idx >= num_states or visited[idx]:
+            continue
+        if idx == split_idx:
+            return True
+        visited[idx] = True
+        var kind = nfa.states[idx].kind
+        if kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[idx].out1)
+            stack.append(nfa.states[idx].out2)
+        elif kind == NFAStateKind.MATCH:
+            pass  # dead end
+        else:  # CHAR, CHARSET, ANY, SAVE, ANCHOR, etc.
+            stack.append(nfa.states[idx].out1)
+    return False
+
+
 def _detect_start_anchor(mut nfa: NFA):
     """Walk epsilon transitions from nfa.start to find a leading anchor.
 
@@ -252,9 +278,14 @@ def _detect_start_anchor(mut nfa: NFA):
         visited += 1
         var kind = nfa.states[idx].kind
         if kind == NFAStateKind.ANCHOR:
+            # An anchor reached through a real alternation SPLIT does not
+            # dominate every match path (`^a|b` matches mid-input via the
+            # `b` arm), so it must not be recorded: search paths use
+            # start_anchor to restrict candidate start positions.
+            if ambiguous_split:
+                return
             nfa.start_anchor = nfa.states[idx].anchor_type
-            if not ambiguous_split:
-                nfa.start_after_leading_anchor = nfa.states[idx].out1
+            nfa.start_after_leading_anchor = nfa.states[idx].out1
             return
         elif kind == NFAStateKind.SAVE:
             idx = nfa.states[idx].out1
@@ -312,9 +343,18 @@ def _build_fragment(
         return frag^
 
     elif node.kind == ASTNodeKind.CHAR_CLASS:
-        var state_idx = nfa.add_state(
-            NFAState.charset_state(node.charset_index)
-        )
+        # Case-fold at the use site with the effective (possibly scoped)
+        # flags. Folding a copy keeps the pooled original intact; negation
+        # stays a flag on the set, so folding the positive ranges first
+        # matches Python ((?i)[^a-z] rejects 'A').
+        var cs_idx = node.charset_index
+        if flags.ignorecase():
+            var folded = nfa.charsets[cs_idx].copy()
+            _add_case_folding(folded)
+            folded.build_bitmap()
+            cs_idx = len(nfa.charsets)
+            nfa.charsets.append(folded^)
+        var state_idx = nfa.add_state(NFAState.charset_state(cs_idx))
         var frag = NFAFragment(state_idx)
         frag.add_out(state_idx, 1)
         return frag^

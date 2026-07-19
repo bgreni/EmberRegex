@@ -126,5 +126,129 @@ def test_pike_fallback_anchored_no_match() raises:
     assert_false(re.match(input).matched)
 
 
+def test_search_run_skip_multiline_arm_sheng() raises:
+    # Regression: the DFA search run-skip must not jump over a `(?m)^` arm
+    # match that starts inside a run whose class contains '\n'. Small DFA,
+    # so this exercises the Sheng search path.
+    var re = StaticRegex["(?m)^az|[a\\ny]+y"]()
+    var result = re.search("wa\nazQ")
+    assert_true(result.matched)
+    assert_equal(result.start, 3)
+    assert_equal(result.end, 5)
+
+
+def test_search_run_skip_multiline_arm_eager() raises:
+    # Same regression on the eager table walker: the long literal arm
+    # pushes the DFA past the Sheng state cap.
+    var re = StaticRegex["(?m)^azqqqqqqqqqqqqqqqqqq|[a\\ny]+y"]()
+    var result = re.search("wa\nazqqqqqqqqqqqqqqqqqqQ")
+    assert_true(result.matched)
+    assert_equal(result.start, 3)
+    assert_equal(result.end, 23)
+
+
+def test_pivot_prefilter_email() raises:
+    # Pivot-anchored search prefilter (`[class]+ @ …` shape). Expected
+    # spans are CPython outputs.
+    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var r1 = re.search("contact us at support@example.com for help")
+    assert_equal(r1.start, 14)
+    assert_equal(r1.end, 33)
+    # Match at position 0 (backward extension bounded by start).
+    var r2 = re.search("a@b.co")
+    assert_equal(r2.start, 0)
+    assert_equal(r2.end, 6)
+    # Leading pivots with no identifier run before them are dead candidates.
+    var r3 = re.search("@@nope alice@site.org")
+    assert_equal(r3.start, 7)
+    assert_equal(r3.end, 21)
+    # A failed pivot (no domain after '@') must not hide a later match.
+    var r4 = re.search("bad@ then ok@go.com")
+    assert_equal(r4.start, 10)
+    assert_equal(r4.end, 19)
+    # Backward extension stops at a newline (not in the identifier class).
+    var r5 = re.search("x\nuser@host.net")
+    assert_equal(r5.start, 2)
+    assert_equal(r5.end, 15)
+    assert_false(re.search("no emails here at all").matched)
+    var all = re.findall("a@b.co and c.d@e-f.io end")
+    assert_equal(len(all), 2)
+    assert_equal(all[0], "a@b.co")
+    assert_equal(all[1], "c.d@e-f.io")
+
+
+def test_pivot_prefilter_simple_shapes() raises:
+    var re1 = StaticRegex["\\w+@\\w+"]()
+    var r1 = re1.search("hi bob@mail ok")
+    assert_equal(r1.start, 3)
+    assert_equal(r1.end, 11)
+    var re2 = StaticRegex["[0-9]+:[a-z]+"]()
+    var r2 = re2.search("a 12:go b")
+    assert_equal(r2.start, 2)
+    assert_equal(r2.end, 7)
+
+
+def test_teddy_prefix_prefilter() raises:
+    # An alternation-of-literals *prefix* is Teddy-scanned; the engine
+    # verifies at candidates. Expected values are CPython outputs.
+    var re = StaticRegex["(?:GET|POST|PUT) /\\w+"]()
+    assert_true(re._strategy.use_teddy_prefix)
+    var r = re.search("log: GET /home ok")
+    assert_equal(r.start, 5)
+    assert_equal(r.end, 14)
+    assert_false(re.search("no methods here").matched)
+    var re2 = StaticRegex["(?:GET|POST) /\\w+"]()
+    var all = re2.findall("GET /a POST /b GET /c")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "GET /a")
+    assert_equal(all[1], "POST /b")
+    assert_equal(all[2], "GET /c")
+    # Overlapping-chain arms.
+    var re3 = StaticRegex["(?:cat|category)x"]()
+    var r3 = re3.search("a categoryx b")
+    assert_equal(r3.start, 2)
+    assert_equal(r3.end, 11)
+
+
+def test_teddy_prefix_backtracker_lane() raises:
+    # With capture groups the pattern runs the backtracker; the Teddy
+    # prefilter supplies its candidates.
+    var re = StaticRegex["(GET|POST) (\\w+)"]()
+    var input = "x POST data y"
+    var r = re.search(input)
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 11)
+    assert_equal(r.group_str(input, 1), "POST")
+    assert_equal(r.group_str(input, 2), "data")
+
+
+def test_deep_recursion_falls_back_to_pike() raises:
+    # Non-simple loops recurse once per consumed byte; long inputs must hit
+    # the SBT depth cap and fall back to the Pike VM instead of blowing the
+    # stack (this input crashed before the cap existed).
+    var re = StaticRegex["(?:ab)+"]()
+    var big = "ab" * 25000
+    assert_true(re.match(big).matched)
+    assert_false(re.match(big + "a").matched)
+    # Under the cap the specialized backtracker handles it directly.
+    var mid = "ab" * 2000
+    assert_true(re.match(mid).matched)
+    assert_false(re.match(mid + "a").matched)
+
+
+def test_search_run_skip_class_arm_still_matches() raises:
+    # Positive control: the class arm itself still matches, including
+    # across a newline inside the run.
+    var re = StaticRegex["(?m)^az|[a\\ny]+y"]()
+    var r1 = re.search("waayy")
+    assert_true(r1.matched)
+    assert_equal(r1.start, 1)
+    assert_equal(r1.end, 5)
+    var r2 = re.search("wa\nay")
+    assert_true(r2.matched)
+    assert_equal(r2.start, 1)
+    assert_equal(r2.end, 5)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

@@ -2,9 +2,74 @@
 
 Uses SIMD vector operations to scan simd_width_of[DType.uint8]() bytes at a
 time for finding literal prefix positions in input strings.
+
+The core primitive is `lane_bits`: a portable movemask turning a per-lane
+bool mask into a scalar bitmask. One computation serves both the per-chunk
+"any hit?" test and the hit-index extraction, so scan loops pay exactly one
+vector->scalar transfer per chunk. Per target:
+
+- NEON (W == 16): the shrn narrowing trick — view the 0x00/0xFF compare
+  result as 8 uint16 lanes, shift right 4 and truncate to bytes, yielding a
+  64-bit mask with one nibble per lane (first lane = ctz >> 2). LLVM has no
+  native movemask here and would otherwise emit a multi-instruction
+  reduction chain.
+- elsewhere: pack_bits (pmovmskb on x86; one bit per lane).
+
+`LANE_BIT_SHIFT` is the log2 of bits-per-lane for converting a ctz of the
+bitmask into a lane index.
 """
 
+from std.bit import count_trailing_zeros
+from std.memory import bitcast, pack_bits
 from std.sys import simd_width_of
+from std.sys.info import CompilationTarget
+
+comptime _NIBBLE_MASK = (
+    CompilationTarget.has_neon() and simd_width_of[DType.uint8]() == 16
+)
+comptime LANE_BIT_SHIFT = 2 if _NIBBLE_MASK else 0
+
+
+@always_inline
+def lane_bits[W: Int, //](mask: SIMD[DType.bool, W]) -> UInt64:
+    """Scalar bitmask of set lanes; 0 means no lane set.
+
+    First set lane = first_lane_index(bits). Comptime assert keeps the
+    64-bit result sound for any platform width.
+    """
+    comptime assert W << LANE_BIT_SHIFT <= 64, "lane mask exceeds 64 bits"
+    # first_lane_index/clear_first_lane assume 4 bits per lane whenever the
+    # nibble-mask path exists; a non-16-lane mask on such targets would take
+    # the pack_bits branch (1 bit per lane) and silently mis-index.
+    comptime assert LANE_BIT_SHIFT == 0 or W == 16, (
+        "nibble-mask targets require 16-lane masks"
+    )
+    comptime if _NIBBLE_MASK and W == 16:
+        var bytes = mask.select(
+            SIMD[DType.uint8, W](0xFF), SIMD[DType.uint8, W](0)
+        )
+        var nibbles = (bitcast[DType.uint16, W // 2](bytes) >> 4).cast[
+            DType.uint8
+        ]()
+        return UInt64(bitcast[DType.uint64, 1](nibbles))
+    else:
+        return UInt64(pack_bits(mask))
+
+
+@always_inline
+def first_lane_index(bits: UInt64) -> Int:
+    """Lane index of the lowest set bit. Precondition: bits != 0."""
+    return Int(count_trailing_zeros(bits)) >> LANE_BIT_SHIFT
+
+
+@always_inline
+def clear_first_lane(bits: UInt64) -> UInt64:
+    """Clear every bit belonging to the lowest set lane, for iterating
+    candidate lanes. Precondition: bits != 0."""
+    comptime lane_field = (UInt64(1) << UInt64(1 << LANE_BIT_SHIFT)) - 1
+    var t = count_trailing_zeros(bits)
+    var base = (t >> UInt64(LANE_BIT_SHIFT)) << UInt64(LANE_BIT_SHIFT)
+    return bits & ~(lane_field << base)
 
 
 def simd_find_byte[
@@ -22,14 +87,15 @@ def simd_find_byte[
 
     var target = SIMD[DType.uint8, W](byte_val)
 
-    # SIMD scan W bytes at a time
+    # SIMD scan W bytes at a time. The miss check (xor + min-reduce) is
+    # deliberately separate from the hit-index extraction: it measures
+    # faster than deriving both from one movemask on NEON, and the
+    # extraction then runs at most once per call.
     while i + W <= length:
         var chunk = (ptr + i).load[width=W]()
-        # Quick reject: XOR with target; zero byte means match
         if (chunk ^ target).reduce_min() == 0:
-            for j in range(W):
-                if chunk[j] == byte_val:
-                    return i + j
+            var bits = lane_bits(chunk.eq(target))
+            return i + first_lane_index(bits)
         i += W
 
     # Scalar tail

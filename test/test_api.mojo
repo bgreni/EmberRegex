@@ -144,5 +144,85 @@ def test_split_regex_delimiter() raises:
     assert_equal(parts[2], "c")
 
 
+# Empty-match replace/split regressions: an empty match must not swallow
+# the following byte. Expected values are CPython outputs.
+
+
+def test_replace_empty_match_optional() raises:
+    var re = StaticRegex["a?"]()
+    # Python: re.sub('a?', '-', 'xyz') == '-x-y-z-'
+    assert_equal(re.replace("xyz", "-"), "-x-y-z-")
+
+
+def test_replace_empty_match_star() raises:
+    var re = StaticRegex["\\d*"]()
+    # Python: re.sub(r'\d*', '<>', 'ab1cd') == '<>a<>b<><>c<>d<>'
+    assert_equal(re.replace("ab1cd", "<>"), "<>a<>b<><>c<>d<>")
+
+
+def test_replace_empty_adjacent_nonempty() raises:
+    var re = StaticRegex["x*"]()
+    # Python: re.sub('x*', '-', 'xaxbx') == '--a--b--'
+    assert_equal(re.replace("xaxbx", "-"), "--a--b--")
+
+
+def test_split_empty_match_star() raises:
+    var re = StaticRegex["x*"]()
+    # Python: re.split('x*', 'axb') == ['', 'a', '', 'b', '']
+    var parts = re.split("axb")
+    assert_equal(len(parts), 5)
+    assert_equal(parts[0], "")
+    assert_equal(parts[1], "a")
+    assert_equal(parts[2], "")
+    assert_equal(parts[3], "b")
+    assert_equal(parts[4], "")
+
+
+def test_split_empty_match_dfa_lane() raises:
+    # `x?` takes the DFA lane (non-cyclic SPLIT counts as alternation).
+    var re = StaticRegex["x?"]()
+    # Python: re.split('x?', 'axb') == ['', 'a', '', 'b', '']
+    var parts = re.split("axb")
+    assert_equal(len(parts), 5)
+    assert_equal(parts[0], "")
+    assert_equal(parts[1], "a")
+    assert_equal(parts[2], "")
+    assert_equal(parts[3], "b")
+    assert_equal(parts[4], "")
+
+
+def test_replace_dfa_lane_teddy() raises:
+    # Pure literal alternation: replace() runs the Teddy engine.
+    var re = StaticRegex["cat|dog"]()
+    assert_equal(
+        re.replace("a cat and a dog", "pet"), "a pet and a pet"
+    )
+
+
+def test_replace_dfa_lane_alternation() raises:
+    # DFA lane via search_forward (no literal prefix).
+    var re = StaticRegex["(?:a|b)+x"]()
+    assert_equal(re.replace("zaabxq bxw", "-"), "z-q -w")
+
+
+def test_replace_dfa_lane_classes() raises:
+    var re = StaticRegex["\\d+[a-f]+"]()
+    assert_equal(re.replace("z12ab 9fq 33cd", "#"), "z# #q #")
+
+
+def test_split_empty_and_nonempty_matches() raises:
+    var re = StaticRegex["x*"]()
+    # Python: re.split('x*', 'xaxbx') == ['', '', 'a', '', 'b', '', '']
+    var parts = re.split("xaxbx")
+    assert_equal(len(parts), 7)
+    assert_equal(parts[0], "")
+    assert_equal(parts[1], "")
+    assert_equal(parts[2], "a")
+    assert_equal(parts[3], "")
+    assert_equal(parts[4], "b")
+    assert_equal(parts[5], "")
+    assert_equal(parts[6], "")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

@@ -5,6 +5,7 @@ skip-ahead. A literal prefix is the sequence of bytes that every
 match must start with.
 """
 
+from .constants import CHAR_A_UPPER, CHAR_Z_UPPER
 from .nfa import NFA, NFAStateKind
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
@@ -40,6 +41,81 @@ def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
     return prefix^
 
 
+struct FilterPrefix(Copyable, Movable):
+    """Longest known per-position byte filter at the pattern start: exact
+    bytes plus ASCII case-pair positions (the shape (?i) literals compile
+    to) and single-byte charsets.
+
+    A superset of the exact literal prefix — used only for candidate
+    SCANNING (the engine verifies at every candidate), never for the
+    verification-free literal paths (simd literal, sandwich), which keep
+    the exact prefix."""
+
+    var bytes: List[UInt8]  # lowercase byte at caseless positions
+    var caseless: List[Bool]
+
+    def __init__(out self):
+        self.bytes = List[UInt8]()
+        self.caseless = List[Bool]()
+
+
+def extract_filter_prefix(nfa: NFA) -> FilterPrefix:
+    """Comptime: walk the unique path from the start collecting filterable
+    positions. CHAR contributes an exact byte; a non-negated CHARSET
+    contributes an exact byte (single member) or a caseless position
+    (exactly {C, c} for an ASCII letter); SAVE/ANCHOR/no-op SPLITs pass
+    through. Anything else ends the filter."""
+    var fp = FilterPrefix()
+    var state_idx = nfa.start
+    while state_idx >= 0 and state_idx < len(nfa.states):
+        var kind = nfa.states[state_idx].kind
+        if kind == NFAStateKind.CHAR:
+            if nfa.states[state_idx].char_value >= 256:
+                break
+            fp.bytes.append(UInt8(nfa.states[state_idx].char_value))
+            fp.caseless.append(False)
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.CHARSET:
+            ref cs = nfa.charsets[nfa.states[state_idx].charset_index]
+            if cs.negated:
+                break
+            # Collect member bytes from the bitmap (ranges aren't reliably
+            # readable at comptime); bail past two members.
+            var b0 = -1
+            var b1 = -1
+            var count = 0
+            for b in range(256):
+                if (cs.bitmap[b >> 3] & (UInt8(1) << UInt8(b & 7))) != 0:
+                    count += 1
+                    if count == 1:
+                        b0 = b
+                    elif count == 2:
+                        b1 = b
+                    else:
+                        break
+            if count == 1:
+                fp.bytes.append(UInt8(b0))
+                fp.caseless.append(False)
+            elif (
+                count == 2
+                and b1 == b0 + 32
+                and b0 >= Int(CHAR_A_UPPER)
+                and b0 <= Int(CHAR_Z_UPPER)
+            ):
+                fp.bytes.append(UInt8(b1))  # the lowercase member
+                fp.caseless.append(True)
+            else:
+                break
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            state_idx = nfa.states[state_idx].out1
+        elif kind == NFAStateKind.SPLIT and nfa.states[state_idx].out2 == -1:
+            state_idx = nfa.states[state_idx].out1
+        else:
+            break
+    return fp^
+
+
 def is_pure_literal(nfa: NFA) -> Bool:
     """Return True if the entire pattern is a fixed literal string with no
     alternation, quantifiers, anchors, or other constructs."""
@@ -53,6 +129,183 @@ def is_pure_literal(nfa: NFA) -> Bool:
         else:
             return kind == NFAStateKind.MATCH
     return False
+
+
+# Teddy verifies every literal at each candidate position, and the masks
+# carry one bucket bit per literal — 8 bits bounds the set.
+comptime TEDDY_MAX_LITERALS = 8
+
+
+struct LiteralAlt(Copyable, Movable):
+    """A pattern that is exactly an alternation of plain literals
+    (`cat|dog|bird`), extracted for the Teddy multi-literal engine."""
+
+    var valid: Bool
+    var lits: List[List[Int]]  # byte values per literal, pattern order
+    var min_len: Int
+
+    def __init__(out self):
+        self.valid = False
+        self.lits = List[List[Int]]()
+        self.min_len = 0
+
+
+def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
+    """Comptime: detect a pure alternation of 2..TEDDY_MAX_LITERALS plain
+    literals.
+
+    The start must expand (through no-op SPLITs and SAVEs) into a SPLIT
+    tree whose leaves are CHAR chains ending at MATCH. Anything else —
+    anchors, charsets, quantifier cycles, empty branches, nested
+    alternation mid-chain — invalidates the extraction.
+    """
+    var result = LiteralAlt()
+    var num_states = len(nfa.states)
+
+    # Expand the alternation tree into branch heads. The expansion budget
+    # rejects quantifier cycles (which revisit SPLITs indefinitely).
+    var heads = List[Int]()
+    var stack: List[Int] = [nfa.start]
+    var budget = 4 * TEDDY_MAX_LITERALS
+    while len(stack) > 0:
+        budget -= 1
+        if budget < 0:
+            return result^
+        var s = stack.pop()
+        if s < 0 or s >= num_states:
+            return result^
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.SPLIT:
+            if nfa.states[s].out2 == -1:
+                stack.append(nfa.states[s].out1)
+            else:
+                stack.append(nfa.states[s].out2)
+                stack.append(nfa.states[s].out1)
+        elif kind == NFAStateKind.SAVE:
+            stack.append(nfa.states[s].out1)
+        elif kind == NFAStateKind.CHAR:
+            heads.append(s)
+        else:
+            return result^
+    if len(heads) < 2 or len(heads) > TEDDY_MAX_LITERALS:
+        return result^
+
+    var min_len = num_states  # any literal is shorter than the NFA
+    for h in heads:
+        var bytes = List[Int]()
+        var s = h
+        var steps = 0
+        while True:
+            steps += 1
+            if steps > num_states or s < 0 or s >= num_states:
+                return result^
+            var kind = nfa.states[s].kind
+            if kind == NFAStateKind.CHAR:
+                var cv = nfa.states[s].char_value
+                if cv >= 256:
+                    return result^
+                bytes.append(Int(cv))
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.SAVE:
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.SPLIT and nfa.states[s].out2 == -1:
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.MATCH:
+                break
+            else:
+                return result^
+        if len(bytes) == 0:
+            return result^
+        if len(bytes) < min_len:
+            min_len = len(bytes)
+        result.lits.append(bytes^)
+    result.min_len = min_len
+    result.valid = True
+    return result^
+
+
+def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
+    """Comptime: detect a *required* alternation-of-literals prefix — the
+    pattern starts with a SPLIT tree whose every arm begins with >= 2
+    literal CHAR bytes (`(?:GET|POST|PUT) /...`). Unlike
+    extract_literal_alternation the chains need not reach MATCH: they are
+    truncated at the first non-literal state (or at 8 bytes) and serve as
+    a Teddy *prefilter* — every match must start with one of the chains,
+    and the engine verifies at each candidate.
+
+    Invalid when the whole pattern is already a literal alternation (the
+    full Teddy engine owns that), when any arm starts with a non-CHAR
+    state, or when more than TEDDY_MAX_LITERALS arms exist."""
+    var result = LiteralAlt()
+    var num_states = len(nfa.states)
+
+    var heads = List[Int]()
+    var stack: List[Int] = [nfa.start]
+    var budget = 4 * TEDDY_MAX_LITERALS
+    while len(stack) > 0:
+        budget -= 1
+        if budget < 0:
+            return result^
+        var s = stack.pop()
+        if s < 0 or s >= num_states:
+            return result^
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.SPLIT:
+            if nfa.states[s].out2 == -1:
+                stack.append(nfa.states[s].out1)
+            else:
+                stack.append(nfa.states[s].out2)
+                stack.append(nfa.states[s].out1)
+        elif kind == NFAStateKind.SAVE:
+            stack.append(nfa.states[s].out1)
+        elif kind == NFAStateKind.CHAR:
+            heads.append(s)
+        else:
+            return result^
+    if len(heads) < 2 or len(heads) > TEDDY_MAX_LITERALS:
+        return result^
+
+    comptime CHAIN_CAP = 8  # verification cost bound per candidate
+    var min_len = CHAIN_CAP
+    var all_end_at_match = True
+    for h in heads:
+        var bytes = List[Int]()
+        var s = h
+        var steps = 0
+        var ended_at_match = False
+        while len(bytes) < CHAIN_CAP:
+            steps += 1
+            if steps > num_states or s < 0 or s >= num_states:
+                break
+            var kind = nfa.states[s].kind
+            if kind == NFAStateKind.CHAR:
+                var cv = nfa.states[s].char_value
+                if cv >= 256:
+                    break
+                bytes.append(Int(cv))
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.SAVE:
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.SPLIT and nfa.states[s].out2 == -1:
+                s = nfa.states[s].out1
+            else:
+                if kind == NFAStateKind.MATCH:
+                    ended_at_match = True
+                break
+        if len(bytes) < 2:
+            return result^  # a 1-byte arm filters no better than the bitmap
+        if not ended_at_match:
+            all_end_at_match = False
+        if len(bytes) < min_len:
+            min_len = len(bytes)
+        result.lits.append(bytes^)
+    if all_end_at_match:
+        # Whole-pattern literal alternation: the full Teddy engine's
+        # territory (extract_literal_alternation), not a prefilter.
+        return LiteralAlt()
+    result.min_len = min_len
+    result.valid = True
+    return result^
 
 
 def _match_unreachable_without_byte(nfa: NFA, byte: Int) -> Bool:
@@ -229,6 +482,160 @@ def extract_match_sandwich(nfa: NFA) -> MatchSandwich:
         else:
             return info^
     return info^
+
+
+def extract_literal_suffix(nfa: NFA) -> List[UInt8]:
+    """Extract the literal byte suffix every match must end with.
+
+    Locates the main MATCH state by forward reachability from the start
+    state (lookaround sub-NFAs contain their own MATCH states but are not
+    part of the main control flow), then walks backward through unique
+    predecessors: CHAR states contribute bytes; SAVE, ANCHOR, and SPLIT
+    states consume nothing and pass through. A state with zero or several
+    predecessors, a variable-width state (CHARSET/ANY/BACKREF), or a
+    lookaround stops the walk.
+
+    The result is a necessary condition only — callers may fast-fail a
+    full-input match when the input does not end with these bytes, but a
+    passing check proves nothing.
+    """
+    var suffix = List[UInt8]()
+    var num_states = len(nfa.states)
+
+    # Forward reachability over the main control flow (out1/out2 only —
+    # never sub_start, so lookaround sub-graphs stay excluded).
+    var reachable = List[Bool](length=num_states, fill=False)
+    var stack = List[Int]()
+    stack.append(nfa.start)
+    var match_idx = -1
+    var match_count = 0
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= num_states or reachable[s]:
+            continue
+        reachable[s] = True
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.MATCH:
+            match_idx = s
+            match_count += 1
+        elif kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[s].out1)
+            stack.append(nfa.states[s].out2)
+        else:
+            stack.append(nfa.states[s].out1)
+    if match_count != 1:
+        return suffix^
+
+    # Predecessor map restricted to reachable states: pred[t] is t's sole
+    # predecessor, or -1 when t has zero or several.
+    var pred = List[Int](length=num_states, fill=-1)
+    var pred_count = List[Int](length=num_states, fill=0)
+    for s in range(num_states):
+        if not reachable[s]:
+            continue
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.MATCH:
+            continue
+        var t1 = nfa.states[s].out1
+        if t1 >= 0 and t1 < num_states:
+            pred_count[t1] += 1
+            pred[t1] = s
+        if kind == NFAStateKind.SPLIT:
+            var t2 = nfa.states[s].out2
+            if t2 >= 0 and t2 < num_states:
+                pred_count[t2] += 1
+                pred[t2] = s
+
+    # Backward walk from MATCH. `visited` guards quantifier cycles
+    # (e.g. `a+`, whose SPLIT and CHAR are mutual predecessors). The walk
+    # stops at the start state: execution enters there without traversing
+    # any edge, so predecessors say nothing about paths beginning at it
+    # (e.g. `a*?`, whose start SPLIT reaches MATCH consuming nothing).
+    var visited = List[Bool](length=num_states, fill=False)
+    var rev = List[UInt8]()
+    var cur = match_idx
+    while cur != nfa.start and pred_count[cur] == 1 and not visited[cur]:
+        visited[cur] = True
+        var p = pred[cur]
+        var kind = nfa.states[p].kind
+        if kind == NFAStateKind.CHAR:
+            if nfa.states[p].char_value >= 256:
+                break
+            rev.append(UInt8(nfa.states[p].char_value))
+            cur = p
+        elif (
+            kind == NFAStateKind.SAVE
+            or kind == NFAStateKind.ANCHOR
+            or kind == NFAStateKind.SPLIT
+        ):
+            cur = p
+        else:
+            break
+    for i in range(len(rev) - 1, -1, -1):
+        suffix.append(rev[i])
+    return suffix^
+
+
+def _probe_rank_table() -> List[Int]:
+    """Comptime: approximate background byte frequency (0 = rarest, 255 =
+    most common) over typical text/code, for prefilter probe selection.
+
+    Precision is irrelevant — only the relative order of the pattern's own
+    prefix bytes matters, and even a rough order beats always probing
+    first+last (the memchr-crate heuristic this follows)."""
+    var t = List[Int](fill=20, length=256)
+    for b in range(128, 256):
+        t[b] = 100  # UTF-8 payload bytes: middling
+    t[0x20] = 255  # space
+    t[0x0A] = 240  # \n
+    t[0x09] = 210  # \t
+    t[0x0D] = 200  # \r
+    var lower = "etaoinshrdlcumwfgypbvkjxqz"
+    var lb = lower.as_bytes()
+    for i in range(len(lb)):
+        t[Int(lb[i])] = 250 - 4 * i  # 250 down to 150
+        t[Int(lb[i]) - 32] = 170 - 4 * i  # uppercase: same order, rarer
+    var digits = "0123456789"
+    var db = digits.as_bytes()
+    for i in range(len(db)):
+        t[Int(db[i])] = 175
+    var punct = ".,-_'\"/:=();<>*!+%[]{}#|&@?$^~`\\"
+    var pb = punct.as_bytes()
+    for i in range(len(pb)):
+        t[Int(pb[i])] = 190 - 5 * i  # 190 down to 35
+    return t^
+
+
+def select_probe_offsets(
+    prefix: List[UInt8], caseless: List[Bool]
+) -> Tuple[Int, Int]:
+    """Comptime: offsets of the two rarest prefix positions for the
+    two-byte candidate filter, per _probe_rank_table. A caseless position
+    matches both cases, so its rank is the sum of both cases' frequencies.
+    Ties prefer later offsets (larger spread rejects repeated-byte runs
+    sooner). Requires len(prefix) >= 2; returns (off_a, off_b) with
+    off_a < off_b."""
+    var ranks = _probe_rank_table()
+    var n = len(prefix)
+    var pr = List[Int]()
+    for i in range(n):
+        var r = ranks[Int(prefix[i])]
+        if caseless[i]:
+            r += ranks[Int(prefix[i]) - 32]
+        pr.append(r)
+    var best1 = 0
+    for i in range(1, n):
+        if pr[i] <= pr[best1]:
+            best1 = i
+    var best2 = 1 if best1 == 0 else 0
+    for i in range(n):
+        if i == best1:
+            continue
+        if pr[i] <= pr[best2]:
+            best2 = i
+    if best1 < best2:
+        return (best1, best2)
+    return (best2, best1)
 
 
 def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
