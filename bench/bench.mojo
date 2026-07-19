@@ -661,6 +661,27 @@ def bench_static_teddy_prefix_search(mut b: Bench) raises:
     b.bench_function[go](BenchId("static_teddy_prefix_search_2KB"))
 
 
+def bench_pathological_pike_search_miss(mut b: Bench) raises:
+    # SBT budget exhausts on the all-'a' run; the search falls to the Pike
+    # VM, whose single unanchored pass replaces the old O(n^2)
+    # per-position restart (measured 55x on this input).
+    var re = StaticRegex["(a+)+b"]()
+    var input = "a" * 600
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            var r = re.search(input)
+            keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("pathological_pike_search_miss_600B"))
+
+
 def bench_static_nested_quantifier(mut b: Bench) raises:
     var re = StaticRegex["([a-z]+[0-9]+)+x"]()
     var input = "abc123def456ghi789x"
@@ -1973,6 +1994,7 @@ def main() raises:
     bench_split_many(b)
 
     # Pathological
+    bench_pathological_pike_search_miss(b)
     bench_pathological_optional_16(b)
     bench_pathological_dotstar_anchored(b)
     bench_pathological_dotstar_miss(b)

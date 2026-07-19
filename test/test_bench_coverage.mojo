@@ -433,6 +433,17 @@ def test_bench_ignorecase_search() raises:
     assert_equal(r.start, filler.byte_length() + 3)
 
 
+def test_bench_pike_search_miss() raises:
+    # bench pathological_pike_search_miss_600B: all-'a' input has no 'b',
+    # so no match; positive control with a 'b' appended.
+    var re = StaticRegex["(a+)+b"]()
+    assert_false(re.search("a" * 600).matched)
+    var hit = re.search("a" * 50 + "b")
+    assert_true(hit.matched)
+    assert_equal(hit.start, 0)
+    assert_equal(hit.end, 51)
+
+
 def test_bench_teddy_prefix_search() raises:
     # bench static_teddy_prefix_search_2KB: filler misses, tail hits.
     var re = StaticRegex["(?:GET|POST|PUT) /\\w+"]()

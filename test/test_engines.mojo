@@ -126,6 +126,22 @@ def test_pike_fallback_anchored_no_match() raises:
     assert_false(re.match(input).matched)
 
 
+def test_pike_unanchored_search_with_captures() raises:
+    # The 40-'a' prefix exhausts the SBT budget (exponential miss), so the
+    # whole search runs on the Pike VM's single unanchored pass. The
+    # winning thread's start and capture slots must survive the injection
+    # machinery. (CPython's re explodes exponentially on this input, so
+    # the expectation is hand-derived: leftmost (a+)+b match is "aab".)
+    var re = StaticRegex["((a+)+b)"]()
+    var input = "a" * 40 + " aab"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 41)
+    assert_equal(r.end, 44)
+    assert_equal(r.group_str(input, 1), "aab")
+    assert_equal(r.group_str(input, 2), "aa")
+
+
 def test_search_run_skip_multiline_arm_sheng() raises:
     # Regression: the DFA search run-skip must not jump over a `(?m)^` arm
     # match that starts inside a run whose class contains '\n'. Small DFA,

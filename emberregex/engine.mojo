@@ -934,8 +934,151 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             pos = nl + 1
         return MatchResult[Self._num_slots].no_match()
 
+    @always_inline
+    @staticmethod
+    def _span_result(start: Int, end: Int) -> MatchResult[Self._num_slots]:
+        """A MatchResult carrying only a span (capture-free lanes)."""
+        return MatchResult[Self._num_slots](
+            matched=True,
+            start=start,
+            end=end,
+            slots=InlineArray[Int, Self._num_slots](fill=-1),
+        )
+
+    def finditer(
+        mut self, input: String
+    ) -> List[MatchResult[Self._num_slots]]:
+        """All non-overlapping matches as MatchResults (spans plus capture
+        slots), eagerly collected.
+
+        No per-match String allocation: slice lazily via span() /
+        group_str(). findall() is a wrapper over this."""
+        comptime if Self._strategy.required_byte >= 0:
+            if (
+                simd_find_byte(
+                    input.as_bytes(),
+                    UInt8(Self._strategy.required_byte),
+                    0,
+                )
+                < 0
+            ):
+                return List[MatchResult[Self._num_slots]]()
+        comptime if Self._strategy.use_simd_literal:
+            var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
+                self._simd_lit
+            )
+            var results = List[MatchResult[Self._num_slots]]()
+            var input_bytes = input.as_bytes()
+            var pos = 0
+            while True:
+                pos = simd_find_literal(input_bytes, lit, pos)
+                if pos < 0:
+                    break
+                results.append(
+                    Self._span_result(pos, pos + Self._strategy.prefix_len)
+                )
+                pos += Self._strategy.prefix_len
+            return results^
+        elif Self._strategy.use_dfa:
+            var results = List[MatchResult[Self._num_slots]]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+
+            try:
+                # BOL: only position 0
+                comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+                    var match_end = self._dfa_match_at(input_bytes, 0)
+                    if match_end >= 0:
+                        var end = self._lf_end_at(input_bytes, 0, match_end)
+                        results.append(Self._span_result(0, end))
+                    return results^
+
+                # BOL_MULTILINE: skip to BOL positions via SIMD newline scan
+                elif Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
+                    while pos <= input_len:
+                        var match_end = self._dfa_match_at(input_bytes, pos)
+                        if match_end >= 0:
+                            match_end = self._lf_end_at(
+                                input_bytes, pos, match_end
+                            )
+                            results.append(Self._span_result(pos, match_end))
+                            if match_end > pos:
+                                pos = match_end
+                            else:
+                                pos += 1
+                            # If the match ended right after a newline, pos
+                            # is already a BOL — don't skip past it.
+                            if (
+                                pos <= input_len
+                                and input_bytes.unsafe_get(pos - 1)
+                                == CHAR_NEWLINE
+                            ):
+                                continue
+                        # Skip to next BOL position
+                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                        if nl < 0:
+                            break
+                        pos = nl + 1
+                    return results^
+
+                # General case
+                elif Self._strategy.start_anchor != AnchorKind.BOL and Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+                    while pos <= input_len:
+                        comptime if Self._use_scan_filter:
+                            pos = self._scan_candidate(
+                                input_bytes, input_len, pos
+                            )
+                            if pos < 0:
+                                break
+                            var match_end = self._dfa_match_at(input_bytes, pos)
+                            if match_end >= 0:
+                                match_end = self._lf_end_at(
+                                    input_bytes, pos, match_end
+                                )
+                                results.append(
+                                    Self._span_result(pos, match_end)
+                                )
+                                if match_end > pos:
+                                    pos = match_end
+                                else:
+                                    pos += 1
+                                continue
+                            pos += 1
+                        else:
+                            var range = self._dfa_search_forward(
+                                input_bytes, pos
+                            )
+                            if range[0] < 0:
+                                break
+                            var start = range[0]
+                            var end = self._lf_end_at(
+                                input_bytes, start, range[1]
+                            )
+                            results.append(Self._span_result(start, end))
+                            if end > start:
+                                pos = end
+                            else:
+                                pos = start + 1
+                    return results^
+            except:
+                # DFA state-cache overflow — fall back to the Pike VM
+                return self._pike_finditer(input)
+        try:
+            return self._finditer_impl(input)
+        except:
+            return self._pike_finditer(input)
+
     def findall(mut self, input: String) -> List[String]:
-        """Find all non-overlapping matches and return their text."""
+        """Find all non-overlapping matches and return their text.
+
+        With capture groups, returns group 1's text when it participated
+        (Python-re flavored); use finditer() for full spans and slots.
+
+        Deliberately a direct single-pass sibling of finditer(), not a
+        wrapper over it: materializing the intermediate MatchResult list
+        measured 1.3-1.9x on findall-heavy rows. Keep the iteration
+        structure of the two in sync."""
         comptime if Self._strategy.required_byte >= 0:
             if (
                 simd_find_byte(
@@ -1173,6 +1316,145 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 results.append(String(unsafe_from_utf8=input_bytes[pos:end]))
         else:
             results.append(String(unsafe_from_utf8=input_bytes[pos:end]))
+
+    def _pike_findall(self, input: String) -> List[String]:
+        """PikeVM fallback for findall when backtracker exhausts budget."""
+        var nfa = _build_static_nfa(Self.pattern)
+        var num_states = len(nfa.states)
+        var vm = PikeVM[Self._num_slots](nfa^)
+        var bufs = _VMBuffers(num_states, Self._num_slots)
+        var results = List[String]()
+        var input_bytes = input.as_bytes()
+        var input_len = input.byte_length()
+        var pos = 0
+        while pos <= input_len:
+            var result = vm._execute_with_bufs(
+                input_bytes, pos, bufs, unanchored=True
+            )
+            if not result.matched:
+                # Unanchored: a miss covers every start >= pos.
+                break
+            comptime if Self._group_count > 0:
+                if result.group_matched(1):
+                    results.append(result.group_str(input_bytes, 1))
+                else:
+                    results.append(
+                        String(
+                            unsafe_from_utf8=input_bytes[
+                                result.start : result.end
+                            ]
+                        )
+                    )
+            else:
+                results.append(
+                    String(
+                        unsafe_from_utf8=input_bytes[result.start : result.end]
+                    )
+                )
+            if result.end > result.start:
+                pos = result.end
+            else:
+                pos = result.end + 1
+        return results^
+
+    def _finditer_impl(
+        mut self, input: String
+    ) raises -> List[MatchResult[Self._num_slots]]:
+        """finditer() implementation for the backtracker path (carries the
+        real capture slots per match)."""
+        var results = List[MatchResult[Self._num_slots]]()
+        var input_bytes = input.as_bytes()
+        var input_len = input.byte_length()
+
+        # BOL anchor: only position 0
+        comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            var slots = ALL_NEG_ONES[Self._num_slots]
+            var end = _sbt_run[
+                nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
+            ](input_bytes, 0, slots)
+            if end >= 0:
+                results.append(
+                    MatchResult[Self._num_slots](
+                        matched=True, start=0, end=end, slots=slots^
+                    )
+                )
+            return results^
+
+        else:
+            comptime if Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
+                # Skip to BOL positions using SIMD newline scan
+                var pos = 0
+                while pos <= input_len:
+                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var end = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                    ](input_bytes, pos, slots)
+                    if end >= 0:
+                        results.append(
+                            MatchResult[Self._num_slots](
+                                matched=True, start=pos, end=end, slots=slots^
+                            )
+                        )
+                        if end > pos:
+                            pos = end
+                        else:
+                            pos += 1
+                        # If the match ended right after a newline, pos is
+                        # already a BOL — don't skip past it.
+                        if (
+                            pos <= input_len
+                            and input_bytes.unsafe_get(pos - 1) == CHAR_NEWLINE
+                        ):
+                            continue
+                        # Otherwise skip to the next BOL
+                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                        if nl < 0:
+                            break
+                        pos = nl + 1
+                        continue
+                    # Skip to next BOL position
+                    var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
+                    if nl < 0:
+                        break
+                    pos = nl + 1
+                return results^
+
+            elif Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+                var pos = 0
+                while pos <= input_len:
+                    comptime if Self._use_scan_filter:
+                        pos = self._scan_candidate(
+                            input_bytes, input_len, pos
+                        )
+                        if pos < 0:
+                            break
+                    else:
+                        comptime if Self._strategy.first_byte_useful:
+                            pos = self._next_candidate_pos(
+                                input_bytes, input_len, pos
+                            )
+                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var end = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                    ](input_bytes, pos, slots)
+                    if end < 0:
+                        pos += 1
+                        continue
+                    results.append(
+                        MatchResult[Self._num_slots](
+                            matched=True, start=pos, end=end, slots=slots^
+                        )
+                    )
+                    if end > pos:
+                        pos = end
+                    else:
+                        pos += 1
+                return results^
+        return results^
 
     def replace(mut self, input: String, replacement: String) -> String:
         """Replace all non-overlapping matches with replacement string.
@@ -1791,44 +2073,32 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var bufs = _VMBuffers(num_states, Self._num_slots)
         return vm.search_with_bufs(input, bufs)
 
-    def _pike_findall(self, input: String) -> List[String]:
-        """PikeVM fallback for findall when backtracker exhausts budget."""
+    def _pike_finditer(
+        self, input: String
+    ) -> List[MatchResult[Self._num_slots]]:
+        """PikeVM fallback for finditer when backtracker exhausts budget."""
         var nfa = _build_static_nfa(Self.pattern)
         var num_states = len(nfa.states)
         var vm = PikeVM[Self._num_slots](nfa^)
         var bufs = _VMBuffers(num_states, Self._num_slots)
-        var results = List[String]()
+        var results = List[MatchResult[Self._num_slots]]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
         var pos = 0
         while pos <= input_len:
-            var result = vm._execute_with_bufs(input_bytes, pos, bufs)
+            var result = vm._execute_with_bufs(
+                input_bytes, pos, bufs, unanchored=True
+            )
             if not result.matched:
-                # The VM is anchored at pos; a failure here says nothing
-                # about later start positions.
-                pos += 1
-                continue
-            comptime if Self._group_count > 0:
-                if result.group_matched(1):
-                    results.append(result.group_str(input_bytes, 1))
-                else:
-                    results.append(
-                        String(
-                            unsafe_from_utf8=input_bytes[
-                                result.start : result.end
-                            ]
-                        )
-                    )
+                # Unanchored: a miss covers every start >= pos.
+                break
+            var start = result.start
+            var end = result.end
+            results.append(result^)
+            if end > start:
+                pos = end
             else:
-                results.append(
-                    String(
-                        unsafe_from_utf8=input_bytes[result.start : result.end]
-                    )
-                )
-            if result.end > pos:
-                pos = result.end
-            else:
-                pos += 1
+                pos = end + 1
         return results^
 
     def _pike_replace(self, input: String, replacement: String) -> String:
@@ -1843,23 +2113,23 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var pos = 0
         var prev_end = 0
         while pos <= input_len:
-            var result = vm._execute_with_bufs(input_bytes, pos, bufs)
+            var result = vm._execute_with_bufs(
+                input_bytes, pos, bufs, unanchored=True
+            )
             if not result.matched:
-                pos += 1
-                continue
+                break
             if result.start > prev_end:
                 output += String(
                     unsafe_from_utf8=input_bytes[prev_end : result.start]
                 )
             output += self._expand_replacement(input_bytes, result, replacement)
-            if result.end > pos:
-                prev_end = result.end
+            prev_end = result.end
+            if result.end > result.start:
                 pos = result.end
             else:
-                # Empty match: keep the byte at pos in the next segment
-                # (mirrors _replace_impl).
-                prev_end = pos
-                pos += 1
+                # Empty match: keep the byte at result.start in the next
+                # segment (mirrors _replace_impl).
+                pos = result.end + 1
         if prev_end < input_len:
             output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
         return output^
@@ -1876,20 +2146,21 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         var pos = 0
         var prev_end = 0
         while pos <= input_len:
-            var result = vm._execute_with_bufs(input_bytes, pos, bufs)
+            var result = vm._execute_with_bufs(
+                input_bytes, pos, bufs, unanchored=True
+            )
             if not result.matched:
-                pos += 1
-                continue
+                break
             parts.append(
                 String(unsafe_from_utf8=input_bytes[prev_end : result.start])
             )
-            if result.end > pos:
-                prev_end = result.end
+            prev_end = result.end
+            if result.end > result.start:
                 pos = result.end
             else:
-                # Empty match: keep the byte at pos in the next segment.
-                prev_end = pos
-                pos += 1
+                # Empty match: keep the byte at result.start in the next
+                # segment.
+                pos = result.end + 1
         if prev_end <= input_len:
             parts.append(
                 String(unsafe_from_utf8=input_bytes[prev_end:input_len])

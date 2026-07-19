@@ -210,6 +210,49 @@ def test_replace_dfa_lane_classes() raises:
     assert_equal(re.replace("z12ab 9fq 33cd", "#"), "z# #q #")
 
 
+def test_finditer_spans() raises:
+    # Python: [m.span() for m in re.finditer(r'\d+', 'a1b22c333')]
+    #         == [(1, 2), (3, 5), (6, 9)]
+    var re = StaticRegex["\\d+"]()
+    var matches = re.finditer("a1b22c333")
+    assert_equal(len(matches), 3)
+    assert_equal(matches[0].start, 1)
+    assert_equal(matches[0].end, 2)
+    assert_equal(matches[1].start, 3)
+    assert_equal(matches[1].end, 5)
+    assert_equal(matches[2].start, 6)
+    assert_equal(matches[2].end, 9)
+
+
+def test_finditer_groups() raises:
+    # Python: re.search(r'(\w+)@(\w+)', 'mail bob@host now')
+    #         span (5, 13), groups ('bob', 'host')
+    var re = StaticRegex["(\\w+)@(\\w+)"]()
+    var input = "mail bob@host now"
+    var matches = re.finditer(input)
+    assert_equal(len(matches), 1)
+    assert_equal(matches[0].start, 5)
+    assert_equal(matches[0].end, 13)
+    assert_equal(matches[0].group_str(input, 1), "bob")
+    assert_equal(matches[0].group_str(input, 2), "host")
+
+
+def test_finditer_empty_matches() raises:
+    # Python: [m.span() for m in re.finditer(r'x*', 'axb')]
+    #         == [(0, 0), (1, 2), (2, 2), (3, 3)]
+    var re = StaticRegex["x*"]()
+    var matches = re.finditer("axb")
+    assert_equal(len(matches), 4)
+    assert_equal(matches[0].start, 0)
+    assert_equal(matches[0].end, 0)
+    assert_equal(matches[1].start, 1)
+    assert_equal(matches[1].end, 2)
+    assert_equal(matches[2].start, 2)
+    assert_equal(matches[2].end, 2)
+    assert_equal(matches[3].start, 3)
+    assert_equal(matches[3].end, 3)
+
+
 def test_split_empty_and_nonempty_matches() raises:
     var re = StaticRegex["x*"]()
     # Python: re.split('x*', 'xaxbx') == ['', '', 'a', '', 'b', '', '']

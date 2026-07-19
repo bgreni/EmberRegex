@@ -46,19 +46,25 @@ struct _VMBuffers(Copyable):
     var init_slots: List[Int]
     var num_states: Int
     var num_slots: Int
+    var stride: Int
+    """Per-thread slot stride: num_slots capture slots plus one extra slot
+    carrying the thread's match START position, so unanchored execution can
+    report where the winning thread began."""
 
     def __init__(out self, num_states: Int, num_slots: Int):
+        var stride = num_slots + 1
         self.current_states = List[Int](capacity=num_states)
-        self.current_slot_data = List[Int](capacity=num_states * num_slots)
+        self.current_slot_data = List[Int](capacity=num_states * stride)
         self.next_states = List[Int](capacity=num_states)
-        self.next_slot_data = List[Int](capacity=num_states * num_slots)
+        self.next_slot_data = List[Int](capacity=num_states * stride)
         self.gen = List[Int](length=num_states, fill=0)
         self.gen_counter = 0
-        self.temp_slots = List[Int](length=num_slots, fill=-1)
-        self.best_slots = List[Int](length=num_slots, fill=-1)
-        self.init_slots = List[Int](length=num_slots, fill=-1)
+        self.temp_slots = List[Int](length=stride, fill=-1)
+        self.best_slots = List[Int](length=stride, fill=-1)
+        self.init_slots = List[Int](length=stride, fill=-1)
         self.num_states = num_states
         self.num_slots = num_slots
+        self.stride = stride
 
     def reset(mut self):
         """Reset buffers for a new _execute call. O(1) — no clearing needed."""
@@ -66,7 +72,7 @@ struct _VMBuffers(Copyable):
         self.current_slot_data.clear()
         self.next_states.clear()
         self.next_slot_data.clear()
-        memset(self.best_slots.unsafe_ptr(), -1, self.num_slots)
+        memset(self.best_slots.unsafe_ptr(), -1, self.stride)
 
 
 struct PikeVM[num_slots: Int](Copyable):
@@ -76,6 +82,10 @@ struct PikeVM[num_slots: Int](Copyable):
     `MatchResult` carries an `InlineArray` whose length is fixed at compile
     time. The NFA's runtime `group_count` must equal `num_slots // 2`.
     """
+
+    # Per-thread slot stride: capture slots + the thread's start position
+    # (see _VMBuffers.stride).
+    comptime _stride = Self.num_slots + 1
 
     var nfa: NFA
 
@@ -101,14 +111,14 @@ struct PikeVM[num_slots: Int](Copyable):
     def search_with_bufs(
         self, input: String, mut bufs: _VMBuffers
     ) -> MatchResult[Self.num_slots]:
-        """Search for the first match anywhere in the input."""
-        var i = 0
-        while i <= input.byte_length():
-            var result = self._execute_with_bufs(input.as_bytes(), i, bufs)
-            if result.matched:
-                return result^
-            i += 1
-        return MatchResult[Self.num_slots].no_match()
+        """Search for the first match anywhere in the input.
+
+        Single unanchored pass: fresh start-state threads are injected at
+        every position at lowest priority, so the leftmost match wins —
+        O(n * states) instead of the O(n^2) per-position restart."""
+        return self._execute_with_bufs(
+            input.as_bytes(), 0, bufs, unanchored=True
+        )
 
     def _execute_with_bufs[
         origin: Origin, //
@@ -119,12 +129,16 @@ struct PikeVM[num_slots: Int](Copyable):
         mut bufs: _VMBuffers,
         max_pos: Int = -1,
         full: Bool = False,
+        unanchored: Bool = False,
     ) -> MatchResult[Self.num_slots]:
         """Core NFA simulation using pre-allocated buffers.
 
         If max_pos >= 0, limits processing to positions < max_pos.
         If full is True, MATCH only accepts at end of input (fullmatch);
         otherwise the VM implements leftmost-first (Python re) semantics.
+        If unanchored is True, a fresh start-state thread is injected at
+        every position (at lowest priority) until a match is recorded, so
+        one pass finds the leftmost match anywhere >= start_pos.
         """
         var input_len = len(input)
         if max_pos >= 0 and max_pos < input_len:
@@ -136,9 +150,11 @@ struct PikeVM[num_slots: Int](Copyable):
         var ptr = input.unsafe_ptr()
         bufs.reset()
 
-        # Seed with start state (init_slots pre-allocated in bufs, always -1)
+        # Seed with start state. init_slots holds -1 capture slots; its
+        # extra stride slot carries the thread's start position.
         bufs.gen_counter += 1
         var curr_gen = bufs.gen_counter
+        bufs.init_slots.unsafe_set(Self.num_slots, start_pos)
         self._add_state(
             bufs.current_states,
             bufs.current_slot_data,
@@ -170,11 +186,11 @@ struct PikeVM[num_slots: Int](Copyable):
                         ):
                             matched = True
                             best_match_end = pos
-                            for s in range(Self.num_slots):
+                            for s in range(Self._stride):
                                 bufs.best_slots.unsafe_set(
                                     s,
                                     bufs.current_slot_data.unsafe_get(
-                                        i * Self.num_slots + s
+                                        i * Self._stride + s
                                     ),
                                 )
                             break
@@ -193,15 +209,15 @@ struct PikeVM[num_slots: Int](Copyable):
                     ):
                         matched = True
                         best_match_end = pos
-                        for s in range(Self.num_slots):
+                        for s in range(Self._stride):
                             bufs.best_slots.unsafe_set(
                                 s,
                                 bufs.current_slot_data.unsafe_get(
-                                    i * Self.num_slots + s
+                                    i * Self._stride + s
                                 ),
                             )
                         bufs.current_states.resize(i, 0)
-                        bufs.current_slot_data.resize(i * Self.num_slots, 0)
+                        bufs.current_slot_data.resize(i * Self._stride, 0)
                         break
 
             if pos >= input_len:
@@ -219,8 +235,8 @@ struct PikeVM[num_slots: Int](Copyable):
                 var out1 = state.out1
 
                 # Copy current slots to temp buffer
-                var base = i * Self.num_slots
-                for s in range(Self.num_slots):
+                var base = i * Self._stride
+                for s in range(Self._stride):
                     bufs.temp_slots.unsafe_set(
                         s, bufs.current_slot_data.unsafe_get(base + s)
                     )
@@ -266,6 +282,23 @@ struct PikeVM[num_slots: Int](Copyable):
                             pos + 1,
                         )
 
+            # Unanchored: seed a fresh lowest-priority thread at the next
+            # position while no match is recorded (earlier-start threads
+            # already in the list outrank it, so leftmost-first holds).
+            if unanchored and not matched:
+                bufs.init_slots.unsafe_set(Self.num_slots, pos + 1)
+                self._add_state(
+                    bufs.next_states,
+                    bufs.next_slot_data,
+                    bufs.gen,
+                    next_gen,
+                    self.nfa.start,
+                    bufs.init_slots,
+                    input,
+                    input_len,
+                    pos + 1,
+                )
+
             # Swap current <-> next
             var tmp_states = bufs.current_states^
             bufs.current_states = bufs.next_states^
@@ -287,7 +320,7 @@ struct PikeVM[num_slots: Int](Copyable):
                 result_slots[s] = bufs.best_slots.unsafe_get(s)
             return MatchResult[Self.num_slots](
                 matched=True,
-                start=start_pos,
+                start=bufs.best_slots.unsafe_get(Self.num_slots),
                 end=best_match_end,
                 slots=result_slots^,
             )
@@ -405,7 +438,7 @@ struct PikeVM[num_slots: Int](Copyable):
                 # Consuming state (CHAR, CHARSET, ANY, MATCH) — commit to flat array
                 gen.unsafe_set(state_idx, gen_val)
                 state_list.append(state_idx)
-                for s in range(Self.num_slots):
+                for s in range(Self._stride):
                     slot_data.append(slots.unsafe_get(s))
                 return
 

@@ -71,6 +71,22 @@ var tags = re2.findall("<html><body><p>")
 # tags: ["html", "body", "p"]
 ```
 
+### Find Iter
+
+`finditer()` returns all non-overlapping matches as `MatchResult` values
+(spans plus capture slots) without allocating a `String` per match — slice
+lazily with `span()` / `group_str()`:
+
+```mojo
+var re = StaticRegex["(\\w+)@(\\w+)"]()
+var input = "mail bob@host now"
+var matches = re.finditer(input)
+for i in range(len(matches)):
+    ref m = matches[i]
+    print(m.start, m.end, m.group_str(input, 1), m.group_str(input, 2))
+# 5 13 bob host
+```
+
 ### Replace
 
 `replace()` substitutes all matches with a replacement string. Backreferences `\1`-`\9` and named backreferences `\g<name>` are supported:
