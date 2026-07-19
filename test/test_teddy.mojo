@@ -136,5 +136,53 @@ def test_teddy_full_match_via_fullmatch_verb() raises:
     assert_false(re.match("GETX").matched)
 
 
+def test_teddy_caseless_alternation() raises:
+    # (?i) case-pair charsets extend the Teddy chains: masks admit both
+    # cases, verification folds via |0x20. CPython-verified expectations.
+    var re = StaticRegex["(?i)(?:cat|dog)"]()
+    assert_true(re._strategy.use_teddy)
+    var r = re.search("x DoG y")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 5)
+    assert_true(re.match("DOG").matched)
+    assert_false(re.match("DOc").matched)
+    var re2 = StaticRegex["(?i)cat|dog"]()
+    var all = re2.findall("CAT dog CaT")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "CAT")
+    assert_equal(all[1], "dog")
+    assert_equal(all[2], "CaT")
+    assert_equal(
+        re2.replace("CAT and Dog here", "pet"), "pet and pet here"
+    )
+
+
+def test_teddy_caseless_mixed_arms() raises:
+    # Scoped (?i:) folds one arm only: `(?i:cat)|dog` matches CAT but
+    # not DOG (CPython-verified).
+    var re = StaticRegex["(?i:cat)|dog"]()
+    var r = re.search("a CAT b")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 5)
+    assert_false(re.search("a DOG b").matched)
+
+
+def test_teddy_caseless_prefix_prefilter() raises:
+    # Caseless chains work for the alternation-*prefix* prefilter too,
+    # on both the DFA lane and the backtracker lane (capture groups).
+    var re = StaticRegex["(?i)(?:GET|POST) /\\w+"]()
+    assert_true(re._strategy.use_teddy_prefix)
+    var r = re.search("log: post /Home ok")
+    assert_equal(r.start, 5)
+    assert_equal(r.end, 15)
+    var re2 = StaticRegex["(?i)(GET|POST) (\\w+)"]()
+    var input = "x pOsT data y"
+    var r2 = re2.search(input)
+    assert_equal(r2.start, 2)
+    assert_equal(r2.end, 11)
+    assert_equal(r2.group_str(input, 1), "pOsT")
+    assert_equal(r2.group_str(input, 2), "data")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

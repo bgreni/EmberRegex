@@ -59,6 +59,40 @@ struct FilterPrefix(Copyable, Movable):
         self.caseless = List[Bool]()
 
 
+def _charset_filter_byte(nfa: NFA, cs_idx: Int) -> Tuple[Int, Bool]:
+    """Comptime: classify a charset as a filterable position — (byte,
+    False) for a single member, (lowercase byte, True) for an ASCII case
+    pair (the shape (?i) literals compile to), (-1, False) otherwise.
+
+    Member bytes come from the bitmap (ranges aren't reliably readable at
+    comptime); bails past two members."""
+    ref cs = nfa.charsets[cs_idx]
+    if cs.negated:
+        return (-1, False)
+    var b0 = -1
+    var b1 = -1
+    var count = 0
+    for b in range(256):
+        if (cs.bitmap[b >> 3] & (UInt8(1) << UInt8(b & 7))) != 0:
+            count += 1
+            if count == 1:
+                b0 = b
+            elif count == 2:
+                b1 = b
+            else:
+                break
+    if count == 1:
+        return (b0, False)
+    if (
+        count == 2
+        and b1 == b0 + 32
+        and b0 >= Int(CHAR_A_UPPER)
+        and b0 <= Int(CHAR_Z_UPPER)
+    ):
+        return (b1, True)  # the lowercase member
+    return (-1, False)
+
+
 def extract_filter_prefix(nfa: NFA) -> FilterPrefix:
     """Comptime: walk the unique path from the start collecting filterable
     positions. CHAR contributes an exact byte; a non-negated CHARSET
@@ -76,36 +110,13 @@ def extract_filter_prefix(nfa: NFA) -> FilterPrefix:
             fp.caseless.append(False)
             state_idx = nfa.states[state_idx].out1
         elif kind == NFAStateKind.CHARSET:
-            ref cs = nfa.charsets[nfa.states[state_idx].charset_index]
-            if cs.negated:
+            var fb = _charset_filter_byte(
+                nfa, nfa.states[state_idx].charset_index
+            )
+            if fb[0] < 0:
                 break
-            # Collect member bytes from the bitmap (ranges aren't reliably
-            # readable at comptime); bail past two members.
-            var b0 = -1
-            var b1 = -1
-            var count = 0
-            for b in range(256):
-                if (cs.bitmap[b >> 3] & (UInt8(1) << UInt8(b & 7))) != 0:
-                    count += 1
-                    if count == 1:
-                        b0 = b
-                    elif count == 2:
-                        b1 = b
-                    else:
-                        break
-            if count == 1:
-                fp.bytes.append(UInt8(b0))
-                fp.caseless.append(False)
-            elif (
-                count == 2
-                and b1 == b0 + 32
-                and b0 >= Int(CHAR_A_UPPER)
-                and b0 <= Int(CHAR_Z_UPPER)
-            ):
-                fp.bytes.append(UInt8(b1))  # the lowercase member
-                fp.caseless.append(True)
-            else:
-                break
+            fp.bytes.append(UInt8(fb[0]))
+            fp.caseless.append(fb[1])
             state_idx = nfa.states[state_idx].out1
         elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
             state_idx = nfa.states[state_idx].out1
@@ -138,15 +149,21 @@ comptime TEDDY_MAX_LITERALS = 8
 
 struct LiteralAlt(Copyable, Movable):
     """A pattern that is exactly an alternation of plain literals
-    (`cat|dog|bird`), extracted for the Teddy multi-literal engine."""
+    (`cat|dog|bird`), extracted for the Teddy multi-literal engine.
+
+    Positions may be caseless (ASCII case pairs from (?i) literals): the
+    stored byte is the lowercase one and the parallel flag is True; masks
+    admit both cases and verification folds via |0x20."""
 
     var valid: Bool
     var lits: List[List[Int]]  # byte values per literal, pattern order
+    var caseless: List[List[Bool]]  # parallel per-byte caseless flags
     var min_len: Int
 
     def __init__(out self):
         self.valid = False
         self.lits = List[List[Int]]()
+        self.caseless = List[List[Bool]]()
         self.min_len = 0
 
 
@@ -185,6 +202,10 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
             stack.append(nfa.states[s].out1)
         elif kind == NFAStateKind.CHAR:
             heads.append(s)
+        elif kind == NFAStateKind.CHARSET and _charset_filter_byte(
+            nfa, nfa.states[s].charset_index
+        )[0] >= 0:
+            heads.append(s)  # (?i) case pair or single-member charset
         else:
             return result^
     if len(heads) < 2 or len(heads) > TEDDY_MAX_LITERALS:
@@ -193,6 +214,7 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
     var min_len = num_states  # any literal is shorter than the NFA
     for h in heads:
         var bytes = List[Int]()
+        var cl = List[Bool]()
         var s = h
         var steps = 0
         while True:
@@ -205,6 +227,16 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
                 if cv >= 256:
                     return result^
                 bytes.append(Int(cv))
+                cl.append(False)
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.CHARSET:
+                var fb = _charset_filter_byte(
+                    nfa, nfa.states[s].charset_index
+                )
+                if fb[0] < 0:
+                    return result^
+                bytes.append(fb[0])
+                cl.append(fb[1])
                 s = nfa.states[s].out1
             elif kind == NFAStateKind.SAVE:
                 s = nfa.states[s].out1
@@ -219,6 +251,7 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
         if len(bytes) < min_len:
             min_len = len(bytes)
         result.lits.append(bytes^)
+        result.caseless.append(cl^)
     result.min_len = min_len
     result.valid = True
     return result^
@@ -260,6 +293,10 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
             stack.append(nfa.states[s].out1)
         elif kind == NFAStateKind.CHAR:
             heads.append(s)
+        elif kind == NFAStateKind.CHARSET and _charset_filter_byte(
+            nfa, nfa.states[s].charset_index
+        )[0] >= 0:
+            heads.append(s)  # (?i) case pair or single-member charset
         else:
             return result^
     if len(heads) < 2 or len(heads) > TEDDY_MAX_LITERALS:
@@ -270,6 +307,7 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
     var all_end_at_match = True
     for h in heads:
         var bytes = List[Int]()
+        var cl = List[Bool]()
         var s = h
         var steps = 0
         var ended_at_match = False
@@ -283,6 +321,16 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
                 if cv >= 256:
                     break
                 bytes.append(Int(cv))
+                cl.append(False)
+                s = nfa.states[s].out1
+            elif kind == NFAStateKind.CHARSET:
+                var fb = _charset_filter_byte(
+                    nfa, nfa.states[s].charset_index
+                )
+                if fb[0] < 0:
+                    break  # unfilterable charset ends the chain
+                bytes.append(fb[0])
+                cl.append(fb[1])
                 s = nfa.states[s].out1
             elif kind == NFAStateKind.SAVE:
                 s = nfa.states[s].out1
@@ -299,6 +347,7 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
         if len(bytes) < min_len:
             min_len = len(bytes)
         result.lits.append(bytes^)
+        result.caseless.append(cl^)
     if all_end_at_match:
         # Whole-pattern literal alternation: the full Teddy engine's
         # territory (extract_literal_alternation), not a prefilter.

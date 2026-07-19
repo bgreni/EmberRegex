@@ -433,6 +433,18 @@ def test_bench_ignorecase_search() raises:
     assert_equal(r.start, filler.byte_length() + 3)
 
 
+def test_bench_ignorecase_alternation() raises:
+    # bench static_ignorecase_alternation_2KB: filler misses, tail hits.
+    var re = StaticRegex["(?i)(?:error|warning|fatal)"]()
+    var filler = "the everyday sentence keeps several e letters here "
+    assert_false(re.search(filler).matched)
+    var input = filler + "then a FATAL crash"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, filler.byte_length() + 7)
+    assert_equal(r.end, filler.byte_length() + 12)
+
+
 def test_bench_pike_search_miss() raises:
     # bench pathological_pike_search_miss_600B: all-'a' input has no 'b',
     # so no match; positive control with a 'b' appended.

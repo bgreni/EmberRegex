@@ -661,6 +661,31 @@ def bench_static_teddy_prefix_search(mut b: Bench) raises:
     b.bench_function[go](BenchId("static_teddy_prefix_search_2KB"))
 
 
+def bench_static_ignorecase_alternation(mut b: Bench) raises:
+    # Caseless Teddy: (?i) alternation runs the 3-position filter with
+    # both-case masks instead of a {first-bytes} bitmap crawl.
+    var re = StaticRegex["(?i)(?:error|warning|fatal)"]()
+    var filler = "the everyday sentence keeps several e letters here "
+    var input = String("")
+    for _ in range(40):
+        input += filler
+    input += "then a FATAL crash"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.start)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_ignorecase_alternation_2KB"))
+
+
 def bench_pathological_pike_search_miss(mut b: Bench) raises:
     # SBT budget exhausts on the all-'a' run; the search falls to the Pike
     # VM, whose single unanchored pass replaces the old O(n^2)
@@ -1933,6 +1958,7 @@ def main() raises:
     bench_static_bol_alternation_miss(b)
     bench_static_replace_alternation(b)
     bench_static_ignorecase_search(b)
+    bench_static_ignorecase_alternation(b)
     bench_static_teddy_prefix_search(b)
     bench_static_nested_quantifier(b)
 

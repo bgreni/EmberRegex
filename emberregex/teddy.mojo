@@ -36,28 +36,39 @@ def _teddy_pos_masks(
     alt: LiteralAlt, j: Int
 ) -> Tuple[_NibbleTable, _NibbleTable]:
     """Comptime: (lo, hi) nibble tables for literal byte position j;
-    entry bits are literal indices."""
+    entry bits are literal indices. Caseless positions admit both cases
+    (same low nibble, both high nibbles)."""
     var lo = _NibbleTable(0)
     var hi = _NibbleTable(0)
     for i in range(len(alt.lits)):
         var b = alt.lits[i][j]
-        lo[b & 0x0F] |= UInt8(1) << UInt8(i)
-        hi[b >> 4] |= UInt8(1) << UInt8(i)
+        var bit = UInt8(1) << UInt8(i)
+        lo[b & 0x0F] |= bit
+        hi[b >> 4] |= bit
+        if alt.caseless[i][j]:
+            var u = b - 32  # the uppercase member
+            lo[u & 0x0F] |= bit
+            hi[u >> 4] |= bit
     return (lo, hi)
 
 
 @always_inline
 def _lit_at[
-    origin: Origin, //, lit: List[Int]
+    origin: Origin, //, lit: List[Int], cl: List[Bool]
 ](input: Span[Byte, origin], pos: Int) -> Bool:
-    """Does the literal occur at pos? Length check + unrolled compares."""
+    """Does the literal occur at pos? Length check + unrolled compares;
+    caseless positions fold via |0x20 (targets are lowercase letters)."""
     comptime L = len(lit)
     if pos + L > len(input):
         return False
     comptime for j in range(L):
         comptime bj = lit[j]
-        if input.unsafe_get(pos + j) != Byte(bj):
-            return False
+        comptime if cl[j]:
+            if (input.unsafe_get(pos + j) | 0x20) != Byte(bj):
+                return False
+        else:
+            if input.unsafe_get(pos + j) != Byte(bj):
+                return False
     return True
 
 
@@ -70,7 +81,8 @@ def teddy_match_at[
     var best = -1
     comptime for i in range(len(alt.lits)):
         comptime lit = alt.lits[i].copy()
-        if _lit_at[lit=lit](input, start):
+        comptime cli = alt.caseless[i].copy()
+        if _lit_at[lit=lit, cl=cli](input, start):
             comptime L = len(lit)
             if start + L > best:
                 best = start + L
@@ -85,8 +97,9 @@ def teddy_full_match[
     var input_len = len(input)
     comptime for i in range(len(alt.lits)):
         comptime lit = alt.lits[i].copy()
+        comptime cli = alt.caseless[i].copy()
         comptime L = len(lit)
-        if input_len == L and _lit_at[lit=lit](input, 0):
+        if input_len == L and _lit_at[lit=lit, cl=cli](input, 0):
             return True
     return False
 
@@ -126,7 +139,8 @@ def teddy_find_prefix[
             var at = pos + first_lane_index(bits)
             comptime for i in range(len(alt.lits)):
                 comptime lit = alt.lits[i].copy()
-                if _lit_at[lit=lit](input, at):
+                comptime cli = alt.caseless[i].copy()
+                if _lit_at[lit=lit, cl=cli](input, at):
                     return at
             bits = clear_first_lane(bits)
         pos += W - (k - 1)
@@ -134,7 +148,8 @@ def teddy_find_prefix[
     while pos + alt.min_len <= input_len:
         comptime for i in range(len(alt.lits)):
             comptime lit = alt.lits[i].copy()
-            if _lit_at[lit=lit](input, pos):
+            comptime cli = alt.caseless[i].copy()
+            if _lit_at[lit=lit, cl=cli](input, pos):
                 return pos
         pos += 1
 
