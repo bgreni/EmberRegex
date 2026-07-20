@@ -109,10 +109,10 @@ amend the plan:
   word while the run-skip scans ~2L, which for L≈4 is a wash — the skip
   only pays off once runs are long (hence the long-token bench).
 
-Future work (unchanged from non-goals plus new observations): runtime
-truffle masks for the lazy DFA, Sheng in-state acceleration, `shift_or`
-fallback for targets without byte shuffles, truly mid-pattern literal
-alternations (after a variable-length prefix). *Start-anchored*
+Future work now lives in **ROADMAP.md** (reverse-inner literal
+prefilter, Sheng micro-experiments, lazy-DFA modernization, `shift_or`
+fallback, design decisions), together with the measured dead ends that
+must not be retried. *Start-anchored*
 alternation prefixes are DONE (July 2026): `extract_alt_prefix` +
 `teddy_find_prefix` prefilter `(?:GET|POST|PUT) /...`-shaped patterns on
 both the DFA and backtracker lanes via the unified `_scan_candidate`
