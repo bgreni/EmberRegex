@@ -433,6 +433,18 @@ def test_bench_ignorecase_search() raises:
     assert_equal(r.start, filler.byte_length() + 3)
 
 
+def test_bench_url_search() raises:
+    # bench static_url_search_2KB: colon-dense filler misses, tail hits.
+    var re = StaticRegex["[a-z]+://[a-z.]+"]()
+    var filler = "svc: api level: info msg: ok elapsed: three trace: nine "
+    assert_false(re.search(filler).matched)
+    var input = filler + "see http://example.com now"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, filler.byte_length() + 4)
+    assert_equal(r.end, filler.byte_length() + 22)
+
+
 def test_bench_ignorecase_alternation() raises:
     # bench static_ignorecase_alternation_2KB: filler misses, tail hits.
     var re = StaticRegex["(?i)(?:error|warning|fatal)"]()

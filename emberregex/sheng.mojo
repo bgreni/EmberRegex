@@ -34,6 +34,7 @@ from .static_dfa import (
     EagerDFA,
     _edfa_accel_skip,
     _edfa_has_accel,
+    _pivot_forced_chain,
     _pivot_prefilter,
     _start_run_skip_idx,
     nibble_table_from,
@@ -276,11 +277,23 @@ def sheng_search_forward[
         comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
         comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
         comptime pivot_byte = UInt8(pv[1])
+        comptime fchain = _pivot_forced_chain(d, pv)
         var ppos = start
         while True:
             var p = simd_find_byte(input, pivot_byte, ppos)
             if p < 0:
                 return (-1, -1)
+            # Forced-chain rejection (see edfa_search_forward).
+            comptime fclen = len(fchain)
+            comptime if fclen > 0:
+                var fok = p + 1 + fclen <= input_len
+                comptime for j in range(len(fchain)):
+                    comptime fb = Byte(fchain[j])
+                    if fok:
+                        fok = input.unsafe_get(p + 1 + j) == fb
+                if not fok:
+                    ppos = p + 1
+                    continue
             var s = p
             while s > start and not _class_contains[
                 kind=pk, t0=pt0, t1=pt1

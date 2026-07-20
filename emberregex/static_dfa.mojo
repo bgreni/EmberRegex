@@ -16,6 +16,7 @@ from std.sys import simd_width_of
 
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind
+from .optimize import _probe_rank_table
 from .dfa import _epsilon_closure, _check_eol_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
@@ -530,7 +531,11 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
                 return (-1, -1)  # start enters S1 on a non-loop byte
 
     # Pivot byte: the only live P-column entry is from S1, leaving S1.
+    # Among qualifying bytes prefer the statistically rarest (background
+    # frequency): fewer occurrences means fewer candidate attempts.
+    var ranks = _probe_rank_table()
     var pivot = -1
+    var best_rank = 1_000_000
     for b in range(256):
         var t1 = d.table[s1 * 256 + b]
         if t1 < 0 or t1 == s1:
@@ -540,9 +545,9 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
             if s != s1 and d.table[s * 256 + b] >= 0:
                 unique = False
                 break
-        if unique:
+        if unique and ranks[b] < best_rank:
+            best_rank = ranks[b]
             pivot = b
-            break
     if pivot < 0:
         return (-1, -1)
 
@@ -562,6 +567,41 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
                 continue
             stack.append(d.table[s * 256 + b])
     return (rs, pivot)
+
+
+def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
+    """Comptime: bytes provably forced right after the pivot — from the
+    pivot's target state, follow states that have exactly ONE live
+    transition byte and no accept capability (capped at 4).
+
+    A match consuming the pivot must consume these bytes next or die, so
+    a candidate whose following input differs is rejected with a couple
+    of compares instead of a backward extension + anchored attempt. For
+    `[a-z]+://…` the chain is "//": on colon-dense text (timestamps),
+    that guts the false-candidate cost."""
+    var chain = List[Int]()
+    if pv[0] < 0:
+        return chain^
+    var s1 = d.accel_nib_states[pv[0]]
+    var cur = d.table[s1 * 256 + pv[1]]
+    var cap = 4
+    while cap > 0 and cur >= 0:
+        if cur < d.num_match_states or d.flags[cur] != 0:
+            break  # accept-capable: nothing further is forced
+        var only = -1
+        var count = 0
+        for b in range(256):
+            if d.table[cur * 256 + b] >= 0:
+                count += 1
+                only = b
+                if count > 1:
+                    break
+        if count != 1:
+            break
+        chain.append(only)
+        cur = d.table[cur * 256 + only]
+        cap -= 1
+    return chain^
 
 
 @always_inline
@@ -728,11 +768,24 @@ def edfa_search_forward[
         comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
         comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
         comptime pivot_byte = UInt8(pv[1])
+        comptime fchain = _pivot_forced_chain(d, pv)
         var ppos = start
         while True:
             var p = simd_find_byte(input, pivot_byte, ppos)
             if p < 0:
                 return (-1, -1)
+            # Forced-chain rejection: bytes required right after the pivot
+            # kill false candidates before the extension + attempt.
+            comptime fclen = len(fchain)
+            comptime if fclen > 0:
+                var fok = p + 1 + fclen <= input_len
+                comptime for j in range(len(fchain)):
+                    comptime fb = Byte(fchain[j])
+                    if fok:
+                        fok = input.unsafe_get(p + 1 + j) == fb
+                if not fok:
+                    ppos = p + 1
+                    continue
             # The accel tables encode S1's EXIT set; loop set = complement.
             var s = p
             while s > start and not _class_contains[

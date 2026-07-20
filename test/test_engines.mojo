@@ -193,6 +193,24 @@ def test_pivot_prefilter_email() raises:
     assert_equal(all[1], "c.d@e-f.io")
 
 
+def test_pivot_forced_chain_url() raises:
+    # `[a-z]+://[a-z.]+` pivots on ':' with forced chain "//": lone colons
+    # (timestamps) are rejected without an anchored attempt. Expected
+    # values are CPython outputs.
+    var re = StaticRegex["[a-z]+://[a-z.]+"]()
+    var r1 = re.search("visit http://example.com now")
+    assert_equal(r1.start, 6)
+    assert_equal(r1.end, 24)
+    var r2 = re.search("12:30:45 log: msg from http://a.io end")
+    assert_equal(r2.start, 23)
+    assert_equal(r2.end, 34)
+    assert_false(re.search("12:30:45 no urls 08:15:00 here").matched)
+    var all = re.findall("ftp://x.y and https://z.w")
+    assert_equal(len(all), 2)
+    assert_equal(all[0], "ftp://x.y")
+    assert_equal(all[1], "https://z.w")
+
+
 def test_pivot_prefilter_simple_shapes() raises:
     var re1 = StaticRegex["\\w+@\\w+"]()
     var r1 = re1.search("hi bob@mail ok")

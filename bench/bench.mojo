@@ -661,6 +661,33 @@ def bench_static_teddy_prefix_search(mut b: Bench) raises:
     b.bench_function[go](BenchId("static_teddy_prefix_search_2KB"))
 
 
+def bench_static_url_search(mut b: Bench) raises:
+    # Pivot prefilter with forced-chain rejection: the haystack has a
+    # word-adjacent ':' every few bytes, but only "://" survives the
+    # forced two-byte check, so false pivots cost two compares instead
+    # of a backward extension + anchored attempt (measured 1.75x).
+    var re = StaticRegex["[a-z]+://[a-z.]+"]()
+    var filler = "svc: api level: info msg: ok elapsed: three trace: nine "
+    var input = String("")
+    for _ in range(35):
+        input += filler
+    input += "see http://example.com now"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.start)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("static_url_search_2KB"))
+
+
 def bench_static_ignorecase_alternation(mut b: Bench) raises:
     # Caseless Teddy: (?i) alternation runs the 3-position filter with
     # both-case masks instead of a {first-bytes} bitmap crawl.
@@ -1959,6 +1986,7 @@ def main() raises:
     bench_static_replace_alternation(b)
     bench_static_ignorecase_search(b)
     bench_static_ignorecase_alternation(b)
+    bench_static_url_search(b)
     bench_static_teddy_prefix_search(b)
     bench_static_nested_quantifier(b)
 
