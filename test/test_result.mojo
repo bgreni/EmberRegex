@@ -1,25 +1,25 @@
 """Tests for MatchResult API: span, group_span, group_matched, group_str."""
 
-from emberregex import StaticRegex, MatchResult
+from emberregex import Regex, MatchResult
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
 def test_result_bool_true() raises:
-    var re = StaticRegex["\\d+"]()
+    var re = Regex["\\d+"]()
     var result = re.match("123")
     assert_true(result.matched)
     assert_true(result.__bool__())
 
 
 def test_result_bool_false() raises:
-    var re = StaticRegex["\\d+"]()
+    var re = Regex["\\d+"]()
     var result = re.match("abc")
     assert_false(result.matched)
     assert_false(result.__bool__())
 
 
 def test_result_span() raises:
-    var re = StaticRegex["\\d+"]()
+    var re = Regex["\\d+"]()
     var result = re.search("abc 123 def")
     assert_true(result.matched)
     var span = result.span()
@@ -28,7 +28,7 @@ def test_result_span() raises:
 
 
 def test_result_span_no_match() raises:
-    var re = StaticRegex["\\d+"]()
+    var re = Regex["\\d+"]()
     var result = re.match("abc")
     assert_false(result.matched)
     var span = result.span()
@@ -37,7 +37,7 @@ def test_result_span_no_match() raises:
 
 
 def test_result_group_span() raises:
-    var re = StaticRegex["(\\d+)-(\\d+)"]()
+    var re = Regex["(\\d+)-(\\d+)"]()
     var input = "123-456"
     var result = re.match(input)
     assert_true(result.matched)
@@ -50,7 +50,7 @@ def test_result_group_span() raises:
 
 
 def test_result_group_span_out_of_range() raises:
-    var re = StaticRegex["(\\d+)"]()
+    var re = Regex["(\\d+)"]()
     var result = re.match("123")
     assert_true(result.matched)
     var g = result.group_span(99)
@@ -59,7 +59,7 @@ def test_result_group_span_out_of_range() raises:
 
 
 def test_result_group_matched_true() raises:
-    var re = StaticRegex["(a)|(b)"]()
+    var re = Regex["(a)|(b)"]()
     var result = re.match("a")
     assert_true(result.matched)
     assert_true(result.group_matched(1))
@@ -67,7 +67,7 @@ def test_result_group_matched_true() raises:
 
 
 def test_result_group_matched_out_of_range() raises:
-    var re = StaticRegex["(\\d+)"]()
+    var re = Regex["(\\d+)"]()
     var result = re.match("123")
     assert_true(result.matched)
     assert_false(result.group_matched(0))
@@ -76,7 +76,7 @@ def test_result_group_matched_out_of_range() raises:
 
 
 def test_result_group_str_basic() raises:
-    var re = StaticRegex["(\\w+)@(\\w+)"]()
+    var re = Regex["(\\w+)@(\\w+)"]()
     var input = "user@host"
     var result = re.match(input)
     assert_true(result.matched)
@@ -85,7 +85,7 @@ def test_result_group_str_basic() raises:
 
 
 def test_result_group_str_out_of_range() raises:
-    var re = StaticRegex["(\\d+)"]()
+    var re = Regex["(\\d+)"]()
     var input = "123"
     var result = re.match(input)
     assert_true(result.matched)
@@ -93,7 +93,7 @@ def test_result_group_str_out_of_range() raises:
 
 
 def test_result_start_end() raises:
-    var re = StaticRegex["\\d+"]()
+    var re = Regex["\\d+"]()
     var result = re.search("abc 42 def")
     assert_true(result.matched)
     assert_equal(result.start, 4)
@@ -101,21 +101,21 @@ def test_result_start_end() raises:
 
 
 def test_result_group_count_no_groups() raises:
-    var re = StaticRegex["\\d+"]()
+    var re = Regex["\\d+"]()
     var result = re.match("123")
     assert_true(result.matched)
     assert_equal(result.group_count, 0)
 
 
 def test_result_group_count_with_groups() raises:
-    var re = StaticRegex["(\\d+)-(\\d+)"]()
+    var re = Regex["(\\d+)-(\\d+)"]()
     var result = re.match("1-2")
     assert_true(result.matched)
     assert_equal(result.group_count, 2)
 
 
 def test_result_group_count_non_capturing() raises:
-    var re = StaticRegex["(?:abc)(\\d+)"]()
+    var re = Regex["(?:abc)(\\d+)"]()
     var result = re.match("abc123")
     assert_true(result.matched)
     assert_equal(result.group_count, 1)

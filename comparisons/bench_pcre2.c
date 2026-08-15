@@ -178,6 +178,18 @@ static char *repeat_word(const char *word, const char *sep, int n) {
     return buf;
 }
 
+/* Returns malloc'd buffer: unit repeated n times, then suffix appended. */
+static char *repeat_unit(const char *unit, size_t n, const char *suffix) {
+    size_t ulen = strlen(unit), slen = suffix ? strlen(suffix) : 0;
+    char *buf = (char *)malloc(ulen * n + slen + 1);
+    if (!buf) { perror("malloc"); exit(1); }
+    char *p = buf;
+    for (size_t i = 0; i < n; i++) { memcpy(p, unit, ulen); p += ulen; }
+    if (suffix) memcpy(p, suffix, slen);
+    p[slen] = '\0';
+    return buf;
+}
+
 /* Returns malloc'd buffer: 100 log lines (line 750 = ERROR, rest INFO). */
 static char *make_log_lines(int n) {
     /* max ~80 chars per line */
@@ -250,6 +262,10 @@ int main(void) {
     char *in_alt4_search_2KB = make_lines_plus(80, " delta");
     char *in_email_search_2KB = make_lines_plus(
         80, " contact us at first.last@example.com today");
+    /* Ends in 'x' so a literal-suffix fast-fail can't reject it outright, but
+       still misses: the trailing "a" has no digits to close the group.
+       Must stay in sync with bench.mojo / bench_compare.py. */
+    char *in_patho_nested = repeat_unit("a1", 800, "ax");
 
     /* Fixed-length string inputs (stack OK) */
     const char *in_hello_world       = "hello world";
@@ -265,7 +281,6 @@ int main(void) {
     const char *in_john_doe          = "John Doe";
     const char *in_patho_16          = "aaaaaaaaaaaaaaaa";
     const char *in_patho_backref     = "hello hello hello";
-    const char *in_patho_nested      = "aaaaaaaaaaaaaaaa";
     const char *in_url               = "https://www.example.com/path/to/page?q=1&r=2";
     const char *in_phone             = "(555) 123-4567";
     const char *in_hex               = "#1a2B3c";

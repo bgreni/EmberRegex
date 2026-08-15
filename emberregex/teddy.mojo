@@ -121,10 +121,10 @@ def teddy_find_prefix[
 
     var input_len = len(input)
     var pos = start
-    var ptr = input.unsafe_ptr()
+    var ptr = Pointer(input.unsafe_ptr())
 
     while pos + W <= input_len:
-        var v = (ptr + pos).load[width=W]()
+        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
         var lo = v & 0x0F
         var hi = v >> 4
         var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
@@ -170,10 +170,10 @@ def teddy_search_forward[
 
     var input_len = len(input)
     var pos = start
-    var ptr = input.unsafe_ptr()
+    var ptr = Pointer(input.unsafe_ptr())
 
     while pos + W <= input_len:
-        var v = (ptr + pos).load[width=W]()
+        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
         var lo = v & 0x0F
         var hi = v >> 4
         var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)

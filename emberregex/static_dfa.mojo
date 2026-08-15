@@ -1,6 +1,6 @@
 """Eager DFA: NFA determinization at compile time.
 
-Subset construction runs inside StaticRegex's comptime field initializers,
+Subset construction runs inside Regex's comptime field initializers,
 producing a flat transition table (num_states x 256) plus per-state flag
 bytes that materialize as constant data. The runtime engine is then a pure
 table walk: no lazy state construction, no hashing, no fallible paths, and
@@ -11,9 +11,11 @@ detected at compile time and fall back to the runtime LazyDFA (dfa.mojo),
 which keeps its own 4096-state cap and Pike VM fallback.
 """
 
+from std.bit import count_trailing_zeros
 from std.collections import InlineArray
 from std.sys import simd_width_of
 
+from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind
 from .optimize import _probe_rank_table
@@ -44,6 +46,102 @@ comptime EDFA_EOL_AT_NEWLINE: UInt8 = 4
 # pattern needing more states than this is better served by the lazy DFA
 # discovering only the states the input actually reaches.
 comptime EDFA_STATE_CAP = 128
+
+# NFA-size capacity of the bitset determinizer: 64 lanes x 64 bits. An NFA
+# past this cannot fit a subset bitset; in practice such NFAs overflow
+# EDFA_STATE_CAP anyway, so the pattern falls to the LazyDFA unchanged.
+comptime EDFA_NFA_CAP = 4096
+
+# NFA state sets as SIMD bitsets. The comptime interpreter models SIMD
+# natively (whole-vector ops and lane accesses cost about as much as scalar
+# arithmetic, ~1us), while every List element access costs ~40us and every
+# call passing the NFA aggregate ~0.7ms — measured 2026-08. The determinizer
+# below is shaped around that: bitsets and SIMD lanes in the hot loops, List
+# reads only where unavoidable, no NFA-passing calls per (state, byte).
+comptime _StateBits = SIMD[DType.uint64, 64]
+
+
+@always_inline
+def _bs_set(mut b: _StateBits, i: Int):
+    b[i >> 6] = b[i >> 6] | (UInt64(1) << UInt64(i & 63))
+
+
+@always_inline
+def _bs_any(b: _StateBits) -> Bool:
+    return b.reduce_or() != 0
+
+
+@always_inline
+def _bs_eq(a: _StateBits, b: _StateBits) -> Bool:
+    return (a ^ b).reduce_or() == 0
+
+
+def _mk_bs_salt() -> SIMD[DType.uint64, 64]:
+    """Distinct odd multiplier per lane so identical words in different
+    lanes hash differently."""
+    var v = SIMD[DType.uint64, 64](0)
+    for i in range(64):
+        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
+    return v
+
+
+comptime _BS_SALT = _mk_bs_salt()
+
+
+@always_inline
+def _bs_hash(b: _StateBits) -> UInt64:
+    return (b * _BS_SALT).reduce_add()
+
+
+def _flat_closure(
+    kinds: List[Int],
+    out1s: List[Int],
+    out2s: List[Int],
+    anchors: List[Int],
+    seed: Int,
+    at_start: Bool,
+    after_newline: Bool,
+) -> _StateBits:
+    """Epsilon closure of one seed state as a bitset, over flat NFA views.
+
+    Mirrors `_epsilon_closure` exactly: SPLIT/SAVE expand, BOL kinds
+    resolve against the position context, EOL kinds are KEPT in the set
+    for runtime resolution, everything else (consuming, MATCH, and the
+    non-DFA state kinds) is kept as-is.
+    """
+    var bits = _StateBits(0)
+    var visited = _StateBits(0)
+    var n = len(kinds)
+    var stack: List[Int] = [seed]
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= n:
+            continue
+        if (visited[s >> 6] >> UInt64(s & 63)) & 1 != 0:
+            continue
+        _bs_set(visited, s)
+        var kind = kinds.unsafe_get(s)
+        if kind == NFAStateKind.SPLIT:
+            stack.append(out1s.unsafe_get(s))
+            stack.append(out2s.unsafe_get(s))
+        elif kind == NFAStateKind.SAVE:
+            stack.append(out1s.unsafe_get(s))
+        elif kind == NFAStateKind.ANCHOR:
+            var at = anchors.unsafe_get(s)
+            if at == AnchorKind.BOL:
+                if at_start:
+                    stack.append(out1s.unsafe_get(s))
+            elif at == AnchorKind.BOL_MULTILINE:
+                if at_start or after_newline:
+                    stack.append(out1s.unsafe_get(s))
+            elif at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
+                _bs_set(bits, s)
+            # WORD_BOUNDARY etc. — not handled in DFA (dropped, as in
+            # _epsilon_closure)
+        else:
+            # CHAR, CHARSET, ANY, MATCH, and non-DFA kinds
+            _bs_set(bits, s)
+    return bits
 
 
 struct EagerDFA(Copyable, Movable):
@@ -99,6 +197,91 @@ struct EagerDFA(Copyable, Movable):
         self.accel_nib_kind = List[Int]()
         self.accel_nib_t0 = List[Int]()
         self.accel_nib_t1 = List[Int]()
+
+
+def _eol_ml_continuation_consumes(nfa: NFA) -> Bool:
+    """Comptime: does any EOL_MULTILINE anchor's continuation consume?
+
+    The DFA lanes keep EOL anchors unresolved in state sets and resolve
+    them via per-state flags, so a continuation that must consume more
+    input (e.g. `(?m)a$\\nb`) is unreachable there — the DFA silently
+    under-reports. Such patterns must stay off the DFA lanes. Strict EOL
+    needs no such guard: it holds only at end of input, where a
+    consuming continuation is provably dead. The walk follows any
+    anchor conservatively (assume it could hold).
+    """
+    var num_states = len(nfa.states)
+    for i in range(num_states):
+        if nfa.states[i].kind != NFAStateKind.ANCHOR:
+            continue
+        if nfa.states[i].anchor_type != AnchorKind.EOL_MULTILINE:
+            continue
+        var visited = List[Bool](length=num_states, fill=False)
+        var stack: List[Int] = [nfa.states[i].out1]
+        while len(stack) > 0:
+            var s = stack.pop()
+            if s < 0 or s >= num_states or visited[s]:
+                continue
+            visited[s] = True
+            var kind = nfa.states[s].kind
+            if (
+                kind == NFAStateKind.CHAR
+                or kind == NFAStateKind.CHARSET
+                or kind == NFAStateKind.ANY
+                or kind == NFAStateKind.BACKREF
+            ):
+                return True
+            if kind == NFAStateKind.SPLIT:
+                stack.append(nfa.states[s].out1)
+                stack.append(nfa.states[s].out2)
+            elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+                stack.append(nfa.states[s].out1)
+    return False
+
+
+def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
+    """Comptime: does any EOL anchor's continuation reach an anchor whose
+    truth is NOT implied by the EOL that precedes it?
+
+    The DFA lanes resolve EOL anchors with per-state flag bytes, which
+    carry one bit of context ("we are at a '\\n'" / "we are at the end").
+    A nested EOL anchor is fine — `_reaches_match` follows the kinds that
+    hold in the same context, which is what makes `ab$$` work. A BOL kind
+    or a word boundary is not: whether it holds depends on the *preceding*
+    byte, which the flag cannot express, so the walk would have to guess.
+    Such patterns stay off these lanes rather than guess (the same
+    treatment `_eol_ml_continuation_consumes` gives consuming
+    continuations).
+    """
+    var num_states = len(nfa.states)
+    for i in range(num_states):
+        if nfa.states[i].kind != NFAStateKind.ANCHOR:
+            continue
+        var at = nfa.states[i].anchor_type
+        if at != AnchorKind.EOL and at != AnchorKind.EOL_MULTILINE:
+            continue
+        var visited = List[Bool](length=num_states, fill=False)
+        var stack: List[Int] = [nfa.states[i].out1]
+        while len(stack) > 0:
+            var s = stack.pop()
+            if s < 0 or s >= num_states or visited[s]:
+                continue
+            visited[s] = True
+            var kind = nfa.states[s].kind
+            if kind == NFAStateKind.SPLIT:
+                stack.append(nfa.states[s].out1)
+                stack.append(nfa.states[s].out2)
+            elif kind == NFAStateKind.SAVE:
+                stack.append(nfa.states[s].out1)
+            elif kind == NFAStateKind.ANCHOR:
+                var at2 = nfa.states[s].anchor_type
+                if at2 == AnchorKind.EOL or at2 == AnchorKind.EOL_MULTILINE:
+                    stack.append(nfa.states[s].out1)
+                else:
+                    return True
+            # consuming states end the walk; the consuming case has its
+            # own guard (_eol_ml_continuation_consumes)
+    return False
 
 
 def _state_flags(nfa: NFA, states: List[Int], has_match: Bool) -> Int:
@@ -160,47 +343,138 @@ def _accepts(nfa: NFA, state: Int, byte: Int) -> Bool:
 
 
 def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
-    """Partition bytes into equivalence classes over the NFA's consuming states.
+    """Partition bytes into classes the determinizer can treat as one column.
 
-    Two bytes are equivalent when every consuming state accepts both or
-    neither AND they agree on newline-ness (newline changes the epsilon
-    closure context, so it always gets its own class). Fills `class_of`
-    (256 entries) and returns one representative byte per class. Bounds the
-    determinizer's per-state work by #classes instead of 256.
+    Interval-boundary partition: a byte starts a new class wherever some
+    consuming state's accept-set boundary lands (a range endpoint, a CHAR
+    value, or the newline byte — newline changes the epsilon closure
+    context, so it is always cut out on its own). Classes are therefore
+    byte INTERVALS, and every class lies entirely inside or outside each
+    state's accept set. A set and its complement share boundaries, so
+    negated charsets need no special casing.
+
+    This is a REFINEMENT of the exact partition (two equal-behaved but
+    non-adjacent intervals stay separate classes), which is all any caller
+    needs: bytes within one class provably behave identically. The exact
+    partition (256 x #classes x #consuming signature compares) took tens
+    of seconds in the comptime interpreter for the big Unicode classes —
+    `\\p{L}` is ~1250 consuming states — where this is O(states + 256).
+
+    Fills `class_of` (256 entries) and returns one representative byte per
+    class (the first byte of each interval).
     """
-    var consuming = List[Int]()
+    var mark = List[Bool](fill=False, length=257)
+    mark[0] = True
+    mark[Int(CHAR_NEWLINE)] = True
+    mark[Int(CHAR_NEWLINE) + 1] = True
     for i in range(len(nfa.states)):
         var kind = nfa.states[i].kind
-        if (
-            kind == NFAStateKind.CHAR
-            or kind == NFAStateKind.ANY
-            or kind == NFAStateKind.CHARSET
-        ):
-            consuming.append(i)
-
+        if kind == NFAStateKind.CHAR:
+            var c = Int(nfa.states[i].char_value)
+            if c < 256:
+                mark[c] = True
+                mark[c + 1] = True
+        elif kind == NFAStateKind.CHARSET:
+            var cs = nfa.states[i].charset_index
+            for r in range(len(nfa.charsets[cs].ranges)):
+                var lo = Int(nfa.charsets[cs].ranges[r].lo)
+                var hi = Int(nfa.charsets[cs].ranges[r].hi)
+                if lo > hi or lo > 255:
+                    continue
+                if hi > 255:
+                    hi = 255
+                mark[lo] = True
+                mark[hi + 1] = True
+        # ANY accepts all but newline; newline is already marked.
     var reps = List[Int]()
-    var sigs = List[List[Bool]]()
-    for byte in range(256):
-        var sig = List[Bool]()
-        sig.append(byte == Int(CHAR_NEWLINE))
-        for s in consuming:
-            sig.append(_accepts(nfa, s, byte))
-        var found = -1
-        for c in range(len(sigs)):
-            var equal = True
-            for i in range(len(sig)):
-                if sigs[c][i] != sig[i]:
-                    equal = False
-                    break
-            if equal:
-                found = c
-                break
-        if found < 0:
-            found = len(sigs)
-            sigs.append(sig^)
-            reps.append(byte)
-        class_of[byte] = found
+    var cls = -1
+    for b in range(256):
+        if mark[b]:
+            cls += 1
+            reps.append(b)
+        class_of[b] = cls
     return reps^
+
+
+def _flatten_nfa(
+    nfa: NFA,
+    class_of: List[Int],
+    nclasses: Int,
+    nl_class: Int,
+    mut kinds: List[Int],
+    mut out1s: List[Int],
+    mut out2s: List[Int],
+    mut anchors: List[Int],
+    mut cls_mask: List[SIMD[DType.uint64, 4]],
+    mut consuming_bits: _StateBits,
+    mut match_bits: _StateBits,
+    mut eol_bits: _StateBits,
+    mut has_bol_ml: Bool,
+):
+    """One flat pass over the NFA, shared by the bitset determinizers.
+
+    Fills flat views for the closure walks, membership bitsets, and each
+    state's accepted-class mask (classes are byte intervals wholly inside
+    or outside every accept set, so a class bitmask per state captures
+    acceptance exactly). Called ONCE per build: the point of the flat
+    views is that the hot loops never pass the NFA aggregate across a
+    call boundary again.
+    """
+    var n = len(nfa.states)
+    for i in range(n):
+        var kind = nfa.states[i].kind
+        kinds.append(kind)
+        out1s.append(nfa.states[i].out1)
+        out2s.append(nfa.states[i].out2)
+        var at = nfa.states[i].anchor_type
+        anchors.append(at)
+        var cm = SIMD[DType.uint64, 4](0)
+        if kind == NFAStateKind.CHAR:
+            var c = Int(nfa.states[i].char_value)
+            if c < 256:
+                var ci = class_of[c]
+                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+            _bs_set(consuming_bits, i)
+        elif kind == NFAStateKind.ANY:
+            for ci in range(nclasses):
+                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+            cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
+                UInt64(1) << UInt64(nl_class & 63)
+            )
+            _bs_set(consuming_bits, i)
+        elif kind == NFAStateKind.CHARSET:
+            var cs = nfa.states[i].charset_index
+            for r in range(len(nfa.charsets[cs].ranges)):
+                var lo = Int(nfa.charsets[cs].ranges[r].lo)
+                var hi = Int(nfa.charsets[cs].ranges[r].hi)
+                if lo > hi or lo > 255:
+                    continue
+                if hi > 255:
+                    hi = 255
+                # _byte_classes marked lo and hi+1, so the classes of lo
+                # and hi bound exactly the classes inside [lo, hi].
+                for ci in range(class_of[lo], class_of[hi] + 1):
+                    cm[ci >> 6] = cm[ci >> 6] | (
+                        UInt64(1) << UInt64(ci & 63)
+                    )
+            if nfa.charsets[cs].negated:
+                # Classes are pure w.r.t. this charset, so negation is
+                # exact at class granularity.
+                for w in range(4):
+                    cm[w] = ~cm[w]
+                for ci in range(nclasses, 256):
+                    cm[ci >> 6] = cm[ci >> 6] & ~(
+                        UInt64(1) << UInt64(ci & 63)
+                    )
+            _bs_set(consuming_bits, i)
+        elif kind == NFAStateKind.MATCH:
+            _bs_set(match_bits, i)
+        elif kind == NFAStateKind.ANCHOR:
+            if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
+                _bs_set(eol_bits, i)
+            elif at == AnchorKind.BOL_MULTILINE:
+                has_bol_ml = True
+        cls_mask.append(cm)
 
 
 def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
@@ -209,74 +483,229 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
     Returns an invalid placeholder when `enabled` is False (pattern doesn't
     take a DFA engine, so no comptime work is spent) or when the state count
     exceeds EDFA_STATE_CAP (caller falls back to the LazyDFA).
+
+    Shaped for the comptime interpreter (see _StateBits): state sets are
+    SIMD bitsets, per-state metadata is read out of the NFA exactly once,
+    and continuation closures are memoized by target state — the inner
+    loops touch only bitsets, SIMD lanes, and flat Lists. The naive form
+    (per-(state, byte) `_accepts` calls, List[Int] state sets) cost tens of
+    seconds to minutes per big Unicode class pattern.
     """
     var result = EagerDFA()
     if not enabled:
         return result^
 
+    var n = len(nfa.states)
+    if n > EDFA_NFA_CAP:
+        return result^  # cannot bitset; would blow EDFA_STATE_CAP anyway
+
+    # --- Byte classes: intervals with a representative first byte. ---
     var class_of = List[Int](fill=-1, length=256)
     var reps = _byte_classes(nfa, class_of)
+    var nclasses = len(reps)
+    var rep_lo = SIMD[DType.int32, 256](0)
+    var rep_hi = SIMD[DType.int32, 256](0)
+    for ci in range(nclasses):
+        rep_lo[ci] = Int32(reps[ci])
+        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
+            255
+        )
+    var nl_class = class_of[Int(CHAR_NEWLINE)]
 
-    var sets = List[List[Int]]()
+    # --- One flat pass over the NFA (see _flatten_nfa). ---
+    var kinds = List[Int]()
+    var out1s = List[Int]()
+    var out2s = List[Int]()
+    var anchors = List[Int]()
+    var cls_mask = List[SIMD[DType.uint64, 4]]()
+    var consuming_bits = _StateBits(0)
+    var match_bits = _StateBits(0)
+    var eol_bits = _StateBits(0)
+    var has_bol_ml = False
+    _flatten_nfa(
+        nfa,
+        class_of,
+        nclasses,
+        nl_class,
+        kinds,
+        out1s,
+        out2s,
+        anchors,
+        cls_mask,
+        consuming_bits,
+        match_bits,
+        eol_bits,
+        has_bol_ml,
+    )
+
+    # --- Continuation closures, memoized by target state. ---
+    # closure(union of targets) == union of closures, so per-member work in
+    # the main loop is one memo lookup + a bitset OR. The `_nl` variant
+    # differs only when a BOL_MULTILINE anchor can resolve differently
+    # after '\n'.
+    var tslot = List[Int](fill=-1, length=n)
+    var gslot = List[Int](fill=-1, length=n)
+    var gval_o = List[_StateBits]()
+    var gval_n = List[_StateBits]()
+
+    # --- State-set bookkeeping: bitsets, hashes in SIMD lanes, flags. ---
+    var sets_bits = List[_StateBits]()
     var flags = List[Int]()
+    var hashv = SIMD[DType.uint64, 256](0)
 
     # Same three position contexts as LazyDFA._ensure_init.
-    var s_other = _add_start(nfa, False, False, sets, flags)
-    var s_nl = _add_start(nfa, False, True, sets, flags)
-    var s0 = _add_start(nfa, True, True, sets, flags)
+    var starts = List[Int]()  # other, after-nl, at-0
+    for ctx in range(3):
+        var closed = _flat_closure(
+            kinds, out1s, out2s, anchors, nfa.start, ctx == 2, ctx >= 1
+        )
+        var h = _bs_hash(closed)
+        var found = -1
+        for k in range(len(sets_bits)):
+            if hashv[k] == h and _bs_eq(sets_bits.unsafe_get(k), closed):
+                found = k
+                break
+        if found < 0:
+            var fl = 0
+            if _bs_any(closed & match_bits):
+                fl |= Int(EDFA_MATCH)
+            if _bs_any(closed & eol_bits):
+                var members = List[Int]()
+                for l in range(64):
+                    var w = closed[l]
+                    while w != 0:
+                        members.append(
+                            64 * l + Int(count_trailing_zeros(w))
+                        )
+                        w &= w - 1
+                fl = _state_flags(nfa, members, fl & Int(EDFA_MATCH) != 0)
+            flags.append(fl)
+            hashv[len(sets_bits)] = h
+            sets_bits.append(closed)
+            found = len(sets_bits) - 1
+        starts.append(found)
 
-    var table = List[Int]()
+    # --- Main loop: one member pass per DFA state feeds ALL classes. ---
+    # Per-class accumulators are generation-stamped so they need no
+    # per-state reset.
+    var rows = List[SIMD[DType.int32, 256]]()
+    var accu = List[_StateBits](fill=_StateBits(0), length=256)
+    var accu_gen = SIMD[DType.int32, 256](-1)
+    var gen = 0
     var cur = 0
-    while cur < len(sets):
-        if len(sets) > EDFA_STATE_CAP:
-            return result^  # state blowup: stay invalid, use LazyDFA
+    while cur < len(sets_bits):
+        var cur_bits = sets_bits.unsafe_get(cur) & consuming_bits
+        gen += 1
+        for l in range(64):
+            var w = cur_bits[l]
+            while w != 0:
+                var s = 64 * l + Int(count_trailing_zeros(w))
+                w &= w - 1
+                var slot = gslot.unsafe_get(s)
+                if slot < 0:
+                    var t = out1s.unsafe_get(s)
+                    if t < 0:
+                        continue  # dangling out — accepts into nothing
+                    slot = tslot.unsafe_get(t)
+                    if slot < 0:
+                        var c_o = _flat_closure(
+                            kinds, out1s, out2s, anchors, t, False, False
+                        )
+                        var c_n = c_o
+                        if has_bol_ml:
+                            c_n = _flat_closure(
+                                kinds, out1s, out2s, anchors, t, False, True
+                            )
+                        gval_o.append(c_o)
+                        gval_n.append(c_n)
+                        slot = len(gval_o) - 1
+                        tslot[t] = slot
+                    gslot[s] = slot
+                var g_o = gval_o.unsafe_get(slot)
+                var cm = cls_mask.unsafe_get(s)
+                for cw in range(4):
+                    var cwbits = cm[cw]
+                    while cwbits != 0:
+                        var ci = 64 * cw + Int(count_trailing_zeros(cwbits))
+                        cwbits &= cwbits - 1
+                        var gv = g_o
+                        if ci == nl_class and has_bol_ml:
+                            gv = gval_n.unsafe_get(slot)
+                        if Int(accu_gen[ci]) == gen:
+                            accu[ci] = accu[ci] | gv
+                        else:
+                            accu_gen[ci] = Int32(gen)
+                            accu[ci] = gv
 
-        # One transition per byte class, fanned out to all 256 columns.
-        var class_targets = List[Int](fill=-1, length=len(reps))
-        for ci in range(len(reps)):
-            var byte = reps[ci]
-            var nxt = List[Int]()
-            for i in range(len(sets[cur])):
-                var s = sets[cur][i]
-                if _accepts(nfa, s, byte):
-                    nxt.append(nfa.states[s].out1)
-            if len(nxt) == 0:
-                continue  # dead transition stays -1
-            var closed = List[Int]()
-            var m = _epsilon_closure(
-                nfa,
-                nxt^,
-                closed,
-                at_start=False,
-                after_newline=byte == Int(CHAR_NEWLINE),
-            )
-            class_targets[ci] = _find_or_add(nfa, closed^, m, sets, flags)
-
-        for byte in range(256):
-            table.append(class_targets[class_of[byte]])
+        var row = SIMD[DType.int32, 256](-1)
+        for ci in range(nclasses):
+            if Int(accu_gen[ci]) != gen:
+                continue  # dead transition: row lanes stay -1
+            var closed = accu.unsafe_get(ci)
+            var h = _bs_hash(closed)
+            var found = -1
+            for k in range(len(sets_bits)):
+                if hashv[k] == h and _bs_eq(
+                    sets_bits.unsafe_get(k), closed
+                ):
+                    found = k
+                    break
+            if found < 0:
+                var fl = 0
+                if _bs_any(closed & match_bits):
+                    fl |= Int(EDFA_MATCH)
+                if _bs_any(closed & eol_bits):
+                    var members = List[Int]()
+                    for l in range(64):
+                        var w = closed[l]
+                        while w != 0:
+                            members.append(
+                                64 * l + Int(count_trailing_zeros(w))
+                            )
+                            w &= w - 1
+                    fl = _state_flags(
+                        nfa, members, fl & Int(EDFA_MATCH) != 0
+                    )
+                flags.append(fl)
+                if len(sets_bits) >= EDFA_STATE_CAP + 1:
+                    return result^  # state blowup: stay invalid, use LazyDFA
+                hashv[len(sets_bits)] = h
+                sets_bits.append(closed)
+                found = len(sets_bits) - 1
+            for b in range(Int(rep_lo[ci]), Int(rep_hi[ci]) + 1):
+                row[b] = Int32(found)
+        rows.append(row)
         cur += 1
+        if len(sets_bits) > EDFA_STATE_CAP:
+            return result^  # state blowup: stay invalid, use LazyDFA
 
     # Permute states so match states occupy ids [0, num_match): the hot
     # per-byte match test becomes `cur < num_match` (no flags load).
-    var n = len(sets)
-    var perm = List[Int](fill=-1, length=n)
+    var nsets = len(sets_bits)
+    var perm = SIMD[DType.int32, 256](-1)
     var next_id = 0
-    for s in range(n):
-        if flags[s] & Int(EDFA_MATCH) != 0:
-            perm[s] = next_id
+    for s in range(nsets):
+        if flags.unsafe_get(s) & Int(EDFA_MATCH) != 0:
+            perm[s] = Int32(next_id)
             next_id += 1
     var num_match = next_id
-    for s in range(n):
-        if perm[s] < 0:
-            perm[s] = next_id
+    for s in range(nsets):
+        if Int(perm[s]) < 0:
+            perm[s] = Int32(next_id)
             next_id += 1
-    var new_table = List[Int](fill=-1, length=n * 256)
-    var new_flags = List[Int](fill=0, length=n)
-    for s in range(n):
-        new_flags[perm[s]] = flags[s]
-        for byte in range(256):
-            var t = table[s * 256 + byte]
-            new_table[perm[s] * 256 + byte] = perm[t] if t >= 0 else -1
+    var new_flags = List[Int](fill=0, length=nsets)
+    var new_rows = List[SIMD[DType.int32, 256]](
+        fill=SIMD[DType.int32, 256](-1), length=nsets
+    )
+    for s in range(nsets):
+        var row = rows.unsafe_get(s)
+        var row2 = SIMD[DType.int32, 256](-1)
+        for b in range(256):
+            var t = Int(row[b])
+            if t >= 0:
+                row2[b] = perm[t]
+        new_rows[Int(perm[s])] = row2
+        new_flags[Int(perm[s])] = flags.unsafe_get(s)
 
     # Acceleration: a state that self-loops on all but an exit-byte set gets
     # a SIMD scan to its next exit byte instead of a per-byte table walk.
@@ -286,15 +715,20 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
     # byte shuffle. EOL_AT_NEWLINE-flagged states are excluded: skipping
     # bytes would skip their per-'\n' last_match updates when '\n'
     # self-loops.
-    for s in range(n):
+    for s in range(nsets):
         if new_flags[s] & Int(EDFA_EOL_AT_NEWLINE) != 0:
             continue
+        var row = new_rows.unsafe_get(s)
+        var exit_count = 0
+        for byte in range(256):
+            if Int(row[byte]) != s:
+                exit_count += 1
+        if exit_count == 0 or exit_count == 256:
+            continue  # never exits / never self-loops: nothing to skip
         var exits = List[Int]()
         for byte in range(256):
-            if new_table[s * 256 + byte] != s:
+            if Int(row[byte]) != s:
                 exits.append(byte)
-        if len(exits) == 0 or len(exits) == 256:
-            continue  # never exits / never self-loops: nothing to skip
         if len(exits) <= 2:
             result.accel_states.append(s)
             result.accel_exit1.append(exits[0])
@@ -312,12 +746,18 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
             result.accel_nib_t0.extend(t0^)
             result.accel_nib_t1.extend(t1^)
 
+    var new_table = List[Int]()
+    for s in range(nsets):
+        var row = new_rows.unsafe_get(s)
+        for byte in range(256):
+            new_table.append(Int(row[byte]))
+
     result.valid = True
-    result.num_states = n
+    result.num_states = nsets
     result.num_match_states = num_match
-    result.start_at_0 = perm[s0]
-    result.start_after_nl = perm[s_nl]
-    result.start_other = perm[s_other]
+    result.start_at_0 = Int(perm[starts[2]])
+    result.start_after_nl = Int(perm[starts[1]])
+    result.start_other = Int(perm[starts[0]])
     for f in new_flags:
         if f & Int(EDFA_EOL_AT_NEWLINE) != 0:
             result.any_eol_nl = True
@@ -359,11 +799,11 @@ def _find_exit2[
 ](input: Span[Byte, origin], start: Int) -> Int:
     """First position >= start whose byte is e1 or e2, else len(input)."""
     comptime W = simd_width_of[DType.uint8]()
-    var ptr = input.unsafe_ptr()
+    var ptr = Pointer(input.unsafe_ptr())
     var input_len = len(input)
     var pos = start
     while pos + W <= input_len:
-        var block = (ptr + pos).load[width=W]()
+        var block = ptr.unsafe_offset(pos).unsafe_load[width=W]()
         var bits = lane_bits(block.eq(e1) | block.eq(e2))
         if bits != 0:
             return pos + first_lane_index(bits)
@@ -521,9 +961,7 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
             if d.table[s * 256 + b] != s1 or s == s1:
                 continue
             var is_start = (
-                s == d.start_at_0
-                or s == d.start_after_nl
-                or s == d.start_other
+                s == d.start_at_0 or s == d.start_after_nl or s == d.start_other
             )
             if not is_start:
                 return (-1, -1)
@@ -615,6 +1053,10 @@ def _edfa_full_match_impl[
     flags: InlineArray[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
+    # `table` / `flags` are comptime arrays; `materialize` binds them to the
+    # constant data emitted in the binary (no copy) so the walk can index them.
+    var tbl = materialize[table]()
+    var flg = materialize[flags]()
     var cur = d.start_at_0
     var pos = 0
     var input_len = len(input)
@@ -624,7 +1066,7 @@ def _edfa_full_match_impl[
             pos = _edfa_accel_skip[d=d](input, cur, pos, unused)
             if pos >= input_len:
                 break
-        var nxt = Int(table.unsafe_get(cur * 256 + Int(input.unsafe_get(pos))))
+        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(input.unsafe_get(pos))))
         if nxt < 0:
             return False
         cur = nxt
@@ -632,7 +1074,7 @@ def _edfa_full_match_impl[
     comptime if d.any_eol_end:
         return (
             cur < d.num_match_states
-            or (flags.unsafe_get(cur) & EDFA_EOL_AT_END) != 0
+            or (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0
         )
     else:
         return cur < d.num_match_states
@@ -676,6 +1118,8 @@ def _edfa_match_at_impl[
     flags: InlineArray[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin], start: Int) -> Int:
+    var tbl = materialize[table]()
+    var flg = materialize[flags]()
     var cur: Int
     if start == 0:
         cur = d.start_at_0
@@ -699,10 +1143,10 @@ def _edfa_match_at_impl[
         comptime if d.any_eol_nl:
             if (
                 b == CHAR_NEWLINE
-                and (flags.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
+                and (flg.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
             ):
                 last_match = pos
-        var nxt = Int(table.unsafe_get(cur * 256 + Int(b)))
+        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(b)))
         if nxt < 0:
             # Died mid-input: EOL-at-end flags don't apply (mirrors the
             # `current >= 0` guard in LazyDFA.match_at).
@@ -712,7 +1156,7 @@ def _edfa_match_at_impl[
         if cur < d.num_match_states:
             last_match = pos
     comptime if d.any_eol_end:
-        if (flags.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
+        if (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
             last_match = pos
     return last_match
 
@@ -788,9 +1232,9 @@ def edfa_search_forward[
                     continue
             # The accel tables encode S1's EXIT set; loop set = complement.
             var s = p
-            while s > start and not _class_contains[
-                kind=pk, t0=pt0, t1=pt1
-            ](input.unsafe_get(s - 1)):
+            while s > start and not _class_contains[kind=pk, t0=pt0, t1=pt1](
+                input.unsafe_get(s - 1)
+            ):
                 s -= 1
             var end = edfa_match_at[d=d, table=table, flags=flags](input, s)
             if end >= 0:

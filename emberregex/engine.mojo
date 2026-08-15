@@ -1,14 +1,15 @@
 """Compile-time regex: pattern is parsed and NFA is built at compile time.
 
 Usage:
-    var re = StaticRegex["\\d+\\.\\d+"]()
+    var re = Regex["\\d+\\.\\d+"]()
     var result = re.match(input)
     var result = re.search(input)
 
 The pattern is parsed during compilation. Invalid patterns cause an abort
 at compile time. The backtracking engine is specialized per-NFA-state via
-comptime parameters and @always_inline, collapsing the entire NFA interpreter
-into a single inlined function with zero dispatch overhead.
+comptime parameters: each state's instantiation keeps only the branch for
+its own kind, so there is no runtime dispatch on state kind. See
+backtrack.mojo for what that does and does not flatten.
 """
 
 from std.os import abort
@@ -21,7 +22,7 @@ from .constants import (
     CHAR_ZERO,
 )
 from .parser import parse
-from .nfa import build_nfa, forms_cycle, NFA, NFAStateKind
+from .nfa import build_nfa, split_cycle_flags, NFA, NFAStateKind
 from .ast import AnchorKind
 from .result import MatchResult
 from .flags import RegexFlags
@@ -58,6 +59,8 @@ from .backtrack import _sbt_try_match, SBT_BUDGET
 from .dfa import LazyDFA
 from .static_dfa import (
     EagerDFA,
+    _eol_continuation_crosses_anchor,
+    _eol_ml_continuation_consumes,
     _pivot_prefilter,
     build_eager_dfa,
     edfa_table_arr,
@@ -82,7 +85,6 @@ from .simd_kernels import (
 )
 from .executor import PikeVM, _VMBuffers
 from std.collections import InlineArray
-from std.memory import UnsafePointer
 
 
 @always_inline
@@ -97,6 +99,7 @@ def _sbt_run[
     input: Span[Byte, origin],
     pos: Int,
     mut slots: InlineArray[Int, num_slots],
+    end_at: Int = -1,
 ) raises -> Int:
     """Run backtracker with a fresh budget allocation.
 
@@ -115,7 +118,7 @@ def _sbt_run[
         state_idx=state_idx,
         num_slots=num_slots,
         anchored_end=anchored_end,
-    ](input, pos, slots, budget)
+    ](input, pos, slots, budget, 0, end_at)
     if budget < 0:
         raise Error("SBT_BUDGET_EXHAUSTED")
     return result
@@ -131,7 +134,7 @@ def _build_static_nfa(pattern: String) -> NFA:
         var merged_flags = ast.flags
         return build_nfa(ast^, merged_flags)
     except e:
-        abort("StaticRegex: invalid pattern")
+        abort("Regex: invalid pattern")
 
 
 @always_inline
@@ -140,7 +143,7 @@ def _is_bitmap_useful(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Bool:
     return bitmap.ne(UInt8(0xFF)).reduce_or()
 
 
-def _has_alternation_splits(nfa: NFA) -> Bool:
+def _has_alternation_splits(nfa: NFA, cyclic: List[Bool]) -> Bool:
     """Return True if the NFA has SPLIT states that are alternations (not quantifier loops).
 
     Quantifier loops (*, +, {n,}) create cyclic SPLITs that the backtracker's
@@ -157,12 +160,12 @@ def _has_alternation_splits(nfa: NFA) -> Bool:
         if nfa.states[i].out2 == -1:
             continue
         # If this SPLIT doesn't form a cycle, it's an alternation — DFA helps
-        if not forms_cycle(nfa, i):
+        if not cyclic[i]:
             return True
     return False
 
 
-def _quantifier_has_suffix(nfa: NFA) -> Bool:
+def _quantifier_has_suffix(nfa: NFA, cyclic: List[Bool]) -> Bool:
     """Return True if any quantifier loop's exit leads to consuming states.
 
     When a greedy quantifier (e.g. `.*`, `\\w+`) is followed by more pattern
@@ -174,7 +177,7 @@ def _quantifier_has_suffix(nfa: NFA) -> Bool:
     for i in range(num_states):
         if nfa.states[i].kind != NFAStateKind.SPLIT:
             continue
-        if not forms_cycle(nfa, i):
+        if not cyclic[i]:
             continue
         # This is a quantifier loop. Check if the exit branch (out2 for
         # greedy, out1 for lazy) leads to consuming states before MATCH.
@@ -231,6 +234,7 @@ def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
     if nfa.has_lazy:
         return False
     var num_states = len(nfa.states)
+    var cyclic = split_cycle_flags(nfa)
     var cycle_split = -1
     for i in range(num_states):
         if nfa.states[i].kind != NFAStateKind.SPLIT:
@@ -239,7 +243,7 @@ def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
             continue  # single-armed epsilon SPLIT
         if not nfa.states[i].greedy:
             return False
-        if not forms_cycle(nfa, i):
+        if not cyclic[i]:
             return False  # alternation: arm priority affects the end
         if cycle_split >= 0:
             return False  # more than one quantifier loop
@@ -333,13 +337,24 @@ def _probe_eq1[caseless: Bool, target: UInt8](b: Byte) -> Bool:
 
 
 def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
-    """True when the pattern should run on a DFA engine (eager or lazy)."""
-    return (
-        nfa.can_use_dfa
-        and group_count == 0
-        and not nfa.has_lazy
-        and (_has_alternation_splits(nfa) or _quantifier_has_suffix(nfa))
-    )
+    """True when the pattern should run on a DFA engine (eager or lazy).
+
+    Comptime memoization applies to `comptime` field declarations, not to
+    repeated internal calls, so Regex evaluates this ONCE into
+    `_use_dfa_candidate` and threads the result — each evaluation walks
+    the NFA several times.
+    """
+    if not nfa.can_use_dfa or group_count != 0 or nfa.has_lazy:
+        return False
+    var cyclic = split_cycle_flags(nfa)
+    if not (
+        _has_alternation_splits(nfa, cyclic)
+        or _quantifier_has_suffix(nfa, cyclic)
+    ):
+        return False
+    return not _eol_ml_continuation_consumes(
+        nfa
+    ) and not _eol_continuation_crosses_anchor(nfa)
 
 
 @fieldwise_init
@@ -386,10 +401,10 @@ def _compute_strategy(
     pivot_ok: Bool,
     fprefix_len: Int,
     alt_prefix_valid: Bool,
+    use_dfa: Bool,
 ) -> MatchStrategy:
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
-    var use_dfa = _dfa_candidate(nfa, group_count)
     var pure_literal = is_pure_literal(nfa)
     var use_simd_literal = (
         pure_literal
@@ -442,14 +457,15 @@ def _compute_strategy(
     )
 
 
-struct StaticRegex[pattern: String](Copyable, Movable):
+struct Regex[pattern: String](Copyable, Movable):
     """A compile-time regex where parsing and NFA construction happen during
     compilation.
 
-    The backtracking engine is specialized per-NFA-state via comptime parameters.
-    Each NFA state becomes a distinct @always_inline function instantiation.
-    The compiler collapses all recursive calls into a single inlined function,
-    eliminating runtime dispatch and achieving near hand-written performance.
+    The backtracking engine is specialized per-NFA-state via comptime
+    parameters. Each NFA state becomes a distinct function instantiation that
+    keeps only the branch for its own kind, eliminating runtime dispatch on
+    state kind; acyclic chains inline aggressively. Cyclic splits still
+    recurse — see backtrack.mojo.
     """
 
     comptime nfa = _build_static_nfa(Self.pattern)
@@ -462,11 +478,15 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     comptime _first_byte_bitmap = extract_first_byte_bitmap(Self.nfa)
     comptime _sandwich = extract_match_sandwich(Self.nfa)
     comptime _lit_alt = extract_literal_alternation(Self.nfa)
+    # Evaluated once as a field: _dfa_candidate walks the NFA several
+    # times, and comptime memoization covers field declarations, not
+    # repeated internal calls.
+    comptime _use_dfa_candidate = _dfa_candidate(Self.nfa, Self._group_count)
     # Teddy-claimed patterns (pure literal alternations on shuffle targets)
     # never run the DFA engines, so skip their comptime determinization.
     comptime _edfa = build_eager_dfa(
         Self.nfa,
-        _dfa_candidate(Self.nfa, Self._group_count)
+        Self._use_dfa_candidate
         and not (Self._lit_alt.valid and HAS_FAST_BYTE_SHUFFLE),
     )
     comptime _strategy = _compute_strategy(
@@ -482,6 +502,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         _pivot_prefilter(Self._edfa)[0] >= 0,
         len(Self._fpre.bytes),
         Self._alt_prefix.valid,
+        Self._use_dfa_candidate,
     )
     # LazyDFA only backs DFA patterns whose comptime determinization
     # overflowed EDFA_STATE_CAP — and that Teddy didn't claim.
@@ -507,6 +528,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
     comptime _use_scan_filter = (
         Self._strategy.fprefix_len > 0 or Self._strategy.use_teddy_prefix
     )
+    # Field, not a per-method call: the check runs a cycle-flags pass over
+    # the NFA, and comptime memoization covers field declarations only.
+    comptime _lf_end_is_dfa_end = _dfa_end_is_leftmost_first(Self.nfa)
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
     var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
@@ -525,7 +549,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](None)
             self._dfa = rebind_var[type_of(self._dfa)](None)
         comptime if Self._strategy.use_simd_literal:
-            comptime vec = Self._prefix.unsafe_ptr().load[
+            comptime vec = Pointer(Self._prefix.unsafe_ptr()).unsafe_load[
                 width=Self._strategy.prefix_len
             ]()
             self._simd_lit = rebind_var[type_of(self._simd_lit)](vec)
@@ -646,14 +670,14 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             var input_len = input.byte_length()
             if input_len < prefix_len + suffix_len:
                 return MatchResult[Self._num_slots].no_match()
-            var ptr = input.unsafe_ptr()
+            var ptr = Pointer(input.unsafe_ptr())
             comptime for i in range(prefix_len):
                 comptime pb = Self._prefix[i]
-                if ptr[i] != pb:
+                if ptr[unsafe_offset=i] != pb:
                     return MatchResult[Self._num_slots].no_match()
             comptime for i in range(suffix_len):
                 comptime sb = Self._sandwich.suffix[i]
-                if ptr[input_len - suffix_len + i] != sb:
+                if ptr[unsafe_offset = input_len - suffix_len + i] != sb:
                     return MatchResult[Self._num_slots].no_match()
             return MatchResult[Self._num_slots](
                 matched=True,
@@ -666,7 +690,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 self._simd_lit
             )
             if input.byte_length() == Self._strategy.prefix_len:
-                var chunk = input.unsafe_ptr().load[
+                var chunk = Pointer(input.unsafe_ptr()).unsafe_load[
                     width=Self._strategy.prefix_len
                 ]()
                 if chunk == lit:
@@ -691,7 +715,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_match(input)
         try:
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             # anchored_end: MATCH only accepts at end of input, so
             # alternatives that prefer a shorter match (e.g. `(a|ab)` on
             # "ab") can't mask a valid full match.
@@ -788,9 +812,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             )
                             if pos < 0:
                                 return MatchResult[Self._num_slots].no_match()
-                            var match_end = self._dfa_match_at(
-                                input_bytes, pos
-                            )
+                            var match_end = self._dfa_match_at(input_bytes, pos)
                             if match_end >= 0:
                                 return MatchResult[Self._num_slots](
                                     matched=True,
@@ -836,7 +858,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
 
         # BOL anchor: only try position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
             ](input_bytes, 0, slots)
@@ -871,7 +893,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             else:
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input, input_len, pos)
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
             ](input, pos, slots)
@@ -916,7 +938,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                         break
                     pos = nl + 1
                     continue
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=entry_state, num_slots=Self._num_slots
             ](input, pos, slots)
@@ -945,9 +967,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             slots=InlineArray[Int, Self._num_slots](fill=-1),
         )
 
-    def finditer(
-        mut self, input: String
-    ) -> List[MatchResult[Self._num_slots]]:
+    def finditer(mut self, input: String) -> List[MatchResult[Self._num_slots]]:
         """All non-overlapping matches as MatchResults (spans plus capture
         slots), eagerly collected.
 
@@ -1219,7 +1239,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
 
         # BOL anchor: only position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
             ](input_bytes, 0, slots)
@@ -1232,7 +1252,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 # Skip to BOL positions using SIMD newline scan
                 var pos = 0
                 while pos <= input_len:
-                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
                         nfa=Self.nfa,
                         state_idx=Self._start,
@@ -1268,9 +1288,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
-                        pos = self._scan_candidate(
-                            input_bytes, input_len, pos
-                        )
+                        pos = self._scan_candidate(input_bytes, input_len, pos)
                         if pos < 0:
                             break
                     else:
@@ -1278,7 +1296,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             pos = self._next_candidate_pos(
                                 input_bytes, input_len, pos
                             )
-                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
                         nfa=Self.nfa,
                         state_idx=Self._start,
@@ -1368,7 +1386,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
 
         # BOL anchor: only position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
             ](input_bytes, 0, slots)
@@ -1385,7 +1403,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 # Skip to BOL positions using SIMD newline scan
                 var pos = 0
                 while pos <= input_len:
-                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
                         nfa=Self.nfa,
                         state_idx=Self._start,
@@ -1425,9 +1443,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
-                        pos = self._scan_candidate(
-                            input_bytes, input_len, pos
-                        )
+                        pos = self._scan_candidate(input_bytes, input_len, pos)
                         if pos < 0:
                             break
                     else:
@@ -1435,7 +1451,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                             pos = self._next_candidate_pos(
                                 input_bytes, input_len, pos
                             )
-                    var slots = ALL_NEG_ONES[Self._num_slots]
+                    var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
                         nfa=Self.nfa,
                         state_idx=Self._start,
@@ -1592,7 +1608,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             else:
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa,
                 state_idx=Self._start,
@@ -1612,7 +1628,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                     matched=True,
                     start=pos,
                     end=end,
-                    slots=slots,
+                    slots=slots^,
                 )
                 output += self._expand_replacement(
                     input_bytes, match_result, replacement
@@ -1642,9 +1658,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             try:
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
-                        pos = self._scan_candidate(
-                            input_bytes, input_len, pos
-                        )
+                        pos = self._scan_candidate(input_bytes, input_len, pos)
                         if pos < 0:
                             break
                         var match_end = self._dfa_match_at(input_bytes, pos)
@@ -1712,7 +1726,7 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             else:
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
-            var slots = ALL_NEG_ONES[Self._num_slots]
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa,
                 state_idx=Self._start,
@@ -1777,10 +1791,10 @@ struct StaticRegex[pattern: String](Copyable, Movable):
                 return simd_find_byte(input, b0, start)
             else:
                 comptime W = simd_width_of[DType.uint8]()
-                var ptr = input.unsafe_ptr()
+                var ptr = Pointer(input.unsafe_ptr())
                 var pos = start
                 while pos + W <= input_len:
-                    var chunk = (ptr + pos).load[width=W]()
+                    var chunk = ptr.unsafe_offset(pos).unsafe_load[width=W]()
                     var bits = lane_bits((chunk | 0x20).eq(b0))
                     if bits != 0:
                         return pos + first_lane_index(bits)
@@ -1804,24 +1818,24 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             # Loop guards use the full filter extent, not off_b: a candidate
             # in the last lane is verified across all fprefix_len bytes.
             comptime last_off = fpn - 1
-            var ptr = input.unsafe_ptr()
+            var ptr = Pointer(input.unsafe_ptr())
             var pos = start
 
             # 4x-unrolled SIMD body: 4*W bytes per iter
             while pos + 4 * W + last_off <= input_len:
-                var b0 = (ptr + pos + off_a).load[width=W]()
-                var b1 = (ptr + pos + W + off_a).load[width=W]()
-                var b2 = (ptr + pos + 2 * W + off_a).load[width=W]()
-                var b3 = (ptr + pos + 3 * W + off_a).load[width=W]()
+                var b0 = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
+                var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[width=W]()
+                var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[width=W]()
+                var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[width=W]()
                 var e0 = _probe_eq[caseless=ca, target=byte_a](b0)
                 var e1 = _probe_eq[caseless=ca, target=byte_a](b1)
                 var e2 = _probe_eq[caseless=ca, target=byte_a](b2)
                 var e3 = _probe_eq[caseless=ca, target=byte_a](b3)
                 if (e0 | e1 | e2 | e3).reduce_or():
-                    var l0 = (ptr + pos + off_b).load[width=W]()
-                    var l1 = (ptr + pos + W + off_b).load[width=W]()
-                    var l2 = (ptr + pos + 2 * W + off_b).load[width=W]()
-                    var l3 = (ptr + pos + 3 * W + off_b).load[width=W]()
+                    var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
+                    var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[width=W]()
+                    var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[width=W]()
+                    var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[width=W]()
                     var m0 = e0 & _probe_eq[caseless=cb, target=byte_b](l0)
                     var m1 = e1 & _probe_eq[caseless=cb, target=byte_b](l1)
                     var m2 = e2 & _probe_eq[caseless=cb, target=byte_b](l2)
@@ -1844,10 +1858,10 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             # Single-chunk SIMD body for the bytes between the unrolled body
             # and the tail
             while pos + W + last_off <= input_len:
-                var block_a = (ptr + pos + off_a).load[width=W]()
+                var block_a = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
                 var mask_a = _probe_eq[caseless=ca, target=byte_a](block_a)
                 if mask_a.reduce_or():
-                    var block_b = (ptr + pos + off_b).load[width=W]()
+                    var block_b = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
                     var mask = mask_a & _probe_eq[caseless=cb, target=byte_b](
                         block_b
                     )
@@ -1907,14 +1921,16 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         comptime probes = select_probe_offsets(
             Self._fpre.bytes, Self._fpre.caseless
         )
-        var ptr = input.unsafe_ptr()
+        var ptr = Pointer(input.unsafe_ptr())
         var ok = True
         comptime for k in range(Self._strategy.fprefix_len):
             comptime if k != probes[0] and k != probes[1]:
                 comptime pb = Self._fpre.bytes[k]
                 comptime pc = Self._fpre.caseless[k]
                 if ok:
-                    ok = _probe_eq1[caseless=pc, target=pb]((ptr + pos + k)[])
+                    ok = _probe_eq1[caseless=pc, target=pb](
+                        ptr[unsafe_offset = pos + k]
+                    )
         return ok
 
     @always_inline
@@ -1954,9 +1970,9 @@ struct StaticRegex[pattern: String](Copyable, Movable):
             # qualifies almost every call, and the peek resolves that in a
             # few instructions versus the vector kernel's fixed cost.
             if pos < input_len and not _class_contains[
-                kind = km[0], t0 = km[1], t1 = km[2]
+                kind=km[0], t0=km[1], t1=km[2]
             ](input.unsafe_get(pos)):
-                return find_in_class[kind = km[0], t0 = km[1], t1 = km[2]](
+                return find_in_class[kind=km[0], t0=km[1], t1=km[2]](
                     input, pos + 1
                 )
             return pos
@@ -2035,11 +2051,11 @@ struct StaticRegex[pattern: String](Copyable, Movable):
         _dfa_end_is_leftmost_first), the re-run is skipped at compile time
         and the DFA's end is returned directly.
         """
-        comptime if _dfa_end_is_leftmost_first(Self.nfa):
+        comptime if Self._lf_end_is_dfa_end:
             return dfa_end
         else:
             try:
-                var slots = ALL_NEG_ONES[Self._num_slots]
+                var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                 var end = _sbt_run[
                     nfa=Self.nfa,
                     state_idx=Self._start,

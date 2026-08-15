@@ -1,6 +1,6 @@
 """Tests for inline flags: (?i) ignorecase, (?m) multiline, (?s) dotall."""
 
-from emberregex import StaticRegex
+from emberregex import Regex
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -8,7 +8,7 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
 def test_ignorecase_basic() raises:
-    var re = StaticRegex["(?i)hello"]()
+    var re = Regex["(?i)hello"]()
     assert_true(re.match("hello").matched)
     assert_true(re.match("HELLO").matched)
     assert_true(re.match("Hello").matched)
@@ -17,27 +17,27 @@ def test_ignorecase_basic() raises:
 
 
 def test_ignorecase_charset() raises:
-    var re = StaticRegex["(?i)[a-z]+"]()
+    var re = Regex["(?i)[a-z]+"]()
     assert_true(re.match("abc").matched)
     assert_true(re.match("ABC").matched)
     assert_true(re.match("AbC").matched)
 
 
 def test_ignorecase_search() raises:
-    var re = StaticRegex["(?i)world"]()
+    var re = Regex["(?i)world"]()
     var result = re.search("Hello WORLD")
     assert_true(result.matched)
     assert_equal(result.start, 6)
 
 
 def test_ignorecase_with_alternation() raises:
-    var re = StaticRegex["(?i)hello|world"]()
+    var re = Regex["(?i)hello|world"]()
     assert_true(re.match("HELLO").matched)
     assert_true(re.match("World").matched)
 
 
 def test_ignorecase_with_quantifier() raises:
-    var re = StaticRegex["(?i)[a-z]+"]()
+    var re = Regex["(?i)[a-z]+"]()
     assert_true(re.match("HeLLo").matched)
 
 
@@ -45,25 +45,25 @@ def test_ignorecase_with_quantifier() raises:
 
 
 def test_multiline_bol() raises:
-    var re = StaticRegex["(?m)^hello"]()
+    var re = Regex["(?m)^hello"]()
     assert_true(re.search("hello world").matched)
     assert_true(re.search("foo\nhello").matched)
 
 
 def test_multiline_eol() raises:
-    var re = StaticRegex["(?m)world$"]()
+    var re = Regex["(?m)world$"]()
     assert_true(re.search("world\nfoo").matched)
     assert_true(re.search("hello world").matched)
 
 
 def test_multiline_default_no_newline() raises:
-    var re = StaticRegex["^hello"]()
+    var re = Regex["^hello"]()
     assert_true(re.search("hello world").matched)
     assert_false(re.search("foo\nhello").matched)
 
 
 def test_multiline_bol_findall() raises:
-    var re = StaticRegex["(?m)^\\w+"]()
+    var re = Regex["(?m)^\\w+"]()
     var results = re.findall("hello\nworld\nfoo")
     assert_equal(len(results), 3)
     assert_equal(results[0], "hello")
@@ -72,7 +72,7 @@ def test_multiline_bol_findall() raises:
 
 
 def test_multiline_eol_findall() raises:
-    var re = StaticRegex["(?m)\\w+$"]()
+    var re = Regex["(?m)\\w+$"]()
     var results = re.findall("hello\nworld")
     assert_true(len(results) >= 1)
 
@@ -81,24 +81,24 @@ def test_multiline_eol_findall() raises:
 
 
 def test_dotall_basic() raises:
-    var re = StaticRegex["(?s)a.b"]()
+    var re = Regex["(?s)a.b"]()
     assert_true(re.match("axb").matched)
     assert_true(re.match("a\nb").matched)
 
 
 def test_dotall_default_no_newline() raises:
-    var re = StaticRegex["a.b"]()
+    var re = Regex["a.b"]()
     assert_true(re.match("axb").matched)
     assert_false(re.match("a\nb").matched)
 
 
 def test_dotall_with_quantifier() raises:
-    var re = StaticRegex["(?s)a.+b"]()
+    var re = Regex["(?s)a.+b"]()
     assert_true(re.match("a\nX\nb").matched)
 
 
 def test_dotall_multiple_newlines() raises:
-    var re = StaticRegex["(?s)a.*b"]()
+    var re = Regex["(?s)a.*b"]()
     assert_true(re.match("a\n\n\nb").matched)
 
 
@@ -106,29 +106,29 @@ def test_dotall_multiple_newlines() raises:
 
 
 def test_combined_ignorecase_multiline() raises:
-    var re = StaticRegex["(?im)^hello"]()
+    var re = Regex["(?im)^hello"]()
     assert_true(re.search("foo\nHELLO").matched)
 
 
 def test_combined_all_three() raises:
-    var re = StaticRegex["(?ims)^hello.world$"]()
+    var re = Regex["(?ims)^hello.world$"]()
     assert_true(re.search("HELLO\nWORLD").matched)
 
 
 def test_scoped_ignorecase_charset() raises:
     # Scoped (?i:...) must case-fold character classes, not just literals.
-    var re = StaticRegex["(?i:[a-z])"]()
+    var re = Regex["(?i:[a-z])"]()
     assert_true(re.match("A").matched)
     assert_true(re.match("a").matched)
     # Folding applies only inside the scoped group.
-    var re2 = StaticRegex["(?i:[a-z])[a-z]"]()
+    var re2 = Regex["(?i:[a-z])[a-z]"]()
     assert_true(re2.match("Aa").matched)
     assert_false(re2.match("AA").matched)
 
 
 def test_scoped_remove_ignorecase_charset() raises:
     # (?-i:...) must remove folding from charsets under a global (?i).
-    var re = StaticRegex["(?i)x(?-i:[a-z])"]()
+    var re = Regex["(?i)x(?-i:[a-z])"]()
     assert_true(re.match("Xa").matched)
     assert_false(re.match("XA").matched)
 
@@ -136,7 +136,7 @@ def test_scoped_remove_ignorecase_charset() raises:
 def test_caseless_prefix_search() raises:
     # (?i) literals form a caseless filter prefix (rare-byte probes with
     # the |0x20 fold). Expected values are CPython outputs.
-    var re = StaticRegex["(?i)error"]()
+    var re = Regex["(?i)error"]()
     var r = re.search("no issues found... an ERRor was logged")
     assert_equal(r.start, 22)
     assert_equal(r.end, 27)
@@ -150,17 +150,17 @@ def test_caseless_prefix_search() raises:
 
 def test_caseless_prefix_scoped_and_mixed() raises:
     # Exact and caseless positions mix; scoped (?i:) folds only its span.
-    var re = StaticRegex["abc(?i:def)"]()
+    var re = Regex["abc(?i:def)"]()
     var r = re.search("zzabcDeFzz")
     assert_equal(r.start, 2)
     assert_equal(r.end, 8)
     assert_false(re.search("zzaBcdefzz").matched)
     # Charset-of-one extends the filter prefix.
-    var re2 = StaticRegex["delt[a]"]()
+    var re2 = Regex["delt[a]"]()
     var r2 = re2.search("the delta value")
     assert_equal(r2.start, 4)
     assert_equal(r2.end, 9)
-    var re3 = StaticRegex["(?i)error\\d+"]()
+    var re3 = Regex["(?i)error\\d+"]()
     var r3 = re3.search("zzz ERROR42 zzz")
     assert_equal(r3.start, 4)
     assert_equal(r3.end, 11)
@@ -168,7 +168,7 @@ def test_caseless_prefix_scoped_and_mixed() raises:
 
 def test_ignorecase_negated_charset() raises:
     # Negation applies after folding: (?i)[^a-z] rejects 'A' (Python re).
-    var re = StaticRegex["(?i)[^a-z]"]()
+    var re = Regex["(?i)[^a-z]"]()
     assert_false(re.match("A").matched)
     assert_false(re.match("a").matched)
     assert_true(re.match("5").matched)

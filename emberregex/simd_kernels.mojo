@@ -47,7 +47,7 @@ comptime _NibbleTable = SIMD[DType.uint8, NIBBLE_TABLE_SIZE]
 
 @always_inline
 def nibble_lookup[
-    W: SIMDSize, //
+    W: SIMDLength, //
 ](table: _NibbleTable, indices: SIMD[DType.uint8, W]) -> SIMD[DType.uint8, W]:
     """Per-lane table lookup: out[i] = table[indices[i]].
 
@@ -187,11 +187,11 @@ def find_in_class[
     """First position >= start whose byte is in the encoded stop set, else
     len(input)."""
     comptime W = simd_width_of[DType.uint8]()
-    var ptr = input.unsafe_ptr()
+    var ptr = Pointer(input.unsafe_ptr())
     var input_len = len(input)
     var pos = start
     while pos + W <= input_len:
-        var v = (ptr + pos).load[width=W]()
+        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
         var bits = lane_bits(_class_hit[kind=kind, t0=t0, t1=t1](v))
         if bits != 0:
             return pos + first_lane_index(bits)

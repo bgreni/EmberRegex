@@ -109,12 +109,12 @@ struct LazyDFA(Copyable, Movable):
         """
         self._ensure_init(nfa)
         var current = self._init_start  # full_match starts at pos 0
-        var ptr = input.unsafe_ptr()
+        var ptr = Pointer(input.unsafe_ptr())
         var length = input.byte_length()
 
         for i in range(length):
             # Inline the cache-hit path to avoid _step call overhead
-            var byte_idx = Int(UInt8(ptr[i]))
+            var byte_idx = Int(UInt8(ptr[unsafe_offset=i]))
             var cached = self.states.unsafe_get(current).transitions.unsafe_get(
                 byte_idx
             )
@@ -136,7 +136,7 @@ struct LazyDFA(Copyable, Movable):
         """Try to match at start position. Returns end position or -1.
 
         The returned end is leftmost-longest; callers that need Python's
-        leftmost-first end must re-resolve it (see StaticRegex._lf_end_at).
+        leftmost-first end must re-resolve it (see Regex._lf_end_at).
         """
         self._ensure_init(nfa)
         var input_len = len(input)
@@ -410,15 +410,29 @@ def _check_eol_match(nfa: NFA, nfa_states: List[Int], at_end: Bool) -> Bool:
             elif not at_end and anchor_type == AnchorKind.EOL_MULTILINE:
                 applicable = True
             if applicable:
-                if _reaches_match(nfa, nfa.states.unsafe_get(s).out1):
+                if _reaches_match(nfa, nfa.states.unsafe_get(s).out1, at_end):
                     return True
     return False
 
 
-def _reaches_match(nfa: NFA, start: Int) -> Bool:
-    """Check if MATCH is reachable via epsilon transitions from start."""
+def _reaches_match(nfa: NFA, start: Int, at_end: Bool) -> Bool:
+    """Check if MATCH is reachable via epsilon transitions from start,
+    in the context where an EOL anchor has just been resolved.
+
+    Nested EOL anchors of a kind that ALSO holds in this context are
+    followed: `ab$$` puts a second EOL state in the continuation, and
+    stopping there would leave the state with no EOL flag at all, so the
+    walk would never accept (found by review, 2026-07-26 — it silently
+    dropped matches on every DFA lane).
+
+    Any other anchor kind stops the walk: whether it holds depends on
+    runtime context the per-state flag bytes cannot carry.
+    `_eol_continuation_crosses_anchor` keeps such patterns off these
+    lanes entirely, so stopping here never under-reports for a pattern
+    that actually rides them.
+    """
     var visited = List[Bool](fill=False, length=len(nfa.states))
-    var stack = [start]
+    var stack: List[Int] = [start]
     while len(stack) > 0:
         var s = stack.pop()
         if s < 0 or s >= len(nfa.states) or visited.unsafe_get(s):
@@ -432,6 +446,15 @@ def _reaches_match(nfa: NFA, start: Int) -> Bool:
             stack.append(nfa.states.unsafe_get(s).out2)
         elif kind == NFAStateKind.SAVE:
             stack.append(nfa.states.unsafe_get(s).out1)
+        elif kind == NFAStateKind.ANCHOR:
+            var at = nfa.states.unsafe_get(s).anchor_type
+            var holds: Bool
+            if at_end:
+                holds = at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE
+            else:
+                holds = at == AnchorKind.EOL_MULTILINE
+            if holds:
+                stack.append(nfa.states.unsafe_get(s).out1)
     return False
 
 

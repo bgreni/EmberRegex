@@ -41,9 +41,9 @@ def lane_bits[W: Int, //](mask: SIMD[DType.bool, W]) -> UInt64:
     # first_lane_index/clear_first_lane assume 4 bits per lane whenever the
     # nibble-mask path exists; a non-16-lane mask on such targets would take
     # the pack_bits branch (1 bit per lane) and silently mis-index.
-    comptime assert LANE_BIT_SHIFT == 0 or W == 16, (
-        "nibble-mask targets require 16-lane masks"
-    )
+    comptime assert (
+        LANE_BIT_SHIFT == 0 or W == 16
+    ), "nibble-mask targets require 16-lane masks"
     comptime if _NIBBLE_MASK and W == 16:
         var bytes = mask.select(
             SIMD[DType.uint8, W](0xFF), SIMD[DType.uint8, W](0)
@@ -83,7 +83,7 @@ def simd_find_byte[
     comptime W = simd_width_of[DType.uint8]()
     var length = len(input)
     var i = start
-    var ptr = input.unsafe_ptr()
+    var ptr = Pointer(input.unsafe_ptr())
 
     var target = SIMD[DType.uint8, W](byte_val)
 
@@ -92,7 +92,7 @@ def simd_find_byte[
     # faster than deriving both from one movemask on NEON, and the
     # extraction then runs at most once per call.
     while i + W <= length:
-        var chunk = (ptr + i).load[width=W]()
+        var chunk = ptr.unsafe_offset(i).unsafe_load[width=W]()
         if (chunk ^ target).reduce_min() == 0:
             var bits = lane_bits(chunk.eq(target))
             return i + first_lane_index(bits)
@@ -100,7 +100,7 @@ def simd_find_byte[
 
     # Scalar tail
     while i < length:
-        if UInt8(ptr[i]) == byte_val:
+        if UInt8(ptr[unsafe_offset=i]) == byte_val:
             return i
         i += 1
 
@@ -118,16 +118,16 @@ def simd_find_literal[
     (no-candidate) path vectorized.
     """
     var input_len = len(input)
-    var last_start = input_len - lit.size
+    var last_start = input_len - lit.length
     var pos = start
-    var ptr = input.unsafe_ptr().bitcast[Scalar[lit.dtype]]()
+    var ptr = Pointer(input.unsafe_ptr()).unsafe_bitcast[Scalar[lit.dtype]]()
     var first_byte = lit[0].cast[DType.uint8]()
 
     while pos <= last_start:
         var candidate = simd_find_byte(input, first_byte, pos)
         if candidate < 0 or candidate > last_start:
             return -1
-        var chunk = (ptr + candidate).load[width=lit.size]()
+        var chunk = ptr.unsafe_offset(candidate).unsafe_load[width=lit.length]()
         if chunk == lit:
             return candidate
         pos = candidate + 1

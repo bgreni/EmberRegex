@@ -25,7 +25,7 @@ from .charset import CharSet
 from .ast import AnchorKind
 from .result import MatchResult
 from std.collections import InlineArray
-from std.memory import memset
+from std.memory import unsafe_memset
 
 
 struct _VMBuffers(Copyable):
@@ -72,7 +72,7 @@ struct _VMBuffers(Copyable):
         self.current_slot_data.clear()
         self.next_states.clear()
         self.next_slot_data.clear()
-        memset(self.best_slots.unsafe_ptr(), -1, self.stride)
+        unsafe_memset(self.best_slots.unsafe_ptr(), -1, self.stride)
 
 
 struct PikeVM[num_slots: Int](Copyable):
@@ -147,7 +147,7 @@ struct PikeVM[num_slots: Int](Copyable):
         if num_states == 0:
             return MatchResult[Self.num_slots].no_match()
 
-        var ptr = input.unsafe_ptr()
+        var ptr = Pointer(input.unsafe_ptr())
         bufs.reset()
 
         # Seed with start state. init_slots holds -1 capture slots; its
@@ -223,7 +223,7 @@ struct PikeVM[num_slots: Int](Copyable):
             if pos >= input_len:
                 break
 
-            var ch = UInt32((ptr + pos).load())
+            var ch = UInt32(ptr.unsafe_offset(pos).unsafe_load())
 
             # Advance each thread
             bufs.gen_counter += 1
@@ -456,7 +456,7 @@ struct PikeVM[num_slots: Int](Copyable):
         MULTILINE behavior is baked into the anchor kind at NFA construction time:
         BOL_MULTILINE / EOL_MULTILINE handle line-boundary matching without a runtime flag check.
         """
-        var ptr = input.unsafe_ptr()
+        var ptr = Pointer(input.unsafe_ptr())
         if anchor_type == AnchorKind.BOL:
             return pos == 0
         elif anchor_type == AnchorKind.BOL_MULTILINE:
@@ -467,18 +467,18 @@ struct PikeVM[num_slots: Int](Copyable):
             return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
         elif anchor_type == AnchorKind.WORD_BOUNDARY:
             var before_word = pos > 0 and Self._is_word_char(
-                (ptr + pos - 1).load()
+                ptr.unsafe_offset(pos - 1).unsafe_load()
             )
             var after_word = pos < input_len and Self._is_word_char(
-                (ptr + pos).load()
+                ptr.unsafe_offset(pos).unsafe_load()
             )
             return before_word != after_word
         elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
             var before_word = pos > 0 and Self._is_word_char(
-                (ptr + pos - 1).load()
+                ptr.unsafe_offset(pos - 1).unsafe_load()
             )
             var after_word = pos < input_len and Self._is_word_char(
-                (ptr + pos).load()
+                ptr.unsafe_offset(pos).unsafe_load()
             )
             return before_word == after_word
         return False

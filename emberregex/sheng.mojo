@@ -101,7 +101,7 @@ def _sheng_step(
 ) -> _ShengMask:
     """One transition: shuffle the byte's mask by the state vector."""
     ref first = masks.unsafe_get(Int(b) * SHENG_STATE_CAP)
-    var mask = UnsafePointer(to=first).load[width=SHENG_STATE_CAP]()
+    var mask = Pointer(to=first).unsafe_load[width=SHENG_STATE_CAP]()
     return nibble_lookup(mask, state_vec)
 
 
@@ -122,6 +122,10 @@ def _sheng_full_match_impl[
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
     comptime dead = d.num_states
+    # `masks` / `flags` are comptime arrays; `materialize` binds them to the
+    # constant data emitted in the binary (no copy) so the walk can index them.
+    var msk = materialize[masks]()
+    var flg = materialize[flags]()
     var cur_vec = _ShengMask(UInt8(d.start_at_0))
     var cur = d.start_at_0
     var pos = 0
@@ -133,7 +137,7 @@ def _sheng_full_match_impl[
             pos = skipped
             if pos >= input_len:
                 break
-            cur_vec = _sheng_step(masks, input.unsafe_get(pos), cur_vec)
+            cur_vec = _sheng_step(msk, input.unsafe_get(pos), cur_vec)
             cur = Int(cur_vec[0])
             if cur == dead:
                 return False
@@ -146,7 +150,7 @@ def _sheng_full_match_impl[
         while pos < input_len:
             var chunk_end = min(pos + _SHENG_DEAD_CHECK_STRIDE, input_len)
             while pos < chunk_end:
-                cur_vec = _sheng_step(masks, input.unsafe_get(pos), cur_vec)
+                cur_vec = _sheng_step(msk, input.unsafe_get(pos), cur_vec)
                 pos += 1
             cur = Int(cur_vec[0])
             if cur == dead:
@@ -154,7 +158,7 @@ def _sheng_full_match_impl[
     comptime if d.any_eol_end:
         return (
             cur < d.num_match_states
-            or (flags.unsafe_get(cur) & EDFA_EOL_AT_END) != 0
+            or (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0
         )
     else:
         return cur < d.num_match_states
@@ -192,6 +196,8 @@ def _sheng_match_at_impl[
     accel: Bool,
 ](input: Span[Byte, origin], start: Int) -> Int:
     comptime dead = d.num_states
+    var msk = materialize[masks]()
+    var flg = materialize[flags]()
     var cur: Int
     if start == 0:
         cur = d.start_at_0
@@ -216,10 +222,10 @@ def _sheng_match_at_impl[
         comptime if d.any_eol_nl:
             if (
                 b == CHAR_NEWLINE
-                and (flags.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
+                and (flg.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
             ):
                 last_match = pos
-        cur_vec = _sheng_step(masks, b, cur_vec)
+        cur_vec = _sheng_step(msk, b, cur_vec)
         cur = Int(cur_vec[0])
         if cur == dead:
             # Died mid-input: EOL-at-end flags don't apply (mirrors
@@ -229,7 +235,7 @@ def _sheng_match_at_impl[
         if cur < d.num_match_states:
             last_match = pos
     comptime if d.any_eol_end:
-        if (flags.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
+        if (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
             last_match = pos
     return last_match
 
@@ -295,9 +301,9 @@ def sheng_search_forward[
                     ppos = p + 1
                     continue
             var s = p
-            while s > start and not _class_contains[
-                kind=pk, t0=pt0, t1=pt1
-            ](input.unsafe_get(s - 1)):
+            while s > start and not _class_contains[kind=pk, t0=pt0, t1=pt1](
+                input.unsafe_get(s - 1)
+            ):
                 s -= 1
             var end = sheng_match_at[d=d, masks=masks, flags=flags](input, s)
             if end >= 0:

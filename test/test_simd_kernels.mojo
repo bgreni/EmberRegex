@@ -7,7 +7,7 @@ nibble acceleration are pinned (so detection regressions are caught) and
 exercised on inputs with long runs, including bytes >= 0x80.
 """
 
-from emberregex import StaticRegex
+from emberregex import Regex
 from emberregex.simd_kernels import (
     ACCEL_SHUFTI,
     ACCEL_TRUFFLE,
@@ -135,7 +135,7 @@ def test_find_in_class_start_offset() raises:
 
 
 def test_email_pattern_gets_nibble_accel() raises:
-    comptime E = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
+    comptime E = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
         comptime n_nib = len(E._edfa.accel_nib_states)
         assert_true(n_nib >= 1)
@@ -150,7 +150,7 @@ def test_nibble_accel_long_runs() raises:
     # Runs much longer than W force many accelerated iterations; the match
     # boundaries must still land exactly.
     comptime W = simd_width_of[DType.uint8]()
-    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
     var user = String("u") * (3 * W + 1)
     var host = String("h") * (2 * W + 5)
     var input = "@@ " + user + "@" + host + ".com !"
@@ -162,7 +162,7 @@ def test_nibble_accel_long_runs() raises:
 
 def test_shufti_state_pattern() raises:
     # `[^a-z]*[a-z]+` self-loops exit on a-z (2 high nibbles): shufti.
-    comptime E = StaticRegex["[^a-z]*[a-z]+"]
+    comptime E = Regex["[^a-z]*[a-z]+"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
         comptime kinds = E._edfa.accel_nib_kind
         comptime has_shufti = ACCEL_SHUFTI in kinds
@@ -179,7 +179,7 @@ def test_shufti_state_pattern() raises:
 def test_nibble_accel_high_bytes() raises:
     # Bytes >= 0x80 (UTF-8 continuation range) in skipped and terminating
     # regions exercise the high-nibble table half.
-    var re = StaticRegex["[^a-z]*[a-z]+"]()
+    var re = Regex["[^a-z]*[a-z]+"]()
     var buf = List[Byte]()
     comptime W = simd_width_of[DType.uint8]()
     for _ in range(2 * W + 3):
@@ -196,7 +196,7 @@ def test_nibble_accel_high_bytes() raises:
 
 def test_dotstar_suffix_still_accelerated() raises:
     # `.*x` keeps its 2-exit-byte compare path alongside nibble accel.
-    comptime E = StaticRegex[".*x"]
+    comptime E = Regex[".*x"]
     comptime n_exit2 = len(E._edfa.accel_states)
     assert_true(n_exit2 >= 1)
     var re = E()
@@ -211,7 +211,7 @@ def test_dotstar_suffix_still_accelerated() raises:
 
 def test_nibble_accel_findall_multiline() raises:
     # Accel must not skip past '\n' boundaries that end matches.
-    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
     var text = "a@b.com\nnope\nlong.user@sub.host.org\n"
     var all = re.findall(text)
     assert_equal(len(all), 2)

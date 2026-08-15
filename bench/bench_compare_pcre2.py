@@ -1,7 +1,7 @@
-"""StaticRegex vs PCRE2 JIT — two-way benchmark comparison.
+"""Regex vs PCRE2 JIT — two-way benchmark comparison.
 
 Builds PCRE2 (if not already built), runs the C benchmark binary and the Mojo
-StaticRegex benchmark suite, then prints a side-by-side comparison table
+Regex benchmark suite, then prints a side-by-side comparison table
 matching the style of bench_compare.py.
 
 Run with:  python3 bench/bench_compare_pcre2.py
@@ -122,7 +122,7 @@ def run_mojo_static_benchmarks() -> dict[str, float]:
     """Run bench_static via pixi and parse its markdown table output."""
     pixi_cmd = shutil.which("pixi")
     if pixi_cmd is None:
-        print("  [warning] pixi not found in PATH — skipping StaticRegex benchmarks.")
+        print("  [warning] pixi not found in PATH — skipping Regex benchmarks.")
         return {}
 
     result = subprocess.run(
@@ -179,10 +179,10 @@ def print_comparison(
     pcre2: dict[str, float],
     static: dict[str, float],
 ) -> None:
-    """Print a two-column comparison: PCRE2 JIT | StaticRegex | ratio | bar.
+    """Print a two-column comparison: PCRE2 JIT | Regex | ratio | bar.
 
     Ratio = PCRE2 time / Static time.
-    >1x means StaticRegex is faster than PCRE2 JIT.
+    >1x means Regex is faster than PCRE2 JIT.
     """
     # Use PCRE2 results as the canonical name list (it runs first/fully)
     all_names = list(pcre2.keys())
@@ -194,7 +194,7 @@ def print_comparison(
 
     header = (
         f"  {'Benchmark':<{col_name}}  {'PCRE2 JIT':>10}  "
-        f"{'StaticRegex':>11}  {'PCRE2/Stat':>10}  Bar (PCRE2÷Static, 10x=full)"
+        f"{'Regex':>11}  {'PCRE2/Stat':>10}  Bar (PCRE2÷Static, 10x=full)"
     )
     sep = "  " + "─" * (col_name + 65)
 
@@ -228,7 +228,7 @@ def print_comparison(
 
     print(sep)
     print(
-        f"  StaticRegex faster: {faster}  |  slower: {slower}"
+        f"  Regex faster: {faster}  |  slower: {slower}"
         + (f"  |  no data: {missing}" if missing else "")
     )
 
@@ -238,8 +238,8 @@ def print_comparison(
 # ---------------------------------------------------------------------------
 
 def build_pdf_table_data(pcre2: dict[str, float], static: dict[str, float]) -> tuple[list, list]:
-    """Build reportlab table and styles for PCRE2 vs StaticRegex."""
-    rows = [["Benchmark", "StaticRegex (µs)", "PCRE2 JIT (µs)", "Ratio"]]
+    """Build reportlab table and styles for PCRE2 vs Regex."""
+    rows = [["Benchmark", "Regex (µs)", "PCRE2 JIT (µs)", "Ratio"]]
     styles = [
         ("BACKGROUND", (0, 0), (-1, 0), gen_pdf.HEADER_BG),
         ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
@@ -305,7 +305,7 @@ def build_pdf_table_data(pcre2: dict[str, float], static: dict[str, float]) -> t
 
         row_idx += 1
 
-    rows.append([f"StaticRegex faster: {faster}  |  slower: {slower}", "", "", ""])
+    rows.append([f"Regex faster: {faster}  |  slower: {slower}", "", "", ""])
     styles += [
         ("BACKGROUND", (0, row_idx), (-1, row_idx), gen_pdf.HEADER_BG),
         ("TEXTCOLOR",  (0, row_idx), (-1, row_idx), colors.white),
@@ -343,8 +343,8 @@ def generate_pdf(pcre2: dict[str, float], static: dict[str, float], output_path:
     )
 
     elements = []
-    elements.append(Paragraph("StaticRegex vs PCRE2 JIT — Benchmark Results", title_style))
-    elements.append(Paragraph("Ratio = PCRE2 JIT ÷ StaticRegex. &gt;1x = StaticRegex faster. JIT compile time excluded.", subtitle_style))
+    elements.append(Paragraph("Regex vs PCRE2 JIT — Benchmark Results", title_style))
+    elements.append(Paragraph("Ratio = PCRE2 JIT ÷ Regex. &gt;1x = Regex faster. JIT compile time excluded.", subtitle_style))
 
     spec_rows = [[Paragraph(f"<b>{k}</b>", spec_style), Paragraph(v, spec_style)] for k, v in specs]
     spec_table = Table(spec_rows, colWidths=[2.5*cm, 14*cm])
@@ -374,15 +374,15 @@ def generate_pdf(pcre2: dict[str, float], static: dict[str, float], output_path:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run and compare StaticRegex to PCRE2 JIT")
+    parser = argparse.ArgumentParser(description="Run and compare Regex to PCRE2 JIT")
     parser.add_argument("--pdf", action="store_true", help="Generate a PDF report as well")
     args = parser.parse_args()
 
     width = 72
     print(f"\n{'═' * width}")
-    print(f"  StaticRegex vs PCRE2 JIT — benchmark comparison")
-    print(f"  Columns: PCRE2 JIT (µs/op)  |  StaticRegex (µs/op)")
-    print(f"  PCRE2/Stat >1x means StaticRegex wins vs PCRE2 JIT")
+    print(f"  Regex vs PCRE2 JIT — benchmark comparison")
+    print(f"  Columns: PCRE2 JIT (µs/op)  |  Regex (µs/op)")
+    print(f"  PCRE2/Stat >1x means Regex wins vs PCRE2 JIT")
     print(f"  JIT compile time is NOT included in PCRE2 measurements")
     print(f"{'═' * width}")
 
@@ -398,7 +398,7 @@ def main() -> None:
     pcre2 = run_pcre2_benchmarks()
 
     print(f"\n{'═' * width}")
-    print(f"  Running StaticRegex benchmarks (pixi run bench)...")
+    print(f"  Running Regex benchmarks (pixi run bench)...")
     print(f"{'═' * width}")
     static = run_mojo_static_benchmarks()
 
@@ -414,7 +414,7 @@ def main() -> None:
     if not pcre2:
         print("\n  [note] PCRE2 data unavailable.")
     if not static:
-        print("\n  [note] StaticRegex data unavailable (pixi run bench_static failed).")
+        print("\n  [note] Regex data unavailable (pixi run bench_static failed).")
 
     if args.pdf:
         if "reportlab" not in sys.modules:

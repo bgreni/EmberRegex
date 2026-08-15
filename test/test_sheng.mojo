@@ -8,7 +8,7 @@ Selection assertions are gated on HAS_FAST_BYTE_SHUFFLE; behavior
 assertions run everywhere.
 """
 
-from emberregex import StaticRegex
+from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from emberregex.sheng import SHENG_STATE_CAP
 from std.sys import simd_width_of
@@ -17,7 +17,7 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 def test_sheng_selected_for_small_alternation() raises:
     # Non-literal alternation (charset arm) so Teddy doesn't claim it.
-    comptime S = StaticRegex["cat|d[ou]g"]
+    comptime S = Regex["cat|d[ou]g"]
     assert_true(S._strategy.use_eager_dfa)
     assert_false(S._strategy.use_teddy)
     comptime n_states = S._edfa.num_states
@@ -28,7 +28,7 @@ def test_sheng_selected_for_small_alternation() raises:
 
 def test_sheng_not_selected_at_state_cap() raises:
     # 16 DFA states: no lane left for the dead state.
-    comptime S = StaticRegex["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"]
+    comptime S = Regex["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"]
     comptime n_states = S._edfa.num_states
     assert_true(n_states >= SHENG_STATE_CAP)
     assert_false(S._strategy.use_sheng)
@@ -39,7 +39,7 @@ def test_sheng_not_selected_at_state_cap() raises:
 
 
 def test_sheng_match_and_search() raises:
-    var re = StaticRegex["cat|dog|bird"]()
+    var re = Regex["cat|dog|bird"]()
     assert_true(re.match("cat").matched)
     assert_true(re.match("bird").matched)
     assert_false(re.match("cow").matched)
@@ -51,7 +51,7 @@ def test_sheng_match_and_search() raises:
 
 
 def test_sheng_findall_and_split() raises:
-    var re = StaticRegex["cat|dog"]()
+    var re = Regex["cat|dog"]()
     var all = re.findall("a cat, a dog, a cat")
     assert_equal(len(all), 3)
     assert_equal(all[0], "cat")
@@ -66,7 +66,7 @@ def test_sheng_findall_and_split() raises:
 def test_sheng_dotstar_suffix_with_accel() raises:
     # `.*x` is a 2-state DFA with an accelerated state: the Sheng walk
     # must interleave correctly with the accel skip.
-    comptime S = StaticRegex[".*x"]
+    comptime S = Regex[".*x"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
         assert_true(S._strategy.use_sheng)
     var re = S()
@@ -81,7 +81,7 @@ def test_sheng_dotstar_suffix_with_accel() raises:
 
 def test_sheng_leftmost_longest() raises:
     # Greedy quantifier with suffix: leftmost-longest end via last_match.
-    var re = StaticRegex["(?:foo|bar|ba+z)+"]()
+    var re = Regex["(?:foo|bar|ba+z)+"]()
     assert_true(re.match("foobarbaaaz").matched)
     assert_false(re.match("foobarx").matched)
     var r = re.search("xxfooyy")
@@ -91,7 +91,7 @@ def test_sheng_leftmost_longest() raises:
 
 
 def test_sheng_eol_anchor() raises:
-    var re = StaticRegex["(?:ab|cd)$"]()
+    var re = Regex["(?:ab|cd)$"]()
     var r = re.search("xxcd")
     assert_true(r.matched)
     assert_equal(r.start, 2)
@@ -100,7 +100,7 @@ def test_sheng_eol_anchor() raises:
 
 
 def test_sheng_multiline_anchors() raises:
-    var re = StaticRegex["(?m)^(?:ab|cd)$"]()
+    var re = Regex["(?m)^(?:ab|cd)$"]()
     var all = re.findall("ab\ncd\nxx\nab")
     assert_equal(len(all), 3)
     assert_equal(all[0], "ab")
@@ -110,7 +110,7 @@ def test_sheng_multiline_anchors() raises:
 
 def test_sheng_dead_state_mid_input() raises:
     # Dying mid-walk must return the best match seen so far, not extend.
-    var re = StaticRegex["ab+c|q"]()
+    var re = Regex["ab+c|q"]()
     var r = re.search("abbbbq")
     assert_true(r.matched)
     assert_equal(r.start, 5)
@@ -120,7 +120,7 @@ def test_sheng_dead_state_mid_input() raises:
 def test_sheng_long_input_boundaries() raises:
     # Walks crossing many W-chunks; match at the very end of input.
     comptime W = simd_width_of[DType.uint8]()
-    var re = StaticRegex["(?:x|y)+z"]()
+    var re = Regex["(?:x|y)+z"]()
     var input = "xy" * (3 * W) + "z"
     var r = re.search(input)
     assert_true(r.matched)
@@ -131,7 +131,7 @@ def test_sheng_long_input_boundaries() raises:
 def test_sheng_high_bytes() raises:
     # Bytes >= 0x80 must transition to the dead state cleanly (lane ids
     # stay < 16 by construction; input bytes only index the mask table).
-    var re = StaticRegex["cat|dog"]()
+    var re = Regex["cat|dog"]()
     var buf = List[Byte]()
     for _ in range(40):
         buf.append(Byte(0xC3))

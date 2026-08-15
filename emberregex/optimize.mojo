@@ -202,9 +202,10 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
             stack.append(nfa.states[s].out1)
         elif kind == NFAStateKind.CHAR:
             heads.append(s)
-        elif kind == NFAStateKind.CHARSET and _charset_filter_byte(
-            nfa, nfa.states[s].charset_index
-        )[0] >= 0:
+        elif (
+            kind == NFAStateKind.CHARSET
+            and _charset_filter_byte(nfa, nfa.states[s].charset_index)[0] >= 0
+        ):
             heads.append(s)  # (?i) case pair or single-member charset
         else:
             return result^
@@ -230,9 +231,7 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
                 cl.append(False)
                 s = nfa.states[s].out1
             elif kind == NFAStateKind.CHARSET:
-                var fb = _charset_filter_byte(
-                    nfa, nfa.states[s].charset_index
-                )
+                var fb = _charset_filter_byte(nfa, nfa.states[s].charset_index)
                 if fb[0] < 0:
                     return result^
                 bytes.append(fb[0])
@@ -293,9 +292,10 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
             stack.append(nfa.states[s].out1)
         elif kind == NFAStateKind.CHAR:
             heads.append(s)
-        elif kind == NFAStateKind.CHARSET and _charset_filter_byte(
-            nfa, nfa.states[s].charset_index
-        )[0] >= 0:
+        elif (
+            kind == NFAStateKind.CHARSET
+            and _charset_filter_byte(nfa, nfa.states[s].charset_index)[0] >= 0
+        ):
             heads.append(s)  # (?i) case pair or single-member charset
         else:
             return result^
@@ -324,9 +324,7 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
                 cl.append(False)
                 s = nfa.states[s].out1
             elif kind == NFAStateKind.CHARSET:
-                var fb = _charset_filter_byte(
-                    nfa, nfa.states[s].charset_index
-                )
+                var fb = _charset_filter_byte(nfa, nfa.states[s].charset_index)
                 if fb[0] < 0:
                     break  # unfilterable charset ends the chain
                 bytes.append(fb[0])

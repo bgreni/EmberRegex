@@ -1,24 +1,24 @@
 """Tests for engine selection paths: DFA, SIMD literal, and PikeVM fallback on pathological patterns."""
 
-from emberregex import StaticRegex
+from emberregex import Regex
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 from std.sys import simd_width_of
 
 
 def test_dfa_simple_no_capture() raises:
-    var re = StaticRegex["[a-z]+"]()
+    var re = Regex["[a-z]+"]()
     assert_true(re.match("hello").matched)
     assert_true(re.search("123abc456").matched)
 
 
 def test_dfa_optional_chain() raises:
-    var re = StaticRegex["a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaa"]()
+    var re = Regex["a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaa"]()
     assert_true(re.match("aaaaaaaaaaaaaaaa").matched)
     assert_false(re.match("aaaaaaaaaaaaaaab").matched)
 
 
 def _do_simd_literal_test[LIT: String, W: Int]() raises:
-    var re = StaticRegex[LIT]()
+    var re = Regex[LIT]()
     var s = String(LIT)
 
     assert_true(re.match(s).matched)
@@ -62,21 +62,21 @@ def test_simd_width_literal() raises:
 
 
 def test_pathological_match() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     assert_true(re.match("aaa").matched)
     assert_false(re.match("aaab").matched)
     assert_false(re.match("").matched)
 
 
 def test_pathological_search() raises:
-    var re = StaticRegex["(a|aa)+"]()
+    var re = Regex["(a|aa)+"]()
     var result = re.search("baaac")
     assert_true(result.matched)
     assert_equal(result.start, 1)
 
 
 def test_pathological_findall() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     var matches = re.findall("aaa bbb aaa")
     assert_equal(len(matches), 2)
     assert_equal(matches[0], "aaa")
@@ -84,12 +84,12 @@ def test_pathological_findall() raises:
 
 
 def test_pathological_replace() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     assert_equal(re.replace("aaa bbb aaa", "X"), "X bbb X")
 
 
 def test_pathological_split() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     var parts = re.split("xaaay")
     assert_equal(len(parts), 2)
     assert_equal(parts[0], "x")
@@ -97,7 +97,7 @@ def test_pathological_split() raises:
 
 
 def test_pike_fallback_match() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     var input = "a" * 30
     var result = re.match(input)
     assert_true(result.matched)
@@ -106,13 +106,13 @@ def test_pike_fallback_match() raises:
 
 
 def test_pike_fallback_no_match() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     var input = "a" * 30 + "b"
     assert_false(re.match(input).matched)
 
 
 def test_pike_fallback_search() raises:
-    var re = StaticRegex["(a+)+"]()
+    var re = Regex["(a+)+"]()
     var input = "bbb" + "a" * 20 + "bbb"
     var result = re.search(input)
     assert_true(result.matched)
@@ -121,7 +121,7 @@ def test_pike_fallback_search() raises:
 
 
 def test_pike_fallback_anchored_no_match() raises:
-    var re = StaticRegex["(a+)+$"]()
+    var re = Regex["(a+)+$"]()
     var input = "a" * 30 + "b"
     assert_false(re.match(input).matched)
 
@@ -132,7 +132,7 @@ def test_pike_unanchored_search_with_captures() raises:
     # winning thread's start and capture slots must survive the injection
     # machinery. (CPython's re explodes exponentially on this input, so
     # the expectation is hand-derived: leftmost (a+)+b match is "aab".)
-    var re = StaticRegex["((a+)+b)"]()
+    var re = Regex["((a+)+b)"]()
     var input = "a" * 40 + " aab"
     var r = re.search(input)
     assert_true(r.matched)
@@ -146,7 +146,7 @@ def test_search_run_skip_multiline_arm_sheng() raises:
     # Regression: the DFA search run-skip must not jump over a `(?m)^` arm
     # match that starts inside a run whose class contains '\n'. Small DFA,
     # so this exercises the Sheng search path.
-    var re = StaticRegex["(?m)^az|[a\\ny]+y"]()
+    var re = Regex["(?m)^az|[a\\ny]+y"]()
     var result = re.search("wa\nazQ")
     assert_true(result.matched)
     assert_equal(result.start, 3)
@@ -156,7 +156,7 @@ def test_search_run_skip_multiline_arm_sheng() raises:
 def test_search_run_skip_multiline_arm_eager() raises:
     # Same regression on the eager table walker: the long literal arm
     # pushes the DFA past the Sheng state cap.
-    var re = StaticRegex["(?m)^azqqqqqqqqqqqqqqqqqq|[a\\ny]+y"]()
+    var re = Regex["(?m)^azqqqqqqqqqqqqqqqqqq|[a\\ny]+y"]()
     var result = re.search("wa\nazqqqqqqqqqqqqqqqqqqQ")
     assert_true(result.matched)
     assert_equal(result.start, 3)
@@ -166,7 +166,7 @@ def test_search_run_skip_multiline_arm_eager() raises:
 def test_pivot_prefilter_email() raises:
     # Pivot-anchored search prefilter (`[class]+ @ …` shape). Expected
     # spans are CPython outputs.
-    var re = StaticRegex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
     var r1 = re.search("contact us at support@example.com for help")
     assert_equal(r1.start, 14)
     assert_equal(r1.end, 33)
@@ -197,7 +197,7 @@ def test_pivot_forced_chain_url() raises:
     # `[a-z]+://[a-z.]+` pivots on ':' with forced chain "//": lone colons
     # (timestamps) are rejected without an anchored attempt. Expected
     # values are CPython outputs.
-    var re = StaticRegex["[a-z]+://[a-z.]+"]()
+    var re = Regex["[a-z]+://[a-z.]+"]()
     var r1 = re.search("visit http://example.com now")
     assert_equal(r1.start, 6)
     assert_equal(r1.end, 24)
@@ -212,11 +212,11 @@ def test_pivot_forced_chain_url() raises:
 
 
 def test_pivot_prefilter_simple_shapes() raises:
-    var re1 = StaticRegex["\\w+@\\w+"]()
+    var re1 = Regex["\\w+@\\w+"]()
     var r1 = re1.search("hi bob@mail ok")
     assert_equal(r1.start, 3)
     assert_equal(r1.end, 11)
-    var re2 = StaticRegex["[0-9]+:[a-z]+"]()
+    var re2 = Regex["[0-9]+:[a-z]+"]()
     var r2 = re2.search("a 12:go b")
     assert_equal(r2.start, 2)
     assert_equal(r2.end, 7)
@@ -225,20 +225,20 @@ def test_pivot_prefilter_simple_shapes() raises:
 def test_teddy_prefix_prefilter() raises:
     # An alternation-of-literals *prefix* is Teddy-scanned; the engine
     # verifies at candidates. Expected values are CPython outputs.
-    var re = StaticRegex["(?:GET|POST|PUT) /\\w+"]()
+    var re = Regex["(?:GET|POST|PUT) /\\w+"]()
     assert_true(re._strategy.use_teddy_prefix)
     var r = re.search("log: GET /home ok")
     assert_equal(r.start, 5)
     assert_equal(r.end, 14)
     assert_false(re.search("no methods here").matched)
-    var re2 = StaticRegex["(?:GET|POST) /\\w+"]()
+    var re2 = Regex["(?:GET|POST) /\\w+"]()
     var all = re2.findall("GET /a POST /b GET /c")
     assert_equal(len(all), 3)
     assert_equal(all[0], "GET /a")
     assert_equal(all[1], "POST /b")
     assert_equal(all[2], "GET /c")
     # Overlapping-chain arms.
-    var re3 = StaticRegex["(?:cat|category)x"]()
+    var re3 = Regex["(?:cat|category)x"]()
     var r3 = re3.search("a categoryx b")
     assert_equal(r3.start, 2)
     assert_equal(r3.end, 11)
@@ -247,7 +247,7 @@ def test_teddy_prefix_prefilter() raises:
 def test_teddy_prefix_backtracker_lane() raises:
     # With capture groups the pattern runs the backtracker; the Teddy
     # prefilter supplies its candidates.
-    var re = StaticRegex["(GET|POST) (\\w+)"]()
+    var re = Regex["(GET|POST) (\\w+)"]()
     var input = "x POST data y"
     var r = re.search(input)
     assert_equal(r.start, 2)
@@ -260,7 +260,7 @@ def test_deep_recursion_falls_back_to_pike() raises:
     # Non-simple loops recurse once per consumed byte; long inputs must hit
     # the SBT depth cap and fall back to the Pike VM instead of blowing the
     # stack (this input crashed before the cap existed).
-    var re = StaticRegex["(?:ab)+"]()
+    var re = Regex["(?:ab)+"]()
     var big = "ab" * 25000
     assert_true(re.match(big).matched)
     assert_false(re.match(big + "a").matched)
@@ -273,7 +273,7 @@ def test_deep_recursion_falls_back_to_pike() raises:
 def test_search_run_skip_class_arm_still_matches() raises:
     # Positive control: the class arm itself still matches, including
     # across a newline inside the run.
-    var re = StaticRegex["(?m)^az|[a\\ny]+y"]()
+    var re = Regex["(?m)^az|[a\\ny]+y"]()
     var r1 = re.search("waayy")
     assert_true(r1.matched)
     assert_equal(r1.start, 1)

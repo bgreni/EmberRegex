@@ -4,7 +4,7 @@ Each test names the bug it guards against. Expected values were verified
 against Python's `re` module.
 """
 
-from emberregex import StaticRegex
+from emberregex import Regex
 from emberregex.parser import parse
 from std.testing import (
     assert_equal,
@@ -21,7 +21,7 @@ from std.testing import (
 
 
 def test_dfa_search_overlapping_start() raises:
-    var re = StaticRegex["aab|x"]()
+    var re = Regex["aab|x"]()
     var r = re.search("aaab")
     assert_true(r.matched)
     assert_equal(r.start, 1)
@@ -29,7 +29,7 @@ def test_dfa_search_overlapping_start() raises:
 
 
 def test_dfa_findall_overlapping_start() raises:
-    var re = StaticRegex["aab|x"]()
+    var re = Regex["aab|x"]()
     var all = re.findall("aaab")
     assert_equal(len(all), 1)
     assert_equal(all[0], "aab")
@@ -37,7 +37,7 @@ def test_dfa_findall_overlapping_start() raises:
 
 def test_dfa_search_longer_partial_overlap() raises:
     # Dies 3 bytes into the failed attempt at 0; match starts at 2.
-    var re = StaticRegex["ababc|q"]()
+    var re = Regex["ababc|q"]()
     var r = re.search("abababc")
     assert_true(r.matched)
     assert_equal(r.start, 2)
@@ -49,7 +49,7 @@ def test_dfa_search_longer_partial_overlap() raises:
 
 
 def test_fullmatch_alternation_prefers_shorter_branch() raises:
-    var re = StaticRegex["(a|ab)"]()
+    var re = Regex["(a|ab)"]()
     var r = re.match("ab")
     assert_true(r.matched)
     assert_equal(r.group_str("ab", 1), "ab")
@@ -58,20 +58,20 @@ def test_fullmatch_alternation_prefers_shorter_branch() raises:
 
 
 def test_fullmatch_lazy_star() raises:
-    var re = StaticRegex["a*?"]()
+    var re = Regex["a*?"]()
     assert_true(re.match("aaa").matched)
     assert_true(re.match("").matched)
     assert_false(re.match("aab").matched)
 
 
 def test_fullmatch_lazy_plus_with_suffix() raises:
-    var re = StaticRegex["a+?b"]()
+    var re = Regex["a+?b"]()
     assert_true(re.match("aaab").matched)
     assert_false(re.match("aaa").matched)
 
 
 def test_fullmatch_nested_alternation() raises:
-    var re = StaticRegex["(x|xy)(z|yz)"]()
+    var re = Regex["(x|xy)(z|yz)"]()
     # Needs x + yz; leftmost-first would try xy + ... and x + z first.
     var r = re.match("xyz")
     assert_true(r.matched)
@@ -80,10 +80,10 @@ def test_fullmatch_nested_alternation() raises:
 
 
 def test_fullmatch_eol_anchor_still_works() raises:
-    var re = StaticRegex["a*$"]()
+    var re = Regex["a*$"]()
     assert_true(re.match("aaa").matched)
     assert_false(re.match("aab").matched)
-    var re2 = StaticRegex["(?m)a*$"]()
+    var re2 = Regex["(?m)a*$"]()
     assert_true(re2.match("aa").matched)
     assert_false(re2.match("aa\nb").matched)
 
@@ -91,7 +91,7 @@ def test_fullmatch_eol_anchor_still_works() raises:
 def test_search_still_leftmost_first() raises:
     # search (backtracker path, has captures) keeps Python semantics:
     # the first alternative wins even though a longer match exists.
-    var re = StaticRegex["(a|ab)"]()
+    var re = Regex["(a|ab)"]()
     var r = re.search("ab")
     assert_true(r.matched)
     assert_equal(r.start, 0)
@@ -102,7 +102,7 @@ def test_search_still_leftmost_first() raises:
 
 
 def test_sandwich_word_boundary_not_skipped() raises:
-    var re = StaticRegex["(?s)abc.*\\bxyz"]()
+    var re = Regex["(?s)abc.*\\bxyz"]()
     # q|x is not a word boundary -> no match (old code said match)
     assert_false(re.match("abcqxyz").matched)
     # ' '|x is a word boundary -> match
@@ -110,7 +110,7 @@ def test_sandwich_word_boundary_not_skipped() raises:
 
 
 def test_sandwich_still_used_for_plain_patterns() raises:
-    var re = StaticRegex["(?s)abc.*xyz"]()
+    var re = Regex["(?s)abc.*xyz"]()
     assert_true(re._strategy.use_sandwich_match)
     assert_true(re.match("abcxyz").matched)
     assert_true(re.match("abc123xyz").matched)
@@ -122,7 +122,7 @@ def test_sandwich_still_used_for_plain_patterns() raises:
 def test_sandwich_leading_and_trailing_line_anchors_ok() raises:
     # ^ before any prefix char and $ after the suffix are implied by the
     # full-input check, so the sandwich stays valid and correct.
-    var re = StaticRegex["^abc(?s).*xyz$"]()
+    var re = Regex["^abc(?s).*xyz$"]()
     assert_true(re.match("abcMxyz").matched)
     assert_false(re.match("Xabcxyz").matched)
 
@@ -131,7 +131,7 @@ def test_sandwich_leading_and_trailing_line_anchors_ok() raises:
 
 
 def test_backref_empty_group_first_byte() raises:
-    var re = StaticRegex["(x?)\\1abc"]()
+    var re = Regex["(x?)\\1abc"]()
     var r = re.search("abc")
     assert_true(r.matched)
     assert_equal(r.start, 0)
@@ -157,7 +157,7 @@ def test_invalid_backref_rejected_by_parser() raises:
 
 def test_icase_partial_range_folding() raises:
     # [?-B] covers ?@AB; icase adds only a,b — not C-Z or punctuation.
-    var re = StaticRegex["(?i)[?-B]"]()
+    var re = Regex["(?i)[?-B]"]()
     assert_true(re.match("?").matched)
     assert_true(re.match("A").matched)
     assert_true(re.match("a").matched)
@@ -169,7 +169,7 @@ def test_icase_partial_range_folding() raises:
 
 def test_icase_partial_range_folding_lowercase_side() raises:
     # [x-{] covers x,y,z,{; icase adds only X,Y,Z.
-    var re = StaticRegex["(?i)[x-{]"]()
+    var re = Regex["(?i)[x-{]"]()
     assert_true(re.match("y").matched)
     assert_true(re.match("Y").matched)
     assert_true(re.match("{").matched)
@@ -178,7 +178,7 @@ def test_icase_partial_range_folding_lowercase_side() raises:
 
 
 def test_icase_full_range_still_folds() raises:
-    var re = StaticRegex["(?i)[a-z]+"]()
+    var re = Regex["(?i)[a-z]+"]()
     assert_true(re.match("MiXeD").matched)
 
 
@@ -186,7 +186,7 @@ def test_icase_full_range_still_folds() raises:
 
 
 def test_findall_multiline_back_to_back_lines() raises:
-    var re = StaticRegex["(?m)^ab\\n"]()
+    var re = Regex["(?m)^ab\\n"]()
     var all = re.findall("ab\nab\n")
     assert_equal(len(all), 2)
     assert_equal(all[0], "ab\n")
@@ -195,7 +195,7 @@ def test_findall_multiline_back_to_back_lines() raises:
 
 def test_findall_multiline_dfa_path() raises:
     # Alternation with no captures selects the DFA engine.
-    var re = StaticRegex["(?m)^(?:ab|cd)\\n"]()
+    var re = Regex["(?m)^(?:ab|cd)\\n"]()
     assert_true(re._strategy.use_dfa)
     var all = re.findall("ab\ncd\nab\n")
     assert_equal(len(all), 3)
@@ -203,7 +203,7 @@ def test_findall_multiline_dfa_path() raises:
 
 
 def test_findall_multiline_nonadjacent_still_works() raises:
-    var re = StaticRegex["(?m)^ab"]()
+    var re = Regex["(?m)^ab"]()
     var all = re.findall("ab\nxx\nab")
     assert_equal(len(all), 2)
 
@@ -214,7 +214,7 @@ def test_findall_multiline_nonadjacent_still_works() raises:
 def test_pike_fallback_findall_advances() raises:
     # 40 a's with no b exhausts the backtracker budget ((a+)+ is
     # exponential), forcing the Pike fallback for the whole findall.
-    var re = StaticRegex["(a+)+b"]()
+    var re = Regex["(a+)+b"]()
     var input = String()
     for _ in range(40):
         input += "a"
@@ -226,7 +226,7 @@ def test_pike_fallback_findall_advances() raises:
 
 
 def test_pike_fallback_search_finds_later_match() raises:
-    var re = StaticRegex["(a+)+b"]()
+    var re = Regex["(a+)+b"]()
     var input = String()
     for _ in range(40):
         input += "a"
@@ -242,8 +242,8 @@ def test_pike_fallback_search_finds_later_match() raises:
 
 
 def test_class_shorthand_negated_digit_high_bytes() raises:
-    var re_bare = StaticRegex["\\D+"]()
-    var re_class = StaticRegex["[\\D]+"]()
+    var re_bare = Regex["\\D+"]()
+    var re_class = Regex["[\\D]+"]()
     var high = String(chr(200))  # 2 UTF-8 bytes, both >= 0x80
     assert_true(re_bare.match(high).matched)
     assert_true(re_class.match(high).matched)
@@ -263,7 +263,7 @@ def test_bad_range_with_shorthand_rejected() raises:
 
 
 def test_dfa_search_leftmost_first_end() raises:
-    var re = StaticRegex["a|ab"]()
+    var re = Regex["a|ab"]()
     assert_true(re._strategy.use_dfa)
     var r = re.search("ab")
     assert_true(r.matched)
@@ -272,7 +272,7 @@ def test_dfa_search_leftmost_first_end() raises:
 
 
 def test_dfa_findall_leftmost_first_tokenization() raises:
-    var re = StaticRegex["a|ab"]()
+    var re = Regex["a|ab"]()
     var all = re.findall("abab")
     # Python: ['a', 'a'] — matching "a" at 0 then rescanning from 1
     assert_equal(len(all), 2)
@@ -281,7 +281,7 @@ def test_dfa_findall_leftmost_first_tokenization() raises:
 
 
 def test_dfa_split_leftmost_first() raises:
-    var re = StaticRegex["-|--"]()
+    var re = Regex["-|--"]()
     assert_true(re._strategy.use_dfa)
     var parts = re.split("a--b")
     # Python: ['a', '', 'b'] — two single-dash delimiters, not one "--"
@@ -292,7 +292,7 @@ def test_dfa_split_leftmost_first() raises:
 
 
 def test_dfa_search_empty_first_alternative() raises:
-    var re = StaticRegex["(?:|a)"]()
+    var re = Regex["(?:|a)"]()
     var r = re.search("a")
     assert_true(r.matched)
     assert_equal(r.start, 0)
@@ -301,12 +301,12 @@ def test_dfa_search_empty_first_alternative() raises:
 
 def test_dfa_longest_alternative_still_reachable() raises:
     # When the longer alternative is listed first, it wins — same as Python.
-    var re = StaticRegex["ab|a"]()
+    var re = Regex["ab|a"]()
     var r = re.search("ab")
     assert_true(r.matched)
     assert_equal(r.end, 2)
     # And fullmatch is unaffected by end disambiguation either way.
-    var re2 = StaticRegex["a|ab"]()
+    var re2 = Regex["a|ab"]()
     assert_true(re2.match("ab").matched)
 
 
@@ -317,7 +317,7 @@ def test_dfa_state_cap_falls_back() raises:
     # (?:a|b)*a(?:a|b){12} needs ~2^13 DFA states on high-entropy input,
     # blowing the 4096-state cache cap. The engine must fall back to the
     # Pike VM and still report the correct answer.
-    var re = StaticRegex["(?:a|b)*a(?:a|b){12}"]()
+    var re = Regex["(?:a|b)*a(?:a|b){12}"]()
     assert_true(re._strategy.use_dfa)
     var input = String()
     var seed = 12345
@@ -341,7 +341,7 @@ def test_dfa_state_cap_falls_back() raises:
 
 
 def test_pure_literal_engine_after_scan_rewrite() raises:
-    var re = StaticRegex["abcd"]()
+    var re = Regex["abcd"]()
     assert_true(re._strategy.use_simd_literal)
     var r = re.search("aaaabcd")
     assert_true(r.matched)

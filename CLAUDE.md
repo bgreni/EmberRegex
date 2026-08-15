@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 pixi run test          # run all tests
-pixi run bench         # StaticRegex benchmark suite
+pixi run bench         # single-pattern (`Regex`) benchmark suite
 pixi run bench_all     # run all benchmarks
 
 # Run a single test file
@@ -22,7 +22,7 @@ python3 bench/bench_compare.py
 
 The pipeline is: **pattern string → Parser → AST → NFA → (engine selection) → match**.
 
-All parsing and NFA construction happen at **compile time** inside `StaticRegex[pattern]` field initializers. Invalid patterns abort at compile time rather than raising at runtime.
+All parsing and NFA construction happen at **compile time** inside `Regex[pattern]` field initializers. Invalid patterns abort at compile time rather than raising at runtime.
 
 ### 1. Parser (`parser.mojo`)
 
@@ -42,7 +42,7 @@ The NFA records capability flags used for engine selection:
 - `needs_backtrack` — true when the pattern contains backreferences
 - `start_anchor` — leading anchor kind (`BOL`, `BOL_MULTILINE`, or `-1`), used for position-skip optimizations
 
-### 3. Engine selection (`engine.mojo` — `StaticRegex`)
+### 3. Engine selection (`engine.mojo` — `Regex`)
 
 Engine selection happens at compile time via `comptime if` branches:
 
@@ -62,7 +62,9 @@ Engine selection happens at compile time via `comptime if` branches:
 
 **Pike VM** (`executor.mojo`) — fallback for patterns where the specialized backtracker exhausts its budget (e.g. pathological patterns like `(a+)+`). Parallel NFA simulation: two lists of `(state_idx, slots)` pairs swap at each input byte. Capture positions are carried per-thread through SAVE states via `_add_state()`.
 
-**Specialized backtracker** (`backtrack.mojo`) — `_sbt_try_match[nfa, state_idx, num_slots]` is specialized per NFA state via comptime parameters and `@always_inline`. Each state becomes a distinct function instantiation; the compiler eliminates dead branches and collapses all recursive calls into a single inlined function with zero runtime dispatch.
+**Specialized backtracker** (`backtrack.mojo`) — `_sbt_try_match[nfa, state_idx, num_slots]` is specialized per NFA state via comptime parameters. Each state becomes a distinct function instantiation whose body is a `comptime if` chain over the state kind, so every branch belonging to the other kinds is eliminated and what remains is straight-line code for that one state with its fields baked in — no runtime dispatch on state kind. The leaf primitives (`_sbt_bitmap_check`, `_sbt_check_anchor`, case folding) are `@always_inline` and fold into that code, and the acyclic parts of the call graph are small and terminating, so chains inline aggressively.
+
+It is **not** flattened into a single function, and `_sbt_try_match` itself is deliberately not `@always_inline`. A cyclic SPLIT can reach its own instantiation, so the general-SPLIT branch is real recursion: that is why `SBT_MAX_DEPTH` (10,000) exists as a *stack* bound distinct from `SBT_BUDGET`, and why `(?:ab)+` on 50KB once overflowed the stack (see ROADMAP.md). Two cyclic shapes escape it — a greedy or lazy SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back compiles to iteration (`is_simple_loop` / `is_simple_lazy`), which is what `_sbt_needs_depth_guard` keys off to skip depth tracking entirely.
 
 ### 5. Result (`result.mojo`)
 `MatchResult` stores a flat `slots: List[Int]` — pairs of `[start, end]` byte offsets, one pair per group. Group 0 is the full match. `group_str(input, n)` slices the input using those offsets.

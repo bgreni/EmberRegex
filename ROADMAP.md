@@ -5,6 +5,12 @@ implemented and extended). This file records what is left after the
 July 2026 review-and-optimize pass, in value order, with the measured
 findings and soundness conditions that future work must respect.
 
+**2026-07 pivot**: single-pattern performance work is paused in favor of
+the multi-pattern ("Hyperscan mode") effort — see `MULTIPATTERN_PLAN.md`.
+Item 1 below (reverse-inner-literal prefilter) shares its
+reverse-determinization machinery with that plan's phase 4 (SOM); build
+it once with both consumers in mind.
+
 Current state for calibration: 380 tests (expectations CPython-verified),
 the last PCRE2 loss row flipped (email search 49x via the pivot
 prefilter), engine ladder = sandwich/pure-literal → Teddy (incl. caseless

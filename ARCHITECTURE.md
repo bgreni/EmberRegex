@@ -1,356 +1,311 @@
 # EmberRegex Architecture
 
-A high-performance regex library for Mojo with four matching engines selected automatically based on pattern features.
+Two public entry points, one shared front end:
 
-## Pipeline Overview
+- **`Regex[pattern]`** — a single pattern, matched with Python-style
+  leftmost-first semantics.
+- **`RegexSet[patterns]`** — a multi-pattern database in the shape of
+  Intel Hyperscan: scan once, report every pattern that matches and where.
+
+Everything — parsing, NFA construction, determinization, table generation,
+engine selection — happens **at compile time**, inside `comptime` field
+initializers. An invalid pattern is a compile error, not a runtime
+exception, and the emitted binary contains the automaton as constant data.
+
+---
+
+## Shared front end
 
 ```
-Pattern String
-    │
-    ├──── StringLiteral? ──────────────────────────────────────────┐
-    │                                                               │
-    ▼                                                               ▼
-┌──────────────────┐                                   ┌──────────────────────┐
-│  Parser          │  Recursive descent                │  StaticRegex         │
-│  (parser.mojo)   │  Extracts inline flags, groups    │  (static.mojo)       │
-└────────┬─────────┘                                   │  Runs pipeline at    │
-         │                                             │  *compile time*      │
-         ▼                                             └──────────┬───────────┘
-┌──────────────────┐                                              │
-│  AST             │  Flat-pool of ASTNode + CharSet              │ (same parser/NFA
-│  (ast.mojo)      │                                              │  but comptime)
-└────────┬─────────┘                                              │
-         │                                                        ▼
-         ▼                                             ┌──────────────────────┐
-┌──────────────────┐                                   │  Specialized         │
-│  NFA Builder     │  Thompson's construction          │  Backtracking Engine │
-│  (nfa.mojo)      │  Capability flags, start_anchor   │  (static_backtrack)  │
-└────────┬─────────┘                                   │  Per-state comptime  │
-         │                                             │  specialization      │
-         ▼                                             └──────────┬───────────┘
-┌──────────────────┐                                              │
-│  CompiledRegex   │  Engine selection + acceleration             │
-│  (compile.mojo)  │  Builds one-pass NFA if eligible             │
-└────────┬─────────┘                                              │
-         │                                                        │
-    ┌────┴────┬────────────┬───────────────┐                      │
-    ▼         ▼            ▼               ▼                      │
-┌────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐            │
-│Lazy DFA│ │One-Pass  │ │ Pike VM  │ │ Backtracking │            │
-│  O(n)  │ │  NFA     │ │ captures │ │ backrefs     │            │
-│anchors │ │ captures │ │          │ │              │            │
-└────────┘ └──────────┘ └──────────┘ └──────────────┘            │
-    │           │            │               │                    │
-    └────┬──────┴────────────┴───────────────┴────────────────────┘
-         ▼
-┌──────────────────┐
-│  MatchResult     │  Flat slots array: [g1_start, g1_end, g2_start, g2_end, ...]
-│  (result.mojo)   │
-└──────────────────┘
+pattern string
+     │
+     ▼
+  parser.mojo      recursive descent; grammar is
+     │             alternation > concat > quantified > atom.
+     │             Extracts inline flags ((?i)(?m)(?s)(?x)), named groups,
+     │             POSIX classes, (?# comments).
+     ▼
+   ast.mojo        flat pool of ASTNode + CharSet, indexed by integer
+     │             rather than pointer (cache locality, and comptime-
+     │             friendly — the interpreter handles Lists of PODs well).
+     ▼
+   nfa.mojo        Thompson's construction into NFAFragment values.
+     │             Records the capability flags engine selection reads:
+     │             can_use_dfa, has_lazy, start_anchor.
+     ▼
+ engine selection  (comptime if — see below)
 ```
 
-## Engine Selection
+Flag-dependent behaviour is **baked into the states**, never checked at
+runtime: `(?m)` picks `BOL_MULTILINE` over `BOL`, `(?i)` turns a literal
+into a two-member charset, `(?s)` turns `.` into a full-byte charset.
+`\A` and `\z` lower to plain `BOL`/`EOL` and deliberately skip the
+multiline promotion, which is the only difference between them and `^`/`$`.
 
-Chosen at compile time based on NFA capability flags:
+`CharSet` stores sorted non-overlapping ranges plus a 256-bit SIMD bitmap
+for O(1) byte membership. `MatchResult` stores a flat `slots` list — pairs
+of `[start, end]` byte offsets, one pair per group, group 0 being the whole
+match.
+
+### UTF-8 mode (`utf8.mojo`, `unicode_tables.mojo`)
+
+Every engine here is byte-oriented — that is what makes the DFA tables and
+the SIMD kernels work at all. `(?u)` does not change that; it changes what
+the *compiler emits*. A codepoint range becomes an alternation of byte-range
+SEQUENCES, so `[α-ω]` is one automaton over bytes rather than a byte class
+that would happily match a lone continuation byte:
+
+```
+[α-ω]  ->  CE B1-BF        (U+03B1 .. U+03BF)
+        |  CF 80-89        (U+03C0 .. U+03C9)
+```
+
+Two things make this affordable for the large Unicode classes:
+
+- **Prefix factoring** (`_utf8_trie_fragment` in `nfa.mojo`). One chain per
+  sequence is the obvious construction and it does not scale: `\p{L}` is 836
+  sequences ≈ 3600 states behind an 836-way SPLIT chain, so every epsilon
+  closure walks all 836 alternatives. Factoring the shared leading byte
+  range (`a·X | a·Y` → `a·(X|Y)`) gives ~1240 states behind a 35-way split.
+  Grouping is by exact range equality — always a valid factoring, and the
+  right one here because UTF-8 sequence sets share whole lead ranges rather
+  than partially overlapping them. Within a bucket every sequence has the
+  same length, because UTF-8 encodes length in the lead byte and the
+  lead-byte ranges for lengths 1/2/3/4 are disjoint; the code checks that
+  invariant rather than silently corrupting the NFA if it ever breaks.
+- **Surrogates are excluded.** U+D800..U+DFFF are not Unicode scalar values
+  and have no UTF-8 encoding, so `utf8_ranges` cuts the block out of any
+  range that spans it (`\p{Any}`, `\p{C}`, `.` under DOTALL). Emitting them
+  would build an automaton accepting `ED A0 80` — ill-formed UTF-8.
+
+Property tables are **generated** from the UCD (`tools/gen_unicode_tables.py`
+→ `unicode_tables.mojo`, Unicode 17.0) and checked in, so a build needs no
+Python. They cover every general category and 43 scripts. Everything comes
+from ONE source (the `regex` module): deriving categories from CPython's
+`unicodedata` and scripts from `regex` was tried first and is a trap — they
+are independent UCD copies on independent release cadences, and were 15.1.0
+vs 17.0 here, disagreeing on 24 ranges of `\p{L}` alone. The generator
+cross-checks each major category against the union of its subcategories.
+
+Big classes still cost real compile time (`\p{Lu}` ≈ 3 min), because all the
+automaton construction is comptime work. Lookbehind is refused in UTF-8
+mode: it needs a fixed byte width and a codepoint class spans 1-4.
+
+---
+
+## Single-pattern engines (`Regex`)
+
+Selected fastest-first at compile time:
 
 | Condition | Engine | File |
-|---|---|---|
-| Pattern has backreferences (`\1`) | Backtracking | `backtrack.mojo` |
-| No captures, no lookaround, no word-boundary anchors | Lazy DFA | `dfa.mojo` |
-| One-pass eligible with captures (DFA-compatible + no lazy quantifiers) | One-Pass NFA | `onepass.mojo` |
-| Patterns with captures or lookaround | Pike VM | `executor.mojo` |
+| --- | --- | --- |
+| pattern is a literal string | SIMD literal scan | `simd_scan.mojo` |
+| `prefix + .* + suffix` | sandwich (startswith/endswith) | `optimize.mojo` |
+| alternation of literals | Teddy nibble shuffles | `teddy.mojo` |
+| ≤ 16 DFA states, shuffle target | Sheng | `sheng.mojo` |
+| `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA | `static_dfa.mojo` |
+| `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
+| backrefs / lookaround / captures | specialized backtracker | `backtrack.mojo` |
+| backtracker budget exhausted | Pike VM | `executor.mojo` |
 
-Notes:
-- Simple line anchors (`^`, `$`, `^` with MULTILINE, `$` with MULTILINE) do **not** prevent DFA use — they are handled directly by the DFA engine.
-- Word boundary anchors (`\b`, `\B`) prevent DFA use and fall back to Pike VM.
-- The hybrid search path uses DFA to find match boundaries, then one-pass NFA (or Pike VM) only at confirmed positions to extract captures.
+**The eager DFA is the interesting one.** Subset construction runs in the
+comptime interpreter over the comptime NFA; byte equivalence classes bound
+the per-state work; the transition table and per-state flag bytes
+materialize as constant data. The runtime engine is a pure table walk with
+no lazy construction and no fallible path. Two structural optimizations:
+match states are permuted to ids `[0, num_match_states)` so the per-byte
+match test is an integer compare, and states that self-loop on all but a
+few bytes are **accelerated** — the walker SIMD-scans to the next exit byte
+instead of stepping the table.
 
-## Modules
+The **specialized backtracker** is comptime-specialized per NFA state: each
+`_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind
+with all fields baked in. The body is a `comptime if` chain over the kind, so
+every branch belonging to the other kinds is eliminated — what survives is
+straight-line code for that state, with no runtime dispatch on kind and no
+field loads for branches that no longer exist. The leaf primitives
+(`_sbt_bitmap_check`, `_sbt_check_anchor`, case folding) are `@always_inline`,
+and the acyclic parts of the call graph are small and terminating, so chains
+inline aggressively.
 
-### Parser (`parser.mojo`)
+What it is *not* is one flat function — `_sbt_try_match` carries no
+`@always_inline`, and could not honour one: a cyclic SPLIT reaches its own
+instantiation, which is unflattenable in principle. So the general-SPLIT
+branch is genuine recursion, and the engine carries **two** independent caps:
+`SBT_BUDGET` bounds total work, while `SBT_MAX_DEPTH` bounds the *stack* —
+budget alone does not, since `(?:ab)+` recurses once per byte consumed and has
+overflowed the stack on a 50KB input. Exhausting either falls through to the
+Pike VM. Two cyclic shapes avoid the recursion altogether: a greedy or lazy
+SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
+`while` loop (`is_simple_loop` / `is_simple_lazy`), so `a+`, `[a-z]*` and
+`.*?` iterate. `_sbt_needs_depth_guard` keys off exactly that distinction and
+drops depth tracking for patterns where every cyclic split is simple —
+measured 1.25-1.6x on recursion-heavy patterns.
 
-Recursive descent parser. Grammar precedence (lowest to highest):
+Search gets its own prefilters: literal prefixes drive `simd_find_prefix`,
+required-byte and first-byte bitmaps drive shufti/truffle skips, and the
+`[class]+ P …` shape gets a pivot-anchored search that hops between
+occurrences of a rare byte.
 
-1. **Alternation** — `a|b`
-2. **Concatenation** — `ab`
-3. **Quantified** — `a*`, `a+`, `a?`, `a{n,m}` (greedy and lazy variants)
-4. **Atom** — literals, `.`, `[...]`, `(...)`, `\d`, `\w`, `\s`, anchors, escapes
+---
 
-Produces an `AST` with:
-- `nodes: List[ASTNode]` — flat pool of nodes indexed by `Int`
-- `charsets: List[CharSet]` — flat pool of character sets
-- `root: Int` — index of the root node
-- `group_count`, `group_names`, `flags`
+## Multi-pattern engines (`RegexSet`)
 
-### AST (`ast.mojo`)
+### The contract
 
-**ASTNodeKind** constants: `LITERAL`, `DOT`, `CHAR_CLASS`, `ALTERNATION`, `CONCAT`, `QUANTIFIER`, `GROUP`, `ANCHOR`, `LOOKAHEAD`, `LOOKBEHIND`, `BACKREFERENCE`.
+Report `(id, end)` for **every** position where some match of pattern `id`
+ends, regardless of where it started. Duplicates at the same `(id, end)`
+collapse; order is nondecreasing `end`, ties ascending `id`; unanchored by
+default. This is Hyperscan's reporting model, and it is what a single pass
+can actually deliver.
 
-**AnchorKind** constants:
-- `BOL` (^) — beginning of string
-- `EOL` ($) — end of string
-- `WORD_BOUNDARY` (\b), `NOT_WORD_BOUNDARY` (\B)
-- `BOL_MULTILINE` (^ with MULTILINE) — beginning of string or after `\n`
-- `EOL_MULTILINE` ($ with MULTILINE) — end of string or before `\n`
+It is **not** `re.finditer`: `ab|a` on `"ab"` reports end 1 *and* end 2.
+Ground truth is therefore an O(n²) sweep (`tools/set_oracle.py`), not
+finditer — a trap that has bitten this project more than once.
 
-`BOL_MULTILINE` / `EOL_MULTILINE` are baked into NFA anchor states at construction time when the MULTILINE flag is active, so engines need no runtime flag check.
+### The union NFA
 
-Each `ASTNode` carries kind-specific fields (`char_value`, `quantifier_min/max`, `greedy`, `group_index`, `charset_index`, `children`, `anchor_type`, `negated`). Children are stored as `List[Int]` indices into the node pool.
+`set_nfa.mojo` parses each pattern independently (so inline flags stay
+per-pattern), demotes captures, splices the fragments into one shared state
+pool under a SPLIT chain, and tags each MATCH with its `report_id`.
 
-### Character Sets (`charset.mojo`)
+Backreferences and lookaround are **widened** here rather than rejected —
+see "Exact backrefs and lookaround" below.
 
-`CharSet` stores sorted, non-overlapping `CharRange` pairs plus a 256-bit SIMD bitmap for O(1) ASCII membership testing.
-
-```
-CharSet
-├── ranges: List[CharRange]          # [lo, hi] inclusive pairs
-├── negated: Bool                    # inverted membership
-├── bitmap: SIMD[DType.uint8, 32]    # 256-bit ASCII fast path
-└── bitmap_valid: Bool               # bitmap built?
-```
-
-`build_bitmap()` is called during parsing and NFA construction. `contains(ch)` uses the bitmap for ASCII, falls back to range scan for Unicode.
-
-### NFA Construction (`nfa.mojo`)
-
-Thompson's construction converts AST fragments bottom-up into `NFAFragment` values (start state + dangling output list), then patches them together.
-
-**NFAStateKind** constants: `CHAR`, `CHARSET`, `ANY`, `SPLIT`, `MATCH`, `SAVE`, `ANCHOR`, `LOOKAHEAD`, `LOOKBEHIND`, `BACKREF`.
-
-**NFAState** — 12 fields covering all state types. Key fields by kind:
-
-| Kind | Key Fields |
-|---|---|
-| CHAR | `char_value`, `out1` |
-| CHARSET | `charset_index`, `out1` |
-| ANY | `out1` |
-| SPLIT | `out1`, `out2`, `greedy` |
-| SAVE | `save_slot`, `out1` |
-| ANCHOR | `anchor_type`, `out1` |
-| LOOKAHEAD/BEHIND | `sub_start`, `negated`, `out1`, `lookbehind_len` |
-| BACKREF | `backref_group` |
-
-**NFA** struct holds:
-- `states: List[NFAState]` — state pool
-- `charsets: List[CharSet]` — copied from AST
-- `start: Int` — entry state
-- Capability flags: `can_use_dfa`, `needs_backtrack`, `has_lazy`
-- `start_anchor: Int` — leading anchor kind (`-1` if none), detected by walking epsilon transitions from `nfa.start` after construction
-
-**`start_anchor` detection** (`_detect_start_anchor`): walks SPLIT and SAVE epsilon transitions from the start state. If the first consuming-or-anchor state is an ANCHOR, its type is recorded in `start_anchor`. This enables the `_search_from_bol_multiline` position-skip optimization in `compile.mojo`.
-
-Quantifier expansion:
-- `a*` → SPLIT(a, skip), greedy: prefer `a`
-- `a*?` → SPLIT(skip, a), lazy: prefer skip
-- `a+` → a, SPLIT(a, skip)
-- `a{n,m}` → n copies of `a`, then (m-n) optional copies
-
-### Lazy DFA (`dfa.mojo`)
-
-Builds DFA states on demand from NFA epsilon closures. Single-pass O(n) matching with no capture overhead. Now handles simple line anchors directly.
-
-**`_DFAState`**:
-- `transitions: InlineArray[Int, 256]` — byte→DFA-state cache (-1=uncomputed, -2=dead)
-- `is_match: Bool`
-- `eol_at_end: Bool` — True if following EOL/EOL_MULTILINE anchors in this state reaches MATCH
-- `eol_at_newline: Bool` — True if following EOL_MULTILINE anchors in this state reaches MATCH
-- `nfa_states: List[Int]` — sorted NFA state indices (the DFA state's identity)
-
-**`LazyDFA`** — persistent cache across match/search calls:
-- `states: List[_DFAState]` — DFA state pool
-- `state_map: Dict[String, Int]` — maps NFA state set key → DFA state index
-- `_init_start` — initial DFA state index for position 0 (BOL + BOL_MULTILINE hold)
-- `_init_after_nl` — initial DFA state index after `\n` (BOL_MULTILINE holds only)
-- `_init_other` — initial DFA state index for mid-line positions (no BOL anchors)
-- Cap: 4096 states to prevent blowup
-
-**Anchor handling in epsilon closure** (`_epsilon_closure`):
-- `BOL` anchors: followed only when `at_start=True` (position 0)
-- `BOL_MULTILINE` anchors: followed when `at_start=True` or `after_newline=True`
-- `EOL` / `EOL_MULTILINE` anchors: kept in the output state set for runtime resolution (not resolved during closure, since the next byte is unknown)
-- The three initial states allow correct BOL anchor behavior at different start positions
-
-**`_step()`**: For a given DFA state + input byte:
-1. Check cached transition → return immediately if found
-2. Advance all consuming NFA states (CHAR, CHARSET, ANY) by the byte; skip ANCHOR/MATCH states
-3. Compute epsilon closure of the resulting NFA states, passing `after_newline=(byte == '\n')` for BOL_MULTILINE resolution
-4. Look up or create the new DFA state
-5. Cache the transition
-
-**EOL anchor resolution** in `match_at` / `search_forward`:
-- Before consuming each `\n` byte: if `eol_at_newline` is set on the current state, record a match at the current position
-- After exhausting input: if `eol_at_end` is set on the current state, record a match at `input_len`
-
-**`search_forward()`** — single-pass search with **position-skip optimization**:
-- Incorporates the bitmap skip loop (no literal prefix required)
-- After the DFA dies at position P having started at position S, skips ahead to P instead of trying S+1, S+2, ..., P-1 (those would all die at the same position)
-- Returns `(match_start, match_end)` directly
-
-### One-Pass NFA (`onepass.mojo`)
-
-A single linear-pass NFA simulation that extracts captures without thread management. Applicable when at each (state, byte) there is at most one valid transition — conflicts are resolved by greedy/lazy priority rather than being true ambiguities.
-
-**Eligibility**: a pattern is one-pass eligible when `build_onepass()` determines that no DFA state in the pattern would require two threads at the same byte value with different captures. Used when `can_use_dfa=True` and `group_count > 0`.
-
-**`_OnePassState`** — pre-computed transition table:
-- 256-entry table mapping byte → `_OnePassTransition`
-- Each `_OnePassTransition` holds: `next_state`, `num_saves`, up to 4 save actions (slot index + value)
-- `match_saves` — save actions to apply when MATCH is reached
-
-**`_OnePassBufs`** — pre-allocated slot buffer reused across calls to avoid per-search heap allocation.
-
-**Key functions**:
-- `build_onepass(nfa)` — constructs the one-pass NFA. Pre-computes epsilon closures once per consuming state (not once per byte value) to keep compilation O(states) not O(states × 256).
-- `onepass_match(op, input, start, end)` — run bounded match (used in hybrid DFA+one-pass path)
-- `onepass_search_at(op, input, input_len, pos, bufs)` — find match at a given position
-- `onepass_findall(op, input, bufs, prefix, bitmap, bitmap_useful)` — specialized findall inlining the search loop to avoid per-match `MatchResult` allocation
-
-### Pike VM (`executor.mojo`)
-
-Parallel NFA simulation — the default engine for patterns with captures that are not one-pass eligible.
-
-**Core algorithm** (`_execute_with_bufs`):
-1. Seed start state via `_add_state()` (epsilon closure)
-2. For each input byte:
-   - Check for MATCH states in current threads
-   - Advance each thread: if consuming state matches byte, add successor
-   - Swap current ↔ next thread lists
-3. Record best match (latest end position with slots)
-
-**Key data structures**:
-- `_VMBuffers` — pre-allocated buffers reused across `_execute` calls (amortizes allocation for `findall`/`replace`/`split`)
-- Thread state stored as two parallel arrays: `states: List[Int]` + `slot_data: List[Int]` (flat, stride = `num_slots`)
-- Generation counter array (`gen: List[Int]`) for O(1) duplicate detection without per-step reset
-
-**`_add_state()`** — epsilon closure with tail-call optimization:
-- Follows SPLIT, SAVE, ANCHOR, LOOKAHEAD, LOOKBEHIND transitions
-- SPLIT: loops on `out1` (preferred/greedy), recurses on `out2`
-- SAVE: modifies slot in-place, recurses, restores (stack-based save/restore)
-- Only consuming states (CHAR, CHARSET, ANY, MATCH) are added to the thread list
-
-### Backtracking Engine (`backtrack.mojo`)
-
-Recursive descent through NFA states. Required for backreference patterns (`\1`).
-
-- `_bt_try_match(nfa, input, state_idx, pos, slots, depth)` — returns end position or -1
-- SPLIT: try preferred branch, backtrack to other on failure
-- SAVE: modify slot in-place, restore on failure
-- BACKREF: byte-by-byte comparison with previously captured text
-- Depth limit: 10,000 to prevent stack overflow
-
-### Compilation & Public API (`compile.mojo`)
-
-`CompiledRegex` ties everything together:
+### The engine ladder
 
 ```
-CompiledRegex
-├── _vm: PikeVM              # always built (holds the NFA)
-├── _dfa: LazyDFA            # persistent DFA cache
-├── _onepass: OnePassNFA     # pre-built one-pass NFA (if eligible)
-├── _op_bufs: _OnePassBufs   # pre-allocated buffers for one-pass engine
-├── _bufs: _VMBuffers        # pre-allocated buffers for Pike VM
-├── _needs_backtrack: Bool
-├── _can_use_dfa: Bool
-├── _can_use_onepass: Bool
-├── _start_anchor: Int       # leading anchor kind, or -1
-├── _literal_prefix: List[UInt8]              # for SIMD skip-ahead
-├── _first_byte_bitmap: SIMD[DType.uint8, 32] # for fast rejection
-├── _first_byte_useful: Bool
-├── pattern: String
-└── group_names: Dict[String, Int]
+litset ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
 ```
 
-**Public methods**: `match()`, `search()`, `findall()`, `replace()`, `split()`.
+| Lane | When | File |
+| --- | --- | --- |
+| **litset** | every pattern is a plain literal | `set_literal.mojo` |
+| **rose** | patterns carry required literal factors | `set_rose.mojo` |
+| **mdfa** | general, determinizes within `MDFA_STATE_CAP` | `set_dfa.mojo` |
+| **bitnfa** | determinization blew up, or EOL-consuming continuations | `set_bitnfa.mojo` |
+| **pike** | word boundaries, or anything above failed | `set_pike.mojo` |
 
-**Search routing** (`_search_from`) — in priority order:
-1. **BOL anchor** (`_start_anchor == BOL`): only try position 0; use DFA if eligible
-2. **BOL_MULTILINE anchor** (`_search_from_bol_multiline`): skip to positions 0 and after every `\n`; use DFA at each if eligible, else Pike VM
-3. **DFA-only** (`can_use_dfa and group_count == 0`): `_search_from_dfa_only` → `dfa.search_forward()`
-4. **One-pass** (`can_use_onepass and can_use_dfa`): `_search_from_onepass` with prefix/bitmap skip
-5. **Fallback** (`_search_from_bufs`): hybrid DFA+one-pass/PikeVM or pure Pike VM
+**litset** — bucketed Teddy. The candidate mask stays `UInt8` but a bucket
+holds a *list* of literal ids, which is Hyperscan's trick for k > 8. No
+automaton at all, just shuffles.
 
-**`_search_from_dfa_only`**: Uses `dfa.search_forward()` which incorporates bitmap skip and position-skip optimization in a single call. Falls back to prefix-accelerated `match_at` loop when a literal prefix exists.
+**rose** — literal decomposition, Hyperscan's real performance move. Each
+pattern is walked at comptime for a literal run that every match must
+contain at a *fixed* offset from the match start; all factors pool into one
+Teddy front end, and a per-pattern **anchored** DFA runs only at candidate
+positions. Patterns with no usable factor stay resident on the lane below,
+over their own union NFA, and the two report streams merge. Measured 10.2x
+over the multi-accept DFA on sparse 64KB input.
 
-**Hybrid DFA+capture path** (in `_search_from_bufs`):
-1. DFA `match_at()` quickly finds match boundaries
-2. If one-pass eligible: `onepass_match()` extracts captures within that boundary
-3. Otherwise: Pike VM `_execute_with_bufs()` with `max_pos` bound
+**mdfa** — determinizes `.*?(P0|P1|…)` with the unanchored start closure
+folded into every state, so the automaton never dies and never restarts.
+Each state carries a slice into a flat report pool. Acceleration applies
+under a hard rule: a state with any report slice is never accelerated, or a
+skip could jump over a reporting position.
 
-**`findall` fast path**: When both `_can_use_onepass` and `_can_use_dfa` are true and the pattern has no lazy quantifiers, calls `onepass_findall()` directly, avoiding per-match `MatchResult` allocation.
+**bitnfa** — LimEx-style bit-parallel NFA over Glushkov positions.
+Chain successors ride one global bit-shift; joins, loops and anchor
+crossings live in an exception table touched only when their bits fire.
+Construction is **linear**, which is why it is also the streaming engine.
 
-### StaticRegex (`static.mojo`, `static_backtrack.mojo`)
+**pike** — tagged all-match Pike VM. Permanent bottom rung, and the
+differential oracle every other lane is tested against.
 
-`StaticRegex[pattern]` runs the full parser → NFA pipeline at compile time and specializes the match engine per NFA state via comptime parameters.
+### Start-of-match (`scan_som`, `scan_spans`)
 
-**Compile-time NFA construction** (`_build_static_nfa`): calls `parse()` and `build_nfa()` inside a `comptime` field initializer. Invalid patterns abort at compile time rather than raising at runtime. All NFA metadata is stored as comptime struct fields:
+The forward lanes deliberately know nothing about where a match began —
+that is what lets them fold the restart into every state. `set_reverse.mojo`
+recovers it afterwards by walking a determinized **reverse** automaton
+leftward from each reported end:
 
-```text
-StaticRegex[pattern]
-├── comptime nfa              — full NFA (states, charsets, capability flags)
-├── comptime _group_count     — nfa.group_count
-├── comptime _num_slots       — 2 * group_count
-├── comptime _start           — nfa.start (entry state index)
-├── comptime _start_anchor    — nfa.start_anchor (BOL, BOL_MULTILINE, or -1)
-├── comptime _prefix          — extract_literal_prefix(nfa)
-├── comptime _prefix_len      — len(_prefix)
-├── comptime _first_byte_bitmap — extract_first_byte_bitmap(nfa)
-└── comptime _first_byte_useful — any byte rejected by bitmap?
+```
+forward:  state set = "which NFA states are about to consume input[p]"
+reverse:  state set = "which NFA states could be ENTERED at position p"
 ```
 
-**Specialized backtracking engine** (`static_backtrack.mojo`): `_sbt_try_match[nfa, state_idx, num_slots]` is parameterized by both the NFA and the current state index. Each instantiation handles exactly one NFA state kind with all fields baked in as compile-time constants:
+Anchors mirror the forward design with the roles swapped: walking leftward
+the byte just consumed *is* `input[p]`, so EOL resolves during the closure
+while BOL depends on the byte about to be consumed and defers to per-state
+slices. Word-boundary sets, which cannot ride a DFA at all, use a
+SOM-carrying Pike instead.
 
-- `comptime state = nfa.states[state_idx]` — state fields become constants
-- `comptime if kind == NFAStateKind.CHAR:` — dead branches are eliminated entirely
-- Recursive calls `_sbt_try_match[nfa=nfa, state_idx=state.out1, ...]` produce distinct function instantiations for each successor state
-- `@always_inline` causes the compiler to collapse all instantiations into a single flat function with no dispatch overhead
+`scan_spans` filters that stream to per-id leftmost non-overlapping spans.
+It is leftmost-**longest**, not CPython's leftmost-first; they agree for
+greedy unambiguous patterns, which is most of them.
 
-For SPLIT states with a simple single-body loop (`a*`, `\d+`, `[a-z]*`), a dedicated greedy/lazy fast path scans forward without recursion, avoiding per-character function calls.
+### Streaming (`SetStream`)
 
-**InlineArray slots**: capture group slot data uses `InlineArray[Int, num_slots]` (stack-allocated, fixed size known at compile time) rather than `List[Int]`. Value copies are free stack memcpys. `_slots_to_list` converts to `List[Int]` only when constructing the final `MatchResult`.
+`set_stream.mojo`. Runs on the bit-parallel NFA regardless of which lane
+block mode picks — LimEx construction is linear, so every set that can ride
+an automaton can also stream without paying determinization, and the
+measured per-byte cost is at parity with the multi-accept DFA.
 
-**Search acceleration**: all the same prefix/bitmap skip logic as `CompiledRegex` is applied via `comptime if` blocks at compile time, so patterns with no literal prefix pay no branch overhead for prefix logic at runtime.
+Stream state is the automaton's own state plus a global offset. Sets whose
+reports can depend on the byte *after* the match (`$`, `(?m)$`) additionally
+hold one step, so a match ending on the final byte of a write is reported by
+the next write or by `close()` — Hyperscan documents the same caveat. Sets
+without such anchors pay no latency at all. `scan_vectored` falls straight
+out.
 
-### Search Acceleration (`optimize.mojo`, `simd_scan.mojo`)
+### Semantic surface
 
-**`extract_literal_prefix(nfa)`** — walks NFA from start, collecting consecutive CHAR states. Stops at any branch, variable-width match, or end. Example: `<(\w+)>` yields prefix `<`.
+`set_semantics.mojo` (SINGLEMATCH, QUIET, min_offset/max_offset/min_length,
+expression info) and `set_combine.mojo` (logical combinations with
+`! > & > |` precedence). All of it is a filter over the report stream rather
+than a change to any engine, so the lanes stay exactly as fast for sets that
+use none of it, and the semantics are identical on every lane instead of
+needing five implementations.
 
-**`extract_first_byte_bitmap(nfa)`** — 256-bit bitmap of all bytes the pattern's first consuming state could accept. Used when no literal prefix exists.
+### Exact backrefs and lookaround — where this beats Hyperscan
 
-**`simd_find_byte(input, byte, start)`** — scans 16 bytes at a time using SIMD XOR + reduce_min for quick rejection, with scalar tail fallback.
+Hyperscan rejects both constructs; its answers are `HS_FLAG_PREFILTER` (a
+superset you confirm yourself) or the separate Chimera library
+(Hyperscan + libpcre). emberregex already ships exact engines for both, so
+`set_prefilter.mojo` does the whole job in one library:
 
-**`simd_find_prefix(input, prefix, start)`** — finds first byte via SIMD, then verifies remaining prefix bytes.
+1. **Widen** the pattern into a superset the set engines can run — drop
+   lookaround (zero-width and purely restrictive, so dropping only admits
+   more), and replace a backreference with a non-capturing *copy* of the
+   referenced group's body (the captured text is always in that group's
+   language).
+2. **Confirm** each candidate on the exact specialized backtracker, anchored
+   at the superset's start-of-match and pinned to the candidate end.
 
-### Flags (`flags.mojo`)
+The pin matters: the engine sees the **whole input** with an `end_at`
+target rather than a truncated slice, because truncating would hide the
+right-hand context a lookahead asserts about.
 
-`RegexFlags` is a bitmask: `IGNORECASE (1)`, `MULTILINE (2)`, `DOTALL (4)`. Supports both explicit flags (`compile("pat", RegexFlags.IGNORECASE)`) and inline flags (`(?i)`, `(?m)`, `(?s)`).
+---
 
-### Result (`result.mojo`)
+## Comptime realities
 
-`MatchResult` stores:
-- `matched`, `start`, `end` — match span in byte offsets
-- `group_count` — number of capture groups
-- `slots: List[Int]` — pairs of `[start, end]` byte offsets, one pair per group (1-based indexing via `group_str(input, n)`)
+Three constraints shape the code more than anything else:
 
-## Performance Design
+- **Determinization cost is superlinear in the comptime interpreter.**
+  `tools/compile_dashboard.py` tracks it. Lanes that avoid determinization
+  (litset, rose, bitnfa) are worth real throughput to reach.
+- **Comptime parameter values are mangled into symbol names.** A function
+  carrying a baked database as a comptime parameter, that the inliner does
+  *not* fold, emits a symbol containing the whole database — and the linker
+  refuses names past a few MB. Every `List` field costs a fixed ~1 MB
+  regardless of length; the same data as `InlineArray` costs ~4 chars per
+  element. Hence `RoseView` and `ReverseView`: POD scalars in the parameter,
+  bulk data in separate `InlineArray`s.
+- **Baked lanes hold zero per-instance state**, so `scan` needs no `mut self`
+  and no scratch object. Keeping the bit-parallel NFA as the always-builds
+  fallback is partly what lets the API stay non-mutating and thread-safe.
 
-Key optimizations:
-- **Flat-pool representation**: AST nodes, NFA states, and charsets are stored in contiguous `List`s indexed by `Int`, not pointer-linked. Better cache locality.
-- **Generation counter**: Pike VM avoids O(num_states) boolean array reset per step. Just incrementing an integer marks all states as "unvisited".
-- **In-place slot save/restore**: SAVE states modify the slot array in-place and restore on return, eliminating per-state slot array copies.
-- **Buffer reuse**: `_VMBuffers` and `_OnePassBufs` are pre-allocated once and reused across `_execute` calls in `findall`/`replace`/`split`.
-- **Persistent DFA cache**: `LazyDFA` caches transition tables across match/search calls, amortizing construction cost over many searches.
-- **SIMD skip-ahead**: Literal prefix scanning processes 16 bytes at a time.
-- **First-byte bitmap**: 256-bit SIMD bitmap rejects non-candidate start positions in O(1).
-- **Position-skip optimization** (`dfa.search_forward`): when DFA dies at position P having started at S, skips directly to P rather than incrementing by 1. Effective for patterns where the DFA runs multiple bytes before failing.
-- **BOL/BOL_MULTILINE position skip**: patterns anchored at `^` only try valid start-of-line positions (position 0 or after `\n`), reducing work from O(n) to O(number of lines).
-- **DFA anchor support**: simple line anchors are handled inside the DFA engine rather than disabling it. BOL/BOL_MULTILINE resolved during epsilon closure; EOL/EOL_MULTILINE resolved via precomputed `eol_at_end`/`eol_at_newline` flags checked in the match loop.
-- **One-pass NFA**: for DFA-eligible patterns with captures, a single linear scan extracts captures with no thread management overhead.
-- **Pre-computed one-pass closures**: `build_onepass` computes epsilon closures once per consuming state (not once per byte value), keeping compilation O(states) rather than O(states × 256).
-- **Hybrid DFA+capture**: DFA pre-filters candidate positions; one-pass NFA or Pike VM extracts captures only at confirmed match boundaries.
-- **`unsafe_get`/`unsafe_set`**: Hot loops use unchecked List access to eliminate bounds-checking overhead.
+## Testing
 
-## Test & Bench Structure
+Every engine is differentially tested against the tagged Pike reference
+across LCG-generated inputs at chunk-boundary-adjacent lengths, including
+bytes ≥ 0x80. Set semantics are ground-truthed against CPython via
+`tools/set_oracle.py` — including `sweep_ctx`, a context-preserving variant
+that is sound for anchors and lookaround where the naive region-bounded
+sweep is not. Streaming is checked by exhaustive block/stream equivalence
+over every 2- and 3-way chunk split.
 
-**Tests** (`test/`): 147 tests across 6 files covering basic patterns, quantifiers, groups, anchors, lookaround, backreferences, flags, and the public API. Run with `pixi run test`.
-
-**Benchmarks** (`bench/`): Basic and extended suites measuring compile time, DFA/Pike VM/backtracking throughput, search scaling, findall/replace/split, pathological patterns, and real-world patterns. Run with `pixi run bench` or `pixi run bench_ext`. A Python comparison script (`bench/bench_compare.py`) mirrors the extended suite against Python's `re` module.
+Benches live in `bench/bench.mojo` (single pattern) and
+`bench/bench_set.mojo` (sets), each row pinned by a coverage test so a
+benchmark cannot silently time the no-match path.
