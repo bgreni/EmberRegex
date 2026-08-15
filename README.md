@@ -5,15 +5,17 @@
 
 A high-performance compile-time regular expression library for [Mojo](https://www.modular.com/mojo).
 
-EmberRegex is focused on patterns known at compile time. `StaticRegex` parses the pattern and builds the NFA during compilation, then specializes the entire match engine per NFA state — eliminating runtime dispatch entirely. Invalid patterns produce a compile error rather than a runtime exception.
+EmberRegex is focused on patterns known at compile time. `Regex` parses the pattern and builds the NFA during compilation, then specializes the entire match engine per NFA state — eliminating runtime dispatch entirely. Invalid patterns produce a compile error rather than a runtime exception.
+
+It also ships **`RegexSet`**, a multi-pattern scanner in the shape of Intel Hyperscan: scan an input once and learn every pattern that matched and where. Unlike Hyperscan it accepts backreferences and lookaround, and reports them exactly. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the engines fit together.
 
 ## Quick Start
 
 ```mojo
-from emberregex import StaticRegex
+from emberregex import Regex
 
 def main():
-    var re = StaticRegex["\\d{3}-\\d{4}"]()
+    var re = Regex["\\d{3}-\\d{4}"]()
     var result = re.match("555-1234")
     print(result.matched)  # True
 ```
@@ -29,14 +31,14 @@ mojo -I /path/to/emberregex your_file.mojo
 
 ## API Reference
 
-`StaticRegex[pattern]` takes the pattern as a compile-time string literal. All parsing and NFA construction happen during compilation.
+`Regex[pattern]` takes the pattern as a compile-time string literal. All parsing and NFA construction happen during compilation.
 
 ### Matching
 
 `match()` tests whether the **entire** input matches the pattern:
 
 ```mojo
-var re = StaticRegex["\\d{3}-\\d{4}"]()
+var re = Regex["\\d{3}-\\d{4}"]()
 
 var result = re.match("555-1234")
 print(result.matched)  # True
@@ -50,7 +52,7 @@ print(result2.matched)  # False (not a full match)
 `search()` finds the **first** occurrence of the pattern anywhere in the input:
 
 ```mojo
-var re = StaticRegex["\\d+"]()
+var re = Regex["\\d+"]()
 var result = re.search("abc 42 def 99")
 if result:
     print(result.start, result.end)  # 4 6
@@ -61,14 +63,30 @@ if result:
 `findall()` returns all non-overlapping matches as a list of strings. If the pattern has a capture group, it returns group 1 instead of the full match:
 
 ```mojo
-var re = StaticRegex["\\d+"]()
+var re = Regex["\\d+"]()
 var matches = re.findall("12 apples, 3 bananas, 456 cherries")
 # matches: ["12", "3", "456"]
 
 # With a capture group, findall returns group 1
-var re2 = StaticRegex["<(\\w+)>"]()
+var re2 = Regex["<(\\w+)>"]()
 var tags = re2.findall("<html><body><p>")
 # tags: ["html", "body", "p"]
+```
+
+### Find Iter
+
+`finditer()` returns all non-overlapping matches as `MatchResult` values
+(spans plus capture slots) without allocating a `String` per match — slice
+lazily with `span()` / `group_str()`:
+
+```mojo
+var re = Regex["(\\w+)@(\\w+)"]()
+var input = "mail bob@host now"
+var matches = re.finditer(input)
+for i in range(len(matches)):
+    ref m = matches[i]
+    print(m.start, m.end, m.group_str(input, 1), m.group_str(input, 2))
+# 5 13 bob host
 ```
 
 ### Replace
@@ -76,12 +94,12 @@ var tags = re2.findall("<html><body><p>")
 `replace()` substitutes all matches with a replacement string. Backreferences `\1`-`\9` and named backreferences `\g<name>` are supported:
 
 ```mojo
-var re = StaticRegex["(\\w+)@(\\w+)"]()
+var re = Regex["(\\w+)@(\\w+)"]()
 var result = re.replace("alice@home bob@work", "\\1 at \\2")
 # result: "alice at home bob at work"
 
 # Named group backreferences
-var re2 = StaticRegex["(?P<first>\\w+) (?P<last>\\w+)"]()
+var re2 = Regex["(?P<first>\\w+) (?P<last>\\w+)"]()
 var result2 = re2.replace("Jane Doe", "\\g<last>, \\g<first>")
 # result2: "Doe, Jane"
 ```
@@ -91,7 +109,7 @@ var result2 = re2.replace("Jane Doe", "\\g<last>, \\g<first>")
 `split()` divides the input at each match of the pattern:
 
 ```mojo
-var re = StaticRegex["[,;\\s]+"]()
+var re = Regex["[,;\\s]+"]()
 var parts = re.split("one, two; three   four")
 # parts: ["one", "two", "three", "four"]
 ```
@@ -101,23 +119,23 @@ var parts = re.split("one, two; three   four")
 Pass flags as a second parameter, or use inline flag syntax in the pattern:
 
 ```mojo
-from emberregex import StaticRegex, RegexFlags
+from emberregex import Regex, RegexFlags
 
 # Explicit flag
-var re = StaticRegex["hello", RegexFlags(RegexFlags.IGNORECASE)]()
+var re = Regex["hello", RegexFlags(RegexFlags.IGNORECASE)]()
 re.match("HELLO").matched  # True
 
 # Inline flag (equivalent)
-var re2 = StaticRegex["(?i)hello"]()
+var re2 = Regex["(?i)hello"]()
 re2.match("HeLLo").matched  # True
 
 # Multiline: ^ and $ match at \n boundaries
-var re3 = StaticRegex["(?m)^\\w+"]()
+var re3 = Regex["(?m)^\\w+"]()
 var lines = re3.findall("foo\nbar\nbaz")
 # lines: ["foo", "bar", "baz"]
 
 # Dotall: . matches \n
-var re4 = StaticRegex["(?s)a.b"]()
+var re4 = Regex["(?s)a.b"]()
 re4.match("a\nb").matched  # True
 ```
 
@@ -126,7 +144,7 @@ re4.match("a\nb").matched  # True
 Use parentheses to capture submatches. Groups are 1-indexed:
 
 ```mojo
-var re = StaticRegex["(\\d{4})-(\\d{2})-(\\d{2})"]()
+var re = Regex["(\\d{4})-(\\d{2})-(\\d{2})"]()
 var result = re.search("date: 2026-03-22")
 if result:
     var year = result.group_str("date: 2026-03-22", 1)   # "2026"
@@ -139,7 +157,7 @@ if result:
 Use `(?:...)` when you need grouping without capturing:
 
 ```mojo
-var re = StaticRegex["(?:https?|ftp)://\\S+"]()
+var re = Regex["(?:https?|ftp)://\\S+"]()
 ```
 
 ### Named Groups
@@ -147,7 +165,7 @@ var re = StaticRegex["(?:https?|ftp)://\\S+"]()
 Use `(?P<name>...)` to name capture groups:
 
 ```mojo
-var re = StaticRegex["(?P<proto>https?)://(?P<host>[^/]+)"]()
+var re = Regex["(?P<proto>https?)://(?P<host>[^/]+)"]()
 var result = re.search("visit https://example.com/page")
 if result:
     var proto = result.group_str("visit https://example.com/page", 1)  # "https"
@@ -181,10 +199,56 @@ The `MatchResult` type is returned by `match()` and `search()`:
 | `\w`, `\W` | Word character `[a-zA-Z0-9_]` / non-word |
 | `\s`, `\S` | Whitespace / non-whitespace |
 | `\t`, `\n`, `\r` | Tab, newline, carriage return |
+| `\h`, `\H` | Horizontal whitespace `[ \t]` / negation |
+| `\v`, `\V` | Vertical whitespace `[\n\x0b\f\r]` / negation (PCRE reading, **not** Python's vertical-tab character) |
+| `[[:alpha:]]` | POSIX class (also `digit alnum upper lower space blank punct xdigit word cntrl print graph`) |
+| `[[:^alpha:]]` | Negated POSIX class |
 | `[abc]` | Character class |
 | `[a-z]` | Character range |
 | `[^abc]` | Negated class |
+| `\p{L}`, `\P{L}` | Unicode property / negation — needs `(?u)`, see below |
 | `\\` | Escaped metacharacter |
+
+### Unicode (UTF-8 mode)
+
+`(?u)` — or the `(*UTF8)` / `(*UCP)` verbs — makes `.` and character
+classes match one **codepoint** rather than one byte. Offsets stay byte
+offsets, which is the library's contract everywhere.
+
+```mojo
+var re = Regex["(?u)\\p{Greek}+"]()
+var m = re.search("hi αβγ there")   # matches "αβγ"
+```
+
+Without `(?u)`, `[α]` keeps its byte-mode reading ("either UTF-8 byte of
+α"), which is deliberate and pinned by a test.
+
+`\p{...}` accepts:
+
+| Form | Examples |
+| --- | --- |
+| General category | `\p{L}` `\p{N}` `\p{P}` `\p{S}` `\p{Z}` `\p{M}` `\p{C}` |
+| Subcategory | `\p{Lu}` `\p{Ll}` `\p{Nd}` `\p{Sc}` `\p{Pd}` `\p{Mn}` … |
+| Shorthand | `\p{Alpha}` `\p{Digit}` `\p{Alnum}` `\p{Word}` `\p{Space}` `\p{Any}` |
+| Script | `\p{Latin}` `\p{Greek}` `\p{Han}` `\p{Devanagari}` … (43 scripts) |
+
+Tables are generated from the Unicode Character Database (17.0) by
+`tools/gen_unicode_tables.py` and checked in, so building needs no
+Python.
+
+Three caveats worth knowing:
+
+- **`\d`, `\w`, `\s`, `\b` stay ASCII**, even under `(?u)` / `(*UCP)`.
+  UTF-8 mode changes `.` and bracket classes; it does not redefine the
+  shorthand escapes the way PCRE's `(*UCP)` does. Write `\p{Nd}`,
+  `\p{Word}`, or `\p{Space}` when you want the Unicode meaning.
+  `(*UCP)` is currently accepted as a spelling of UTF-8 mode, nothing more.
+- **Big classes cost compile time.** `\p{L}` is 836 UTF-8 byte-sequences,
+  and all of that automaton construction happens at compile time
+  (`\p{Lu}` ≈ 3 min). Prefer the narrowest property that says what you
+  mean (`\p{Nd}` over `\p{L}` where it fits).
+- **Lookbehind is refused in UTF-8 mode.** It needs a fixed byte width,
+  and a codepoint class spans 1-4 bytes.
 
 ### Quantifiers
 
@@ -204,6 +268,8 @@ The `MatchResult` type is returned by `match()` and `search()`:
 | --- | --- |
 | `^` | Start of string (or line with MULTILINE) |
 | `$` | End of string (or line with MULTILINE) |
+| `\A` | Start of string — never promoted by MULTILINE |
+| `\z`, `\Z` | End of string — never promoted by MULTILINE (`\Z` is Python's, not PCRE's before-trailing-newline) |
 | `\b` | Word boundary |
 | `\B` | Non-word boundary |
 | `(?=...)` | Positive lookahead |
@@ -220,10 +286,79 @@ The `MatchResult` type is returned by `match()` and `search()`:
 | `(?P<name>...)` | Named capture group |
 | `\1` - `\9` | Backreference to captured group |
 | `a\|b` | Alternation |
+| `(?# ...)` | Comment (ignored) |
+
+## Multi-Pattern Scanning
+
+`RegexSet[patterns]` scans once and reports **every** pattern that matches:
+
+```mojo
+from emberregex import RegexSet
+
+def main():
+    var db = RegexSet[["ERROR", "\\d+ms", "GET /[a-z]+"]]()
+    for m in db.scan("ERROR 42ms GET /api"):
+        print(m.id, m.end)   # 0 5 / 1 10 / 2 19
+```
+
+The contract is Hyperscan's: report `(id, end)` for every position where some
+match of that pattern ends, ordered by end then id. Note this is **not**
+`re.finditer` — `ab|a` on `"ab"` reports end 1 *and* end 2.
+
+### Start of match and spans
+
+```mojo
+db.scan_som(input)     # (id, start, end), start = leftmost for that end
+db.scan_spans(input)   # per-id leftmost NON-OVERLAPPING spans
+```
+
+`scan_spans` is leftmost-longest (POSIX), which agrees with `re.finditer` for
+greedy unambiguous patterns.
+
+### Streaming
+
+```mojo
+from emberregex import SetStream
+
+var st = SetStream[["ERROR", "\\d+ms"]]()
+var a = st.scan(chunk1)    # offsets are GLOBAL
+var b = st.scan(chunk2)
+var c = st.close()
+```
+
+Also `scan_vectored(chunks)`, `reset()`, and copying to fork a stream.
+
+### Per-pattern flags and combinations
+
+```mojo
+RegexSet[
+    ["ERROR", "timeout", "healthy"],
+    flags=[SetFlags.SINGLEMATCH, SetFlags.NONE, SetFlags.QUIET],
+    ext=[0, -1, -1,  -1, -1, 3,  -1, -1, -1],   # min_offset/max_offset/min_length
+    combos=["0 & 1", "!2"],
+]
+```
+
+`db.scan_combined(input)` evaluates the boolean combinations (`! > & > |`) over
+the report stream. Compile-time facts are available too:
+`RegexSet[...].info[0]().min_width`.
+
+### Backreferences and lookaround
+
+Hyperscan rejects both. EmberRegex accepts them in a set and reports them
+exactly, by widening the pattern into a superset for the fast lanes and
+confirming each candidate on the exact backtracking engine:
+
+```mojo
+var db = RegexSet[["(\\w)\\1", "foo(?=bar)"]]()
+db.scan("aa ab foobar")   # (0, 2) and (1, 9) — "ab" and "fooqux" are not reported
+```
 
 ## Performance
 
-`StaticRegex` parses the pattern and builds the NFA at compile time. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct `@always_inline` function instantiation, the compiler eliminates dead branches, and all recursive calls collapse into a single inlined function with zero runtime dispatch.
+`Regex` parses the pattern and builds the NFA at compile time. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct function instantiation whose body is a `comptime if` chain over the state kind, so every branch belonging to the other kinds is eliminated and what is left is straight-line code for that one state with its fields baked in. There is no runtime dispatch on state kind, the leaf primitives (charset bitmap tests, anchor checks, case folding) are `@always_inline`, and the acyclic parts of the call graph inline aggressively.
+
+Recursion does not disappear entirely: a cyclic split whose body is not a single-character self-loop — `(?:ab)+`, `(a+)+` — recurses for real, which is why the engine carries both a work budget and a stack-depth cap and falls back to the Pike VM when either is hit. Simple greedy and lazy quantifiers (`a+`, `[a-z]*`, `.*?`) are compiled to iteration instead and never grow the stack.
 
 At runtime, EmberRegex automatically selects the fastest engine for the pattern:
 
@@ -245,14 +380,14 @@ Additional search accelerations applied regardless of engine:
 # Run tests
 pixi run test
 
-# Run StaticRegex benchmarks
+# Run single-pattern benchmarks
 pixi run bench
 
-# Run Python vs StaticRegex comparison
+# Run Python re vs EmberRegex comparison
 pixi run compare
 pixi run -e pdf compare_pdf  # generate PDF report (requires reportlab)
 
-# Run PCRE2 JIT vs StaticRegex comparison (compiles C benchmark via CMake)
+# Run PCRE2 JIT vs EmberRegex comparison (compiles C benchmark via CMake)
 pixi run -e pcre compare_pcre2
 pixi run -e pcre-pdf compare_pcre2_pdf  # generate PDF report
 

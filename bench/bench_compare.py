@@ -1,6 +1,6 @@
 """EmberRegex vs Python re — benchmark comparison.
 
-Runs the Python re suite and the Mojo StaticRegex benchmark suite, then
+Runs the Python re suite and the Mojo Regex benchmark suite, then
 prints a comparison table with speedup ratios.
 
 Run with:  python3 bench/bench_compare.py
@@ -82,7 +82,7 @@ def _run_mojo_task(task: str) -> dict[str, float]:
 
 
 def run_mojo_static_benchmarks() -> dict[str, float]:
-    """Run bench_static.mojo (StaticRegex) via pixi."""
+    """Run bench_static.mojo (Regex) via pixi."""
     return _run_mojo_task("bench")
 
 
@@ -269,8 +269,12 @@ def run_python_benchmarks() -> dict[str, float]:
     pat = re.compile(r"(\w+)\s\1\s\1")
     bench(py, "pathological_triple_backref", lambda p=pat: p.match("hello hello hello"))
     pat = re.compile(r"([a-z]+[0-9]+)+x")
+    # Ends in 'x' so it survives a literal-suffix fast-fail, but still misses:
+    # the trailing "a" has no digits to close the group. Must stay in sync with
+    # bench.mojo / bench_pcre2.c.
+    text = "a1" * 800 + "ax"
     bench(py, "pathological_nested_quantifier_miss",
-          lambda p=pat: p.match("aaaaaaaaaaaaaaaa"), number=NUMBER // 10)
+          lambda t=text, p=pat: p.match(t), number=NUMBER // 10)
 
     # 11. Real-world patterns
     section("11. Real-world patterns")
@@ -327,8 +331,8 @@ def run_python_benchmarks() -> dict[str, float]:
 
 def main():
     print(f"\n{'═'*72}")
-    print(f"  EmberRegex StaticRegex vs Python {sys.version.split()[0]} re")
-    print(f"  Columns: Python re  |  StaticRegex")
+    print(f"  EmberRegex Regex vs Python {sys.version.split()[0]} re")
+    print(f"  Columns: Python re  |  Regex")
     print(f"  Py/Stat = Python ÷ Static   (>1x means Static wins vs Python)")
     print(f"{'═'*72}")
 
@@ -336,7 +340,7 @@ def main():
     py = run_python_benchmarks()
 
     print(f"\n{'═'*72}")
-    print(f"  Running StaticRegex benchmarks...")
+    print(f"  Running Regex benchmarks...")
     print(f"{'═'*72}")
     static = run_mojo_static_benchmarks()
 

@@ -3,9 +3,11 @@
 !.pixi/config.toml
 **__pycache__**
 playground.mojo
+*.mojoc
 .claude
 .agents
 skills-lock.json
 comparisons/pcre2_build/
 comparisons/bench_pcre2
+comparisons/bench_hyperscan
 FEATURES.md

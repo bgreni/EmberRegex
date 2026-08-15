@@ -36,6 +36,11 @@ struct AnchorKind:
     comptime NOT_WORD_BOUNDARY = 3  # \B
     comptime BOL_MULTILINE = 4  # ^ with MULTILINE — matches after \n too
     comptime EOL_MULTILINE = 5  # $ with MULTILINE — matches before \n too
+    # AST-only markers. \A and \z/\Z mean "string start/end" regardless of
+    # (?m), so the NFA builder lowers them to plain BOL/EOL and SKIPS the
+    # multiline promotion. No engine ever sees these values.
+    comptime BOS = 6  # \A
+    comptime EOS = 7  # \z, \Z
 
 
 struct ASTNode(Copyable, Movable):

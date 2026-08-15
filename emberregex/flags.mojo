@@ -9,6 +9,10 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
     comptime MULTILINE = 2  # (?m) - ^ and $ match line boundaries
     comptime DOTALL = 4  # (?s) - dot matches newline
     comptime VERBOSE = 8  # (?x) - ignore whitespace and # comments
+    comptime UNICODE = 16
+    """(?u) or (*UTF8) — `.` and character classes match one CODEPOINT
+    rather than one byte, by compiling codepoint ranges into byte-sequence
+    automata (utf8.mojo). The engines stay byte-level either way."""
 
     var value: Int
 
@@ -41,3 +45,6 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
 
     def verbose(self) -> Bool:
         return self.has(Self.VERBOSE)
+
+    def unicode(self) -> Bool:
+        return self.has(Self.UNICODE)

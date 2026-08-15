@@ -1,20 +1,22 @@
 [workspace]
 authors = ["Brian Grenier <grenierb96@gmail.com>"]
-channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "emberregex"
 platforms = ["osx-arm64"]
 version = "0.1.0"
 
 [tasks]
 test = { cmd = "python3 run_test.py" }
-build = { cmd = "mojo package emberregex -o emberregex"}
+build = { cmd = "mojo precompile emberregex -o emberregex.mojoc"}
 bench = { cmd = "mojo -I . bench/bench.mojo" }
-bench_all = {depends-on=["bench"]}
+bench_set = { cmd = "mojo -I . bench/bench_set.mojo" }
+bench_all = {depends-on=["bench", "bench_set"]}
 compare = { cmd = "python3 bench/bench_compare.py" }
+compare_set = { cmd = "python3 bench/bench_compare_set.py" }
 format = "mojo format emberregex test bench"
 
 [dependencies]
-mojo = ">=1.0.0b2.dev2026050205,<2"
+mojo = "=1.0.0"
 
 [feature.pdf.dependencies]
 reportlab = "*"
@@ -25,6 +27,12 @@ compare_pdf = { cmd = "python3 bench/gen_pdf.py" }
 [feature.pcre.dependencies]
 cmake = "*"
 
+[feature.hs.dependencies]
+vectorscan = "*"
+
+[feature.hs.tasks]
+compare_hyperscan = { cmd = "python3 bench/bench_compare_hyperscan.py" }
+
 [feature.pcre.tasks]
 compare_pcre2 = { cmd = "python3 bench/bench_compare_pcre2.py" }
 compare_pcre2_pdf = { cmd = "python3 bench/bench_compare_pcre2.py --pdf" }
@@ -34,3 +42,4 @@ default = { features = [], solve-group = "default" }
 pdf = { features = ["pdf"], solve-group = "default" }
 pcre = { features = ["pcre"], solve-group = "default" }
 pcre-pdf = { features = ["pcre", "pdf"], solve-group = "default" }
+hs = { features = ["hs"], solve-group = "default" }

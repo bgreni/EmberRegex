@@ -1,9 +1,19 @@
 """Compile-time specialized backtracking engine.
 
 Each NFA state index becomes a distinct function instantiation via comptime
-parameters. The compiler eliminates dead branches (comptime if) and inlines
-all calls, collapsing the interpreter into specialized code equivalent to a
-hand-written matcher.
+parameters. The body is a `comptime if` chain over the state kind, so every
+branch belonging to the other kinds is eliminated and what remains is
+straight-line code for that one state with its fields baked in — no runtime
+dispatch on kind. The leaf helpers below are `@always_inline` and fold into
+that code, and the acyclic parts of the call graph are small and terminating,
+so chains inline aggressively.
+
+`_sbt_try_match` is deliberately NOT `@always_inline`, and the interpreter is
+not flattened into one function: a cyclic SPLIT can reach its own
+instantiation, so the general-SPLIT branch is real recursion. Hence the two
+independent caps — SBT_BUDGET for total work, SBT_MAX_DEPTH for stack — and
+the simple-loop / simple-lazy rewrites that turn single-character quantifiers
+into iteration. See the comments on those constants.
 
 Charset membership uses the precomputed 256-bit bitmap extracted at compile
 time — the SIMD bitmap materializes cleanly from comptime to runtime, giving
@@ -22,7 +32,7 @@ from .constants import (
     CHAR_Z_LOWER,
     CHAR_Z_UPPER,
 )
-from .nfa import NFA, NFAState, NFAStateKind
+from .nfa import split_cycle_flags, NFA, NFAState, NFAStateKind
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
 
@@ -126,6 +136,43 @@ def _exit_is_eol_then_match(nfa: NFA, out2: Int) -> Bool:
 # creates O(n) branches within a single depth level.
 comptime SBT_BUDGET = 200_000
 
+# Recursion-depth cap (stack bound). The budget alone does not bound stack
+# use: a non-simple loop like `(?:ab)+` recurses once per consumed byte, so
+# a straight-chain match of a long input can blow the stack well within
+# budget. Exceeding the cap signals exhaustion (budget = -1) so callers
+# fall back to the Pike VM instead of crashing.
+comptime SBT_MAX_DEPTH = 10_000
+
+
+def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
+    """Comptime: True when the NFA contains a cyclic SPLIT that the
+    backtracker runs via general recursion (not one of the iterative
+    simple-loop forms). Only such loops grow the recursion depth with the
+    input, so only they pay for depth tracking — the threading measured
+    ~1.25-1.6x on recursion-heavy patterns when applied unconditionally.
+    """
+    var cyclic = split_cycle_flags(nfa)
+    for i in range(len(nfa.states)):
+        ref s = nfa.states[i]
+        if s.kind != NFAStateKind.SPLIT or s.out2 == -1:
+            continue
+        if not cyclic[i]:
+            continue
+        var body = s.out1 if s.greedy else s.out2
+        var simple = (
+            body >= 0
+            and body < len(nfa.states)
+            and nfa.states[body].out1 == i
+            and (
+                nfa.states[body].kind == NFAStateKind.ANY
+                or nfa.states[body].kind == NFAStateKind.CHAR
+                or nfa.states[body].kind == NFAStateKind.CHARSET
+            )
+        )
+        if not simple:
+            return True
+    return False
+
 
 def _sbt_try_match[
     origin: Origin,
@@ -133,17 +180,26 @@ def _sbt_try_match[
     nfa: NFA,
     state_idx: Int,
     num_slots: Int,
+    anchored_end: Bool = False,
 ](
     input: Span[Byte, origin],
     pos: Int,
     mut slots: InlineArray[Int, num_slots],
     mut budget: Int,
+    depth: Int = 0,
+    end_at: Int = -1,
 ) -> Int:
     """Compile-time specialized backtracking match.
 
     Each instantiation of [nfa, state_idx] produces a specialized function
     that handles exactly one NFA state kind with all fields baked in.
     Charset membership uses bitmaps extracted at compile time.
+
+    When `anchored_end` is True, MATCH only accepts at end of input
+    (fullmatch semantics). This must be enforced inside the engine rather
+    than by filtering the result: a leftmost-first engine may prefer a
+    shorter alternative (e.g. `(a|ab)` on "ab" returns end 1), so a
+    post-hoc `end == len` check would reject valid full matches.
 
     The budget pointer tracks remaining work units. Each call decrements it.
     When exhausted, returns -1 (no match). This bounds pathological patterns
@@ -158,17 +214,33 @@ def _sbt_try_match[
     else:
         comptime state = nfa.states[state_idx]
         comptime kind = state.kind
+        # Depth tracking is free for NFAs without general cyclic SPLITs:
+        # DINC folds to 0, `depth` stays the constant 0, and the check in
+        # the general-SPLIT branch compiles out.
+        comptime DINC = 1 if _sbt_needs_depth_guard(nfa) else 0
 
         comptime if kind == NFAStateKind.MATCH:
-            return pos
+            comptime if anchored_end:
+                # `end_at` lets a caller demand a match ending at a
+                # specific offset while still seeing the WHOLE input, so
+                # lookahead and anchors resolve against the real text
+                # rather than a truncated slice (set_prefilter.mojo).
+                if pos == (end_at if end_at >= 0 else len(input)):
+                    return pos
+                return -1
+            else:
+                return pos
 
         elif kind == NFAStateKind.CHAR:
             if pos >= len(input):
                 return -1
             if UInt32(input.unsafe_get(pos)) == state.char_value:
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                ](input, pos + 1, slots, budget)
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos + 1, slots, budget, depth + DINC, end_at)
             return -1
 
         elif kind == NFAStateKind.ANY:
@@ -176,8 +248,11 @@ def _sbt_try_match[
                 return -1
             if input.unsafe_get(pos) != CHAR_NEWLINE:
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                ](input, pos + 1, slots, budget)
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos + 1, slots, budget, depth + DINC, end_at)
             return -1
 
         elif kind == NFAStateKind.CHARSET:
@@ -192,18 +267,22 @@ def _sbt_try_match[
             var ch = UInt32(input.unsafe_get(pos))
             if _sbt_bitmap_check(bitmap, negated, ch):
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                ](input, pos + 1, slots, budget)
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos + 1, slots, budget, depth + DINC, end_at)
             return -1
 
         elif kind == NFAStateKind.SPLIT:
             comptime out1 = state.out1
             comptime out2 = state.out2
             # Detect a simple single-state body loop: SPLIT → body → SPLIT
-            # This covers a*, a+, \d*, \w+, [a-z]*, etc.
-            # Condition: body's successor loops back to this SPLIT state.
+            # This covers a*, a+, \d*, \w+, [a-z]*, etc. Greedy loops carry
+            # the body in out1, lazy loops in out2.
             comptime is_simple_loop = (
-                out1 >= 0
+                state.greedy
+                and out1 >= 0
                 and out1 < len(nfa.states)
                 and nfa.states[out1].out1 == state_idx
                 and (
@@ -212,7 +291,18 @@ def _sbt_try_match[
                     or nfa.states[out1].kind == NFAStateKind.CHARSET
                 )
             )
-            comptime if is_simple_loop and state.greedy:
+            comptime is_simple_lazy = (
+                (not state.greedy)
+                and out2 >= 0
+                and out2 < len(nfa.states)
+                and nfa.states[out2].out1 == state_idx
+                and (
+                    nfa.states[out2].kind == NFAStateKind.ANY
+                    or nfa.states[out2].kind == NFAStateKind.CHAR
+                    or nfa.states[out2].kind == NFAStateKind.CHARSET
+                )
+            )
+            comptime if is_simple_loop:
                 # Greedy: scan forward consuming as many chars as possible,
                 # then try the exit (out2) from rightmost to leftmost position.
                 comptime body = nfa.states[out1]
@@ -247,9 +337,33 @@ def _sbt_try_match[
                         bitmap, negated, UInt32(input.unsafe_get(max_pos))
                     ):
                         max_pos += 1
-                comptime if exit_is_match:
+                comptime if exit_is_match and anchored_end:
+                    # Anchored MATCH accepts only at the target position
+                    # (`end_at`, else end of input); the loop can stop
+                    # anywhere in [pos, max_pos].
+                    var target = end_at if end_at >= 0 else input_len
+                    if pos <= target and target <= max_pos:
+                        return target
+                    return -1
+                elif exit_is_match:
                     # Greedy `body* MATCH` — max_pos is the longest match.
                     return max_pos
+                elif exit_is_eol_then_match and anchored_end:
+                    # With MATCH anchored to the target, success reduces to
+                    # the loop reaching it AND the EOL anchor holding there.
+                    # At end of input the anchor is trivially true, which is
+                    # the only case when `end_at` is unset.
+                    comptime anchored_eol_ml = (
+                        nfa.states[out2].anchor_type == AnchorKind.EOL_MULTILINE
+                    )
+                    var target = end_at if end_at >= 0 else input_len
+                    if pos <= target and target <= max_pos:
+                        if target == input_len:
+                            return target
+                        comptime if anchored_eol_ml:
+                            if input.unsafe_get(target) == CHAR_NEWLINE:
+                                return target
+                    return -1
                 elif exit_is_eol_then_match:
                     # Greedy `body* ANCHOR(EOL/EOL_MULTILINE) MATCH` — fold
                     # the anchor check into the loop so we don't recurse for
@@ -276,23 +390,34 @@ def _sbt_try_match[
                         if budget < 0:
                             return -1
                         var result = _sbt_try_match[
-                            nfa=nfa, state_idx=out2, num_slots=num_slots
-                        ](input, p, slots, budget)
+                            nfa=nfa,
+                            state_idx=out2,
+                            num_slots=num_slots,
+                            anchored_end=anchored_end,
+                        ](input, p, slots, budget, depth + DINC, end_at)
                         if result >= 0:
                             return result
                         p -= 1
                     return -1
-            elif is_simple_loop and not state.greedy:
-                # Lazy: try exit first, then consume one char and repeat.
-                comptime body = nfa.states[out1]
+            elif is_simple_lazy:
+                # Lazy: try the exit (out1 — lazy splits prefer it) first,
+                # then consume one body char (out2) and repeat. This is
+                # the iterative form of the general-SPLIT recursion, so
+                # lazy loops neither recurse per byte nor need the depth
+                # guard. (An earlier version tested out1 for the loop-back
+                # and so never fired for real lazy quantifiers.)
+                comptime body = nfa.states[out2]
                 var input_len = len(input)
                 var cur = pos
                 while True:
                     if budget < 0:
                         return -1
                     var result = _sbt_try_match[
-                        nfa=nfa, state_idx=out2, num_slots=num_slots
-                    ](input, cur, slots, budget)
+                        nfa=nfa,
+                        state_idx=out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                    ](input, cur, slots, budget, depth + DINC, end_at)
                     if result >= 0:
                         return result
                     if cur >= input_len:
@@ -317,15 +442,34 @@ def _sbt_try_match[
                         cur += 1
                 return -1
             else:
-                # General SPLIT (alternation, complex bodies)
+                # General SPLIT (alternation, complex bodies).
+                # Depth check lives here alone: unbounded recursion depth
+                # requires a cycle, cycles pass through SPLITs, and cyclic
+                # simple loops iterate instead of recursing — so every
+                # ~pattern-size frames of stack growth cross this branch.
+                # Keeping the check off the other (hot, chain-bounded)
+                # states measured ~1.6x on recursion-heavy patterns.
+                comptime if DINC == 1:
+                    if depth > SBT_MAX_DEPTH:
+                        # Stack bound: signal exhaustion so the caller
+                        # falls back to the Pike VM rather than
+                        # overflowing.
+                        budget = -1
+                        return -1
                 var result = _sbt_try_match[
-                    nfa=nfa, state_idx=out1, num_slots=num_slots
-                ](input, pos, slots, budget)
+                    nfa=nfa,
+                    state_idx=out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, budget, depth + DINC, end_at)
                 if result >= 0:
                     return result
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=out2, num_slots=num_slots
-                ](input, pos, slots, budget)
+                    nfa=nfa,
+                    state_idx=out2,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, budget, depth + DINC, end_at)
 
         elif kind == NFAStateKind.SAVE:
             comptime slot = state.save_slot
@@ -333,64 +477,91 @@ def _sbt_try_match[
                 var old_val = slots[slot]
                 slots[slot] = pos
                 var result = _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                ](input, pos, slots, budget)
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, budget, depth + DINC, end_at)
                 if result < 0:
                     slots[slot] = old_val
                 return result
             else:
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                ](input, pos, slots, budget)
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, budget, depth + DINC, end_at)
 
         elif kind == NFAStateKind.ANCHOR:
             if _sbt_check_anchor[anchor_type=state.anchor_type](
                 input, len(input), pos
             ):
                 return _sbt_try_match[
-                    nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                ](input, pos, slots, budget)
+                    nfa=nfa,
+                    state_idx=state.out1,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, budget, depth + DINC, end_at)
             return -1
 
         elif kind == NFAStateKind.LOOKAHEAD:
-            var sub_slots = slots
+            var sub_slots = slots.copy()
             var sub_result = _sbt_try_match[
-                nfa=nfa, state_idx=state.sub_start, num_slots=num_slots
-            ](input, pos, sub_slots, budget)
+                nfa=nfa,
+                state_idx=state.sub_start,
+                num_slots=num_slots,
+                anchored_end=False,
+            ](input, pos, sub_slots, budget, depth + DINC, end_at)
             var matched = sub_result >= 0
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                    ](input, pos, slots, budget)
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                    ](input, pos, slots, budget, depth + DINC, end_at)
                 return -1
             else:
                 if matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                    ](input, pos, slots, budget)
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                    ](input, pos, slots, budget, depth + DINC, end_at)
                 return -1
 
         elif kind == NFAStateKind.LOOKBEHIND:
             comptime lb_len = state.lookbehind_len
             var matched = False
             if pos >= lb_len:
-                var sub_slots = slots
+                var sub_slots = slots.copy()
                 var sub_result = _sbt_try_match[
-                    nfa=nfa, state_idx=state.sub_start, num_slots=num_slots
-                ](input, pos - lb_len, sub_slots, budget)
+                    nfa=nfa,
+                    state_idx=state.sub_start,
+                    num_slots=num_slots,
+                    anchored_end=False,
+                ](input, pos - lb_len, sub_slots, budget, depth + DINC, end_at)
                 matched = sub_result >= 0 and sub_result == pos
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                    ](input, pos, slots, budget)
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                    ](input, pos, slots, budget, depth + DINC, end_at)
                 return -1
             else:
                 if matched:
                     return _sbt_try_match[
-                        nfa=nfa, state_idx=state.out1, num_slots=num_slots
-                    ](input, pos, slots, budget)
+                        nfa=nfa,
+                        state_idx=state.out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                    ](input, pos, slots, budget, depth + DINC, end_at)
                 return -1
 
         elif kind == NFAStateKind.BACKREF:
@@ -415,7 +586,10 @@ def _sbt_try_match[
                     if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
                         return -1
             return _sbt_try_match[
-                nfa=nfa, state_idx=state.out1, num_slots=num_slots
-            ](input, pos + ref_len, slots, budget)
+                nfa=nfa,
+                state_idx=state.out1,
+                num_slots=num_slots,
+                anchored_end=anchored_end,
+            ](input, pos + ref_len, slots, budget, depth + DINC, end_at)
 
     return -1

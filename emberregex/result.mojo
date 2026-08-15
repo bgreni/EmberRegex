@@ -7,7 +7,7 @@ struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
     """The result of a regex match or search operation.
 
     `num_slots` is the comptime-known capture-slot count (2 * group_count) for
-    the StaticRegex that produced this result. Storing slots in an
+    the Regex that produced this result. Storing slots in an
     `InlineArray` keeps `MatchResult` a value type with no per-match heap
     allocation.
     """

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 pixi run test          # run all tests
-pixi run bench         # StaticRegex benchmark suite
+pixi run bench         # single-pattern (`Regex`) benchmark suite
 pixi run bench_all     # run all benchmarks
 
 # Run a single test file
@@ -22,7 +22,7 @@ python3 bench/bench_compare.py
 
 The pipeline is: **pattern string → Parser → AST → NFA → (engine selection) → match**.
 
-All parsing and NFA construction happen at **compile time** inside `StaticRegex[pattern]` field initializers. Invalid patterns abort at compile time rather than raising at runtime.
+All parsing and NFA construction happen at **compile time** inside `Regex[pattern]` field initializers. Invalid patterns abort at compile time rather than raising at runtime.
 
 ### 1. Parser (`parser.mojo`)
 
@@ -42,25 +42,29 @@ The NFA records capability flags used for engine selection:
 - `needs_backtrack` — true when the pattern contains backreferences
 - `start_anchor` — leading anchor kind (`BOL`, `BOL_MULTILINE`, or `-1`), used for position-skip optimizations
 
-### 3. Engine selection (`static/engine.mojo` — `StaticRegex`)
+### 3. Engine selection (`engine.mojo` — `Regex`)
 
 Engine selection happens at compile time via `comptime if` branches:
 
 | Condition | Engine |
 | --- | --- |
 | `_is_pure_literal` | SIMD literal scan |
-| `_use_dfa` | Lazy DFA (`dfa.mojo`) |
-| otherwise | Specialized backtracker (`static/backtrack.mojo`), with Pike VM fallback |
+| `use_dfa` | Eager comptime DFA (`static_dfa.mojo`); lazy DFA (`dfa.mojo`) when determinization exceeds `EDFA_STATE_CAP` states |
+| otherwise | Specialized backtracker (`backtrack.mojo`), with Pike VM fallback |
 
 `extract_literal_prefix` (`optimize.mojo`) walks the NFA at compile time to find any guaranteed literal byte sequence at the start. If found, `search` / `findall` / `replace` use `simd_find_prefix` (`simd_scan.mojo`) to skip non-candidate positions before invoking the engine.
 
 ### 4. Execution engines
 
-**Lazy DFA** (`dfa.mojo`) — used when `can_use_dfa` is true and `group_count == 0`. Builds DFA states on demand from NFA epsilon closures and caches transitions in a 256-entry table per state. Single-pass O(n), no capture overhead. Handles simple line anchors directly: BOL/BOL_MULTILINE resolved in epsilon closure, EOL/EOL_MULTILINE checked at `\n` positions and end-of-input via precomputed flags.
+**Eager DFA** (`static_dfa.mojo`) — the default DFA engine when `can_use_dfa` is true and `group_count == 0`. Subset construction runs at **compile time** over the comptime NFA (byte-equivalence classes bound the per-state work); the transition table (`num_states x 256` of `Int32`) and per-state match/EOL flag bytes materialize as constant data in the binary. The runtime engine is a pure table walk: no lazy construction, no hashing, no `raises` path, no runtime NFA copy in `__init__`. Handles the same three start contexts (pos 0 / after `\n` / mid-line) and EOL flags as the lazy DFA. Two structural optimizations are applied at comptime: states are permuted so match states occupy ids `[0, num_match_states)` (the per-byte match test is an integer compare, not a flags load), and states that self-loop on all but ≤ 2 bytes (e.g. the `.*` state of `.*x`) are **accelerated** — the walkers SIMD-scan to the next exit byte instead of stepping the table (states carrying `EOL_AT_NEWLINE` are excluded to keep per-`\n` match tracking). Patterns whose determinization exceeds `EDFA_STATE_CAP` (128) states are detected at compile time and stay on the lazy DFA.
+
+**Lazy DFA** (`dfa.mojo`) — fallback DFA engine for patterns that blow the comptime state cap. Builds DFA states on demand from NFA epsilon closures and caches transitions in a 256-entry table per state. Single-pass O(n), no capture overhead. Handles simple line anchors directly: BOL/BOL_MULTILINE resolved in epsilon closure, EOL/EOL_MULTILINE checked at `\n` positions and end-of-input via precomputed flags. Raises `DFA_STATE_CAP` at 4096 runtime states; callers fall back to the Pike VM.
 
 **Pike VM** (`executor.mojo`) — fallback for patterns where the specialized backtracker exhausts its budget (e.g. pathological patterns like `(a+)+`). Parallel NFA simulation: two lists of `(state_idx, slots)` pairs swap at each input byte. Capture positions are carried per-thread through SAVE states via `_add_state()`.
 
-**Specialized backtracker** (`static/backtrack.mojo`) — `_sbt_try_match[nfa, state_idx, num_slots]` is specialized per NFA state via comptime parameters and `@always_inline`. Each state becomes a distinct function instantiation; the compiler eliminates dead branches and collapses all recursive calls into a single inlined function with zero runtime dispatch.
+**Specialized backtracker** (`backtrack.mojo`) — `_sbt_try_match[nfa, state_idx, num_slots]` is specialized per NFA state via comptime parameters. Each state becomes a distinct function instantiation whose body is a `comptime if` chain over the state kind, so every branch belonging to the other kinds is eliminated and what remains is straight-line code for that one state with its fields baked in — no runtime dispatch on state kind. The leaf primitives (`_sbt_bitmap_check`, `_sbt_check_anchor`, case folding) are `@always_inline` and fold into that code, and the acyclic parts of the call graph are small and terminating, so chains inline aggressively.
+
+It is **not** flattened into a single function, and `_sbt_try_match` itself is deliberately not `@always_inline`. A cyclic SPLIT can reach its own instantiation, so the general-SPLIT branch is real recursion: that is why `SBT_MAX_DEPTH` (10,000) exists as a *stack* bound distinct from `SBT_BUDGET`, and why `(?:ab)+` on 50KB once overflowed the stack (see ROADMAP.md). Two cyclic shapes escape it — a greedy or lazy SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back compiles to iteration (`is_simple_loop` / `is_simple_lazy`), which is what `_sbt_needs_depth_guard` keys off to skip depth tracking entirely.
 
 ### 5. Result (`result.mojo`)
 `MatchResult` stores a flat `slots: List[Int]` — pairs of `[start, end]` byte offsets, one pair per group. Group 0 is the full match. `group_str(input, n)` slices the input using those offsets.

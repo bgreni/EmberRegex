@@ -178,6 +178,18 @@ static char *repeat_word(const char *word, const char *sep, int n) {
     return buf;
 }
 
+/* Returns malloc'd buffer: unit repeated n times, then suffix appended. */
+static char *repeat_unit(const char *unit, size_t n, const char *suffix) {
+    size_t ulen = strlen(unit), slen = suffix ? strlen(suffix) : 0;
+    char *buf = (char *)malloc(ulen * n + slen + 1);
+    if (!buf) { perror("malloc"); exit(1); }
+    char *p = buf;
+    for (size_t i = 0; i < n; i++) { memcpy(p, unit, ulen); p += ulen; }
+    if (suffix) memcpy(p, suffix, slen);
+    p[slen] = '\0';
+    return buf;
+}
+
 /* Returns malloc'd buffer: 100 log lines (line 750 = ERROR, rest INFO). */
 static char *make_log_lines(int n) {
     /* max ~80 chars per line */
@@ -212,6 +224,20 @@ static char *make_lines(int n) {
     return buf;
 }
 
+/* Returns malloc'd buffer: make_lines(n) + suffix (no leading '\n' before
+ * suffix; caller includes any needed separator). */
+static char *make_lines_plus(int n, const char *suffix) {
+    char *lines = make_lines(n);
+    size_t llen = strlen(lines), slen = strlen(suffix);
+    char *buf = (char *)malloc(llen + slen + 1);
+    if (!buf) { perror("malloc"); exit(1); }
+    memcpy(buf, lines, llen);
+    memcpy(buf + llen, suffix, slen);
+    buf[llen + slen] = '\0';
+    free(lines);
+    return buf;
+}
+
 /* ---------------------------------------------------------------------------
  * Main
  * --------------------------------------------------------------------------- */
@@ -233,6 +259,13 @@ int main(void) {
     char *in_replace_50  = repeat_word("42", " text ", 50);
     char *in_dotstar_5K  = repeat_char('a', 5000, "x");
     char *in_dotstar_miss_5K = repeat_char('a', 5000, NULL);
+    char *in_alt4_search_2KB = make_lines_plus(80, " delta");
+    char *in_email_search_2KB = make_lines_plus(
+        80, " contact us at first.last@example.com today");
+    /* Ends in 'x' so a literal-suffix fast-fail can't reject it outright, but
+       still misses: the trailing "a" has no digits to close the group.
+       Must stay in sync with bench.mojo / bench_compare.py. */
+    char *in_patho_nested = repeat_unit("a1", 800, "ax");
 
     /* Fixed-length string inputs (stack OK) */
     const char *in_hello_world       = "hello world";
@@ -248,7 +281,6 @@ int main(void) {
     const char *in_john_doe          = "John Doe";
     const char *in_patho_16          = "aaaaaaaaaaaaaaaa";
     const char *in_patho_backref     = "hello hello hello";
-    const char *in_patho_nested      = "aaaaaaaaaaaaaaaa";
     const char *in_url               = "https://www.example.com/path/to/page?q=1&r=2";
     const char *in_phone             = "(555) 123-4567";
     const char *in_hex               = "#1a2B3c";
@@ -285,6 +317,8 @@ int main(void) {
     RE re_neg_lb       = jit_compile("(?<!\\d)\\w+", 0);
     RE re_password     = jit_compile("(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).{8,}", 0);
     RE re_alt_4        = jit_compile("alpha|beta|gamma|delta", 0);
+    RE re_email_class  = jit_compile(
+        "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", 0);
     RE re_alt_16       = jit_compile(
         "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
         "|iota|kappa|lambda|mu|nu|xi|omicron|pi", 0);
@@ -352,6 +386,8 @@ int main(void) {
      * 6. Alternation scaling
      * --------------------------------------------------------------------- */
     emit("alternation_4",       bench_match(&re_alt_4,  in_delta, strlen(in_delta), ITERS_NORMAL));
+    emit("alternation_4_search_2KB", bench_search(&re_alt_4, in_alt4_search_2KB,
+                                                   strlen(in_alt4_search_2KB), ITERS_MEDIUM));
     emit("alternation_16",      bench_match(&re_alt_16, in_pi,    strlen(in_pi),    ITERS_NORMAL));
     emit("alternation_16_miss", bench_match(&re_alt_16, in_sigma, strlen(in_sigma), ITERS_NORMAL));
 
@@ -383,6 +419,8 @@ int main(void) {
     /* -----------------------------------------------------------------------
      * 11. Real-world patterns
      * --------------------------------------------------------------------- */
+    emit("static_email_search_2KB",         bench_search(&re_email_class, in_email_search_2KB,
+                                                          strlen(in_email_search_2KB), ITERS_MEDIUM));
     emit("realworld_url_parse",             bench_match(&re_url,       in_url,       strlen(in_url),       ITERS_NORMAL));
     emit("realworld_phone",                 bench_match(&re_phone,     in_phone,     strlen(in_phone),     ITERS_NORMAL));
     emit("realworld_hex_color",             bench_match(&re_hex,       in_hex,       strlen(in_hex),       ITERS_NORMAL));
@@ -412,6 +450,7 @@ int main(void) {
     free(in_log_lines); free(in_dots_500);
     free(in_replace_50); free(in_dotstar_5K);
     free(in_dotstar_miss_5K); free(in_aaaa_10KB);
+    free(in_alt4_search_2KB); free(in_email_search_2KB);
 
     return 0;
 }
