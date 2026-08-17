@@ -59,9 +59,7 @@ def _differential[
             var data = _lcg_bytes(seed, n, alphabet)
             var got = db.scan_som(Span(data))
             var want = set_pike_som_scan(unfa, Span(data))
-            assert_spans(
-                got, want, String(label, " seed=", seed, " n=", n)
-            )
+            assert_spans(got, want, String(label, " seed=", seed, " n=", n))
 
 
 # --- Contract, against the CPython sweep ------------------------------------

@@ -466,18 +466,36 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
     var index = new_set_index()
 
     var c_end = _rev_flat_closure(
-        kinds, anchors, pred_data, pred_off, pred_len, match_states,
-        True, True,
+        kinds,
+        anchors,
+        pred_data,
+        pred_off,
+        pred_len,
+        match_states,
+        True,
+        True,
     )
     var s_end = _rbs_find_or_add(c_end, sets_bits, hashes, index)
     var c_nl = _rev_flat_closure(
-        kinds, anchors, pred_data, pred_off, pred_len, match_states,
-        False, True,
+        kinds,
+        anchors,
+        pred_data,
+        pred_off,
+        pred_len,
+        match_states,
+        False,
+        True,
     )
     var s_nl = _rbs_find_or_add(c_nl, sets_bits, hashes, index)
     var c_other = _rev_flat_closure(
-        kinds, anchors, pred_data, pred_off, pred_len, match_states,
-        False, False,
+        kinds,
+        anchors,
+        pred_data,
+        pred_off,
+        pred_len,
+        match_states,
+        False,
+        False,
     )
     var s_other = _rbs_find_or_add(c_other, sets_bits, hashes, index)
 
@@ -519,14 +537,26 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
                     if slot < 0:
                         one_seed[0] = p
                         var g_o = _rev_flat_closure(
-                            kinds, anchors, pred_data, pred_off, pred_len,
-                            one_seed, False, False,
+                            kinds,
+                            anchors,
+                            pred_data,
+                            pred_off,
+                            pred_len,
+                            one_seed,
+                            False,
+                            False,
                         )
                         var g_n = g_o
                         if has_bol_ml or _bs_any(eol_bits):
                             g_n = _rev_flat_closure(
-                                kinds, anchors, pred_data, pred_off,
-                                pred_len, one_seed, False, True,
+                                kinds,
+                                anchors,
+                                pred_data,
+                                pred_off,
+                                pred_len,
+                                one_seed,
+                                False,
+                                True,
                             )
                         gval_o.append(g_o)
                         gval_n.append(g_n)
@@ -561,9 +591,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         for byte in range(256):
             table.append(Int(row[byte]))
 
-    return _rdfa_finish(
-        nfa, preds, sets, table^, s_end, s_nl, s_other, result^
-    )
+    return _rdfa_finish(nfa, preds, sets, table^, s_end, s_nl, s_other, result^)
 
 
 def _rbs_find_or_add(
@@ -651,16 +679,12 @@ def _build_reverse_dfa_list(nfa: NFA) -> ReverseDFA:
                 at_end=False,
                 on_newline=byte == Int(CHAR_NEWLINE),
             )
-            class_targets[ci] = _rev_find_or_add(
-                closed^, sets, fps, index
-            )
+            class_targets[ci] = _rev_find_or_add(closed^, sets, fps, index)
         for byte in range(256):
             table.append(class_targets[class_of[byte]])
         cur += 1
 
-    return _rdfa_finish(
-        nfa, preds, sets, table^, s_end, s_nl, s_other, result^
-    )
+    return _rdfa_finish(nfa, preds, sets, table^, s_end, s_nl, s_other, result^)
 
 
 def _rdfa_finish(

@@ -454,18 +454,14 @@ def _flatten_nfa(
                 # _byte_classes marked lo and hi+1, so the classes of lo
                 # and hi bound exactly the classes inside [lo, hi].
                 for ci in range(class_of[lo], class_of[hi] + 1):
-                    cm[ci >> 6] = cm[ci >> 6] | (
-                        UInt64(1) << UInt64(ci & 63)
-                    )
+                    cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
             if nfa.charsets[cs].negated:
                 # Classes are pure w.r.t. this charset, so negation is
                 # exact at class granularity.
                 for w in range(4):
                     cm[w] = ~cm[w]
                 for ci in range(nclasses, 256):
-                    cm[ci >> 6] = cm[ci >> 6] & ~(
-                        UInt64(1) << UInt64(ci & 63)
-                    )
+                    cm[ci >> 6] = cm[ci >> 6] & ~(UInt64(1) << UInt64(ci & 63))
             _bs_set(consuming_bits, i)
         elif kind == NFAStateKind.MATCH:
             _bs_set(match_bits, i)
@@ -574,9 +570,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
                 for l in range(64):
                     var w = closed[l]
                     while w != 0:
-                        members.append(
-                            64 * l + Int(count_trailing_zeros(w))
-                        )
+                        members.append(64 * l + Int(count_trailing_zeros(w)))
                         w &= w - 1
                 fl = _state_flags(nfa, members, fl & Int(EDFA_MATCH) != 0)
             flags.append(fl)
@@ -645,9 +639,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
             var h = _bs_hash(closed)
             var found = -1
             for k in range(len(sets_bits)):
-                if hashv[k] == h and _bs_eq(
-                    sets_bits.unsafe_get(k), closed
-                ):
+                if hashv[k] == h and _bs_eq(sets_bits.unsafe_get(k), closed):
                     found = k
                     break
             if found < 0:
@@ -663,9 +655,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
                                 64 * l + Int(count_trailing_zeros(w))
                             )
                             w &= w - 1
-                    fl = _state_flags(
-                        nfa, members, fl & Int(EDFA_MATCH) != 0
-                    )
+                    fl = _state_flags(nfa, members, fl & Int(EDFA_MATCH) != 0)
                 flags.append(fl)
                 if len(sets_bits) >= EDFA_STATE_CAP + 1:
                     return result^  # state blowup: stay invalid, use LazyDFA

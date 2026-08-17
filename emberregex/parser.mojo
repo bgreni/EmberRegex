@@ -99,9 +99,7 @@ struct Parser[origin: Origin](Movable):
         var root = self._parse_alternation()
         self.ast.root = root
         if self.pos < len(self.pattern):
-            raise Error(
-                String(RegexError("Unexpected character", self.pos))
-            )
+            raise Error(String(RegexError("Unexpected character", self.pos)))
         # Build bitmaps for all charsets
         for i in range(len(self.ast.charsets)):
             self.ast.charsets[i].build_bitmap()
@@ -314,9 +312,7 @@ struct Parser[origin: Origin](Movable):
         var value: UInt32 = 0
         for _ in range(count):
             if self._at_end():
-                raise Error(
-                    String(RegexError("Expected hex digit", self.pos))
-                )
+                raise Error(String(RegexError("Expected hex digit", self.pos)))
             var ch = self._advance()
             if ch >= CHAR_ZERO and ch <= CHAR_NINE:
                 value = value * 16 + UInt32(ch - CHAR_ZERO)
@@ -1240,9 +1236,7 @@ struct Parser[origin: Origin](Movable):
 
         if self._at_end():
             raise Error(
-                String(
-                    RegexError("Unterminated character class", self.pos)
-                )
+                String(RegexError("Unterminated character class", self.pos))
             )
         self.pos += 1  # consume ']'
 

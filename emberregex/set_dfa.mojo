@@ -688,9 +688,7 @@ def _build_multi_dfa_list(nfa: NFA) -> MultiDFA:
                 at_start=False,
                 after_newline=byte == Int(CHAR_NEWLINE),
             )
-            class_targets[ci] = _find_or_add_set(
-                closed^, sets, fps, index
-            )
+            class_targets[ci] = _find_or_add_set(closed^, sets, fps, index)
 
         for byte in range(256):
             table.append(class_targets[class_of[byte]])

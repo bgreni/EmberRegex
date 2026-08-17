@@ -65,29 +65,98 @@ def _check_well_formed(name: String) raises:
 
 def test_all_categories_well_formed() raises:
     for n in [
-        "L", "M", "N", "P", "S", "Z", "C",
-        "Lu", "Ll", "Lt", "Lm", "Lo",
-        "Mn", "Mc", "Me",
-        "Nd", "Nl", "No",
-        "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po",
-        "Sm", "Sc", "Sk", "So",
-        "Zs", "Zl", "Zp",
-        "Cc", "Cf", "Cs", "Co", "Cn",
-        "Alpha", "Digit", "Alnum", "Word", "Space", "Any",
+        "L",
+        "M",
+        "N",
+        "P",
+        "S",
+        "Z",
+        "C",
+        "Lu",
+        "Ll",
+        "Lt",
+        "Lm",
+        "Lo",
+        "Mn",
+        "Mc",
+        "Me",
+        "Nd",
+        "Nl",
+        "No",
+        "Pc",
+        "Pd",
+        "Ps",
+        "Pe",
+        "Pi",
+        "Pf",
+        "Po",
+        "Sm",
+        "Sc",
+        "Sk",
+        "So",
+        "Zs",
+        "Zl",
+        "Zp",
+        "Cc",
+        "Cf",
+        "Cs",
+        "Co",
+        "Cn",
+        "Alpha",
+        "Digit",
+        "Alnum",
+        "Word",
+        "Space",
+        "Any",
     ]:
         _check_well_formed(n)
 
 
 def test_all_scripts_well_formed() raises:
     for n in [
-        "Adlam", "Arabic", "Armenian", "Balinese", "Bengali", "Bopomofo",
-        "Braille", "Buginese", "Cham", "Cherokee", "Coptic", "Cyrillic",
-        "Devanagari", "Ethiopic", "Georgian", "Greek", "Gujarati",
-        "Gurmukhi", "Han", "Hangul", "Hebrew", "Hiragana", "Javanese",
-        "Kannada", "Katakana", "Khmer", "Lao", "Latin", "Malayalam",
-        "Mongolian", "Myanmar", "Oriya", "Osage", "Sinhala", "Syriac",
-        "Tagalog", "Tamil", "Telugu", "Thaana", "Thai", "Tibetan",
-        "Vai", "Yi",
+        "Adlam",
+        "Arabic",
+        "Armenian",
+        "Balinese",
+        "Bengali",
+        "Bopomofo",
+        "Braille",
+        "Buginese",
+        "Cham",
+        "Cherokee",
+        "Coptic",
+        "Cyrillic",
+        "Devanagari",
+        "Ethiopic",
+        "Georgian",
+        "Greek",
+        "Gujarati",
+        "Gurmukhi",
+        "Han",
+        "Hangul",
+        "Hebrew",
+        "Hiragana",
+        "Javanese",
+        "Kannada",
+        "Katakana",
+        "Khmer",
+        "Lao",
+        "Latin",
+        "Malayalam",
+        "Mongolian",
+        "Myanmar",
+        "Oriya",
+        "Osage",
+        "Sinhala",
+        "Syriac",
+        "Tagalog",
+        "Tamil",
+        "Telugu",
+        "Thaana",
+        "Thai",
+        "Tibetan",
+        "Vai",
+        "Yi",
     ]:
         _check_well_formed(n)
 
@@ -162,10 +231,38 @@ def test_categories_are_disjoint() raises:
     subcategory tables would make `\\p{Lu}` and `\\p{Ll}` both match."""
     for cp in [0x41, 0x61, 0x30, 0x20, 0x2014, 0x24, 0x300, 0x4E00]:
         var hits = 0
-        for n in ["Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me",
-                  "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe", "Pi",
-                  "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl",
-                  "Zp", "Cc", "Cf", "Cs", "Co", "Cn"]:
+        for n in [
+            "Lu",
+            "Ll",
+            "Lt",
+            "Lm",
+            "Lo",
+            "Mn",
+            "Mc",
+            "Me",
+            "Nd",
+            "Nl",
+            "No",
+            "Pc",
+            "Pd",
+            "Ps",
+            "Pe",
+            "Pi",
+            "Pf",
+            "Po",
+            "Sm",
+            "Sc",
+            "Sk",
+            "So",
+            "Zs",
+            "Zl",
+            "Zp",
+            "Cc",
+            "Cf",
+            "Cs",
+            "Co",
+            "Cn",
+        ]:
             if _has(n, cp):
                 hits += 1
         assert_equal(hits, 1, "U+" + hex(cp) + " in " + String(hits) + " cats")
@@ -175,8 +272,11 @@ def test_major_category_contains_its_subcategories() raises:
     for cp in [0x41, 0x61, 0x1E9E, 0x2C00, 0x4E00, 0xAA]:
         assert_equal(
             _has("L", cp),
-            _has("Lu", cp) or _has("Ll", cp) or _has("Lt", cp)
-            or _has("Lm", cp) or _has("Lo", cp),
+            _has("Lu", cp)
+            or _has("Ll", cp)
+            or _has("Lt", cp)
+            or _has("Lm", cp)
+            or _has("Lo", cp),
             "L disagrees with its subcategories at " + hex(cp),
         )
     for cp in [0x30, 0x2160, 0xB2, 0x660]:
@@ -234,8 +334,11 @@ def test_c_includes_unassigned() raises:
     for cp in [0x00, 0x41, 0xAD, 0x0378, 0xE000, 0xD800]:
         assert_equal(
             _has("C", cp),
-            _has("Cc", cp) or _has("Cf", cp) or _has("Cs", cp)
-            or _has("Co", cp) or _has("Cn", cp),
+            _has("Cc", cp)
+            or _has("Cf", cp)
+            or _has("Cs", cp)
+            or _has("Co", cp)
+            or _has("Cn", cp),
             "C disagrees with its subcategories at " + hex(cp),
         )
 

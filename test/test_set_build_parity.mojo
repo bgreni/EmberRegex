@@ -85,8 +85,14 @@ def test_parity_teddy_literals() raises:
 def test_parity_rose_log() raises:
     check(
         [
-            "ERROR", "WARN", "timeout", "\\d+ms", "conn=\\d+", "retry",
-            "fatal", "GET /[a-z]+",
+            "ERROR",
+            "WARN",
+            "timeout",
+            "\\d+ms",
+            "conn=\\d+",
+            "retry",
+            "fatal",
+            "GET /[a-z]+",
         ]
     )
 
@@ -94,8 +100,14 @@ def test_parity_rose_log() raises:
 def test_parity_mdfa_mixed() raises:
     check(
         [
-            "[a-z]+x1", "foo2|bar2", "(?i)case3", "\\d+ms4", "[0-9]{3}-5",
-            "a[ab]{4}6", "x[yz]+7", "q(?:ab|cd)8",
+            "[a-z]+x1",
+            "foo2|bar2",
+            "(?i)case3",
+            "\\d+ms4",
+            "[0-9]{3}-5",
+            "a[ab]{4}6",
+            "x[yz]+7",
+            "q(?:ab|cd)8",
         ]
     )
 

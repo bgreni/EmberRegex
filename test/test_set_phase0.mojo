@@ -217,9 +217,7 @@ def test_capture_demotion() raises:
 
 
 def test_more_than_eight_patterns() raises:
-    var db = RegexSet[
-        ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"]
-    ]()
+    var db = RegexSet[["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"]]()
     assert_reports(
         db.scan("a3 a8"),
         [SetMatch(3, 2), SetMatch(8, 5)],

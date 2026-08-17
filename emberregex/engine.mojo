@@ -677,7 +677,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     return MatchResult[Self._num_slots].no_match()
             comptime for i in range(suffix_len):
                 comptime sb = Self._sandwich.suffix[i]
-                if ptr[unsafe_offset = input_len - suffix_len + i] != sb:
+                if ptr[unsafe_offset=input_len - suffix_len + i] != sb:
                     return MatchResult[Self._num_slots].no_match()
             return MatchResult[Self._num_slots](
                 matched=True,
@@ -1824,18 +1824,32 @@ struct Regex[pattern: String](Copyable, Movable):
             # 4x-unrolled SIMD body: 4*W bytes per iter
             while pos + 4 * W + last_off <= input_len:
                 var b0 = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
-                var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[width=W]()
-                var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[width=W]()
-                var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[width=W]()
+                var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[
+                    width=W
+                ]()
+                var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[
+                    width=W
+                ]()
+                var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[
+                    width=W
+                ]()
                 var e0 = _probe_eq[caseless=ca, target=byte_a](b0)
                 var e1 = _probe_eq[caseless=ca, target=byte_a](b1)
                 var e2 = _probe_eq[caseless=ca, target=byte_a](b2)
                 var e3 = _probe_eq[caseless=ca, target=byte_a](b3)
                 if (e0 | e1 | e2 | e3).reduce_or():
-                    var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
-                    var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[width=W]()
-                    var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[width=W]()
-                    var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[width=W]()
+                    var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[
+                        width=W
+                    ]()
+                    var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[
+                        width=W
+                    ]()
+                    var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[
+                        width=W
+                    ]()
+                    var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[
+                        width=W
+                    ]()
                     var m0 = e0 & _probe_eq[caseless=cb, target=byte_b](l0)
                     var m1 = e1 & _probe_eq[caseless=cb, target=byte_b](l1)
                     var m2 = e2 & _probe_eq[caseless=cb, target=byte_b](l2)
@@ -1858,10 +1872,14 @@ struct Regex[pattern: String](Copyable, Movable):
             # Single-chunk SIMD body for the bytes between the unrolled body
             # and the tail
             while pos + W + last_off <= input_len:
-                var block_a = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
+                var block_a = ptr.unsafe_offset(pos + off_a).unsafe_load[
+                    width=W
+                ]()
                 var mask_a = _probe_eq[caseless=ca, target=byte_a](block_a)
                 if mask_a.reduce_or():
-                    var block_b = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
+                    var block_b = ptr.unsafe_offset(pos + off_b).unsafe_load[
+                        width=W
+                    ]()
                     var mask = mask_a & _probe_eq[caseless=cb, target=byte_b](
                         block_b
                     )
@@ -1929,7 +1947,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime pc = Self._fpre.caseless[k]
                 if ok:
                     ok = _probe_eq1[caseless=pc, target=pb](
-                        ptr[unsafe_offset = pos + k]
+                        ptr[unsafe_offset=pos + k]
                     )
         return ok
 
