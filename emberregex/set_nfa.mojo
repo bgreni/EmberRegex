@@ -111,6 +111,16 @@ def build_union_nfa(
     return build_union_subset_nfa(patterns, sel, allow_empty, ext)
 
 
+def _parse_pattern(patterns: List[String], i: Int) raises -> AST:
+    """Parse one pattern, tagging any error with the pattern's index and
+    text — a comptime abort gives no source mapping to the list element,
+    so the message must carry it."""
+    try:
+        return parse(patterns[i])
+    except e:
+        raise Error(String("pattern ", i, " ('", patterns[i], "'): ", e))
+
+
 def build_union_subset_nfa(
     patterns: List[String],
     sel: List[Int],
@@ -135,7 +145,7 @@ def build_union_subset_nfa(
 
     for j in range(len(sel)):
         var i = sel[j]
-        var ast = parse(patterns[i])
+        var ast = _parse_pattern(patterns, i)
         var widened = False
         _widen_unsupported(ast, i, widened)
         if widened:

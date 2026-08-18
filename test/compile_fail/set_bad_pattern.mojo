@@ -1,5 +1,5 @@
 # An invalid pattern in a set must abort compilation.
-# EXPECT-ERROR: RegexSet:
+# EXPECT-ERROR: pattern 0 ('a('
 from emberregex import RegexSet
 
 
