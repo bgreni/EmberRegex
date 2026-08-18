@@ -92,9 +92,9 @@ from .set_reverse import (
     reverse_som,
 )
 from .set_combine import (
+    combos_error,
     combos_rpn,
     combos_rpn_arr,
-    combos_valid,
     evaluate_combinations,
 )
 from .set_prefilter import build_confirm_nfas, confirm_span
@@ -156,6 +156,21 @@ def _validate_set_params(
                 " total, or an empty list",
             )
         )
+    return True
+
+
+def _check_combos(combos: List[String], num_patterns: Int) -> Bool:
+    """Comptime: abort with the failing combination's index and text.
+
+    Calls `combos_error` twice (once to test, once to format) rather than
+    caching the result in a `var` — the comptime interpreter frees a
+    `String` local's buffer before a conditionally-reached use reads it,
+    producing an "accessing memory that was freed" interpretation
+    failure. Recomputing avoids that entirely; combos lists are small,
+    and this only runs at compile time.
+    """
+    if combos_error(combos, num_patterns).byte_length() > 0:
+        abort(String("RegexSet: ", combos_error(combos, num_patterns)))
     return True
 
 
@@ -378,6 +393,7 @@ struct RegexSet[
 
     # --- Logical combinations (phase 7) ------------------------------------
     comptime _num_combos = len(Self.combos)
+    comptime _combos_ok = _check_combos(Self.combos, Self.num_patterns)
     comptime _COMBO_RPN = combos_rpn_arr[
         max(1, len(combos_rpn(Self.combos, Self.num_patterns)))
     ](combos_rpn(Self.combos, Self.num_patterns))
@@ -416,6 +432,7 @@ struct RegexSet[
         # Force the comptime build so invalid sets fail compilation even
         # on lanes that never touch the runtime copy.
         comptime assert Self._params_ok, "diagnosed in _validate_set_params"
+        comptime assert Self._combos_ok, "diagnosed in _check_combos"
         comptime assert len(Self.nfa.states) > 0
         self._nfa = materialize[Self.nfa]()
         comptime if Self._use_res_pike:
@@ -531,10 +548,7 @@ struct RegexSet[
         Pattern reports still obey QUIET, so marking the contributing
         patterns quiet leaves only the combination visible.
         """
-        comptime assert combos_valid(Self.combos, Self.num_patterns), (
-            "RegexSet: malformed logical combination — expected a"
-            ' boolean expression over pattern ids, e.g. "0 & !1"'
-        )
+        comptime assert Self._combos_ok, "validated at construction"
         return evaluate_combinations[
             rpn=Self._COMBO_RPN,
             num_combos=Self._num_combos,

@@ -146,6 +146,38 @@ def combos_valid(combos: List[String], num_patterns: Int) -> Bool:
     return True
 
 
+def combos_error(combos: List[String], num_patterns: Int) -> String:
+    """Comptime: empty when every combination parses; otherwise a
+    message naming the first failing combination and why.
+
+    parse_combination collapses syntax errors and out-of-range ids into
+    the same empty list; re-parsing with an unbounded id space tells the
+    two mistakes apart."""
+    for k in range(len(combos)):
+        if len(parse_combination(combos[k], num_patterns)) == 0:
+            if len(parse_combination(combos[k], 1 << 30)) != 0:
+                return String(
+                    "combo ",
+                    k,
+                    " ('",
+                    combos[k],
+                    "'): pattern id out of range for a ",
+                    num_patterns,
+                    "-pattern set",
+                )
+            return String(
+                "combo ",
+                k,
+                " ('",
+                combos[k],
+                (
+                    "'): malformed — expected a boolean expression over"
+                    ' pattern ids, e.g. "0 & !1"'
+                ),
+            )
+    return String("")
+
+
 def _eval[
     n: Int, //, rpn: InlineArray[Int32, n]
 ](off: Int, count: Int, seen: List[Bool]) -> Bool:
