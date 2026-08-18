@@ -16,13 +16,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def collect_files(test_dir):
-    out = []
+    normal, cfail = [], []
     for root, _, files in os.walk(test_dir):
         if "bench" in root:
             continue
         for file in files:
             if file.endswith(".mojo"):
-                out.append(os.path.join(root, file))
+                path = os.path.join(root, file)
+                (cfail if "compile_fail" in root else normal).append(path)
 
     def weight(p):
         # Longest-first scheduling. utf8 dominates a cold run outright;
@@ -34,8 +35,8 @@ def collect_files(test_dir):
             return 1
         return 2
 
-    out.sort(key=lambda p: (weight(p), p))
-    return out
+    normal.sort(key=lambda p: (weight(p), p))
+    return normal, cfail
 
 
 def run_one(path):
@@ -47,6 +48,42 @@ def run_one(path):
     return path, ret
 
 
+def expected_errors(path):
+    out = []
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("# EXPECT-ERROR:"):
+                out.append(s[len("# EXPECT-ERROR:"):].strip())
+    return out
+
+
+def run_compile_fail(path):
+    """A compile_fail file must FAIL to compile, and every EXPECT-ERROR
+    substring must appear in the compiler output."""
+    ret = subprocess.run(
+        ["mojo", "-D", "ASSERT=all", "-I", ".", path],
+        capture_output=True,
+        text=True,
+    )
+    combined = ret.stdout + ret.stderr
+    expected = expected_errors(path)
+    if not expected:
+        return path, False, f"compile-fail MISSING EXPECT-ERROR comment: {path}"
+    if ret.returncode == 0:
+        return path, False, (
+            f"compile-fail DID NOT FAIL: {path}"
+            " (expected compilation to fail)"
+        )
+    missing = [e for e in expected if e not in combined]
+    if missing:
+        return path, False, (
+            f"compile-fail WRONG ERROR: {path}\n  missing: {missing}\n"
+            f"  tail of output:\n{combined[-2000:]}"
+        )
+    return path, True, f"compile-fail ok: {path}"
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -55,17 +92,37 @@ if __name__ == "__main__":
         default=min(6, os.cpu_count() or 1),
         help="parallel mojo invocations (default: min(6, cpus))",
     )
+    ap.add_argument(
+        "--only",
+        type=str,
+        default=None,
+        help="run only files whose path contains this substring",
+    )
     args = ap.parse_args()
 
-    files = collect_files("test/")
+    normal, cfail = collect_files("test/")
+    if args.only:
+        normal = [p for p in normal if args.only in p]
+        cfail = [p for p in cfail if args.only in p]
     failed = []
     count = 0
 
     with ThreadPoolExecutor(max_workers=args.j) as pool:
         # Results print as files finish; each file's output stays
         # contiguous because it is collected before printing.
-        futures = [pool.submit(run_one, p) for p in files]
+        futures = {pool.submit(run_one, p): "normal" for p in normal}
+        futures.update(
+            {pool.submit(run_compile_fail, p): "cfail" for p in cfail}
+        )
         for fut in as_completed(futures):
+            if futures[fut] == "cfail":
+                path, ok, msg = fut.result()
+                print(msg)
+                if ok:
+                    count += 1
+                else:
+                    failed.append(path)
+                continue
             path, ret = fut.result()
             if ret.returncode or "FAIL" in ret.stdout:
                 failed.append(path)
