@@ -52,10 +52,10 @@ from .constants import (
     CHAR_RBRACKET,
     CHAR_RPAREN,
     CHAR_S,
+    CHAR_SEVEN,
     CHAR_SPACE,
     CHAR_STAR,
     CHAR_S_LOWER,
-    CHAR_SEVEN,
     CHAR_TAB,
     CHAR_U_LOWER,
     CHAR_VTAB,
@@ -998,6 +998,11 @@ struct Parser[origin: Origin](Movable):
             return UInt32(CHAR_NEWLINE)
         elif esc == CHAR_r:
             return UInt32(CHAR_CR)
+        # NOTE: charset context deliberately does NOT consume octal
+        # digits after \0 (atom-level \012 is LF; [\012] stays
+        # {NUL,'1','2'}). Aligning this with the atom path (and
+        # Python) is a known open item — do not "fix" the atom path
+        # to match this one.
         elif esc == CHAR_ZERO:
             return 0
         elif esc == CHAR_X_LOWER:

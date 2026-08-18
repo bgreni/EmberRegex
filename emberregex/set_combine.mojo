@@ -138,14 +138,6 @@ def combos_rpn(combos: List[String], num_patterns: Int) -> List[Int]:
     return pool^
 
 
-def combos_valid(combos: List[String], num_patterns: Int) -> Bool:
-    """Comptime: did every combination parse?"""
-    for c in combos:
-        if len(parse_combination(c, num_patterns)) == 0:
-            return False
-    return True
-
-
 def combos_error(combos: List[String], num_patterns: Int) -> String:
     """Comptime: empty when every combination parses; otherwise a
     message naming the first failing combination and why.

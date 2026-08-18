@@ -104,6 +104,9 @@ if __name__ == "__main__":
     if args.only:
         normal = [p for p in normal if args.only in p]
         cfail = [p for p in cfail if args.only in p]
+    if args.only and not normal and not cfail:
+        print(f"No test files match --only {args.only!r}")
+        exit(1)
     failed = []
     count = 0
 

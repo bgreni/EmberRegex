@@ -447,6 +447,7 @@ struct RegexSet[
         """Comptime facts about pattern `id` — Hyperscan's
         `hs_expression_info`, except available to `comptime if` and
         static assertions rather than only at runtime."""
+        comptime assert Self._params_ok, "diagnosed in _validate_set_params"
         comptime v = expression_info(Self.nfa, id)
         return v
 
