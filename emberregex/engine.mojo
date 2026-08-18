@@ -134,7 +134,7 @@ def _build_static_nfa(pattern: String) -> NFA:
         var merged_flags = ast.flags
         return build_nfa(ast^, merged_flags)
     except e:
-        abort("Regex: invalid pattern")
+        abort(String("Regex: invalid pattern: ", e))
 
 
 @always_inline

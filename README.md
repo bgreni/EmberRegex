@@ -211,7 +211,7 @@ The `MatchResult` type is returned by `match()` and `search()`:
 
 ### Unicode (UTF-8 mode)
 
-`(?u)` — or the `(*UTF8)` / `(*UCP)` verbs — makes `.` and character
+`(?u)` — or the `(*UTF8)` verb — makes `.` and character
 classes match one **codepoint** rather than one byte. Offsets stay byte
 offsets, which is the library's contract everywhere.
 
@@ -242,7 +242,9 @@ Three caveats worth knowing:
   UTF-8 mode changes `.` and bracket classes; it does not redefine the
   shorthand escapes the way PCRE's `(*UCP)` does. Write `\p{Nd}`,
   `\p{Word}`, or `\p{Space}` when you want the Unicode meaning.
-  `(*UCP)` is currently accepted as a spelling of UTF-8 mode, nothing more.
+  `(*UCP)` is rejected at compile time rather than silently accepted as
+  a UTF-8 alias — matching differently from PCRE would be worse than
+  refusing.
 - **Big classes cost compile time.** `\p{L}` is 836 UTF-8 byte-sequences,
   and all of that automaton construction happens at compile time
   (`\p{Lu}` ≈ 3 min). Prefer the narrowest property that says what you

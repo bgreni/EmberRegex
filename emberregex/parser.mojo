@@ -412,7 +412,7 @@ struct Parser[origin: Origin](Movable):
             return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
     def _consume_verbs(mut self) raises:
-        """Consume leading `(*UTF8)` / `(*UCP)` verbs.
+        """Consume leading `(*UTF8)` verbs; `(*UCP)` is rejected loudly.
 
         PCRE and Hyperscan spell UTF-8 mode this way; `(?u)` is the same
         switch in this library's inline-flag syntax.
@@ -433,11 +433,26 @@ struct Parser[origin: Origin](Movable):
             var name = String("")
             for i in range(self.pos + 2, close):
                 name += String(chr(Int(self.pattern.unsafe_get(i))))
-            if name == "UTF8" or name == "UTF" or name == "UCP":
+            if name == "UTF8" or name == "UTF":
                 self.inline_flags = RegexFlags(
                     self.inline_flags.value | RegexFlags.UNICODE
                 )
                 self.pos = close + 1
+            elif name == "UCP":
+                raise Error(
+                    String(
+                        RegexError(
+                            (
+                                "(*UCP) is not supported: UTF-8 mode does"
+                                " not give \\d \\w \\s \\b their Unicode"
+                                " meanings (PCRE's UCP contract); use"
+                                " (*UTF8) or (?u) for codepoint classes"
+                                " and \\p{...} for Unicode shorthands"
+                            ),
+                            self.pos,
+                        )
+                    )
+                )
             else:
                 raise Error(
                     String(

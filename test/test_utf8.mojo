@@ -144,8 +144,9 @@ def test_utf8_verb() raises:
     var sp = _span["(*UTF8)[α-ω]+"]("xxαβγxx")
     assert_equal(sp[0], 2)
     assert_equal(sp[1], 8)
-    # (*UCP) is accepted as the same switch.
-    assert_true(_m["(*UCP)[α-ω]"]("α"))
+    # (*UCP) is REJECTED at compile time — pinned by
+    # test/compile_fail/ucp_rejected.mojo. Accepting it as a UTF8 alias
+    # would silently keep \d \w \s \b ASCII, diverging from PCRE.
 
 
 def test_byte_mode_unchanged() raises:
