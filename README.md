@@ -238,7 +238,7 @@ Python.
 
 Three caveats worth knowing:
 
-- **`\d`, `\w`, `\s`, `\b` stay ASCII**, even under `(?u)` / `(*UCP)`.
+- **`\d`, `\w`, `\s`, `\b` stay ASCII**, even under `(?u)`.
   UTF-8 mode changes `.` and bracket classes; it does not redefine the
   shorthand escapes the way PCRE's `(*UCP)` does. Write `\p{Nd}`,
   `\p{Word}`, or `\p{Space}` when you want the Unicode meaning.
@@ -300,12 +300,20 @@ from emberregex import RegexSet
 def main():
     var db = RegexSet[["ERROR", "\\d+ms", "GET /[a-z]+"]]()
     for m in db.scan("ERROR 42ms GET /api"):
-        print(m.id, m.end)   # 0 5 / 1 10 / 2 19
+        print(m.id, m.end)   # (0,5) (1,10) (2,17) (2,18) (2,19)
 ```
 
 The contract is Hyperscan's: report `(id, end)` for every position where some
-match of that pattern ends, ordered by end then id. Note this is **not**
-`re.finditer` — `ab|a` on `"ab"` reports end 1 *and* end 2.
+match of that pattern ends, ordered by end then id. That is why id 2 reports
+three times above — `GET /a`, `GET /ap`, and `GET /api` each end somewhere.
+Note this is **not** `re.finditer` — `ab|a` on `"ab"` reports end 1 *and* end 2.
+
+Two build-time notes: a pattern that can match the empty string is a compile
+error unless you opt in with `RegexSet[patterns, True]()` (`allow_empty`); and
+large sets that do NOT decompose into literal factors determinize in the
+comptime interpreter, whose cost grows superlinearly — see the warning at the
+top of `emberregex/set_engine.mojo` for current numbers and the two lanes
+(pure-literal, Rose) that avoid it.
 
 ### Start of match and spans
 
@@ -330,13 +338,24 @@ var c = st.close()
 
 Also `scan_vectored(chunks)`, `reset()`, and copying to fork a stream.
 
+For sets containing `$` (or `(?m)$`) a match ending exactly at a chunk
+boundary is held until the next `scan()` or `close()` — a stream's total
+output only equals block mode's after `close()`. Sets with word
+boundaries, backreferences, or lookaround are refused at compile time
+(streaming cannot run the exact-confirm pass that block mode applies).
+
 ### Per-pattern flags and combinations
 
 ```mojo
+from emberregex import RegexSet, SetFlags
+
 RegexSet[
     ["ERROR", "timeout", "healthy"],
     flags=[SetFlags.SINGLEMATCH, SetFlags.NONE, SetFlags.QUIET],
-    ext=[0, -1, -1,  -1, -1, 3,  -1, -1, -1],   # min_offset/max_offset/min_length
+    # ext: 5 slots per pattern — (min_offset, max_offset, min_length,
+    # edit_distance, hamming_distance), -1 = unset. Wrong sizes are
+    # compile errors.
+    ext=[0, -1, -1, -1, -1, -1, -1, 3, -1, -1, -1, -1, -1, -1, -1],
     combos=["0 & 1", "!2"],
 ]
 ```
@@ -353,7 +372,7 @@ confirming each candidate on the exact backtracking engine:
 
 ```mojo
 var db = RegexSet[["(\\w)\\1", "foo(?=bar)"]]()
-db.scan("aa ab foobar")   # (0, 2) and (1, 9) — "ab" and "fooqux" are not reported
+db.scan("aa ab foobar")   # (0,2) (0,9) (1,9) — "aa", "oo", "foo"; "ab" is not reported
 ```
 
 ## Performance
@@ -362,12 +381,21 @@ db.scan("aa ab foobar")   # (0, 2) and (1, 9) — "ab" and "fooqux" are not repo
 
 Recursion does not disappear entirely: a cyclic split whose body is not a single-character self-loop — `(?:ab)+`, `(a+)+` — recurses for real, which is why the engine carries both a work budget and a stack-depth cap and falls back to the Pike VM when either is hit. Simple greedy and lazy quantifiers (`a+`, `[a-z]*`, `.*?`) are compiled to iteration instead and never grow the stack.
 
-At runtime, EmberRegex automatically selects the fastest engine for the pattern:
+At compile time, EmberRegex selects the fastest engine for the pattern:
 
-- **Lazy DFA** for patterns without captures — O(n) single-pass matching with no capture overhead. Simple line anchors (`^`, `$`, multiline variants) are handled directly by the DFA.
-- **One-pass NFA** for DFA-compatible patterns with captures — single linear scan extracts captures with no thread management overhead.
-- **Pike VM** for patterns with captures that aren't one-pass eligible — parallel NFA simulation.
-- **Backtracking** only when backreferences require it.
+| Condition | Engine |
+| --- | --- |
+| pattern is a literal string | SIMD literal scan |
+| `prefix + .* + suffix` | sandwich (startswith/endswith) |
+| alternation of literals | Teddy nibble shuffles |
+| ≤ 16 DFA states, shuffle-capable target | Sheng |
+| `can_use_dfa`, ≤ `EDFA_STATE_CAP` states | eager comptime DFA |
+| `can_use_dfa`, larger | lazy DFA |
+| backrefs / lookaround / captures | specialized backtracker |
+| backtracker budget exhausted | Pike VM |
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full selection logic and the
+multi-pattern (`RegexSet`) engine ladder.
 
 Additional search accelerations applied regardless of engine:
 
