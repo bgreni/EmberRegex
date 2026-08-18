@@ -1,4 +1,6 @@
-# A word-boundary set must be REFUSED at compile time by SetStream.
+# A word-boundary set must be REFUSED at compile time by SetStream,
+# naming the offending pattern.
+# EXPECT-ERROR: pattern 0
 # EXPECT-ERROR: cannot stream
 from emberregex import SetStream
 

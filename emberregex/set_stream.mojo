@@ -17,11 +17,16 @@ paying determinization, and the measured per-byte cost is at parity with
 the multi-accept DFA anyway (0.52 vs 0.49 GB/s on the phase-3 bench).
 One streaming implementation beats two.
 
-**What cannot stream**: sets whose patterns use word boundaries, which
-keep them off the automaton lanes entirely (`can_use_dfa`). Those are
-rejected at COMPILE time by `comptime assert`, per the plan's "say so
-loudly" — a streaming API that silently under-reports would be worse
-than one that refuses.
+**What cannot stream** (all refused at COMPILE time, per the plan's "say
+so loudly" — a streaming API that silently under- or over-reports would
+be worse than one that refuses):
+
+- sets whose patterns use word boundaries, which keep them off the
+  automaton lanes entirely (`can_use_dfa`);
+- sets containing backreferences or lookaround: block mode confirms the
+  widened superset's candidates on the exact engine, and a stream has no
+  confirm pass, so it would report unconfirmed superset matches;
+- sets whose union exceeds `BITNFA_POS_CAP` positions.
 
 **Hyperscan's zero-width caveat, reproduced exactly — but only where it
 applies.** A report's `nl` and `end` slices resolve against the byte
@@ -34,6 +39,8 @@ block mode's — which the phase-6 tests check exhaustively over every 2-
 and 3-way split.
 """
 
+from std.os import abort
+
 from .set_bitnfa import (
     BitStreamState,
     bitnfa_stream_chunk,
@@ -41,7 +48,74 @@ from .set_bitnfa import (
     bitnfa_stream_open,
 )
 from .set_engine import RegexSet
+from .set_nfa import build_union_subset_nfa
 from .set_pike import SetMatch
+
+
+def _check_streamable(
+    patterns: List[String],
+    can_use_dfa: Bool,
+    can_stream: Bool,
+    needs_confirm: Bool,
+    confirm_ids: List[Int],
+) -> Bool:
+    """Comptime gate for SetStream: returns True or aborts compilation
+    with a diagnostic naming the offending pattern where possible.
+
+    Runs entirely at compile time (referenced from a comptime decl); the
+    per-pattern NFA rebuilds in the word-boundary branch only execute on
+    the failure path, so streamable sets pay nothing.
+    """
+    if needs_confirm:
+        var ids = String("")
+        for k in range(len(confirm_ids)):
+            if k > 0:
+                ids += ", "
+            ids += String(confirm_ids[k])
+        abort(
+            String(
+                "SetStream: pattern(s) ",
+                ids,
+                (
+                    " use backreferences or lookaround; streaming would"
+                    " report the unconfirmed widened superset. Use scan() in"
+                    " block mode, which confirms candidates exactly."
+                ),
+            )
+        )
+    if not can_use_dfa:
+        for i in range(len(patterns)):
+            try:
+                var one = build_union_subset_nfa(
+                    patterns, [i], True, List[Int]()
+                )
+                if not one.can_use_dfa:
+                    abort(
+                        String(
+                            "SetStream: pattern ",
+                            i,
+                            " ('",
+                            patterns[i],
+                            (
+                                "') uses \\b/\\B, which keeps the set off the"
+                                " automaton lanes; it cannot stream. Use"
+                                " scan() in block mode."
+                            ),
+                        )
+                    )
+            except e:
+                pass
+        abort(
+            "SetStream: this set cannot stream (word boundaries keep it"
+            " off the automaton lanes). Use scan() in block mode."
+        )
+    if not can_stream:
+        abort(
+            "SetStream: this set cannot stream — its union exceeds"
+            " BITNFA_POS_CAP positions. Split the set or use scan() in"
+            " block mode."
+        )
+    return True
 
 
 struct SetStream[patterns: List[String], allow_empty: Bool = False](
@@ -56,15 +130,19 @@ struct SetStream[patterns: List[String], allow_empty: Bool = False](
     comptime _db = RegexSet[Self.patterns, Self.allow_empty]
     comptime _bn = Self._db._stream_bn
     comptime _K = Self._bn.lanes
+    comptime _stream_ok = _check_streamable(
+        Self.patterns,
+        Self._db.nfa.can_use_dfa,
+        Self._db._can_stream,
+        Self._db._needs_confirm,
+        Self._db._confirm_ids,
+    )
 
     var _st: BitStreamState[Self._K]
 
     def __init__(out self):
         """Open a stream at global offset 0."""
-        comptime assert Self._db._can_stream, (
-            "RegexSet: this set cannot stream — word boundaries keep"
-            " it off the automaton lanes. Use scan() in block mode."
-        )
+        comptime assert Self._stream_ok, "diagnosed in _check_streamable"
         self._st = bitnfa_stream_open[d=Self._bn]()
 
     def reset(mut self):
