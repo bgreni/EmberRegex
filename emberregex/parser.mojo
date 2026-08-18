@@ -55,6 +55,7 @@ from .constants import (
     CHAR_SPACE,
     CHAR_STAR,
     CHAR_S_LOWER,
+    CHAR_SEVEN,
     CHAR_TAB,
     CHAR_U_LOWER,
     CHAR_VTAB,
@@ -721,9 +722,22 @@ struct Parser[origin: Origin](Movable):
                 ASTNode.anchor(AnchorKind.NOT_WORD_BOUNDARY)
             )
 
-        # Null character \0
+        # Octal escapes: \0 plus up to two octal digits (Python's
+        # reading: \0 = NUL, \07 = BEL, \012 = LF). A non-octal digit
+        # stops the parse, so \08 is NUL followed by literal '8'.
+        # Non-zero-leading forms (\1..\9) stay backreferences below.
         if ch == CHAR_ZERO:
-            return self.ast.add_node(ASTNode.literal(UInt32(0)))
+            var cp = UInt32(0)
+            var ndig = 0
+            while (
+                ndig < 2
+                and not self._at_end()
+                and self._peek() >= CHAR_ZERO
+                and self._peek() <= CHAR_SEVEN
+            ):
+                cp = (cp << 3) | UInt32(self._advance() - CHAR_ZERO)
+                ndig += 1
+            return self.ast.add_node(ASTNode.literal(cp))
 
         # Backreferences \1 through \9
         if ch >= CHAR_ONE and ch <= CHAR_NINE:

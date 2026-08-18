@@ -169,5 +169,28 @@ def test_comment_in_a_set() raises:
     assert_true(r[0] == SetMatch(0, 4), "comment does not shift offsets")
 
 
+# --- Octal escapes ----------------------------------------------------------
+
+
+def test_octal_nul() raises:
+    # \0 alone is NUL (pre-existing behavior, pinned).
+    assert_true(_m["a\\0b"](String("a") + chr(0) + String("b")))
+    assert_false(_m["a\\0b"]("ab"))
+
+
+def test_octal_digits() raises:
+    # \0 consumes up to two octal digits (Python's reading):
+    # \012 = LF, \07 = BEL — NOT NUL followed by literal digits.
+    assert_true(_m["a\\012b"]("a\nb"))
+    assert_false(_m["a\\012b"](String("a") + chr(0) + String("12b")))
+    assert_true(_m["x\\07y"](String("x") + chr(7) + String("y")))
+
+
+def test_octal_stops_at_non_octal_digit() raises:
+    # 8 is not an octal digit: \08 is NUL then a literal '8' (Python's
+    # reading too).
+    assert_true(_m["a\\08b"](String("a") + chr(0) + String("8b")))
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
