@@ -89,7 +89,7 @@ def test_quiet() raises:
 
 
 def test_min_offset() raises:
-    comptime E: List[Int] = [4, -1, -1, -1, -1, -1]
+    comptime E: List[Int] = [4, -1, -1, -1, -1, -1, -1, -1, -1, -1]
     var db = RegexSet[P, False, List[Int](), E]()
     # Only id 0 is constrained; id 1 keeps its early reports.
     assert_reports(
@@ -100,7 +100,7 @@ def test_min_offset() raises:
 
 
 def test_max_offset() raises:
-    comptime E: List[Int] = [-1, 2, -1, -1, -1, -1]
+    comptime E: List[Int] = [-1, 2, -1, -1, -1, -1, -1, -1, -1, -1]
     var db = RegexSet[P, False, List[Int](), E]()
     assert_reports(
         db.scan(INPUT),
@@ -110,7 +110,7 @@ def test_max_offset() raises:
 
 
 def test_min_length_uses_som() raises:
-    comptime E: List[Int] = [-1, -1, 2, -1, -1, -1]
+    comptime E: List[Int] = [-1, -1, 2, -1, -1, -1, -1, -1, -1, -1]
     comptime S = RegexSet[P, False, List[Int](), E]
     comptime needs = S._sem_needs_som
     assert_true(needs)  # min_length constrains WIDTH, so starts are needed
@@ -125,7 +125,7 @@ def test_min_length_uses_som() raises:
 
 def test_flags_compose() raises:
     comptime F: List[Int] = [SetFlags.SINGLEMATCH, SetFlags.QUIET]
-    comptime E: List[Int] = [2, -1, -1, -1, -1, -1]
+    comptime E: List[Int] = [2, -1, -1, -1, -1, -1, -1, -1, -1, -1]
     var db = RegexSet[P, False, F, E]()
     # id 1 is silenced; id 0 must end at >= 2 and reports once.
     assert_reports(db.scan(INPUT), [SetMatch(0, 2)], "composed")
@@ -138,6 +138,19 @@ def test_filter_applies_to_som_too() raises:
     for s in spans:
         assert_true(s.id != 1, "quiet id absent from scan_som")
     assert_equal(len(spans), 4)
+
+
+def test_keyword_parameter_construction() raises:
+    # Pins the README's keyword spelling of per-pattern semantics —
+    # every other in-repo construction spells the fillers positionally.
+    var db = RegexSet[
+        ["a+", "b"], flags=[SetFlags.NONE, SetFlags.SINGLEMATCH]
+    ]()
+    assert_reports(
+        db.scan("aa b b"),
+        [SetMatch(0, 1), SetMatch(0, 2), SetMatch(1, 4)],
+        "keyword flags= form",
+    )
 
 
 # --- Exact backreferences and lookaround (the Hyperscan differentiator) -----

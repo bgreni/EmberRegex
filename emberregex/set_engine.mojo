@@ -99,6 +99,7 @@ from .set_combine import (
 )
 from .set_prefilter import build_confirm_nfas, confirm_span
 from .set_semantics import (
+    EXT_STRIDE,
     ExprInfo,
     apply_semantics,
     apply_semantics_spans,
@@ -122,6 +123,40 @@ def _build_union_set_nfa(
         return build_union_nfa(patterns, allow_empty, ext)
     except e:
         abort(String("RegexSet: ", e))
+
+
+def _validate_set_params(
+    num_patterns: Int, flags_len: Int, ext_len: Int
+) -> Bool:
+    """Comptime: abort with a sizing diagnostic when the per-pattern
+    `flags` / `ext` lists cannot line up with the pattern list — the
+    tolerant runtime readers (flag_of/ext_of) would otherwise silently
+    misassign fields."""
+    if flags_len != 0 and flags_len != num_patterns:
+        abort(
+            String(
+                "RegexSet: flags has ",
+                flags_len,
+                " entries; expected one SetFlags value per pattern (",
+                num_patterns,
+                ") or an empty list",
+            )
+        )
+    if ext_len != 0 and ext_len != EXT_STRIDE * num_patterns:
+        abort(
+            String(
+                "RegexSet: ext has ",
+                ext_len,
+                (
+                    " entries; expected 5 entries per pattern (min_offset,"
+                    " max_offset, min_length, edit_distance,"
+                    " hamming_distance; -1 = unset) = "
+                ),
+                EXT_STRIDE * num_patterns,
+                " total, or an empty list",
+            )
+        )
+    return True
 
 
 def _build_residual_nfa(
@@ -160,16 +195,19 @@ struct RegexSet[
     Case/multiline/dotall use inline syntax ((?i), (?m), (?s)).
 
     `flags` carries one `SetFlags` value per pattern (SINGLEMATCH,
-    QUIET); `ext` carries `(min_offset, max_offset, min_length)` per
-    pattern with -1 for unset. Both default to empty, and when they are
-    empty the entire semantic post-pass is compiled out — see
-    set_semantics.mojo.
+    QUIET); `ext` carries `(min_offset, max_offset, min_length, edit_distance,
+    hamming_distance)` per pattern — stride 5, -1 for unset. Both default to
+    empty, and when they are empty the entire semantic post-pass is compiled
+    out — see set_semantics.mojo.
     """
 
     comptime nfa = _build_union_set_nfa(
         Self.patterns, Self.allow_empty, Self.ext
     )
     comptime num_patterns = len(Self.patterns)
+    comptime _params_ok = _validate_set_params(
+        Self.num_patterns, len(Self.flags), len(Self.ext)
+    )
     comptime _litset = extract_literal_set(Self.nfa, Self.num_patterns)
     comptime _use_litset = Self._litset.valid and HAS_FAST_BYTE_SHUFFLE
 
@@ -377,6 +415,7 @@ struct RegexSet[
     def __init__(out self):
         # Force the comptime build so invalid sets fail compilation even
         # on lanes that never touch the runtime copy.
+        comptime assert Self._params_ok, "diagnosed in _validate_set_params"
         comptime assert len(Self.nfa.states) > 0
         self._nfa = materialize[Self.nfa]()
         comptime if Self._use_res_pike:
