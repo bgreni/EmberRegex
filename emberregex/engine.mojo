@@ -944,6 +944,17 @@ struct Regex[pattern: String](Copyable, Movable):
         )
     )
     comptime _use_lf_lane = Self._use_lf_dfa or Self._use_dfa_span
+    # The `span` type parameter of the lane's per-walk state (`_SpanPike`
+    # / `_LFWalk`): on the lane, "fills slots" is exactly "has captures"
+    # (the two lanes are mutually exclusive on `_group_count`), and this
+    # LEAF expression is what must appear in the type. Mojo mangles a
+    # comptime Bool parameter as its defining EXPRESSION, not its value,
+    # so `_use_dfa_span` there — whose tree repeats `_dfa_shape_ok`, and
+    # through it the one-pass predicates, at every short-circuit — gave
+    # the three `@no_inline` lane methods 2 MB symbol names and a linker
+    # assertion (`ld: name.size() <= maxLength`). Only ever read where
+    # `_use_lf_lane` holds.
+    comptime _span_lane = Self._group_count > 0
     comptime _use_lf_sheng = (
         Self._use_lf_lane
         and sheng_viable(Self._lfdfa.d)
@@ -1319,7 +1330,7 @@ struct Regex[pattern: String](Copyable, Movable):
         self,
         input: Span[Byte, origin],
         pos: Int,
-        mut walk: _LFWalk[Self._num_slots, Self._use_dfa_span, wo],
+        mut walk: _LFWalk[Self._num_slots, Self._span_lane, wo],
         mut slots: InlineArray[Int, Self._num_slots],
         fill: Bool,
     ) -> Tuple[Int, Int]:
@@ -1462,7 +1473,7 @@ struct Regex[pattern: String](Copyable, Movable):
         self,
         input: Span[Byte, origin],
         s0: Int,
-        pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
         mut slots: InlineArray[Int, Self._num_slots],
         fill: Bool,
     ) -> Tuple[Int, Int]:
@@ -1494,7 +1505,7 @@ struct Regex[pattern: String](Copyable, Movable):
         start: Int,
         end: Int,
         mut slots: InlineArray[Int, Self._num_slots],
-        pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
     ):
         """Capture slots of the leftmost-first match `[start, end)` —
         step three of the DFA-bounded capture lane: the one-pass DFA
@@ -1625,7 +1636,7 @@ struct Regex[pattern: String](Copyable, Movable):
         start: Int,
         end: Int,
         mut slots: InlineArray[Int, Self._num_slots],
-        pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
     ):
         """Pike VM on the exact span `[start, end)`: anchored at `start`,
         MATCH accepted only at `end`, anchors resolved against the whole
@@ -1797,7 +1808,7 @@ struct Regex[pattern: String](Copyable, Movable):
             # verb: the walk's state lives in the verb's frame and the
             # walk carries a pointer to it — see `_LFWalk`'s docstring
             # for why it is shaped this way.
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var rng = self._lf_next_match(
@@ -2057,7 +2068,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             while pos <= input_len:
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2212,7 +2223,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             while pos <= input_len:
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2646,7 +2657,7 @@ struct Regex[pattern: String](Copyable, Movable):
         )
         var prev_end = 0
         var pos = 0
-        var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+        var pike = _SpanPike[Self._num_slots, Self._span_lane]()
         var walk = _LFWalk(Pointer(to=pike))
         while pos <= input_len:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2814,7 +2825,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_len = input.byte_length()
             var pos = 0
             var prev_end = 0
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             while pos <= input_len:
                 # split() never reports groups: the span alone.
