@@ -1841,8 +1841,14 @@ def bench_counted_repeat_search_2KB(mut b: Bench) raises:
     # leftmost-first DFA and the row would measure nothing about this code.
     #
     # The haystack is ~2 KB of lowercase words that all START a valid
-    # `[a-z]{3,7}` run and are all refuted by the digit exit, so it times
-    # the giveback, not the happy path. The first real match sits 2/3 in.
+    # `[a-z]{3,7}` run and are all refuted by the digit exit; the first
+    # real match sits 2/3 in, so the row really walks it.
+    #
+    # This exit is POSSESSIVE — its first-byte set (digits) is disjoint
+    # from the body's ([a-z]) — so what it times is the loop's scan plus a
+    # single exit call per candidate, NOT the hand-back. That is the
+    # common shape, and `counted_repeat_giveback_2KB` below covers the
+    # other one.
     var re = Regex["([a-z]{3,7})\\d"]()
     var input = make_counted_haystack(90)
 
@@ -1859,6 +1865,46 @@ def bench_counted_repeat_search_2KB(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("counted_repeat_search_2KB"))
+
+
+def make_giveback_haystack(n: Int) -> String:
+    """~2 KB for `([a-z]{3,7})[a-z]x`, whose exit starts on [a-z] — the
+    SAME class the body eats — so nothing can be possessified and the
+    walker really tries every count from 7 down to 3. Most tokens are
+    7-letter runs the trailing `x` refutes at all five counts; three of
+    them end in `x` and match."""
+    var parts = List[String]()
+    for i in range(n):
+        if i == 59 or i == 74 or i == 89:
+            parts.append("abcdefgx")
+        else:
+            parts.append("abcdefg")
+    return String(" ").join(parts)
+
+
+def bench_counted_repeat_giveback_2KB(mut b: Bench) raises:
+    # The counted loop's hand-back path. `[a-z]{3,7}` followed by `[a-z]x`
+    # has an exit whose first-byte set is the body's own class, so
+    # `_sbt_loop_filter` proves nothing (SBT_GIVEBACK_ALL) and every
+    # position between `hi` and `lo` is really handed to the exit. Against
+    # `counted_repeat_search_2KB`, which is possessive, this is the row
+    # that would move if the giveback bound or its ordering regressed.
+    var re = Regex["([a-z]{3,7})[a-z]x"]()
+    var input = make_giveback_haystack(90)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("counted_repeat_giveback_2KB"))
 
 
 def bench_key_value_pairs(mut b: Bench) raises:
@@ -2240,6 +2286,7 @@ def main() raises:
     bench_hex_color(b)
     bench_semver(b)
     bench_counted_repeat_search_2KB(b)
+    bench_counted_repeat_giveback_2KB(b)
     bench_key_value_pairs(b)
     bench_html_tag_extraction(b)
     bench_whitespace_normalize(b)

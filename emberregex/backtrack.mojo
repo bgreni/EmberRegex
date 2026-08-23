@@ -426,10 +426,13 @@ def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
       which additionally carries folded-exit specialisations this one
       would have to duplicate.
     - **Every fixed chain** (`hi == lo`: `a{3}`, and any literal run of
-      the same byte). There is nothing to collapse: a fixed chain is a
-      run of tail calls the compiler already turns into a jump, so it
-      costs no frame and no giveback. The counted form would buy only
-      instantiations and would give up the tail call to do it.
+      the same byte). There is no giveback to collapse — one end position
+      is reachable — so all the counted form could buy is instantiations,
+      and it would replace a chain of tail-position recursive calls with
+      a loop body that its callers can inline. What was actually measured
+      is the outcome, not the mechanism: with fixed chains admitted,
+      `(a|aa)+b` and `(?:a|aa)+b` on 2000 `a`s stopped conceding to the
+      Pike VM and started overflowing the stack instead.
     """
     var none = SbtCounted(False, 0, 0, -1, -1, True)
     var n = len(nfa.states)
@@ -869,12 +872,14 @@ def _sbt_try_match[
             var min_pos = pos + clo
 
             # `hi != lo` is guaranteed by the gate, so both forms below
-            # really do hand positions to the exit one at a time, and both
-            # use the simple loop's giveback analysis: a position holding a
+            # really do hand positions to the exit one at a time. Where
+            # they call it per position they use the simple loop's
+            # giveback analysis (`_sbt_loop_filter`): a position holding a
             # byte the body ate that the exit cannot START on is a
-            # guaranteed failure and is skipped without being run.
+            # guaranteed failure and is skipped without being run. The
+            # greedy form only needs that analysis on the path that
+            # actually calls the exit, so it is scoped into that branch.
             comptime if counted.greedy:
-                comptime lf = _sbt_loop_filter(nfa, counted.body, cexit)
                 var limit = input_len
                 comptime if chi >= 0:
                     if pos + chi < limit:
@@ -932,6 +937,10 @@ def _sbt_try_match[
                         p -= 1
                     return -1
                 else:
+                    # Scoped here, not above: `_sbt_loop_filter` walks the
+                    # NFA through `first_byte_bitmap_of`, and the folded
+                    # forms above never read it.
+                    comptime lf = _sbt_loop_filter(nfa, counted.body, cexit)
                     comptime mode = lf.mode
                     comptime exit_bits = lf.exit_bits
                     comptime exit_byte = _sbt_single_byte(exit_bits)

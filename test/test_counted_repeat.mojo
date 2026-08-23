@@ -56,6 +56,10 @@ def _bounds_str[pattern: String]() -> String:
 
 def test_shape_bounded_charset() raises:
     assert_equal(_bounds_str["([a-z]{3,7})\\d"](), "3:7")
+    # The giveback twin of that pattern (bench counted_repeat_giveback_2KB):
+    # same chain, but an exit that starts on the body's own class.
+    assert_equal(_bounds_str["([a-z]{3,7})[a-z]x"](), "3:7")
+    assert_equal(_bounds_str["([^x]{2,4})[^x]y"](), "2:4")
 
 
 def test_shape_unbounded_is_minus_one() raises:
@@ -100,7 +104,7 @@ def test_shape_refuses_input_depth_recursion() raises:
 def test_nested_counted_recursion_matches_pike() raises:
     """Behavioural companion to the pin above — the refused shapes must
     still answer correctly, on the general path."""
-    var alpha: List[Byte] = [97, 98, 120, 48, 49]
+    var alpha: List[String] = ["a", "b", "x", "0", "1"]
     _sweep["((?:a|a{2,3})+)b"](
         alpha, "cyclic-counted", ["aab", "aaab", "ab", "aaaaab", "aaa"]
     )
@@ -164,6 +168,8 @@ def test_all_patterns_stay_off_the_dfa() raises:
     assert_false(Regex["(a{2,5}?)(?:b|$)"]._strategy.use_dfa)
     assert_false(Regex["(.{1,4}?)(?:x|$)"]._strategy.use_dfa)
     assert_false(Regex["(x)a{2,4}"]._strategy.use_dfa)
+    assert_false(Regex["([^x]{2,4})[^x]y"]._strategy.use_dfa)
+    assert_false(Regex["([a-z]{3,7})[a-z]x"]._strategy.use_dfa)
     assert_false(Regex["((?:a|a{2,3})+)b"]._strategy.use_dfa)
     assert_false(Regex["([a-z]+[0-9]{2,5})+x"]._strategy.use_dfa)
     assert_false(Regex["([a-z]+[0-9]{2,5})x"]._strategy.use_dfa)
@@ -172,15 +178,21 @@ def test_all_patterns_stay_off_the_dfa() raises:
 # --- differential against the Pike VM ---------------------------------------
 
 
-def _lcg_bytes(seed: Int, n: Int, alphabet: List[Byte]) -> String:
+def _lcg_bytes(seed: Int, n: Int, alphabet: List[String]) -> String:
     """LCG stream seeded from BOTH `seed` and `n`, so the ten lengths of one
-    seed are ten independent inputs rather than prefixes of one stream."""
-    var out = List[Byte]()
+    seed are ten independent inputs rather than prefixes of one stream.
+
+    The alphabet holds whole CHARACTERS, not single bytes, so that
+    multi-byte entries land as valid UTF-8 (a stream of loose bytes >= 0x80
+    is not a `String` and crashes on construction). The engine is
+    byte-oriented here, so it still sees the individual high bytes — which
+    is the point of having them."""
+    var out = String("")
     var x = (seed * 1000003 + n * 104729 + 12345) & 0x7FFFFFFF
     for _ in range(n):
         x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-        out.append(alphabet[x % len(alphabet)])
-    return String(unsafe_from_utf8=Span(out))
+        out += alphabet[x % len(alphabet)]
+    return out^
 
 
 def _assert_pike_agrees[pattern: String](data: String, label: String) raises:
@@ -220,7 +232,7 @@ def _assert_pike_agrees[pattern: String](data: String, label: String) raises:
 
 def _sweep[
     pattern: String
-](alphabet: List[Byte], label: String, crafted: List[String]) raises:
+](alphabet: List[String], label: String, crafted: List[String]) raises:
     """50 LCG inputs plus the crafted ones — random text over a small
     alphabet rarely produces the exact run lengths that sit on a counted
     chain's `lo`/`hi` boundary, which is where the bugs are."""
@@ -235,9 +247,23 @@ def _sweep[
 
 
 def test_counted_against_pike() raises:
-    # a b x y z 0 1 9 . space \n — dense enough that every pattern below both
-    # hits and misses across the sweep.
-    var alpha: List[Byte] = [97, 98, 120, 121, 122, 48, 49, 57, 46, 32, 10]
+    # a b x y z 0 1 9 . space \n plus four bytes >= 0x80. The engine is
+    # byte-oriented here (no `(?u)`), and the high bytes are what make
+    # `[^x]{2,}` and `.{0,5}` — whose classes are defined by what they
+    # EXCLUDE — actually see the other 128 values of the byte range.
+    var alpha: List[String] = [
+        "a",
+        "b",
+        "x",
+        "y",
+        "z",
+        "0",
+        "1",
+        "9",
+        ".",
+        " ",
+        "\n",
+    ]
 
     # Bounded charset body, digit exit: the giveback walks 7 -> 3.
     _sweep["([a-z]{3,7})\\d"](
@@ -303,6 +329,73 @@ def test_counted_against_pike() raises:
     _sweep["(x)a{2,4}"](alpha, "exit-is-match", ["xaa", "xa", "xaaaa", "xaaaaa"])
 
 
+def _assert_pike_spans_agree[
+    pattern: String
+](data: String, label: String) raises:
+    """Differential that compares OFFSETS only — never match text.
+
+    The sweep above materializes every match as a `String` (findall,
+    group_str), which is fine over ASCII and impossible over bytes >= 0x80:
+    a leftmost-first match of `[^x]{2,}` may legitimately start or end in
+    the middle of a multi-byte sequence, and slicing a `String` there is not
+    a `String`. The engine is byte-oriented, so offsets are the whole
+    answer anyway."""
+    var re = Regex[pattern]()
+
+    var got = re.search(data)
+    var want = re._pike_search(data)
+    assert_equal(got.matched, want.matched, label + " search matched")
+    if want.matched:
+        assert_equal(got.start, want.start, label + " search start")
+        assert_equal(got.end, want.end, label + " search end")
+        for i in range(Regex[pattern]._num_slots):
+            assert_equal(
+                got.slots[i], want.slots[i], label + " slot " + String(i)
+            )
+
+    var gm = re.match(data)
+    var wm = re._pike_match(data)
+    assert_equal(gm.matched, wm.matched, label + " match matched")
+    if wm.matched:
+        assert_equal(gm.end, wm.end, label + " match end")
+
+
+def _sweep_high_bytes[
+    pattern: String
+](alphabet: List[String], label: String) raises:
+    for seed in [3, 11, 57, 4242, 20260823]:
+        for n in [0, 1, 2, 3, 5, 8, 13, 21, 34, 55]:
+            var data = _lcg_bytes(seed, n, alphabet)
+            _assert_pike_spans_agree[pattern](
+                data, label + " seed=" + String(seed) + " n=" + String(n)
+            )
+
+
+def test_counted_high_bytes_against_pike() raises:
+    """The classes defined by what they EXCLUDE (`[^x]`, `.`) accept every
+    byte >= 0x80, and nothing in the ASCII sweep above ever hands them one.
+    The alphabet holds whole characters so the inputs stay valid UTF-8;
+    the byte-oriented engine still sees the individual high bytes."""
+    var alpha: List[String] = [
+        "a",
+        "b",
+        "x",
+        "y",
+        "0",
+        " ",
+        "\n",
+        "é",
+        "€",
+        "Ā",
+        "ÿ",
+    ]
+    _sweep_high_bytes["([^x]{2,})y"](alpha, "hi-negated")
+    _sweep_high_bytes["(.{0,5})x"](alpha, "hi-any")
+    _sweep_high_bytes["([a-z]{3,7})\\d"](alpha, "hi-bounded")
+    _sweep_high_bytes["(a{2,5}?)(?:b|$)"](alpha, "hi-lazy")
+    _sweep_high_bytes["([^x]{2,4})[^x]y"](alpha, "hi-giveback")
+
+
 # --- recursion depth --------------------------------------------------------
 
 
@@ -328,8 +421,11 @@ def test_wide_counted_repeat_stays_in_backtracker() raises:
     assert_equal(_bounds_str[P](), "1:2000")
     var text = String("x") + String("a") * 2000 + "b"
     assert_equal(_sbt_end[P](text), 2002)
-    # The no-match direction: the giveback walks 2000 positions back to 1
-    # without recursing per position.
+    # The no-match direction. This exit is POSSESSIVE ('b' is disjoint
+    # from the body's 'a'), so the loop scans 2000 bytes and refutes all
+    # 2000 counts with ONE exit call — the point being that neither
+    # direction recurses per copy. `([a-z]{3,7})[a-z]x` in
+    # test_bench_coverage covers the hand-back itself.
     var miss = String("x") + String("a") * 2000
     assert_equal(_sbt_end[P](miss), -1)
 
