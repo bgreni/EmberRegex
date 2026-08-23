@@ -18,12 +18,15 @@ from emberregex import Regex
 from emberregex.backtrack import (
     SBT_BUDGET,
     SBT_STACK_BUDGET,
+    SBT_STACK_RESERVE,
     _sbt_needs_depth_guard,
     _sbt_try_match,
     sbt_depth_plan,
     sbt_stack_floor,
     sbt_stack_here,
+    sbt_stack_low,
 )
+from emberregex.engine import _sbt_run
 from std.collections import InlineArray
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -129,16 +132,89 @@ def test_guard_does_not_fire_when_it_should_not() raises:
     assert_true(budget > 0)
 
 
-def test_stack_budget_fits_the_main_thread_stack() raises:
-    # 8 MiB is the macOS/Linux main-thread default; the walk gets half.
-    assert_true(SBT_STACK_BUDGET <= 4 * 1024 * 1024)
-    assert_true(SBT_STACK_BUDGET >= 1024 * 1024)
+def test_floor_is_clamped_to_the_real_thread_stack() raises:
+    """The relative rule alone is unsound: it bounds what the WALK adds,
+    not what the caller already spent, so a deep caller or a small thread
+    stack leaves the floor below the end of the stack. The floor must
+    therefore never sit under `stack_low + SBT_STACK_RESERVE`."""
+    var low = sbt_stack_low()
+    # The query answers on macOS and Linux; elsewhere it reports 0 and
+    # the engine keeps the relative rule alone (nothing to assert).
+    assert_true(low > 0)
+    var here = sbt_stack_here()
+    assert_true(here > low)
+    # ...and the thread really is the ~8 MiB main-thread default here,
+    # which is what makes the budget below a half and not a whole.
+    var thread_bytes = here - low
+    assert_true(thread_bytes >= 4 * 1024 * 1024)
+    assert_true(SBT_STACK_BUDGET * 2 <= thread_bytes + SBT_STACK_RESERVE)
+    var floor = sbt_stack_floor[True]()
+    assert_true(floor >= low + SBT_STACK_RESERVE)
+    assert_true(floor >= here - SBT_STACK_BUDGET)
+    # Nothing is charged to a pattern that cannot recurse — not even the
+    # thread query.
+    assert_equal(sbt_stack_floor[False](), 0)
+
+
+@no_inline
+def _burn_then_walk[
+    p: String
+](levels: Int, text: String, mut sink: InlineArray[Int, 4]) -> Int:
+    """Consume 64 KiB of stack per level, then run the backtracker.
+
+    `@no_inline` and the `sink` writes are what stop the optimizer from
+    turning this back into a loop with no frames.
+    """
+    var pad = InlineArray[Int, 8192](fill=levels)
+    if levels == 0:
+        sink[0] = Int(pad[levels & 8191])
+        comptime R = Regex[p]
+        var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+        var memo = List[UInt64]()
+        try:
+            return _sbt_run[
+                nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+            ](text.as_bytes(), 0, slots, memo)
+        except:
+            return -2  # conceded to the Pike VM
+    var r = _burn_then_walk[p](levels - 1, text, sink)
+    sink[1] += Int(pad[(levels + 1) & 8191])
+    return r
+
+
+def test_deep_caller_does_not_overflow() raises:
+    """A caller that has already spent most of the stack.
+
+    70 levels x 64 KiB = 4.5 MiB of caller before a walk that wants far
+    more than the 3.5 MiB left. Measured on the relative-only floor this
+    commit replaces (`-D ASSERT=all`, 8 MiB main thread): 60 levels
+    returned, 64 / 70 / 80 all SIGSEGV'd (exit 139). With the floor
+    clamped to the thread's real stack, 60 / 64 / 70 / 80 / 110 all
+    return, so 70 is chosen to be past the old cliff and comfortably
+    inside the new bound.
+    """
+    var sink = InlineArray[Int, 4](fill=0)
+    var text = String("a") * 200_000
+    var got = _burn_then_walk["((?:a|a{2,})+)b"](70, text, sink)
+    # Either answer is fine; not crashing is the assertion.
+    assert_true(got == -1 or got == -2)
+    assert_true(sink[0] != 12345)
 
 
 # --- deep walks return, and agree with the Pike VM --------------------
 
 
 def _check[p: String](text: String) raises:
+    """`search` agrees with the Pike VM, AND the backtracker itself
+    survives the same input.
+
+    The second half is not redundant. Every captured shape in this file
+    has `_use_dfa_span == True`, so `search` on a long miss is answered
+    by the leftmost-first DFA and never enters the backtracker at all —
+    with the stack guard disabled in a scratch copy, six of these seven
+    tests still passed. `_sbt_run` is therefore driven directly, which is
+    the only thing that pins THIS commit.
+    """
     comptime R = Regex[p]
     var re = Regex[p]()
     var got = re.search(text)
@@ -150,15 +226,34 @@ def _check[p: String](text: String) raises:
         for g in range(comptime(2 * R.nfa.group_count)):
             assert_equal(got.slots[g], want.slots[g])
 
+    # The backtracker, from position 0, on the same bytes. It may return
+    # the right end or concede to the Pike VM (SBT_BUDGET_EXHAUSTED is
+    # raised for both the work bound and the stack bound); it may not
+    # crash, and it may not return a wrong answer.
+    var want_end = want.end if (want.matched and want.start == 0) else -1
+    var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+    var memo = List[UInt64]()
+    try:
+        var end = _sbt_run[
+            nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+        ](text.as_bytes(), 0, slots, memo)
+        assert_equal(end, want_end)
+    except e:
+        assert_equal(String(e), "SBT_BUDGET_EXHAUSTED")
+
 
 def _sweep[p: String]() raises:
-    # 2000 is under the old call-count cap, 200_000 is two orders past
-    # any stack that could hold it — all three must return, not crash.
+    # 2000 is under the old call-count cap; 200_000 is two orders past
+    # any stack that could hold the walk. Both directions at every size:
+    # the miss walks to the end of the input before failing, and the hit
+    # walks exactly as deep first, so neither may crash and `_sbt_run`
+    # must either answer or concede at all six.
     _check[p](String("a") * 2000)
     _check[p](String("a") * 20_000)
     _check[p](String("a") * 200_000)
-    # ...and the matching direction, which walks just as deep first.
     _check[p](String("a") * 2000 + "b")
+    _check[p](String("a") * 20_000 + "b")
+    _check[p](String("a") * 200_000 + "b")
 
 
 def test_deep_unbounded_counted_alternation() raises:
@@ -180,9 +275,12 @@ def test_deep_nested_plus() raises:
 def test_deep_two_byte_alternation() raises:
     comptime P = "((?:ab|a)+)c"
     _check[P](String("a") * 2000)
+    _check[P](String("a") * 20_000)
     _check[P](String("a") * 200_000)
+    _check[P](String("ab") * 10_000)
     _check[P](String("ab") * 100_000)
     _check[P](String("ab") * 1000 + "c")
+    _check[P](String("ab") * 100_000 + "c")
 
 
 def test_deep_lazy_optional_body() raises:
@@ -202,10 +300,17 @@ def test_deep_nested_optional_star() raises:
 
 def test_deep_uncaptured_shapes_stay_correct() raises:
     # No captures, so these ride the DFA lanes for `search` — but the
-    # backtracker still answers `_sbt_run` for them elsewhere, and the
-    # answer must not depend on which lane took it.
+    # backtracker still answers `_sbt_run` for them (the set lane's
+    # confirm, the leftmost-first lane's anchored attempt), and `_check`
+    # drives it directly, so the answer must not depend on which lane a
+    # caller happens to take. `(?:a|a{2,})+b` is the shape whose SIGSEGV
+    # opened this task.
+    _check["(?:a|a{2,})+b"](String("a") * 20_000)
     _check["(?:a|a{2,})+b"](String("a") * 200_000)
+    _check["(?:a|a{2,})+b"](String("a") * 200_000 + "b")
+    _check["(?:ab)+c"](String("ab") * 10_000)
     _check["(?:ab)+c"](String("ab") * 100_000)
+    _check["(?:ab)+c"](String("ab") * 100_000 + "c")
 
 
 def main() raises:

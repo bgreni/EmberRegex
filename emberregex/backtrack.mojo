@@ -38,6 +38,8 @@ O(1) ASCII membership tests with zero runtime overhead.
 """
 
 from std.collections import InlineArray
+from std.ffi import external_call
+from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 
 from .constants import (
@@ -692,7 +694,111 @@ comptime SBT_BUDGET = 200_000
 #
 # Half of the 8 MiB main-thread default (macOS and Linux both) leaves
 # the other half for whatever called us and for the fallback engine.
+# This is the allowance ONE walk gets; `sbt_stack_floor` also clamps it
+# against the thread's real stack, so it is a ceiling on ambition, not a
+# promise that 4 MiB exists.
 comptime SBT_STACK_BUDGET = 4 * 1024 * 1024
+
+# Stack left untouched below the guard's floor. Two things have to fit
+# in it.
+#
+# 1. **The run between two checks.** The check sits in the general-SPLIT
+#    branch, so what nests uncounted between two of them is one cycle of
+#    the call graph: measured at ~4.5 KiB for `(?:a|aa)+b` under
+#    `-D ASSERT=all` (two real frames of ~2.3 KiB plus tail calls that
+#    cost nothing). 512 KiB is ~110 of those. It is not a bound for a
+#    pattern that nests hundreds of lookarounds between two cyclic
+#    SPLITs — lookaround frames are real and are not check sites — which
+#    is recorded as a residual assumption in ARCHITECTURE.md.
+# 2. **The fallback.** After the concession the caller runs the Pike VM,
+#    which is iterative (two thread lists on the heap), so it adds a
+#    handful of frames rather than a walk.
+#
+# Bigger is not free: on a thread whose whole stack is 512 KiB the floor
+# lands at or above the current SP and every guarded pattern concedes to
+# the Pike VM immediately. That is the safe direction — the answer is
+# still correct, only slower — which is why the reserve is sized for
+# safety rather than for reach.
+comptime SBT_STACK_RESERVE = 512 * 1024
+
+
+struct SbtStackBounds(Copyable, Movable):
+    """This thread's stack, low and high address. `low == 0` means the
+    platform could not be asked."""
+
+    var low: Int
+    var high: Int
+
+    def __init__(out self, low: Int, high: Int):
+        self.low = low
+        self.high = high
+
+
+@no_inline
+def sbt_stack_bounds() -> SbtStackBounds:
+    """The address range of this thread's stack, or `(0, 0)` when the
+    platform cannot be asked.
+
+    `sbt_stack_floor`'s relative rule (`here - SBT_STACK_BUDGET`) is only
+    a bound on what the WALK adds. It says nothing about what the caller
+    already spent, so on a thread with a small stack — or under a caller
+    that is already megabytes deep — the floor can sit below the end of
+    the stack and the guard never gets to fire. Reproduced: a caller
+    burning 64 KiB per level around `_sbt_run[((?:a|a{2,})+)b]` on
+    200_000 `a`s returns at 60 levels (~3.9 MiB) and SIGSEGVs at 64.
+    Asking the thread turns that into a hard floor.
+
+    `@no_inline` keeps the Linux path's `pthread_attr_t` buffer out of
+    the caller's frame; the macOS path is three libc calls that cannot
+    inline anyway.
+
+    **Ask this once and keep the answer.** Three libc calls per
+    `_sbt_run` measured **1.388x** on `static_nested_quantifier`
+    (17 -> 23 ns), which is a walk-per-op shape — far past the 1.10x
+    budget. `Regex.__init__` caches the range and hands it to
+    `sbt_stack_floor`, which re-asks only when the cached range does not
+    contain the current stack pointer (i.e. another thread).
+    """
+    comptime if CompilationTarget.is_macos():
+        # Darwin hands back the stack's HIGH address and its size.
+        var me = external_call["pthread_self", Int]()
+        var hi = external_call["pthread_get_stackaddr_np", Int](me)
+        var size = external_call["pthread_get_stacksize_np", Int](me)
+        if hi > 0 and size > 0 and hi > size:
+            return SbtStackBounds(hi - size, hi)
+        return SbtStackBounds(0, 0)
+    elif CompilationTarget.is_linux():
+        # glibc/musl hand back the LOW address. `pthread_attr_t` is 56
+        # bytes on every supported ABI; 128 is slack. The call parses
+        # /proc/self/maps for the main thread, which is why the result
+        # wants hoisting if it ever shows up in a profile (see
+        # ARCHITECTURE.md).
+        var attr = InlineArray[UInt64, 16](fill=0)
+        var me = external_call["pthread_self", Int]()
+        var rc = external_call["pthread_getattr_np", Int32](
+            me, Pointer(to=attr)
+        )
+        if rc != 0:
+            return SbtStackBounds(0, 0)
+        var lo: Int = 0
+        var size: Int = 0
+        var rc2 = external_call["pthread_attr_getstack", Int32](
+            Pointer(to=attr), Pointer(to=lo), Pointer(to=size)
+        )
+        _ = external_call["pthread_attr_destroy", Int32](Pointer(to=attr))
+        if rc2 != 0 or lo <= 0 or size <= 0:
+            return SbtStackBounds(0, 0)
+        return SbtStackBounds(lo, lo + size)
+    else:
+        # Unknown platform: fall back to the relative rule alone, which
+        # is what this engine did before the query existed.
+        return SbtStackBounds(0, 0)
+
+
+@always_inline
+def sbt_stack_low() -> Int:
+    """`sbt_stack_bounds().low`. Tests read this."""
+    return sbt_stack_bounds().low
 
 
 @always_inline
@@ -724,18 +830,49 @@ def sbt_stack_here() -> Int:
 
 
 @always_inline
-def sbt_stack_floor[guarded: Bool]() -> Int:
+def sbt_stack_floor[
+    guarded: Bool
+](cached_low: Int = 0, cached_high: Int = 0) -> Int:
     """The address the walk must stay above, or 0 when this NFA cannot
     recurse without bound.
 
-    0 is not a magic number that has to be tested for: every real stack
-    address is far above it, so `sbt_stack_here() < 0` is simply never
-    true and the guard costs the walk nothing but a compare it always
-    wins. `guarded` is comptime, so patterns that cannot recurse do not
-    even materialize the address.
+    Two rules, and the walk obeys whichever is higher:
+
+    - **relative** — `here - SBT_STACK_BUDGET` bounds what this walk may
+      add to the stack;
+    - **absolute** — `sbt_stack_low() + SBT_STACK_RESERVE` bounds where
+      the thread's stack actually ends. Without it the relative rule is
+      unsound in two directions at once: a caller that has already spent
+      most of the stack, and a thread that never had 8 MiB (a macOS
+      secondary thread defaults to 512 KiB). Both crash before a purely
+      relative floor can be reached.
+
+    A platform that cannot be asked reports 0 and keeps the relative
+    rule alone.
+
+    The returned 0 for an unguarded NFA is not a magic number that has to
+    be tested for: every real stack address is far above it, so
+    `sbt_stack_here() < 0` is simply never true and the guard costs the
+    walk nothing but a compare it always wins. `guarded` is comptime, so
+    patterns that cannot recurse pay for none of this — not the query,
+    not the address.
     """
     comptime if guarded:
-        return sbt_stack_here() - SBT_STACK_BUDGET
+        var here = sbt_stack_here()
+        var low = cached_low
+        # The cache belongs to the thread that built it. A stack pointer
+        # inside the cached range is proof this is still that thread —
+        # stacks do not overlap — and two compares are what make the
+        # common path free. Anything else (no cache, another thread)
+        # pays the query.
+        if not (low > 0 and low < here and here <= cached_high):
+            low = sbt_stack_bounds().low
+        var floor = here - SBT_STACK_BUDGET
+        if low > 0:
+            var hard = low + SBT_STACK_RESERVE
+            if hard > floor:
+                return hard
+        return floor
     else:
         return 0
 
@@ -1089,6 +1226,14 @@ def _sbt_try_match[
         # would leave a cycle unchecked.
         comptime GUARD_AT_SPLIT = GUARD and PLAN.splits_are_fvs
         comptime GUARD_AT_ENTRY = GUARD and not PLAN.splits_are_fvs
+        # NOTE: GUARD_AT_ENTRY has never been exercised. No pattern in
+        # the tree — and none I could construct — makes `splits_are_fvs`
+        # False, because any loop containing another loop's SPLIT has a
+        # non-simple body and so is itself a general SPLIT on the cycle.
+        # It is kept rather than turned into a comptime error because it
+        # is the strictly-safe direction (check more often, never fewer),
+        # and a regex library must not refuse to compile a pattern. Treat
+        # it as untested code if it ever starts firing.
         comptime if GUARD_AT_ENTRY:
             if sbt_stack_here() < stack_floor:
                 budget = -1

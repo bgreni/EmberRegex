@@ -260,10 +260,15 @@ def test_lazy_group() raises:
 
 def test_pike_on_span_fallback() raises:
     # `(a|aa)+b` on 4000 `a`s then `b`: the DFA span is the whole input,
-    # and the backtracker's confirm trips SBT_MAX_DEPTH on it, so the
-    # slots come from the Pike VM run on exactly that span (whole-input
-    # Pike would give the same answer; this pins that the lane still
-    # answers, with Python's last-iteration capture).
+    # and the backtracker's confirm runs out of SBT_STACK_BUDGET on it,
+    # so the slots come from the Pike VM run on exactly that span
+    # (whole-input Pike would give the same answer; this pins that the
+    # lane still answers, with Python's last-iteration capture).
+    #
+    # WHICH bound trips is build-flag dependent — a frame is ~12x bigger
+    # under `-D ASSERT=all` than in a release build, so a release build
+    # may get all the way through on work budget instead. The assertion
+    # below is deliberately on the ANSWER, not on the lane.
     var re = Regex["(a|aa)+b"]()
     assert_true(Regex["(a|aa)+b"]._use_dfa_span)
     var input = String("a") * 4000 + "b"

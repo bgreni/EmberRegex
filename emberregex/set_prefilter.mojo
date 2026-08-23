@@ -192,6 +192,10 @@ def confirm_span[
             slots,
             budget,
             memo_addr=0,
+            # Uncached, unlike the `Regex` verbs: this is the set lane's
+            # confirm, reached once per surviving candidate on patterns
+            # the prefilter could not settle, so the thread query is far
+            # below the walk it guards.
             stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
             end_at=end,
         )

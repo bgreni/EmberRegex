@@ -57,6 +57,7 @@ from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import (
     _sbt_needs_depth_guard,
+    sbt_stack_bounds,
     sbt_stack_floor,
     SBT_BUDGET,
     SBT_MEMO_BITS,
@@ -125,6 +126,8 @@ def _sbt_run[
     mut slots: InlineArray[Int, num_slots],
     mut memo: List[UInt64],
     end_at: Int = -1,
+    stack_lo: Int = 0,
+    stack_hi: Int = 0,
 ) raises -> Int:
     """Run backtracker with a fresh budget allocation.
 
@@ -157,7 +160,7 @@ def _sbt_run[
                     state_idx=state_idx,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, memo, end_at)
+                ](input, pos, slots, memo, end_at, stack_lo, stack_hi)
             memo.clear()
     var budget = SBT_BUDGET
     var result = _sbt_try_match[
@@ -172,7 +175,9 @@ def _sbt_run[
         slots,
         budget,
         memo_addr=0,
-        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
+        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](
+            stack_lo, stack_hi
+        ),
         end_at=end_at,
     )
     if budget < 0:
@@ -189,7 +194,7 @@ def _sbt_run[
                     state_idx=state_idx,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, memo, end_at)
+                ](input, pos, slots, memo, end_at, stack_lo, stack_hi)
         raise Error("SBT_BUDGET_EXHAUSTED")
     return result
 
@@ -214,6 +219,8 @@ def _sbt_run_memo[
     mut slots: InlineArray[Int, num_slots],
     mut memo: List[UInt64],
     end_at: Int = -1,
+    stack_lo: Int = 0,
+    stack_hi: Int = 0,
 ) raises -> Int:
     """Second attempt at a run that exhausted SBT_BUDGET, this time with a
     (state, pos) memo (see backtrack.mojo).
@@ -249,7 +256,7 @@ def _sbt_run_memo[
         state_idx=state_idx,
         num_slots=num_slots,
         anchored_end=anchored_end,
-    ](input, pos, slots, memo, end_at)
+    ](input, pos, slots, memo, end_at, stack_lo, stack_hi)
 
 
 def _sbt_run_memoized[
@@ -265,6 +272,8 @@ def _sbt_run_memoized[
     mut slots: InlineArray[Int, num_slots],
     mut memo: List[UInt64],
     end_at: Int = -1,
+    stack_lo: Int = 0,
+    stack_hi: Int = 0,
 ) raises -> Int:
     """One attempt on the memoized walker, over a buffer that is already
     sized and zeroed for this input.
@@ -293,7 +302,9 @@ def _sbt_run_memoized[
         slots,
         budget,
         memo_addr=Int(memo.unsafe_ptr()),
-        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
+        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](
+            stack_lo, stack_hi
+        ),
         end_at=end_at,
     )
     if budget < 0:
@@ -1032,8 +1043,24 @@ struct Regex[pattern: String](Copyable, Movable):
     var _simd_lit: TypeForPrefixLength[
         Self._strategy.prefix_len
     ] if Self._strategy.use_simd_literal else NoneType
+    # This thread's stack range, asked once here so the backtracker's
+    # stack guard does not pay three libc calls per `_sbt_run` (measured
+    # 1.388x on `static_nested_quantifier`). `sbt_stack_floor` re-asks
+    # whenever the current stack pointer is outside this range, which is
+    # what keeps a `Regex` built on one thread and used on another
+    # correct. Zeroed — and never queried — for patterns whose walk
+    # cannot recurse without bound.
+    var _stack_lo: Int
+    var _stack_hi: Int
 
     def __init__(out self):
+        comptime if _sbt_needs_depth_guard(Self.nfa):
+            var bounds = sbt_stack_bounds()
+            self._stack_lo = bounds.low
+            self._stack_hi = bounds.high
+        else:
+            self._stack_lo = 0
+            self._stack_hi = 0
         comptime if Self._use_lazy_dfa:
             var nfa = _build_static_nfa(Self.pattern)
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
@@ -1215,7 +1242,7 @@ struct Regex[pattern: String](Copyable, Movable):
             memo_addr=0,
             stack_floor=sbt_stack_floor[
                 _sbt_needs_depth_guard(Self.nfa)
-            ](),
+            ](self._stack_lo, self._stack_hi),
             end_at=-1,
         )
         if budget < 0:
@@ -1459,7 +1486,7 @@ struct Regex[pattern: String](Copyable, Movable):
         "this (state, pos) subtree fails" for one fixed `end_at`, and
         every span of a findall pins a different end.
 
-        When the walk exhausts SBT_BUDGET or SBT_MAX_DEPTH the Pike VM
+        When the walk exhausts SBT_BUDGET or SBT_STACK_BUDGET the Pike VM
         runs on exactly this span (`_pike_span`) — never on the whole
         input, which would cost the DFA speed the lane exists for — and
         `pike[].sbt_ok` latches off so the rest of the walk's spans skip
@@ -1477,7 +1504,15 @@ struct Regex[pattern: String](Copyable, Movable):
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
                     anchored_end=True,
-                ](input, start, slots, memo, end_at=end)
+                ](
+                input,
+                start,
+                slots,
+                memo,
+                end_at=end,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
                 if got == end:
                     return
                 debug_assert(
@@ -1615,7 +1650,14 @@ struct Regex[pattern: String](Copyable, Movable):
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
                 anchored_end=True,
-            ](input.as_bytes(), 0, slots, sbt_memo)
+            ](
+                input.as_bytes(),
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1771,7 +1813,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots, sbt_memo)
+            ](
+                input_bytes,
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1808,7 +1857,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input, pos, slots, sbt_memo)
+            ](
+                input,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1855,7 +1911,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=entry_state, num_slots=Self._num_slots
-            ](input, pos, slots, sbt_memo)
+            ](
+                input,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -2208,7 +2271,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots, sbt_memo)
+            ](
+                input_bytes,
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 self._findall_append(results, input, 0, end, slots)
             return results^
@@ -2223,7 +2293,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots, sbt_memo)
+                    ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
                     if end >= 0:
                         self._findall_append(results, input, pos, end, slots)
                         if end > pos:
@@ -2267,7 +2344,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots, sbt_memo)
+                    ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
                     if end < 0:
                         pos += 1
                         continue
@@ -2357,7 +2441,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots, sbt_memo)
+            ](
+                input_bytes,
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 results.append(
                     MatchResult[Self._num_slots](
@@ -2376,7 +2467,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots, sbt_memo)
+                    ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
                     if end >= 0:
                         results.append(
                             MatchResult[Self._num_slots](
@@ -2424,7 +2522,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots, sbt_memo)
+                    ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
                     if end < 0:
                         pos += 1
                         continue
@@ -2633,7 +2738,14 @@ struct Regex[pattern: String](Copyable, Movable):
                 nfa=Self.nfa,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
-            ](input_bytes, pos, slots, sbt_memo)
+            ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end < 0:
                 pos += 1
                 continue
@@ -2787,7 +2899,14 @@ struct Regex[pattern: String](Copyable, Movable):
                 nfa=Self.nfa,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
-            ](input_bytes, pos, slots, sbt_memo)
+            ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end < 0:
                 pos += 1
                 continue
@@ -3149,7 +3268,14 @@ struct Regex[pattern: String](Copyable, Movable):
                     nfa=Self.nfa,
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
-                ](input, start, slots, sbt_memo)
+                ](
+                input,
+                start,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
                 if end >= 0:
                     return end
             except:
