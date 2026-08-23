@@ -521,7 +521,7 @@ def test_bench_lf_dfa_lazy_findall() raises:
     # bench lf_dfa_lazy_findall_64KB: every tag is a match, none spans
     # past its own `>`.
     comptime S = Regex["<.*?>"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var parts = List[String]()
     var n = 64 * 1024 // 14
@@ -534,10 +534,27 @@ def test_bench_lf_dfa_lazy_findall() raises:
     assert_equal(all[n - 1], "<tag>")
 
 
+def test_bench_match_single_byte_run() raises:
+    # bench match_single_byte_run_20KB: the classic table's `a+` state
+    # stays accelerated (a single-byte self-loop is a genuine run).
+    comptime S = Regex["a+e|x"]
+    assert_true(S._strategy.use_eager_dfa)
+    comptime n_accel = len(S._edfa.accel_states) + len(
+        S._edfa.accel_nib_states
+    )
+    assert_true(n_accel >= 1)
+    var re = S()
+    var input = "a" * 20480 + "e"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.end, 20481)
+    assert_false(re.match("a" * 20480 + "f").matched)
+
+
 def test_bench_lf_dfa_class_run_search() raises:
     # bench lf_dfa_class_run_search_20KB: the whole run plus the x.
     comptime S = Regex["[a-z]+x"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var input = "a" * (20 * 1024) + "x"
     var r = re.search(input)

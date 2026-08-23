@@ -168,7 +168,7 @@ def test_lf_end_skip_guard() raises:
     # suffix, the longest end is also the leftmost-first one.
     comptime S1 = Regex[".*x"]
     assert_true(S1._strategy.use_eager_dfa)
-    assert_true(S1._strategy.use_lf_dfa)
+    assert_true(S1._use_lf_dfa)
     var re1 = S1()
     var r1 = re1.search("axbxc")
     assert_equal(r1.start, 0)
@@ -177,7 +177,7 @@ def test_lf_end_skip_guard() raises:
     # longest end 3 on "aab" — the table must encode the priority.
     comptime S2 = Regex["a*(?:ab)*"]
     assert_true(S2._strategy.use_eager_dfa)
-    assert_true(S2._strategy.use_lf_dfa)
+    assert_true(S2._use_lf_dfa)
     var re2 = S2()
     var r2 = re2.search("aab")
     assert_equal(r2.start, 0)

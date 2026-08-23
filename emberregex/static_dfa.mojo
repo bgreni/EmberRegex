@@ -40,6 +40,13 @@ from .simd_kernels import (
 comptime EDFA_MATCH: UInt8 = 1
 comptime EDFA_EOL_AT_END: UInt8 = 2
 comptime EDFA_EOL_AT_NEWLINE: UInt8 = 4
+# Build-time only: a producer's veto on accelerating a state (the
+# leftmost-first determinizer sets it on states whose self-loops exist
+# only because the unanchored restart re-created a thread the byte had
+# just killed — a SIMD scan there never skips anything). Honoured and
+# then stripped by _edfa_finish, so materialized flag bytes never carry
+# it and _minimize keeps such states apart from accelerable ones.
+comptime EDFA_NO_ACCEL: UInt8 = 8
 
 # Determinization cap. Chosen well below the LazyDFA's runtime cap: the
 # comptime interpreter pays for every state x 256 byte columns, and any
@@ -52,16 +59,6 @@ comptime EDFA_STATE_CAP = 128
 # EDFA_STATE_CAP anyway, so the pattern falls to the LazyDFA unchanged.
 comptime EDFA_NFA_CAP = 4096
 
-# Smallest self-loop set a state needs for nibble acceleration. A state
-# looping on one to three bytes is never worth a vector scan — its runs
-# are rare — but it is common: in the leftmost-first unanchored table
-# every "partial literal + restart" state loops on the byte that kills
-# the partial match and starts it over (`[c-thread, restart]` on `c`),
-# and a 32-arm alternation had 17 such states, each paying the per-byte
-# accelerated-state dispatch chain for nothing (measured 1.5x on
-# sheng64_alt_32_search_2KB). The <= 2-exit path is unaffected: those
-# states loop on >= 254 bytes.
-comptime ACCEL_MIN_LOOP_BYTES = 4
 
 # --- Runtime transition-table element type ---------------------------------
 #
@@ -1128,12 +1125,11 @@ def _edfa_finish(
     # <= 2 exit bytes (e.g. the `.*` state of `.*x`) use direct compares;
     # larger sets (e.g. the `\w+` self-loop) are nibble-encoded as shufti
     # masks when exact, truffle otherwise — only on targets with a native
-    # byte shuffle, and only when the self-loop set is big enough to
-    # occur in runs (ACCEL_MIN_LOOP_BYTES). EOL_AT_NEWLINE-flagged states
-    # are excluded: skipping bytes would skip their per-'\n' last_match
-    # updates when '\n' self-loops.
+    # byte shuffle. EOL_AT_NEWLINE-flagged states are excluded: skipping
+    # bytes would skip their per-'\n' last_match updates when '\n'
+    # self-loops. So are states the producer vetoed (EDFA_NO_ACCEL).
     for s in range(nsets):
-        if new_flags[s] & Int(EDFA_EOL_AT_NEWLINE) != 0:
+        if new_flags[s] & (Int(EDFA_EOL_AT_NEWLINE) | Int(EDFA_NO_ACCEL)) != 0:
             continue
         var row = new_rows.unsafe_get(s)
         var exit_count = 0
@@ -1150,7 +1146,7 @@ def _edfa_finish(
             result.accel_states.append(s)
             result.accel_exit1.append(exits[0])
             result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE and 256 - len(exits) >= ACCEL_MIN_LOOP_BYTES:
+        elif HAS_FAST_BYTE_SHUFFLE:
             var t0 = List[Int]()
             var t1 = List[Int]()
             if shufti_encodable(exits):
@@ -1162,6 +1158,9 @@ def _edfa_finish(
             result.accel_nib_states.append(s)
             result.accel_nib_t0.extend(t0^)
             result.accel_nib_t1.extend(t1^)
+    # The veto has done its job; the walkers' flag bytes never carry it.
+    for s in range(nsets):
+        new_flags[s] &= ~Int(EDFA_NO_ACCEL)
 
     var new_table = List[Int]()
     for s in range(nsets):

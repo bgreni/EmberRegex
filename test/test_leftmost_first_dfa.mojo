@@ -35,11 +35,11 @@ def test_lazy_patterns_ride_the_lf_lane() raises:
     comptime S = Regex["<.*?>"]
     assert_true(S._strategy.use_dfa)
     assert_true(S._strategy.use_eager_dfa)
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     assert_false(S._use_lazy_dfa)
     comptime T = Regex["x*?y"]
     assert_true(T._strategy.use_dfa)
-    assert_true(T._strategy.use_lf_dfa)
+    assert_true(T._use_lf_dfa)
     assert_false(T._use_lazy_dfa)
 
 
@@ -50,7 +50,7 @@ def test_lazy_overflow_takes_backtracker_not_lazy_dfa() raises:
     comptime S = Regex["(?:a|b)*?a(?:a|b){12}"]
     assert_false(S._lfdfa.valid)
     assert_false(S._strategy.use_dfa)
-    assert_false(S._strategy.use_lf_dfa)
+    assert_false(S._use_lf_dfa)
     assert_false(S._use_lazy_dfa)
     var re = S()
     var input = "ab" * 6 + "a" + "b" * 12
@@ -62,13 +62,102 @@ def test_lazy_overflow_takes_backtracker_not_lazy_dfa() raises:
 
 
 def test_greedy_overflow_keeps_lazy_dfa_for_search() raises:
-    # A greedy pattern whose tables overflow keeps today's lane: the
-    # LazyDFA with the backtracker end re-run.
+    # A greedy pattern whose CLASSIC table overflows keeps today's lane:
+    # the LazyDFA with the backtracker end re-run.
     comptime S = Regex["(?:a|b)*a(?:a|b){12}"]
     assert_true(S._strategy.use_dfa)
     assert_false(S._strategy.use_eager_dfa)
-    assert_false(S._strategy.use_lf_dfa)
+    assert_false(S._use_lf_dfa)
     assert_true(S._use_lazy_dfa)
+
+
+def test_greedy_lf_overflow_takes_backtracker_for_search() raises:
+    # Classic table exactly at the cap (128 states), leftmost-first table
+    # past it: match() stays on the eager table, and the search verbs go
+    # to the backtracker — NOT a runtime LazyDFA (its NFA copy would sit
+    # in __init__ of a pattern whose match() is a pure table walk; the
+    # flag typing those instance fields must not depend on the
+    # leftmost-first tables or every instantiation would build them).
+    comptime S = Regex["(?:a|b|\n)*a(?:a|b|\n){6}"]
+    assert_true(S._strategy.use_dfa)
+    assert_true(S._strategy.use_eager_dfa)
+    assert_true(S._edfa.valid)
+    assert_false(S._lfdfa.valid)
+    assert_false(S._use_lf_dfa)
+    assert_false(S._use_lazy_dfa)
+    var re = S()
+    for input in [
+        String("ab\nba") + "b" * 6 + "x",
+        String("bbbbbbb"),
+        String("xxabababa\nab"),
+        String("a") * 40 + "\n" + "b" * 3,
+    ]:
+        var got = re.search(input)
+        var exp = re._pike_search(input)
+        assert_equal(got.matched, exp.matched, input)
+        if exp.matched:
+            assert_equal(got.start, exp.start, input)
+            assert_equal(got.end, exp.end, input)
+        var gf = re.finditer(input)
+        var ef = re._pike_finditer(input)
+        assert_equal(len(gf), len(ef), input)
+        for i in range(len(gf)):
+            assert_equal(gf[i].start, ef[i].start, input)
+            assert_equal(gf[i].end, ef[i].end, input)
+        assert_equal(re.match(input).matched, re._pike_match(input).matched)
+
+
+def test_tail_kind_shared_without_bol_multiline() raises:
+    # The restart tail appended after a '\n' is the same closure as the
+    # mid-line one unless the pattern has BOL_MULTILINE, so both contexts
+    # must share one tail kind — minting a second one doubled every
+    # restarting state (114 states, past the cap for the {6} sibling).
+    comptime S = Regex["(?:a|b|\n)*a(?:a|b|\n){5}"]
+    assert_true(S._lfdfa.valid)
+    assert_equal(S._lfdfa.d.num_states, 96)
+    assert_true(S._use_lf_dfa)
+    var re = S()
+    var input = String("b\nab") + "a" * 3 + "\n" + "b" * 5 + "a"
+    var got = re.search(input)
+    var exp = re._pike_search(input)
+    assert_equal(got.start, exp.start)
+    assert_equal(got.end, exp.end)
+
+
+def test_spurious_self_loops_are_not_accelerated() raises:
+    # In the unanchored table `[c-thread, restart]` self-loops on `c`
+    # only because `c` kills the thread and restarts it; accelerating
+    # that never skips a byte and costs the per-byte dispatch. Only the
+    # restart-only state (looping on every byte that starts nothing) is
+    # accelerated here.
+    comptime A = Regex[
+        "cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+        "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap|[0-9]{3}"
+    ]
+    assert_true(A._use_lf_dfa)
+    comptime a_accel = len(A._lfdfa.d.accel_states) + len(
+        A._lfdfa.d.accel_nib_states
+    )
+    assert_equal(a_accel, 1)
+    # A genuine single-byte loop (the `a+` run) IS accelerated, on both
+    # the leftmost-first table and the classic one: `a+e|x` match() on a
+    # 20 KB run measured 16x slower when a loop-set threshold dropped it.
+    comptime B = Regex["a+e|x"]
+    assert_true(B._use_lf_dfa)
+    comptime b_lf_accel = len(B._lfdfa.d.accel_states) + len(
+        B._lfdfa.d.accel_nib_states
+    )
+    comptime b_classic_accel = len(B._edfa.accel_states) + len(
+        B._edfa.accel_nib_states
+    )
+    assert_true(b_lf_accel >= 1)
+    assert_true(b_classic_accel >= 1)
+    var re = B()
+    var run = "a" * 20480 + "e"
+    assert_equal(re.match(run).end, 20481)
+    var r = re.search("zz" + run)
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 20483)
 
 
 def test_match_keeps_the_classic_table() raises:
@@ -77,7 +166,7 @@ def test_match_keeps_the_classic_table() raises:
     # non-literal arm keeps Teddy from claiming the pattern.
     comptime S = Regex["a|a[bc]"]
     assert_true(S._strategy.use_eager_dfa)
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     assert_true(re.match("ab").matched)
     assert_true(re.match("a").matched)
@@ -119,7 +208,7 @@ def test_alternation_priority_end() raises:
 def test_two_loops_leftmost_first_end() raises:
     # Leftmost-first end 2 (greedy a* keeps both a's); longest would be 3.
     comptime S = Regex["a*(?:ab)*"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var r = re.search("aab")
     assert_equal(r.start, 0)
@@ -179,13 +268,13 @@ def test_eol_in_priority_order() raises:
     # `ab$|a`: on "ab" the first arm resolves at end of input (2); on
     # "abc" it dies and the second arm's recorded end (1) stands.
     comptime S = Regex["ab$|a"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     assert_equal(re.search("ab").end, 2)
     assert_equal(re.search("abc").end, 1)
     # `(?m)a$|ab`: the EOL arm matches before a '\n', else `ab` does.
     comptime T = Regex["(?m)a$|ab"]
-    assert_true(T._strategy.use_lf_dfa)
+    assert_true(T._use_lf_dfa)
     var re2 = T()
     assert_equal(re2.search("a\nab").end, 1)
     assert_equal(re2.search("ab\na").end, 2)
@@ -198,7 +287,7 @@ def test_eol_in_priority_order() raises:
 
 def test_bol_multiline_with_unanchored_arm() raises:
     comptime S = Regex["(?m)^ab|a"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var r = re.search("xx\nab")
     assert_equal(r.start, 3)
@@ -217,7 +306,7 @@ def test_bol_anchored_has_no_restart() raises:
     # Nothing can start mid-input, so the unanchored table IS the
     # anchored one and search is a single attempt at 0.
     comptime S = Regex["^(?:ab|cd)"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     assert_true(re.search("cdxx").matched)
     assert_false(re.search("xcd").matched)
@@ -226,7 +315,7 @@ def test_bol_anchored_has_no_restart() raises:
 
 def test_empty_matches_advance() raises:
     comptime S = Regex["a*|b"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var got = re.finditer("baab")
     var exp = re._pike_finditer("baab")
@@ -246,7 +335,7 @@ def test_reverse_walk_never_passes_previous_end() raises:
     # `.*?foo` over many foos: each span starts at the previous end,
     # which only holds if the reverse walk stops at the floor.
     comptime S = Regex[".*?foo"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var input = String("")
     for _ in range(1000):
@@ -277,7 +366,7 @@ def test_reverse_acceleration_bounds() raises:
     # exit byte ('\n' for `.`, the non-letter for `[a-z]`). Runs are
     # longer than a SIMD chunk so the vector path is the one exercised.
     comptime S = Regex["b|.*x"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     comptime any_rev_accel = len(S._rdfa.accel_states) > 0
     assert_true(any_rev_accel)
     var re = S()
@@ -297,7 +386,7 @@ def test_reverse_acceleration_bounds() raises:
     _assert_finditer_pike["b|.*x"]("x" + "a" * 33 + "x\n" + "a" * 17 + "x")
 
     comptime T = Regex["b|[a-z]+x"]
-    assert_true(T._strategy.use_lf_dfa)
+    assert_true(T._use_lf_dfa)
     var re2 = T()
     var got2 = re2.finditer(run)
     assert_equal(len(got2), 2)
@@ -326,7 +415,7 @@ def test_class_run_search_is_linear() raises:
     # `[a-z]+x` on a 20 KB run of `a`: quadratic per-position attempts
     # would cost ~100x the linear scan on a 2 KB run.
     comptime S = Regex["[a-z]+x"]
-    assert_true(S._strategy.use_lf_dfa)
+    assert_true(S._use_lf_dfa)
     var re = S()
     var big = "a" * (20 * 1024) + "x"
     var small = "a" * (2 * 1024) + "x"
@@ -439,7 +528,7 @@ def test_wide_list_signature_renumbering() raises:
     # And on the engine: a class arm keeps Teddy off, so the same lists
     # drive search/findall through the lane.
     comptime W = Regex[_WIDE_ALT + "|[!?]{2}"]
-    assert_true(W._strategy.use_lf_dfa)
+    assert_true(W._use_lf_dfa)
     var re = W()
     var all = re.findall("??q 7!!")
     assert_equal(len(all), 4)

@@ -55,6 +55,7 @@ from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
     EDFA_MATCH,
+    EDFA_NO_ACCEL,
     EDFA_NFA_CAP,
     EDFA_STATE_CAP,
     EagerDFA,
@@ -386,6 +387,18 @@ def build_lf_dfa(
     var st_tail = List[Int]()
     var flags = List[Int]()
     var hashv = SIMD[DType.uint64, 256](0)
+    # Self-loop bookkeeping for the acceleration veto (see EDFA_NO_ACCEL):
+    # a state self-loops GENUINELY when one of its own threads survives
+    # the byte (a `+` loop, a class run) or when nothing at all survives
+    # and only the restart remains (the restart-only state skipping bytes
+    # that start nothing). It self-loops SPURIOUSLY when the byte kills
+    # every thread and the restart re-creates the identical list
+    # (`[c-thread, restart]` on `c` for `cat|cow|…`): a scan there never
+    # skips a byte, and a 32-arm alternation had 17 such states each
+    # paying the per-byte accelerated-state dispatch for nothing
+    # (measured 1.5x on sheng64_alt_32_search_2KB).
+    var st_selfloop = List[Bool]()
+    var st_genuine = List[Bool]()
 
     # --- Start states: (other, after-nl, at-0) unanchored, then anchored.
     var starts = List[Int]()
@@ -457,6 +470,8 @@ def build_lf_dfa(
             st_restart.append(new_restart)
             st_tail.append(0)
             flags.append(acc_fl)
+            st_selfloop.append(False)
+            st_genuine.append(False)
         starts.append(found)
 
     # --- Main loop. ---
@@ -469,6 +484,7 @@ def build_lf_dfa(
         var llen = st_len.unsafe_get(cur)
         var lrestart = st_restart.unsafe_get(cur)
         var ltail = st_tail.unsafe_get(cur)
+        var thread_len = llen  # members below this are the state's own threads
 
         # Materialize the restart tail: the tail context's start closure
         # minus what the thread-derived list already holds, in closure
@@ -646,6 +662,7 @@ def build_lf_dfa(
             var acc_fl = 0
             var trunc = False
             var overflow = False
+            var from_thread = False  # some own thread contributed
             # Walk the members in priority order — on the fast path only
             # those the signature says accept `rc`, highest bit (first
             # member) first — and append each one's closure.
@@ -704,6 +721,8 @@ def build_lf_dfa(
                     slot = Int(slot_o[i])
                 if slot < 0:
                     continue
+                if i < thread_len:
+                    from_thread = True
                 var cv = clo_vec.unsafe_get(slot)
                 var cnt = Int(cv[_LF_CLO_W - 1])
                 var in_lanes = cnt <= _LF_CLO_ELEMS
@@ -738,10 +757,17 @@ def build_lf_dfa(
                     return result^
             # The restart tail (lowest priority) when the state restarts
             # and nothing truncated: recorded as a kind, never appended.
+            # Without BOL_MULTILINE the two contexts' closures are the
+            # same list, so kind 1 serves both (kind 2 would mint a
+            # duplicate of every restarting state).
             var tail = 0
             if lrestart and not trunc:
-                tail = 2 if after_nl else 1
+                tail = 2 if (after_nl and has_bol_ml) else 1
                 acc_fl |= r_fl_n if after_nl else r_fl_o
+                # Reachable when one context's start closure ends in
+                # MATCH and the other's does not: `(?m)^|a` restarts
+                # mid-line (closure [a]) and its '\n' step appends
+                # [MATCH], which truncates and clears the restart.
                 var rtr = r_trunc_n if after_nl else r_trunc_o
                 if rtr:
                     trunc = True
@@ -788,6 +814,12 @@ def build_lf_dfa(
                 st_restart.append(new_restart)
                 st_tail.append(tail)
                 flags.append(acc_fl)
+                st_selfloop.append(False)
+                st_genuine.append(False)
+            if found == cur:
+                st_selfloop[cur] = True
+                if from_thread or acc_len == 0:
+                    st_genuine[cur] = True
             for ci in range(nclasses):
                 if Int(cls_group[ci]) != g:
                     continue
@@ -797,6 +829,10 @@ def build_lf_dfa(
         cur += 1
         if len(st_list) > EDFA_STATE_CAP:
             return result^
+
+    for s in range(len(st_list)):
+        if st_selfloop[s] and not st_genuine[s]:
+            flags[s] |= Int(EDFA_NO_ACCEL)
 
     var pstarts = _edfa_finish(
         result.d, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize

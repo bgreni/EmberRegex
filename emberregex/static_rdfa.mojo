@@ -51,7 +51,6 @@ from .simd_kernels import (
 )
 from .simd_scan import lane_bits, last_lane_index
 from .static_dfa import (
-    ACCEL_MIN_LOOP_BYTES,
     EDFA_DEAD,
     EDFA_NFA_CAP,
     _MIN_CAP,
@@ -90,8 +89,9 @@ struct RDFA(Copyable, Movable):
     var any_bol0: Bool
     var any_bolnl: Bool
     # Accelerated states (no BOL flag): self-loop on all but <= 2 bytes,
-    # or on a nibble-encodable set of >= ACCEL_MIN_LOOP_BYTES bytes — the
-    # same two flavours as EagerDFA, scanning backward.
+    # or on a nibble-encodable set — the same two flavours as EagerDFA,
+    # scanning backward. Every reverse self-loop is a genuine one (there
+    # is no restart here), so none is vetoed.
     var accel_states: List[Int]
     var accel_exit1: List[Int]
     var accel_exit2: List[Int]  # or -1
@@ -449,7 +449,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             result.accel_states.append(si)
             result.accel_exit1.append(exits[0])
             result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE and 256 - len(exits) >= ACCEL_MIN_LOOP_BYTES:
+        elif HAS_FAST_BYTE_SHUFFLE:
             var t0 = List[Int]()
             var t1 = List[Int]()
             if shufti_encodable(exits):
