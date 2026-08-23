@@ -479,6 +479,11 @@ def rdfa_table_arr[
     tiny table is padded with dead rows to EDFA_TABLE_MIN_BYTES,
     EDFA_DEAD survives)."""
     var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
+    # Padding only ever grows the array; a shorter `n` would silently
+    # drop rows.
+    debug_assert(
+        n == 0 or n >= len(d.table), "table array shorter than the table"
+    )
     var m = len(d.table)
     if n < m:
         m = n

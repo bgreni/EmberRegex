@@ -392,7 +392,9 @@ def _reaches_consuming_before_match(nfa: NFA, start: Int) -> Bool:
 
 def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
     """Comptime: True when the DFA's leftmost-longest end always equals the
-    backtracker's leftmost-first end, letting _lf_end_at skip its re-run.
+    backtracker's leftmost-first end, letting _lf_end_at skip its re-run
+    and the leftmost-first lane try its first candidate anchored on the
+    classic table (`Regex._lf_anchored_classic`).
 
     Sound shape: every SPLIT is greedy and part of at most ONE quantifier
     cycle (no alternation-like SPLITs), and the cycle's exit path reaches
@@ -449,6 +451,13 @@ def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
 # Sometimes this produces better IR since the __init__ gets folded into
 # a constant.
 comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
+
+# Steps the leftmost-first lane's speculative backtracker attempt may
+# spend at one candidate (see Regex._sbt_match_at). The shapes it is for
+# (`<.*?>`, `"[^"]*?"`) decide in a handful of steps; past this the
+# unanchored scan is the cheaper judge, so the attempt concedes (-2) and
+# the lane stops speculating for the rest of the walk.
+comptime LF_SBT_ATTEMPT_BUDGET = 2048
 
 # Longest tail verified by the match() suffix fast-fail. The check is a
 # necessary condition only, so truncating to the last bytes stays sound.
@@ -810,7 +819,8 @@ struct Regex[pattern: String](Copyable, Movable):
     )
     # Field, not a per-method call: the check runs a cycle-flags pass over
     # the NFA, and comptime memoization covers field declarations only.
-    # Only the Teddy and LazyDFA search lanes still consult it.
+    # Consulted by the Teddy and LazyDFA search lanes (_lf_end_at) and
+    # by the leftmost-first lane's anchored-first attempt (below).
     comptime _lf_end_is_dfa_end = _dfa_end_is_leftmost_first(Self.nfa)
     # Leftmost-first lane, anchored-first attempt on the classic table
     # (see _lf_next_match): sound exactly when the classic table's
@@ -955,19 +965,31 @@ struct Regex[pattern: String](Copyable, Movable):
     def _sbt_match_at[
         origin: Origin, //
     ](self, input: Span[Byte, origin], start: Int) -> Int:
-        """Anchored attempt at `start` on the specialized backtracker: the
-        leftmost-first end, -1 when nothing matches there, or -2 when the
-        work budget ran out before that was decided."""
-        try:
-            var sbt_memo = List[UInt64]()
-            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            return _sbt_run[
-                nfa=Self.nfa,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](input, start, slots, sbt_memo)
-        except:
+        """Speculative anchored attempt at `start` on the specialized
+        backtracker: the leftmost-first end, -1 when nothing matches
+        there, or -2 when LF_SBT_ATTEMPT_BUDGET steps were spent before
+        that was decided.
+
+        Not `_sbt_run`: that one spends the full SBT_BUDGET (200k steps)
+        and then gambles on a memoized retry before conceding, which is
+        right when the backtracker is the engine of record and wrong
+        here, where the unanchored scan decides the same question in
+        linear time and the attempt is only worth its first few hundred
+        steps (measured: `(?:.*?x){20}` over lines of 39 `x`s burned
+        ~197 us per match under the full budget, 440x the lane).
+        """
+        var budget = LF_SBT_ATTEMPT_BUDGET
+        var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+        var end = _sbt_try_match[
+            nfa=Self.nfa,
+            state_idx=Self._start,
+            num_slots=Self._num_slots,
+            anchored_end=False,
+            memo_on=False,
+        ](input, start, slots, budget, memo_addr=0, depth=0, end_at=-1)
+        if budget < 0:
             return -2
+        return end
 
     @always_inline
     def _lf_candidate[
@@ -987,9 +1009,13 @@ struct Regex[pattern: String](Copyable, Movable):
     @always_inline
     def _lf_next_match[
         origin: Origin, //
-    ](self, input: Span[Byte, origin], pos: Int) -> Tuple[Int, Int]:
+    ](
+        self, input: Span[Byte, origin], pos: Int, mut speculate: Bool
+    ) -> Tuple[Int, Int]:
         """The leftmost-first match starting at or after `pos` as
-        (start, end), or (-1, -1).
+        (start, end), or (-1, -1). `speculate` (True at the start of a
+        walk) enables the anchored-first attempt below; the lane clears
+        it for the rest of the walk once an attempt runs out of budget.
 
         One unanchored forward scan gives the end; the reverse DFA walks
         back from it, never below `pos`, for the start. The prefilters
@@ -1017,9 +1043,16 @@ struct Regex[pattern: String](Copyable, Movable):
         walk over the same bytes (the scan keeps every thread of the
         failed attempt alive, at top priority, until it dies), so the
         lane stays linear where the old per-candidate loop was
-        quadratic. One attempt per call, never one per candidate; a
-        backtracker attempt that runs out of budget decides nothing and
-        the scan starts from the same candidate.
+        quadratic. One attempt per call, never one per candidate.
+
+        The backtracker attempt is speculative: it gets
+        LF_SBT_ATTEMPT_BUDGET steps, and running out decides nothing —
+        the scan starts from the same candidate, and `speculate` is
+        cleared so no later call in this walk tries again. So the waste
+        of an exhausted attempt is bounded by that budget ONCE per walk,
+        not per match (a pattern like `(?:.*?x){20}` can exhaust it on
+        every line); a failed (-1) attempt is bounded by the scan's walk
+        as above.
         """
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             if pos > 0:
@@ -1043,15 +1076,18 @@ struct Regex[pattern: String](Copyable, Movable):
                 if s0 < 0:
                     return (-1, -1)
             elif Self._lf_anchored_sbt:
-                var aend = self._sbt_match_at(input, s0)
-                if aend >= 0:
-                    return (s0, aend)
-                if aend == -1:
-                    if s0 >= input_len:
-                        return (-1, -1)
-                    s0 = self._lf_candidate(input, input_len, s0 + 1)
-                    if s0 < 0:
-                        return (-1, -1)
+                if speculate:
+                    var aend = self._sbt_match_at(input, s0)
+                    if aend >= 0:
+                        return (s0, aend)
+                    if aend == -1:
+                        if s0 >= input_len:
+                            return (-1, -1)
+                        s0 = self._lf_candidate(input, input_len, s0 + 1)
+                        if s0 < 0:
+                            return (-1, -1)
+                    else:
+                        speculate = False
             var end = self._lf_find_end(input, s0)
             if end < 0:
                 return (-1, -1)
@@ -1191,7 +1227,8 @@ struct Regex[pattern: String](Copyable, Movable):
                 slots=InlineArray[Int, Self._num_slots](fill=-1),
             )
         elif Self._use_lf_dfa:
-            var rng = self._lf_next_match(input.as_bytes(), 0)
+            var speculate = True
+            var rng = self._lf_next_match(input.as_bytes(), 0, speculate)
             if rng[0] < 0:
                 return MatchResult[Self._num_slots].no_match()
             return MatchResult[Self._num_slots](
@@ -1449,8 +1486,9 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
+            var speculate = True
             while pos <= input_len:
-                var rng = self._lf_next_match(input_bytes, pos)
+                var rng = self._lf_next_match(input_bytes, pos, speculate)
                 if rng[0] < 0:
                     break
                 results.append(Self._span_result(rng[0], rng[1]))
@@ -1595,8 +1633,9 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
+            var speculate = True
             while pos <= input_len:
-                var rng = self._lf_next_match(input_bytes, pos)
+                var rng = self._lf_next_match(input_bytes, pos, speculate)
                 if rng[0] < 0:
                     break
                 results.append(
@@ -2019,8 +2058,9 @@ struct Regex[pattern: String](Copyable, Movable):
         )
         var prev_end = 0
         var pos = 0
+        var speculate = True
         while pos <= input_len:
-            var rng = self._lf_next_match(input_bytes, pos)
+            var rng = self._lf_next_match(input_bytes, pos, speculate)
             if rng[0] < 0:
                 break
             var start = rng[0]
@@ -2185,8 +2225,9 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_len = input.byte_length()
             var pos = 0
             var prev_end = 0
+            var speculate = True
             while pos <= input_len:
-                var rng = self._lf_next_match(input_bytes, pos)
+                var rng = self._lf_next_match(input_bytes, pos, speculate)
                 if rng[0] < 0:
                     break
                 var start = rng[0]

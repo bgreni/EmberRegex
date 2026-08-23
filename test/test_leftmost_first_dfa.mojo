@@ -378,8 +378,40 @@ def test_anchored_first_attempt_on_backtracker() raises:
     assert_true(T._lf_anchored_sbt)
     var ret = T()
     var miss = "x" * 19 + "y"
+    assert_equal(ret._sbt_match_at(miss.as_bytes(), 0), -2)
     assert_false(ret.search(miss).matched)
     assert_false(ret._pike_search(miss).matched)
+    # The attempt is speculative: LF_SBT_ATTEMPT_BUDGET steps, once per
+    # walk (the lane stops speculating after the first -2). Lines of 39
+    # `x`s exhaust it at every candidate; under the full SBT_BUDGET this
+    # walk cost ~197 us per match (440x the lane), now it is one
+    # bounded attempt plus the scan — within a loose factor of the same
+    # shape with the attempt off (`(?:ab)*` in front makes the loop
+    # recursive and clears `_lf_anchored_sbt`).
+    comptime V = Regex["(?:ab)*(?:.*?x){20}"]
+    assert_true(V._use_lf_dfa)
+    assert_false(V._lf_anchored_sbt)
+    var rv = V()
+    var lines = ("x" * 39 + "\n") * 20
+    var got = ret.findall(lines)
+    var want = rv.findall(lines)
+    assert_equal(len(got), 20)
+    assert_equal(len(got), len(want))
+    for i in range(len(got)):
+        assert_equal(got[i], want[i])
+    var t_on = 1 << 62
+    var t_off = 1 << 62
+    for _ in range(5):
+        var t0 = perf_counter_ns()
+        for _ in range(20):
+            keep(len(ret.findall(lines)))
+        var t1 = perf_counter_ns()
+        for _ in range(20):
+            keep(len(rv.findall(lines)))
+        var t2 = perf_counter_ns()
+        t_on = min(t_on, t1 - t0)
+        t_off = min(t_off, t2 - t1)
+    assert_true(t_on < 5 * t_off + 200_000)
     var hit = "ax" * 19 + "bx" + "x"
     var rh = ret.search(hit)
     var rp = ret._pike_search(hit)

@@ -1227,6 +1227,11 @@ def edfa_table_arr[
     survives the narrowing, so the walkers keep their sign-bit dead test.
     """
     var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
+    # Padding only ever grows the array; a shorter `n` would silently
+    # drop rows.
+    debug_assert(
+        n == 0 or n >= len(d.table), "table array shorter than the table"
+    )
     var m = len(d.table)
     if n < m:
         m = n
