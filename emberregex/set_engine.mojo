@@ -88,6 +88,8 @@ from .set_rose import (
     rose_bcls_len,
     rose_lits_arr,
     rose_lits_len,
+    rose_look_arr,
+    rose_look_len,
     rose_meta_arr,
     rose_meta_len,
     rose_scan,
@@ -278,6 +280,7 @@ struct RegexSet[
     comptime _ROSE_META = rose_meta_arr[rose_meta_len(Self._rose)](Self._rose)
     comptime _ROSE_LITS = rose_lits_arr[rose_lits_len(Self._rose)](Self._rose)
     comptime _ROSE_BCLS = rose_bcls_arr[rose_bcls_len(Self._rose)](Self._rose)
+    comptime _ROSE_LOOK = rose_look_arr[rose_look_len(Self._rose)](Self._rose)
 
     # Patterns Rose could not decompose keep a per-byte automaton, over
     # their own (smaller, better-accelerating) union.
@@ -692,6 +695,7 @@ struct RegexSet[
                 meta=Self._ROSE_META,
                 lits=Self._ROSE_LITS,
                 bcls=Self._ROSE_BCLS,
+                look=Self._ROSE_LOOK,
             ](input)
             comptime if Self._has_residual:
                 return merge_reports(reports^, self._scan_residual(input))

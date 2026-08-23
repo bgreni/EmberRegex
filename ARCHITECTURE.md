@@ -210,6 +210,17 @@ positions. Patterns with no usable factor stay resident on the lane below,
 over their own union NFA, and the two report streams merge. Measured 10.2x
 over the multi-accept DFA on sparse 64KB input.
 
+Between the two sits a **candidate lookaround**: the same comptime walk
+also records the byte classes the pattern's consuming chain requires up to
+`ROSE_LOOK_BYTES` positions on either side of the factor (`conn=\d+` wants
+a digit after it; `\d{2}:\d{2} WARN \w+` wants four fixed classes before
+and a `\w` after), and a Teddy hit whose neighbours disagree — or whose
+required neighbour falls off either end of the input — never reaches the
+confirm DFA. Classes wider than `ROSE_LOOK_MAX_POP` are dropped rather
+than checked, and dropping one does not hide the narrower ones behind it.
+Worth ~10% where the factor occurs without its context, neutral where it
+does not.
+
 **mdfa** — determinizes `.*?(P0|P1|…)` with the unanchored start closure
 folded into every state, so the automaton never dies and never restarts.
 Each state carries a slice into a flat report pool. Acceleration applies

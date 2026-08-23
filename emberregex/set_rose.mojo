@@ -20,7 +20,20 @@ that move, cut down to what comptime can bake:
    for masks and bucket assignment). A candidate lane names a bucket set;
    each literal in those buckets is verified with `_lit_at`.
 
-3. **Confirmation.** A verified factor at `at` for entry `e` means "a match
+3. **Candidate lookaround.** Before any automaton runs, the bytes AROUND
+   the verified factor are checked against the classes the pattern's
+   consuming chain requires there (`_chain_look`, ROSE_LOOK_BYTES each
+   side). `conn=\\d+` insists on a digit after the factor, `\\d{2}:\\d{2}
+   WARN \\w+` on four fixed classes before it and a `\\w` after; a
+   required byte that falls off either end of the input is a rejection.
+   The confirm DFA would reject the same candidates, but it reaches those
+   bytes by stepping a table up to ROSE_CONF_STATE_CAP KB wide and, on
+   the after side, only after re-crossing the factor — these are 32-byte
+   constants read straight away. Worth ~10% on input where the factor
+   occurs without its context, and free where it does not (measured:
+   task-A5 report).
+
+4. **Confirmation.** A verified factor at `at` for entry `e` means "a match
    of pattern `id[e]` may start at `at - offset[e]`". The per-pattern
    ANCHORED eager DFA (static_dfa.mojo, one per covered pattern,
    concatenated into one flat table with global state ids) runs from that
@@ -28,7 +41,7 @@ that move, cut down to what comptime can bake:
    all ends from that start, not leftmost-longest. The walk dies as soon
    as the table says dead, which is what makes this cheap.
 
-4. **Residual.** Patterns with no usable factor keep a per-byte automaton;
+5. **Residual.** Patterns with no usable factor keep a per-byte automaton;
    they form their own union NFA (tagged with the ORIGINAL ids) and run on
    the ordinary mdfa/bitnfa/Pike ladder in set_engine.mojo. The two report
    streams are merged. Splitting strictly helps that lane too: a smaller
@@ -62,6 +75,7 @@ from std.collections import InlineArray
 from std.math import min
 from std.sys import simd_width_of
 
+from .charset import BITMAP_WIDTH
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind, build_nfa
 from .optimize import _charset_filter_byte, _probe_rank_table
@@ -114,6 +128,22 @@ comptime ROSE_MAX_ENTRIES = LITSET_MAX
 # on essentially any input (see _conf_dfa_ok).
 comptime ROSE_MAX_SELFLOOP = 128
 
+# Candidate lookaround (see _chain_look): how many chain positions on each
+# side of the factor are examined before a candidate reaches the confirm
+# DFA. Four is where the marginal position stops paying — the confirm walk
+# is already dead by then on anything the earlier ones let through.
+comptime ROSE_LOOK_BYTES = 4
+
+# A class wider than this rejects too little to be worth a load: `.`
+# (255 of 256 bytes), `\S`, `[^,]`. Skipping one does NOT stop the walk —
+# every chain position is required, so a narrow class further out stays
+# usable (`ab.[0-9]` checks the digit and not the dot).
+comptime ROSE_LOOK_MAX_POP = 128
+
+# One lookaround record: the signed offset from the FACTOR start, then the
+# byte set as 8 x 32-bit words.
+comptime _LOOK_STRIDE = 9
+
 # Total states across ALL confirm DFAs. The concatenated table travels to
 # the walkers as a comptime InlineArray parameter, and Mojo spells such
 # parameters into the mangled symbol name at roughly 3 chars per entry —
@@ -150,6 +180,9 @@ struct RoseSet(Copyable, Movable):
     # Per entry: 8 words of byte bitmap for a variable-offset factor's
     # backward extension, or empty for the fixed-offset majority.
     var back_classes: List[List[Int]]
+    # Per entry: the candidate lookaround, _LOOK_STRIDE ints per record
+    # (see _chain_look). Empty when nothing around the factor filters.
+    var looks: List[List[Int]]
     # Confirm DFAs, concatenated. State ids are global (per-pattern ids
     # biased by that pattern's base); -1 stays dead.
     var conf_table: List[Int]  # num_conf_states * 256
@@ -174,6 +207,7 @@ struct RoseSet(Copyable, Movable):
         self.skip_ok = List[Bool]()
         self.skip_state = List[Int]()
         self.back_classes = List[List[Int]]()
+        self.looks = List[List[Int]]()
         self.conf_table = List[Int](fill=-1, length=256)
         self.conf_flags = List[Int](fill=0, length=1)
         self.num_conf_states = 1
@@ -187,7 +221,7 @@ struct RoseSet(Copyable, Movable):
 
 
 # RoseView.meta stride and field offsets.
-comptime _M_STRIDE = 13
+comptime _M_STRIDE = 15
 comptime _M_BYTE_OFF = 0  # start of this entry's bytes in fbytes/fcl
 comptime _M_LEN = 1  # factor length
 comptime _M_OFFSET = 2  # match start -> factor start
@@ -201,6 +235,8 @@ comptime _M_C0 = 9  # full-walk start state, position-0 context
 comptime _M_CNL = 10  # full-walk start state, after-'\n' context
 comptime _M_COTHER = 11  # full-walk start state, mid-line context
 comptime _M_BACKCLS = 12  # word offset into the class pool, or -1
+comptime _M_LOOKB = 13  # first lookaround record index in the look pool
+comptime _M_LOOKN = 14  # how many lookaround records this entry has
 
 
 struct RoseView(Copyable, Movable):
@@ -252,6 +288,7 @@ def _rose_meta(r: RoseSet) -> List[Int]:
     """Comptime: per-entry metadata, _M_STRIDE ints each."""
     var meta = List[Int]()
     var byte_off = 0
+    var look_base = 0
     for i in range(len(r.lit.lits)):
         var bucket = 0
         for b in range(_NUM_BUCKETS):
@@ -275,6 +312,10 @@ def _rose_meta(r: RoseSet) -> List[Int]:
             meta.append(8 * i)
         else:
             meta.append(-1)
+        var n_look = len(r.looks[i]) // _LOOK_STRIDE
+        meta.append(look_base)
+        meta.append(n_look)
+        look_base += n_look
         byte_off += len(r.lit.lits[i])
     return meta^
 
@@ -324,6 +365,27 @@ def rose_bcls_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
         for w in range(8):
             if 8 * i + w < n:
                 arr[8 * i + w] = Int32(r.back_classes[i][w])
+    return arr^
+
+
+def rose_look_len(r: RoseSet) -> Int:
+    var n = 0
+    for i in range(len(r.looks)):
+        n += len(r.looks[i])
+    return max(1, n)
+
+
+def rose_look_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
+    """Comptime: the concatenated lookaround records, _LOOK_STRIDE ints
+    each (offset from the factor start, then 8 bitmap words). Entry i's
+    slice starts at record _M_LOOKB and runs for _M_LOOKN records."""
+    var arr = InlineArray[Int32, n](fill=0)
+    var w = 0
+    for i in range(len(r.looks)):
+        for j in range(len(r.looks[i])):
+            if w < n:
+                arr[w] = Int32(r.looks[i][j])
+            w += 1
     return arr^
 
 
@@ -420,6 +482,7 @@ struct _Run(Copyable, Movable):
     var caseless: List[Bool]
     var offset: Int
     var back_class: List[Int]  # 8 words of 32-bit bitmap, or empty
+    var look: List[Int]  # _LOOK_STRIDE ints per record (_chain_look)
 
     def __init__(out self):
         self.ok = False
@@ -427,6 +490,7 @@ struct _Run(Copyable, Movable):
         self.caseless = List[Bool]()
         self.offset = 0
         self.back_class = List[Int]()
+        self.look = List[Int]()
 
 
 struct _Factors(Copyable, Movable):
@@ -437,6 +501,7 @@ struct _Factors(Copyable, Movable):
     var caseless: List[List[Bool]]
     var offsets: List[Int]
     var back_classes: List[List[Int]]
+    var looks: List[List[Int]]
 
     def __init__(out self):
         self.ok = False
@@ -444,6 +509,7 @@ struct _Factors(Copyable, Movable):
         self.caseless = List[List[Bool]]()
         self.offsets = List[Int]()
         self.back_classes = List[List[Int]]()
+        self.looks = List[List[Int]]()
 
 
 def _run_score(bytes: List[Int], caseless: List[Bool], ranks: List[Int]) -> Int:
@@ -481,6 +547,107 @@ def _flush_run(
     cur_cl.clear()
 
 
+def _class_words(nfa: NFA, state: Int) -> List[Int]:
+    """Comptime: 8 x 32-bit words naming the bytes a consuming state
+    accepts, or an empty list when the state is not a one-byte consumer.
+
+    This is exactly what static_dfa's `_accepts` tests, which is what the
+    confirm DFA was built from. CHARSET reads the parsed 256-bit bitmap
+    straight off the CharSet — comptime SIMD lane reads are
+    interpreter-native (~1us) and a 256-step `contains` loop is not
+    (35-70us per List step) — and complements it when negated, which is
+    what `contains` does for a byte once the bitmap is built.
+    """
+    var out = List[Int](fill=0, length=8)
+    var kind = nfa.states[state].kind
+    if kind == NFAStateKind.CHAR:
+        var cv = Int(nfa.states[state].char_value)
+        if cv >= 256:
+            return List[Int]()  # a codepoint, not a byte
+        out[cv >> 5] = 1 << (cv & 31)
+        return out^
+    elif kind == NFAStateKind.ANY:
+        for w in range(8):
+            out[w] = 0xFFFFFFFF
+        var nl = Int(CHAR_NEWLINE)
+        out[nl >> 5] &= 0xFFFFFFFF ^ (1 << (nl & 31))
+        return out^
+    elif kind == NFAStateKind.CHARSET:
+        ref cs = nfa.charsets[nfa.states[state].charset_index]
+        if cs.bitmap_valid:
+            # 32 bytes, byte j holding chars 8j..8j+7.
+            for j in range(BITMAP_WIDTH):
+                out[j >> 2] |= Int(cs.bitmap[j]) << (8 * (j & 3))
+            if cs.negated:
+                for w in range(8):
+                    out[w] ^= 0xFFFFFFFF
+        else:
+            # parse() finalizes every bitmap, so this never runs; kept
+            # because `contains` is the authority and a wrong class here
+            # would UNDER-report rather than merely lose filtering.
+            for b in range(256):
+                if cs.contains(UInt32(b)):
+                    out[b >> 5] |= 1 << (b & 31)
+        return out^
+    return List[Int]()
+
+
+def _look_record(nfa: NFA, state: Int, rel: Int) -> List[Int]:
+    """Comptime: one lookaround record — `rel`, then the state's byte set
+    as 8 x 32-bit words.
+
+    Empty when the state is not a one-byte consumer, or when its class is
+    too wide to be worth checking: a class accepting more than
+    ROSE_LOOK_MAX_POP bytes (`.` at 255, `\\S`, `[^,]`) rejects too
+    little to pay for the load. Counting stops as soon as that is known.
+    """
+    var words = _class_words(nfa, state)
+    if len(words) == 0:
+        return List[Int]()
+    var pop = 0
+    for w in range(8):
+        var v = words[w]
+        while v != 0:
+            v &= v - 1  # clear the lowest set bit (Kernighan)
+            pop += 1
+            if pop > ROSE_LOOK_MAX_POP:
+                return List[Int]()
+    if pop == 0:
+        return List[Int]()  # matches nothing; the confirm DFA is dead too
+    var out = List[Int](fill=0, length=_LOOK_STRIDE)
+    out[0] = rel
+    for w in range(8):
+        out[1 + w] = words[w]
+    return out^
+
+
+def _chain_look(
+    nfa: NFA, chain: List[Int], run_off: Int, run_len: Int
+) -> List[Int]:
+    """Comptime: the lookaround records for a literal run sitting at
+    `run_off` (length `run_len`) on a chain of one-byte consuming states.
+
+    Every state on the chain is required — the walk that built it stopped
+    at the first branch — so every one of them is a byte the input MUST
+    carry at a known distance from the factor, and a candidate whose
+    neighbours disagree cannot be a match no matter what the confirm DFA
+    would say. Up to ROSE_LOOK_BYTES positions each side; the ones whose
+    class is too wide to filter drop out without stopping the scan.
+    """
+    var out = List[Int]()
+    for j in range(1, ROSE_LOOK_BYTES + 1):
+        var idx = run_off - j
+        if idx < 0:
+            break
+        out.extend(_look_record(nfa, chain[idx], -j))
+    for j in range(ROSE_LOOK_BYTES):
+        var idx = run_off + run_len + j
+        if idx >= len(chain):
+            break
+        out.extend(_look_record(nfa, chain[idx], run_len + j))
+    return out^
+
+
 def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     """Comptime: walk one arm's unique chain, tracking the byte offset,
     and return its best literal run.
@@ -491,11 +658,16 @@ def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     pass through consuming nothing; a real SPLIT (alternation or
     quantifier), MATCH, or anything else ends the walk. The offset stays
     exact precisely because every consuming state here is one byte wide.
+
+    The consuming states are also kept in chain order, so the winning run
+    can be handed its surrounding byte classes (`_chain_look`) — the whole
+    chain is required, run or not.
     """
     var result = _Run()
     var num_states = len(nfa.states)
     var best_score = -1
     var offset = 0
+    var chain = List[Int]()
     var cur_bytes = List[Int]()
     var cur_cl = List[Bool]()
     var cur_off = 0
@@ -520,6 +692,7 @@ def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
                 cur_off = offset
             cur_bytes.append(Int(cv))
             cur_cl.append(False)
+            chain.append(s)
             offset += 1
             s = nfa.states[s].out1
         elif kind == NFAStateKind.CHARSET:
@@ -537,10 +710,12 @@ def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
                     cur_off = offset
                 cur_bytes.append(fb[0])
                 cur_cl.append(fb[1])
+            chain.append(s)
             offset += 1
             s = nfa.states[s].out1
         elif kind == NFAStateKind.ANY:
             _flush_run(cur_bytes, cur_cl, cur_off, ranks, result, best_score)
+            chain.append(s)
             offset += 1
             s = nfa.states[s].out1
         elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
@@ -550,29 +725,11 @@ def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
         else:
             break
     _flush_run(cur_bytes, cur_cl, cur_off, ranks, result, best_score)
+    if result.ok:
+        result.look = _chain_look(
+            nfa, chain, result.offset, len(result.bytes)
+        )
     return result^
-
-
-def _class_bitmap(nfa: NFA, state: Int) -> List[Int]:
-    """8 x 32-bit words naming the bytes a consuming state accepts, or an
-    empty list when the state is not consuming."""
-    var out = List[Int](fill=0, length=8)
-    var kind = nfa.states[state].kind
-    for b in range(256):
-        var ok: Bool
-        if kind == NFAStateKind.CHAR:
-            ok = UInt32(b) == nfa.states[state].char_value
-        elif kind == NFAStateKind.ANY:
-            ok = b != Int(CHAR_NEWLINE)
-        elif kind == NFAStateKind.CHARSET:
-            ok = nfa.charsets[nfa.states[state].charset_index].contains(
-                UInt32(b)
-            )
-        else:
-            return List[Int]()
-        if ok:
-            out[b >> 5] |= 1 << (b & 31)
-    return out^
 
 
 def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
@@ -632,7 +789,7 @@ def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
 
     if exit_state < 0 or exit_state >= n:
         return result^
-    var cls = _class_bitmap(nfa, loop_state)
+    var cls = _class_words(nfa, loop_state)
     if len(cls) == 0:
         return result^
 
@@ -646,6 +803,11 @@ def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     result.caseless = lit.caseless.copy()
     result.offset = -1
     result.back_class = cls^
+    # `lit.offset == 0` above means the literal opens that chain, so the
+    # records are all forward ones — which is what this shape can use:
+    # backward, the loop is a class the match start floats inside, not a
+    # fixed position.
+    result.look = lit.look.copy()
     return result^
 
 
@@ -719,6 +881,7 @@ def _extract_factors(nfa: NFA, ranks: List[Int]) -> _Factors:
         result.caseless.append(run.caseless.copy())
         result.offsets.append(run.offset)
         result.back_classes.append(run.back_class.copy())
+        result.looks.append(run.look.copy())
     result.ok = True
     return result^
 
@@ -916,6 +1079,7 @@ def build_rose(
     var skip_ok = List[Bool]()
     var skip_state = List[Int]()
     var back_classes = List[List[Int]]()
+    var looks = List[List[Int]]()
     var covered = List[Int]()
     var residual = List[Int]()
 
@@ -1023,6 +1187,7 @@ def build_rose(
             skip_ok.append(sk)
             skip_state.extend(st^)
             back_classes.append(fac.back_classes[j].copy())
+            looks.append(fac.looks[j].copy())
 
     if len(covered) == 0:
         return result^
@@ -1046,6 +1211,7 @@ def build_rose(
     result.skip_ok = skip_ok^
     result.skip_state = skip_state^
     result.back_classes = back_classes^
+    result.looks = looks^
     result.conf_table = conf_table^
     result.conf_flags = conf_flags^
     result.num_conf_states = len(result.conf_flags)
@@ -1146,12 +1312,59 @@ def merge_reports(var a: List[SetMatch], b: List[SetMatch]) -> List[SetMatch]:
 
 @always_inline
 def _in_class[
-    bn: Int, //, bcls: InlineArray[Int32, bn], base: Int
+    bn: Int, //, words: InlineArray[Int32, bn], base: Int
 ](b: Byte) -> Bool:
-    """Is `b` in the backward-extension byte set at `base`?"""
-    var cls = materialize[bcls]()
+    """Is `b` in the 8-word byte set starting at `base`?"""
+    var cls = materialize[words]()
     var w = Int(cls.unsafe_get(base + (Int(b) >> 5)))
     return ((w >> (Int(b) & 31)) & 1) != 0
+
+
+@always_inline
+def _look_ok[
+    origin: Origin,
+    kn: Int,
+    //,
+    look: InlineArray[Int32, kn],
+    base: Int,
+    n: Int,
+](input: Span[Byte, origin], at: Int) -> Bool:
+    """Can a factor hit at `at` have the neighbours its chain requires?
+
+    Each record names a position relative to the factor and the byte set
+    the pattern must have there (`_chain_look`). A required byte that
+    falls off either end of the input is a rejection, not a pass: the
+    match cannot exist if the input has no room for it.
+
+    This is a filter in front of the confirm DFA, and every byte it reads
+    the DFA would read too — but the DFA reaches them by stepping a
+    transition table that is up to ROSE_CONF_STATE_CAP * 1 KB, whereas
+    these are 32-byte constants, and the after-side ones sit past bytes
+    the walk has to re-cross first.
+    """
+    comptime if n == 0:
+        return True
+    else:
+        # One materialization for the whole check: the pool is bound to
+        # the binary's constant data, and doing it per record instead
+        # measured +6s of codegen on test_set_phase4.mojo.
+        var cls = materialize[look]()
+        var input_len = len(input)
+        comptime for j in range(n):
+            comptime rec = _LOOK_STRIDE * (base + j)
+            comptime rel = Int(look[rec])
+            var p = at + rel
+            comptime if rel < 0:
+                if p < 0:
+                    return False
+            else:
+                if p >= input_len:
+                    return False
+            var bb = Int(input.unsafe_get(p))
+            var w = Int(cls.unsafe_get(rec + 1 + (bb >> 5)))
+            if ((w >> (bb & 31)) & 1) == 0:
+                return False
+        return True
 
 
 @always_inline
@@ -1261,6 +1474,7 @@ def _rose_verify_at[
     mn: Int,
     ln: Int,
     bn: Int,
+    kn: Int,
     //,
     r: RoseView,
     table: InlineArray[Int32, tn],
@@ -1268,6 +1482,7 @@ def _rose_verify_at[
     meta: InlineArray[Int32, mn],
     lits: InlineArray[Int32, ln],
     bcls: InlineArray[Int32, bn],
+    look: InlineArray[Int32, kn],
 ](
     input: Span[Byte, origin],
     at: Int,
@@ -1292,15 +1507,19 @@ def _rose_verify_at[
                     comptime k1 = Int(meta[_M_STRIDE * i + _M_KNL])
                     comptime k2 = Int(meta[_M_STRIDE * i + _M_KOTHER])
                     comptime skip = meta[_M_STRIDE * i + _M_SKIP] != 0
+                    comptime kb = Int(meta[_M_STRIDE * i + _M_LOOKB])
+                    comptime n_look = Int(meta[_M_STRIDE * i + _M_LOOKN])
                     comptime if bc >= 0:
                         # Variable-offset factor: the match start is the
                         # start of the maximal run of the loop's byte set
                         # ending here. Every start inside that run reaches
                         # this literal in the same automaton state, so one
                         # confirm from the earliest yields every end.
-                        if _lit_at[lit=lit, cl=cli](input, at):
+                        if _lit_at[lit=lit, cl=cli](input, at) and _look_ok[
+                            look=look, base=kb, n=n_look
+                        ](input, at):
                             var s0 = at
-                            while s0 > 0 and _in_class[bcls=bcls, base=bc](
+                            while s0 > 0 and _in_class[words=bcls, base=bc](
                                 input.unsafe_get(s0 - 1)
                             ):
                                 s0 -= 1
@@ -1317,7 +1536,11 @@ def _rose_verify_at[
                     elif skip and (k0 >= 0 or k1 >= 0 or k2 >= 0):
                         # The front end already proved these L bytes;
                         # resume past them in the baked state.
-                        if at >= off and _lit_at[lit=lit, cl=cli](input, at):
+                        if (
+                            at >= off
+                            and _lit_at[lit=lit, cl=cli](input, at)
+                            and _look_ok[look=look, base=kb, n=n_look](input, at)
+                        ):
                             var cur: Int
                             if at == 0:
                                 cur = k0
@@ -1336,7 +1559,11 @@ def _rose_verify_at[
                                     pid=pid,
                                 ](input, at + L, cur, out)
                     elif not skip:
-                        if at >= off and _lit_at[lit=lit, cl=cli](input, at):
+                        if (
+                            at >= off
+                            and _lit_at[lit=lit, cl=cli](input, at)
+                            and _look_ok[look=look, base=kb, n=n_look](input, at)
+                        ):
                             _rose_confirm[
                                 r=r,
                                 table=table,
@@ -1356,6 +1583,7 @@ def rose_scan[
     mn: Int,
     ln: Int,
     bn: Int,
+    kn: Int,
     //,
     r: RoseView,
     table: InlineArray[Int32, tn],
@@ -1363,6 +1591,7 @@ def rose_scan[
     meta: InlineArray[Int32, mn],
     lits: InlineArray[Int32, ln],
     bcls: InlineArray[Int32, bn],
+    look: InlineArray[Int32, kn],
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan for the factor-group patterns: Teddy front end, per-candidate
     confirmation. Returns contract-ordered, deduped reports.
@@ -1403,6 +1632,7 @@ def rose_scan[
                 meta=meta,
                 lits=lits,
                 bcls=bcls,
+                look=look,
             ](input, pos + lane, cand[lane], out)
             bits = clear_first_lane(bits)
         pos += W - (k - 1)
@@ -1415,6 +1645,7 @@ def rose_scan[
             meta=meta,
             lits=lits,
             bcls=bcls,
+            look=look,
         ](input, pos, UInt8(0xFF), out)
         pos += 1
 
