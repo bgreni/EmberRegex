@@ -38,6 +38,7 @@ O(1) ASCII membership tests with zero runtime overhead.
 """
 
 from std.collections import InlineArray
+from std.sys.intrinsics import llvm_intrinsic
 
 from .constants import (
     CHAR_A_LOWER,
@@ -693,26 +694,28 @@ comptime SBT_BUDGET = 200_000
 comptime SBT_STACK_BUDGET = 4 * 1024 * 1024
 
 
-@no_inline
+@always_inline
 def sbt_stack_here() -> Int:
-    """Address of a local in THIS function's frame — a monotonically
-    decreasing witness of how deep the caller has nested, since a
-    callee's frame sits directly below its caller's. Public so tests can
-    build their own floor.
+    """The current stack pointer — a monotonically decreasing witness of
+    how deep the walk has nested. Public so tests can build their own
+    floor.
 
-    `@no_inline` is load-bearing twice over. It keeps the returned
-    address a fixed offset below the caller's stack pointer whatever the
-    caller looks like, and — the reason it is spelled out rather than
-    left to the optimizer — it keeps the address-of to ONE function in
-    the whole binary. Inlined into the walker it becomes one escaping
-    alloca per instantiation, and at ~800 general SPLITs over the ~2100
-    states of `(?u)\\p{L}+` that SIGSEGVs the Mojo compiler outright
-    (verified: with the address-of inlined, a file with five `\\p{...}`
-    patterns crashes `mojo` in 2m31s; with it here, the same file
-    compiles).
+    `llvm.stacksave` and not the address of a local, for two reasons.
+    It reads a register instead of forcing a stack slot, so the walk's
+    frames keep the size (and the codegen) they had before the guard
+    existed; and it does not put an escaping alloca in every one of the
+    walker's instantiations, which SIGSEGVs the Mojo compiler outright
+    on the ~2100-state NFAs the Unicode property classes build (verified
+    both ways: with `Pointer(to=local)` inlined into the walker, a file
+    with five `\\p{...}` patterns crashes `mojo` in 2m31s). Hiding the
+    local behind a `@no_inline` helper compiles, but the call it leaves
+    in the general-SPLIT branch spills enough extra state to double the
+    stack the walk needs per input byte — measured on `(a|aa)+b`, which
+    went from ~2.2 KB per byte to ~4.4 KB.
     """
-    var slot: Int = 0
-    return Int(Pointer(to=slot))
+    return Int(
+        llvm_intrinsic["llvm.stacksave.p0", Pointer[UInt8, ImmStaticOrigin]]()
+    )
 
 
 @always_inline

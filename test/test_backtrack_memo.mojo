@@ -42,15 +42,16 @@ def test_ambiguous_alternation_plus_stays_in_backtracker() raises:
     # Pike fallback, so a plain -1 is the thing being asserted.
     #
     # The size is bounded by SBT_STACK_BUDGET, not by the memo: this
-    # shape recurses ~3 frames per input byte, and a frame measures
-    # ~1480 B under `-D ASSERT=all` (~120 B without), so 500 `a`s spend
-    # ~2.2 MB of the 4 MiB a walk gets. It used to read 2000, which
-    # wanted ~7.4 MB — it passed only because the main-thread stack is 8
-    # MiB, and the same shape with `a{2,}` for the second arm SIGSEGV'd.
-    # What the memo has to make true is unchanged and still asserted:
-    # without it this walk cannot finish at any of these sizes.
+    # shape recurses ~3 frames per input byte and concedes past n=1898
+    # under `-D ASSERT=all` (frames are ~12x smaller without it). It
+    # used to read 2000, which wanted ~7.4 MB — it "fit" only because
+    # the guard of the day counted calls and let the walk run to within
+    # a few hundred KB of the 8 MiB main-thread stack, and the same
+    # shape with `a{2,}` for the second arm SIGSEGV'd. What the memo has
+    # to make true is unchanged and still asserted: without it this walk
+    # cannot finish at any of these sizes.
     comptime P = "(?:a|aa)+b"
-    var text = String("a") * 500 + "c"
+    var text = String("a") * 1500 + "c"
     assert_equal(_sbt_end[P](text), -1)
 
 
@@ -301,6 +302,10 @@ def test_memo_still_collapses_the_shape_it_is_for() raises:
     # and it finishes well inside the table-proportional budget. If a
     # future tightening of `sbt_memo_budget` starves this, the row
     # `memo_ambiguous_plus_miss_1500` loses its ~2x and this fails first.
+    #
+    # 1500 is also inside SBT_STACK_BUDGET for this shape, which concedes
+    # past n=1858 under `-D ASSERT=all` — a 19% margin here, and ~9x in
+    # the release build the bench row is measured in.
     comptime P = "(a|aa)+b"
     assert_false(_sbt_concedes[P](String("a") * 1500 + "c"))
     assert_equal(_sbt_end[P](String("a") * 1500 + "c"), -1)
