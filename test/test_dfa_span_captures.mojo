@@ -230,6 +230,22 @@ def test_anchored_first_attempt_paths() raises:
     var r4 = fb.search(text)
     assert_equal(r4.start, 5)
     assert_equal(r4.group_str(text, 2), "bcd")
+    # Pivot prefilter on a short input (<= LF_SHORT_INPUT bytes): the
+    # candidate is `pos` itself when its byte can start a match, the
+    # hop otherwise; exactly 16 bytes, a match ending at the end, and a
+    # trailing candidate at `input_len` (the probe must not read it).
+    var kv = Regex["(\\w+)=(\\w+)"]()
+    assert_true(Regex["(\\w+)=(\\w+)"]._lf_pivot[0] >= 0)
+    var short = "ab=cd  ef=gh  ij"
+    assert_equal(short.byte_length(), 16)
+    var all = kv.finditer(short)
+    assert_equal(len(all), 2)
+    assert_equal(all[1].start, 7)
+    assert_equal(all[1].group_str(short, 2), "gh")
+    var tail = "x ab=cd ef=ghijk"
+    assert_equal(tail.byte_length(), 16)
+    assert_equal(kv.replace(tail, "<\\2>"), "x <cd> <ghijk>")
+    assert_equal(len(kv.findall("abcdefghijklmnop")), 0)
 
 
 def test_lazy_group() raises:

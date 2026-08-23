@@ -461,6 +461,11 @@ comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
 # the lane stops speculating for the rest of the walk.
 comptime LF_SBT_ATTEMPT_BUDGET = 2048
 
+# Capture lane: an input this short skips the pivot prefilter hop when
+# the byte at the candidate position can start a match (see
+# Regex._lf_candidate).
+comptime LF_SHORT_INPUT = 16
+
 # Longest tail verified by the match() suffix fast-fail. The check is a
 # necessary condition only, so truncating to the last bytes stays sound.
 comptime MATCH_SUFFIX_CHECK_MAX = 8
@@ -1201,6 +1206,26 @@ struct Regex[pattern: String](Copyable, Movable):
         comptime if Self._use_scan_filter:
             return self._scan_candidate(input, input_len, pos)
         elif Self._lf_pivot[0] >= 0:
+            comptime if Self._use_dfa_span and Self._strategy.first_byte_useful:
+                # Capture lane, short input: `pos` itself is a sound
+                # candidate whenever its byte can start a match, and the
+                # anchored attempt it feeds decides in a few steps — so
+                # skip the pivot hop (a SIMD scan to the pivot byte plus a
+                # scalar walk back over the class run), which on
+                # `(\w+) (\w+)` over "John Doe" cost 9 ns against a 37 ns
+                # replace (1.24x) to land on byte 0. The length gate is
+                # per input, not per candidate: probing at every candidate
+                # (a bitmap bit, but a branch in the loop) measured 1.10x
+                # on the 19- and 55-byte replace/findall rows, where the
+                # hop is already the cheaper choice. A failed attempt here
+                # is bounded like any other and its successor candidate
+                # comes from the hop.
+                if (
+                    input_len <= LF_SHORT_INPUT
+                    and pos < input_len
+                    and self._first_byte_hit(input.unsafe_get(pos))
+                ):
+                    return pos
             return pivot_first_candidate[d=Self._edfa](input, pos)
         elif Self._use_dfa_span and Self._strategy.first_byte_useful:
             # Capture lane only: the candidate feeds a backtracker
@@ -2965,6 +2990,15 @@ struct Regex[pattern: String](Copyable, Movable):
                 return base + j
             bits = clear_first_lane(bits)
         return -1
+
+    @always_inline
+    def _first_byte_hit(self, b: Byte) -> Bool:
+        """Is `b` in the pattern's first-byte set? One bit of
+        `_first_byte_bitmap` — cheaper than the shuffle-mask scalar test
+        for a single byte."""
+        var byte_idx = Int(b) >> 3
+        var bit_idx = UInt8(Int(b) & 7)
+        return (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) != 0
 
     @always_inline
     def _next_candidate_pos[
