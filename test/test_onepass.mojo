@@ -93,42 +93,36 @@ def test_onepass_invalid_patterns() raises:
 
 def test_onepass_selection() raises:
     # Selected exactly where the one-pass walk beats the backtracker
-    # (`onepass_shape`): every loop is one the backtracker runs by
-    # recursion (a cyclic SPLIT whose body is not a single state) and
-    # consumes at most ONEPASS_MAX_BODY bytes per iteration — 4-5x
-    # faster at every length, and no SBT_BUDGET / SBT_MAX_DEPTH cliff.
-    # Any simple loop (`\w+`) keeps the pattern on the backtracker,
-    # whose SIMD class runs win there; so does a longer loop body.
+    # (`onepass_shape`): a general loop the backtracker runs by
+    # recursion whose body carries an ALTERNATION — where it re-tries
+    # an arm per iteration — and no simple loop anywhere. 4-9x faster at
+    # every length, and no SBT_BUDGET / SBT_MAX_DEPTH cliff.
     assert_true(Regex["(?:(x)|y)+"]._use_onepass)
-    assert_true(Regex["((a)(b))+"]._use_onepass)
-    assert_true(Regex["((a)(b))+|q"]._use_onepass)
-    assert_true(Regex["(?:([a-z])(\\d))+"]._use_onepass)
-    assert_true(Regex["(?:(ab)|(cd))+"]._use_onepass)
-    assert_true(Regex["(?:(a|b)+c)+"]._use_onepass)
+    assert_true(Regex["(?:(x)|(y)|z)+"]._use_onepass)
     assert_true(Regex["(a|b)*(c)"]._use_onepass)
+    assert_true(Regex["(?:(ab)|(cd))+"]._use_onepass)
+    assert_true(Regex["(?:([a-z])|(\\d)|[=;&])+"]._use_onepass)
     assert_true(Regex["(?:(a)|b)+$"]._use_onepass)
     assert_true(Regex["(?:(x)|y)+"]._onepass_shape)
     assert_true(Regex["(?:(x)|y)+"]._sbt_general_loop)
-    # One-pass but with simple loops: backtracker.
+    # General loop, but no alternation in the body — the backtracker's
+    # recursion is cheap and its leaf checks are SIMD-fast, so it wins.
+    assert_false(Regex["((a)(b))+"]._use_onepass)
+    assert_true(_valid["((a)(b))+"]())
+    assert_false(Regex["(?:([a-z])(\\d))+"]._use_onepass)
+    assert_true(_valid["(?:([a-z])(\\d))+"]())
+    # One-pass but simple loops: backtracker.
     assert_false(Regex["(\\d+)-(\\d+)"]._use_onepass)
     assert_false(Regex["(\\d+)-(\\d+)"]._onepass_shape)
     assert_false(Regex["(\\w+)@(\\w+)\\.com"]._use_onepass)
     assert_false(Regex["(?P<k>[^=]+)=(?P<v>[^;]*)"]._use_onepass)
     assert_false(Regex["(a)?b"]._use_onepass)
-    assert_false(Regex["(?:(\\w+)=(\\w+);)+"]._use_onepass)
-    assert_true(Regex["(?:(\\w+)=(\\w+);)+"]._sbt_general_loop)
-    # General-only loops whose body is longer than ONEPASS_MAX_BODY:
-    # the backtracker amortizes its recursion over the body.
-    assert_false(Regex["(?:([a-z])=(\\d);)+"]._use_onepass)
-    assert_true(_valid["(?:([a-z])=(\\d);)+"]())
-    assert_false(Regex["(?:(x)|yzw)+"]._use_onepass)
-    assert_false(Regex["(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?"]._use_onepass)
-    # General loop but not one-pass: backtracker (Pike when it gives up).
+    # An alternation loop with a simple loop somewhere: excluded.
+    assert_false(Regex["(?:(\\w+)|(\\d+))+;"]._use_onepass)
+    # Alternation loop, not one-pass: backtracker (Pike when it gives up).
     assert_false(Regex["(a|aa)+b"]._use_onepass)
-    assert_true(Regex["(a|aa)+b"]._onepass_shape)
     assert_false(Regex["((\\w+)\\s)+\\w+"]._use_onepass)
-    # Capture-free patterns never take this engine (the DFA lanes and
-    # the classic table serve them).
+    # Capture-free patterns never take this engine.
     assert_false(Regex["(?:x|y)+"]._use_onepass)
     assert_false(Regex["a|ab"]._use_onepass)
 
@@ -343,29 +337,30 @@ def test_match_anchors() raises:
 
 
 def test_match_general_loop_shapes() raises:
-    var re = Regex["(?:([a-z])(\\d))+"]()
+    var re = Regex["(?:(x)|(y)|z)+"]()
     assert_true(re._use_onepass)
-    var input = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"
+    var input = "xyzxyzxyzxyzxyzxyzxyzxyzxyzxyz"
     var r = re.match(input)
     assert_true(r.matched)
-    assert_equal(r.group_str(input, 1), "t")
-    assert_equal(r.group_str(input, 2), "0")
-    _assert_groups(re.match(input), re._pike_match(input), "kv loop")
-    assert_false(re.match("a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t").matched)
-    # The same shape with simple loops inside, or a longer body, stays
-    # on the backtracker with the same answers.
-    var rw = Regex["(?:(\\w+)=(\\w+);)+"]()
-    assert_false(rw._use_onepass)
-    var inw = "host=db01;port=5432;user=admin;retry=55;"
-    _assert_groups(rw.match(inw), rw._pike_match(inw), "kv words")
-    var rk = Regex["(?:([a-z])=(\\d);)+"]()
-    assert_false(rk._use_onepass)
-    var ink = "a=1;b=2;c=3;"
-    _assert_groups(rk.match(ink), rk._pike_match(ink), "kv 4-byte body")
+    assert_equal(r.slots[0], 27)  # last (x)
+    assert_equal(r.slots[1], 28)
+    assert_equal(r.slots[2], 28)  # last (y)
+    assert_equal(r.slots[3], 29)
+    _assert_groups(re.match(input), re._pike_match(input), "xyz loop")
+    assert_false(re.match("xyzw").matched)
     var ra = Regex["(a|b)*(c)"]()
     _assert_groups(ra.match("ababc"), ra._pike_match("ababc"), "altstar")
     _assert_groups(ra.match("c"), ra._pike_match("c"), "altstar empty")
     assert_false(ra.match("abab").matched)
+    # A non-alternation general loop and a simple-loop loop keep the
+    # backtracker with the same answers.
+    var rn = Regex["((a)(b))+"]()
+    assert_false(rn._use_onepass)
+    _assert_groups(rn.match("abab"), rn._pike_match("abab"), "nested")
+    var rw = Regex["(?:(\\w+)=(\\w+);)+"]()
+    assert_false(rw._use_onepass)
+    var inw = "host=db01;port=5432;"
+    _assert_groups(rw.match(inw), rw._pike_match(inw), "kv words")
 
 
 def test_match_no_backtracker_budget() raises:
@@ -395,10 +390,10 @@ def test_search_uses_span_confirm() raises:
     assert_true(rb._use_onepass)
     _assert_groups(rb.search("xab c"), rb._pike_search("xab c"), "ab\\b")
     _assert_groups(rb.search("xabc"), rb._pike_search("xabc"), "abc\\b")
-    var rs = Regex["(?:([a-z])(\\d))+"]()
+    var rs = Regex["(?:(x)|(y)|z)+"]()
     assert_true(rs._use_onepass)
     assert_true(rs._use_dfa_span)
-    var input = String("lorem 42 ipsum ") * 300 + "a1b2" + String(" x 7 ") * 200 + "c3"
+    var input = String("lorem 42 ipsum ") * 300 + "xyzxyz" + String(" q 7 ") * 200 + "zyx"
     var got = rs.finditer(input)
     var exp = rs._pike_finditer(input)
     assert_equal(len(got), len(exp))
@@ -406,7 +401,7 @@ def test_search_uses_span_confirm() raises:
         _assert_groups(got[i], exp[i], String("sparse[", i, "]"))
     # A match longer than the backtracker attempt's budget: the one-pass
     # attempt is exact and has none.
-    var long = String("k7") * 6000 + " tail"
+    var long = String("xyz") * 4000 + " tail"
     var gl = rs.finditer(long)
     var el = rs._pike_finditer(long)
     assert_equal(len(gl), 1)
@@ -621,6 +616,8 @@ def test_differential_loops() raises:
     _differential["(?:([a-z])(\\d))+"](_alpha_kvloop(), "kv2 loop")
     _differential["(?:(ab)|(cd))+"](_alpha_abcdef(), "(?:(ab)|(cd))+")
     _differential["(a|b)*(c)"](_alpha_abcdef(), "(a|b)*(c)")
+    _differential["(?:(x)|(y)|z)+"](_alpha_xy(), "(?:(x)|(y)|z)+")
+    _differential["(?:([a-z])|(\\d)|[=;&])+"](_alpha_kvloop(), "kvtok")
     _differential["(?:(a)|b)+$"](_alpha_ab(), "(?:(a)|b)+$")
     _differential["(?:(a)|b)+\\b"](_alpha_ab(), "(?:(a)|b)+\\b")
     _differential["(?m)(?:(a)|b)+$"](_alpha_ab(), "(?m)(?:(a)|b)+$")
@@ -629,6 +626,9 @@ def test_differential_loops() raises:
     _differential["(a*?)b"](_alpha_ab(), "(a*?)b")
     _fullmatch_differential["(?:(x)|y)+"](
         ["x", "y", "xy", "yx", "xyx", "xyy", "yyx", "xx", ""], "loop full"
+    )
+    _fullmatch_differential["(?:(x)|(y)|z)+"](
+        ["x", "z", "xyz", "zzz", "xyzw", "", "yx"], "xyz full"
     )
     _fullmatch_differential["(?:(\\w+)=(\\w+);)+"](
         ["a=1;", "a=1;b=2;", "a=1;b=2", "=1;", "a=;", ""], "kv loop full"

@@ -239,14 +239,14 @@ def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
 
 def bench_onepass_match_kv(mut b: Bench) raises:
     # One-pass DFA (onepass.mojo): a capture pattern whose NFA admits at
-    # most one consuming thread per byte AND whose only loop the
-    # backtracker would run by recursion, with a short body (see
-    # `onepass_shape`), so match() is one forward table walk writing
-    # the slots as it goes — no recursion, no budget. 40-byte input of
-    # twenty key/value pairs; the groups report the last pair
-    # (Python's last-iteration semantics).
-    var re = Regex["(?:([a-z])(\\d))+"]()
-    var input = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"
+    # most one consuming thread per byte AND whose loop the backtracker
+    # runs by recursion with an ALTERNATION in its body (see
+    # `onepass_shape`) — where the backtracker re-tries an arm per
+    # character. match() is one forward table walk writing the slots as
+    # it goes; the backtracker recurses and re-scans per arm. 40-byte
+    # key/value token run; the groups report the last letter/digit token.
+    var re = Regex["(?:([a-z])|(\\d)|[=;&])+"]()
+    var input = "host=db01&port=5432&user=admin&retry=55&"
 
     @always_inline
     @parameter
@@ -264,17 +264,20 @@ def bench_onepass_match_kv(mut b: Bench) raises:
 
 
 def onepass_findall_input() -> String:
-    """~1.9 KB: 64 space-separated runs of 14 key/value pairs — 64
-    matches for `(?:([a-z])(\\d))+`."""
-    return String("a1b2c3d4e5f6g7h8i9j0k1l2m3n4 ") * 64
+    """~2 KB: two ~1 KB alternation-loop matches for `(?:(x)|(y)|z)+`,
+    each far longer than the backtracker's per-attempt step budget so
+    its span confirm exhausts and (on the base) falls to the Pike VM,
+    while the one-pass confirm walks the span exactly."""
+    return String("xyz") * 340 + " " + String("zyx") * 340
 
 
 def bench_onepass_findall_2KB(mut b: Bench) raises:
-    # The capture lane on the one-pass DFA (a one-pass pattern rides it
-    # whatever its shape): every candidate is real, so each match is one
-    # exact leftmost-first table walk (the anchored attempt), where the
-    # backtracker lane ran the recursive loop per pair.
-    var re = Regex["(?:([a-z])(\\d))+"]()
+    # The one-pass span confirm on the capture lane: each long match's
+    # anchored backtracker attempt exhausts LF_SBT_ATTEMPT_BUDGET and
+    # latches, so the lane scans for the end and confirms the span —
+    # one-pass (exact, O(span)) here, the backtracker-then-Pike ladder
+    # on the base.
+    var re = Regex["(?:(x)|(y)|z)+"]()
     var input = onepass_findall_input()
 
     @always_inline

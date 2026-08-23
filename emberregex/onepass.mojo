@@ -188,100 +188,56 @@ struct OnePass(Copyable, Movable):
         self.accel = EagerDFA()
 
 
-# Longest loop body (consuming states on any path from a general loop's
-# body back to its SPLIT) the one-pass walk is selected for.
-comptime ONEPASS_MAX_BODY = 2
-
-
-def _op_body_len(nfa: NFA, body: Int, split_idx: Int) -> Int:
-    """Comptime: the most consuming states on any path from `body` back
-    to `split_idx` (-1: none). Cycles through other loops are cut at the
-    state already on the path, so a nested loop counts as one pass
-    through it — enough for the `<= ONEPASS_MAX_BODY` question."""
+def _op_loop_has_alternation(nfa: NFA, body: Int, split_idx: Int) -> Bool:
+    """Comptime: does the loop body reach a two-armed SPLIT other than
+    the loop's own (an alternation, `(?:(x)|y)+`, `(a|b)*c`) before it
+    returns to `split_idx`? That is where the backtracker re-tries an
+    arm per iteration and the one-pass walk does not — the shape the
+    walk clearly wins on."""
     var n = len(nfa.states)
-    # -3 unvisited, -2 on the path, -1 no path, else the length.
-    var memo = List[Int](fill=-3, length=n)
-    var st_s: List[Int] = [body]
-    var st_phase: List[Int] = [0]
-    while len(st_s) > 0:
-        var top = len(st_s) - 1
-        var s = st_s[top]
-        if s < 0 or s >= n:
-            _ = st_s.pop()
-            _ = st_phase.pop()
+    var seen = List[Bool](fill=False, length=n)
+    var stack: List[Int] = [body]
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= n or seen[s] or s == split_idx:
             continue
-        if s == split_idx:
-            memo[s] = 0
-            _ = st_s.pop()
-            _ = st_phase.pop()
+        seen[s] = True
+        ref st = nfa.states[s]
+        if st.kind == NFAStateKind.MATCH:
             continue
-        var kind = nfa.states[s].kind
-        if st_phase[top] == 0:
-            if memo[s] != -3:
-                _ = st_s.pop()
-                _ = st_phase.pop()
-                continue
-            memo[s] = -2
-            st_phase[top] = 1
-            if kind == NFAStateKind.MATCH:
-                continue
-            var c1 = nfa.states[s].out1
-            if c1 >= 0 and c1 < n and memo[c1] == -3:
-                st_s.append(c1)
-                st_phase.append(0)
-            if kind == NFAStateKind.SPLIT:
-                var c2 = nfa.states[s].out2
-                if c2 >= 0 and c2 < n and memo[c2] == -3:
-                    st_s.append(c2)
-                    st_phase.append(0)
-        else:
-            var best = -1
-            var here = 0
-            if (
-                kind == NFAStateKind.CHAR
-                or kind == NFAStateKind.CHARSET
-                or kind == NFAStateKind.ANY
-            ):
-                here = 1
-            if kind != NFAStateKind.MATCH:
-                var c1 = nfa.states[s].out1
-                if c1 >= 0 and c1 < n and memo[c1] >= 0:
-                    best = memo[c1] + here
-                if kind == NFAStateKind.SPLIT:
-                    var c2 = nfa.states[s].out2
-                    if c2 >= 0 and c2 < n and memo[c2] >= 0:
-                        if memo[c2] + here > best:
-                            best = memo[c2] + here
-            memo[s] = best
-            _ = st_s.pop()
-            _ = st_phase.pop()
-    return memo[body] if memo[body] >= 0 else -1
+        if st.kind == NFAStateKind.SPLIT and st.out2 != -1:
+            return True
+        stack.append(st.out1)
+        if st.kind == NFAStateKind.SPLIT:
+            stack.append(st.out2)
+    return False
 
 
 def onepass_shape(nfa: NFA) -> Bool:
     """Comptime: the shape on which the one-pass walk beats the
-    specialized backtracker — every loop is one the backtracker runs by
-    general recursion (a cyclic SPLIT whose body is not one consuming
-    state) and consumes at most ONEPASS_MAX_BODY bytes per iteration:
-    `(?:(x)|y)+`, `((a)(b))+`, `(a|b)*c`, `(?:(ab)|(cd))+`.
+    specialized backtracker — a general loop (a cyclic two-armed SPLIT
+    the backtracker runs by recursion, not one of the iterative
+    simple-loop forms) whose body carries an ALTERNATION, and no simple
+    loop anywhere. That is where the backtracker re-tries an arm per
+    iteration (`(?:(x)|y)+`, `(?:(x)|(y)|z)+`, `(a|b)*c`,
+    `(?:(ab)|(cd))+`), which the single table walk collapses.
 
     Measured (2026-08-23, `match()`, ns per call, one-pass vs
-    backtracker): the table walk costs ~1.8 ns per byte whatever the
-    pattern; the backtracker costs a few ns per general-loop iteration
-    (more per failing alternation arm, and growing with the recursion
-    depth) plus SIMD-speed class runs. Where every iteration is a byte
-    or two the walk wins at every length — `(?:(x)|y)+` 71 vs 326 at 40
-    bytes and 2.0 vs 7.8 us at 1 KB (the backtracker exhausts
-    SBT_BUDGET past 8 KB); `(?:(x)|(y)|z)+` 72 vs 612; `((a)(b))+` 83 vs
-    106 and 2.0 vs 6.5 us; `(?:(ab)|(cd))+` 70 vs 76 and 1.9 vs 5.3 us —
-    and has no SBT_BUDGET / SBT_MAX_DEPTH cliff. A longer body amortizes
-    the recursion: `(?:([a-z])=(\\d);)+` 70 vs 35 at 40 bytes and even
-    at 1 KB; with `(?:;|,)` for the separator 66 vs 48 and 1.9 vs 3.3 us.
-    A simple loop anywhere hands its bytes to the backtracker's SIMD
-    scan: `(?:(\\w+)=(\\w+);)+` 55 vs 30; `(\\w+)@(\\w+)\\.(\\w+)` 25 vs 8.
+    backtracker): the walk costs ~1.8 ns per byte whatever the pattern;
+    the backtracker pays that per arm it tries. On an alternation loop
+    the walk wins at every length and loses the SBT_BUDGET /
+    SBT_MAX_DEPTH cliff — `(?:(x)|y)+` 71 vs 326 at 40 bytes, 2.0 vs
+    7.8 us at 1 KB (backtracker exhausts the budget → Pike VM past
+    8 KB); `(?:(x)|(y)|z)+` 72 vs 612; `(a|b)*(c)` 72 vs 90 and 1.6 vs
+    6.4 us; `(?:(ab)|(cd))+` 70 vs 76 and 1.9 vs 5.3 us. Without a body
+    alternation the backtracker's recursion is cheap enough that its
+    SIMD-speed leaf checks win (`(?:([a-z])(\\d))+` 78 vs 65;
+    `((a)(b))+` is a modest walk win at 84 vs 110 but not worth the
+    lane admission it forces); a simple loop hands its bytes to the
+    backtracker's class scan outright (`(?:(\\w+)=(\\w+);)+` 55 vs 30).
     """
     var cyclic = split_cycle_flags(nfa)
-    var general = False
+    var found = False
     for i in range(len(nfa.states)):
         ref st = nfa.states[i]
         if st.kind != NFAStateKind.SPLIT or st.out2 == -1:
@@ -291,10 +247,9 @@ def onepass_shape(nfa: NFA) -> Bool:
         var body = st.out1 if st.greedy else st.out2
         if _sbt_is_simple_body(nfa, i, body):
             return False
-        if _op_body_len(nfa, body, i) > ONEPASS_MAX_BODY:
-            return False
-        general = True
-    return general
+        if _op_loop_has_alternation(nfa, body, i):
+            found = True
+    return found
 
 
 def _op_norm_ctx(ctx: Int, has_bol: Bool, has_bol_ml: Bool, has_wb: Bool) -> Int:

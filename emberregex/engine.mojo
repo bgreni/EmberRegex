@@ -114,7 +114,6 @@ from .onepass import (
     onepass_class_arr,
     onepass_eps_arr,
     onepass_eps_len,
-    onepass_find_end,
     onepass_match,
     onepass_state_arr,
     onepass_state_len,
@@ -1058,10 +1057,9 @@ struct Regex[pattern: String](Copyable, Movable):
     # The one-pass DFA (onepass.mojo): capture extraction in a single
     # forward table walk for patterns where at most one thread can
     # consume each byte. Serves match() (fullmatch over the whole input)
-    # and, on the capture lane, both the anchored-first attempt
-    # (`_onepass_match_at`, leftmost-first) and the span confirm
-    # (`_span_fill_slots`, pinned). Its own field, referenced by
-    # `_use_onepass` alone and never by `_strategy`:
+    # and the capture lane's span confirm (`_span_fill_slots`, pinned).
+    # Its own field, referenced by `_use_onepass` alone and never by
+    # `_strategy`:
     # every argument into `_compute_strategy` is elaborated for every
     # pattern, and this build is only worth paying for where a capture
     # verb runs. Capture-free patterns have the classic table and the
@@ -1376,11 +1374,6 @@ struct Regex[pattern: String](Copyable, Movable):
         lane stays linear where the old per-candidate loop was
         quadratic. One attempt per call, never one per candidate.
 
-        On a one-pass pattern (`_use_onepass`) the attempt is the
-        one-pass DFA's leftmost-first walk instead: exact (a -1 proves
-        nothing starts at the candidate), never out of budget, and its
-        bytes are charged to the same per-call allowance.
-
         The backtracker attempt is speculative: it gets
         LF_SBT_ATTEMPT_BUDGET steps, and running out decides nothing —
         the scan starts from the same candidate, and `speculate` is
@@ -1439,16 +1432,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     var spent = 0
                     while True:
                         var budget = LF_SBT_ATTEMPT_BUDGET
-                        var aend: Int
-                        comptime if Self._use_onepass:
-                            # Exact and budget-free: one table walk from
-                            # s0 is the leftmost-first match there, or
-                            # proof that none starts there.
-                            aend = self._onepass_match_at(
-                                input, s0, slots, budget
-                            )
-                        else:
-                            aend = self._sbt_match_at(input, s0, slots, budget)
+                        var aend = self._sbt_match_at(input, s0, slots, budget)
                         if aend >= 0:
                             return (s0, aend)
                         if aend == -2:
@@ -1576,35 +1560,6 @@ struct Regex[pattern: String](Copyable, Movable):
         # Slots may hold a partial walk's writes: the Pike result
         # replaces every one of them.
         self._pike_span(input, start, end, slots, pike)
-
-    @always_inline
-    def _onepass_match_at[
-        origin: Origin, //
-    ](
-        self,
-        input: Span[Byte, origin],
-        start: Int,
-        mut slots: InlineArray[Int, Self._num_slots],
-        mut budget: Int,
-    ) -> Int:
-        """The capture lane's anchored attempt on the one-pass DFA (see
-        `onepass_find_end`): Python's leftmost-first end of the match
-        starting at `start` with its slots, or -1 — exact, so never -2.
-        `budget` is charged one step per byte walked, the same allowance
-        `_sbt_match_at` spends, so the lane's per-call accounting of
-        failed attempts is unchanged. Only meaningful when
-        `_use_onepass`."""
-        var steps = 0
-        var end = onepass_find_end[
-            op=Self._onepass,
-            table=Self._OP_TABLE,
-            classes=Self._OP_CLASSES,
-            eps=Self._OP_EPS,
-            states=Self._OP_STATES,
-            num_slots=Self._num_slots,
-        ](input, start, slots, steps)
-        budget -= steps
-        return end
 
     @always_inline
     def _onepass_walk[

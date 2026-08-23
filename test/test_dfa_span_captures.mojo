@@ -45,12 +45,13 @@ def test_span_lane_selection() raises:
     # after it, or an anchor-only suffix, stays on the backtracker (one
     # pass there beats three on the lane); an alternation arm admits it.
     # Exception: a one-pass pattern the one-pass DFA takes
-    # (`_use_onepass`) rides the lane whatever its shape — its attempt
-    # is one exact table walk where the backtracker recursed per
-    # iteration (see `_dfa_candidate`'s `admit_shape`).
-    assert_true(Regex["((a)(b))+"]._use_onepass)
-    assert_true(Regex["((a)(b))+"]._use_dfa_span)
-    assert_false(Regex["((a)(\\w+))+"]._use_onepass)  # simple loop inside
+    # (`_use_onepass` — an alternation loop) rides the lane whatever its
+    # shape, so its span confirm is the exact one-pass walk (see
+    # `_dfa_candidate`'s `admit_shape`).
+    assert_true(Regex["(?:(a)|b)+"]._use_onepass)
+    assert_true(Regex["(?:(a)|b)+"]._use_dfa_span)
+    assert_false(Regex["((a)(b))+"]._use_onepass)  # no body alternation
+    assert_false(Regex["((a)(b))+"]._use_dfa_span)
     assert_true(Regex["((a)(b))+|q"]._use_dfa_span)
     assert_false(Regex["(?m)^(\\w+)$"]._use_dfa_span)
     assert_true(Regex["(?m)^(\\w+)$|q"]._use_dfa_span)
