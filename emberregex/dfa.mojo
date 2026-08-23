@@ -15,6 +15,22 @@ from .nfa import NFA, NFAStateKind
 from .ast import AnchorKind
 
 
+comptime DFA_STATE_CAP = 4096
+"""Cached DFA states allowed before the cache is cleared (or the walk ends).
+"""
+
+comptime MIN_CACHE_CLEARS = 3
+"""Clears to tolerate before the efficiency check may end the walk."""
+
+comptime MIN_BYTES_PER_STATE = 10
+"""Input bytes each state minted since the last clear has to be paying for.
+
+Below this the cache is churning -- states are being built faster than
+input is consumed -- so the DFA gives up and the caller re-runs the match
+on the Pike VM.
+"""
+
+
 struct _DFAState(Copyable, Movable):
     """A single DFA state: a set of NFA states with a cached transition table.
     """
@@ -42,7 +58,15 @@ struct _DFAState(Copyable, Movable):
 
 
 struct LazyDFA(Copyable, Movable):
-    """Persistent lazy DFA with cached state transitions."""
+    """Persistent lazy DFA with cached state transitions.
+
+    A full state cache does not end the walk. The DFA drops every cached
+    state, re-derives the three start states and the state the walk is
+    standing in, and carries on (regex-automata's hybrid strategy). Only
+    once clearing has stopped paying for itself does it raise
+    `DFA_STATE_CAP` for the caller to re-run on the Pike VM -- see
+    `_cache_full_gives_up`.
+    """
 
     var states: List[_DFAState]
     var state_map: Dict[String, Int]
@@ -51,6 +75,18 @@ struct LazyDFA(Copyable, Movable):
     var _init_after_nl: Int  # initial state after '\n' (only BOL_MULTILINE holds)
     var _init_other: Int  # initial state at mid-line (no BOL anchors hold)
 
+    # --- cache-clearing bookkeeping ---
+    var clear_count: Int
+    """How many times the state cache has been cleared."""
+    var states_since_clear: Int
+    """States minted since the last clear (or since construction)."""
+    var bytes_since_clear: Int
+    """Bytes stepped since the last clear, as of the last full-cache hit."""
+    var _run_start: Int
+    """Input position the current uninterrupted walk started at."""
+    var _bytes_before_run: Int
+    """Bytes stepped since the last clear by walks that already finished."""
+
     def __init__(out self):
         self.states = List[_DFAState]()
         self.state_map = Dict[String, Int]()
@@ -58,12 +94,20 @@ struct LazyDFA(Copyable, Movable):
         self._init_start = 0
         self._init_after_nl = 0
         self._init_other = 0
+        self.clear_count = 0
+        self.states_since_clear = 0
+        self.bytes_since_clear = 0
+        self._run_start = 0
+        self._bytes_before_run = 0
 
     def _ensure_init(mut self, nfa: NFA):
         if self._initialized:
             return
         self._initialized = True
+        self._build_init_states(nfa)
 
+    def _build_init_states(mut self, nfa: NFA):
+        """(Re-)create the three start-context states."""
         # State 1: no BOL context (mid-line start)
         self._init_other = self._make_init_state(
             nfa, at_start=False, after_newline=False
@@ -88,29 +132,102 @@ struct LazyDFA(Copyable, Movable):
             nfa, seeds^, init_states, at_start, after_newline
         )
         var key = _state_key(init_states)
+        var eol_end = _check_eol_match(nfa, init_states, at_end=True)
+        var eol_nl = _check_eol_match(nfa, init_states, at_end=False)
+        return self._intern(key^, init_states^, init_match, eol_end, eol_nl)
 
+    def _intern(
+        mut self,
+        var key: String,
+        var nfa_states: List[Int],
+        is_match: Bool,
+        eol_end: Bool,
+        eol_nl: Bool,
+    ) -> Int:
+        """Look up a state set by key, appending it when it isn't cached."""
         var maybe = self.state_map.get(key)
         if maybe:
             return maybe.value()
-
-        var eol_end = _check_eol_match(nfa, init_states, at_end=True)
-        var eol_nl = _check_eol_match(nfa, init_states, at_end=False)
         var idx = len(self.states)
-        var dfa_state = _DFAState(init_states^, init_match, eol_end, eol_nl)
+        var dfa_state = _DFAState(nfa_states^, is_match, eol_end, eol_nl)
         self.states.append(dfa_state^)
         self.state_map[key^] = idx
+        self.states_since_clear += 1
         return idx
+
+    # --- byte accounting -------------------------------------------------
+    # The efficiency heuristic needs "bytes stepped since the last clear",
+    # but paying for it with a counter bump inside the per-byte loop would
+    # tax every walk. Instead each uninterrupted walk records where it
+    # started and folds its length in when it ends, so the hot loop is
+    # untouched and `_step` only reconstructs the number on the cold
+    # cache-full path.
+
+    @always_inline
+    def _begin_run(mut self, pos: Int):
+        self._run_start = pos
+
+    @always_inline
+    def _end_run(mut self, pos: Int):
+        self._bytes_before_run += pos - self._run_start
+        self._run_start = pos
+
+    @always_inline
+    def _cache_full_gives_up(mut self, pos: Int) -> Bool:
+        """Decide whether a full cache means clearing or giving up.
+
+        Clearing pays while the DFA consumes a decent number of input
+        bytes per state it builds. Once it has cleared `MIN_CACHE_CLEARS`
+        times and is still minting states faster than
+        `MIN_BYTES_PER_STATE`, the cache is thrashing and another clear
+        would only buy more of the same.
+        """
+        var bytes = self._bytes_before_run + (pos - self._run_start)
+        self.bytes_since_clear = bytes
+        if self.clear_count < MIN_CACHE_CLEARS:
+            return False
+        return bytes < self.states_since_clear * MIN_BYTES_PER_STATE
+
+    def _clear_cache(mut self, nfa: NFA, current: Int, pos: Int) -> Int:
+        """Drop every cached state, keeping the walk where it stands.
+
+        Returns the id `current` holds in the fresh cache: a walk is
+        identified by its NFA state set, which survives the clear and is
+        re-interned here, so stepping continues from the same set with an
+        empty transition cache.
+        """
+        var cur_states = self.states.unsafe_get(current).nfa_states.copy()
+        var cur_is_match = self.states.unsafe_get(current).is_match
+        var cur_eol_end = self.states.unsafe_get(current).eol_at_end
+        var cur_eol_nl = self.states.unsafe_get(current).eol_at_newline
+
+        self.states.clear()
+        self.state_map.clear()
+        self.clear_count += 1
+        self.states_since_clear = 0
+        self._bytes_before_run = 0
+        self._run_start = pos
+
+        # Start states first: search_forward re-reads _init_* for every
+        # start position it tries, so they have to be live after a clear.
+        self._build_init_states(nfa)
+
+        var key = _state_key(cur_states)
+        return self._intern(
+            key^, cur_states^, cur_is_match, cur_eol_end, cur_eol_nl
+        )
 
     def full_match(mut self, nfa: NFA, input: String) raises -> Bool:
         """Full match using lazy DFA. Returns True if entire input matches.
 
-        Raises "DFA_STATE_CAP" when the state cache overflows; callers
+        Raises "DFA_STATE_CAP" when the state cache is thrashing; callers
         should fall back to the Pike VM.
         """
         self._ensure_init(nfa)
         var current = self._init_start  # full_match starts at pos 0
         var ptr = Pointer(input.unsafe_ptr())
         var length = input.byte_length()
+        self._begin_run(0)
 
         for i in range(length):
             # Inline the cache-hit path to avoid _step call overhead
@@ -121,12 +238,15 @@ struct LazyDFA(Copyable, Movable):
             if cached >= 0:
                 current = cached
             elif cached == -2:
+                self._end_run(i)
                 return False
             else:
-                current = self._step(nfa, current, UInt8(byte_idx))
+                current = self._step(nfa, current, UInt8(byte_idx), i)
                 if current < 0:
+                    self._end_run(i)
                     return False
 
+        self._end_run(length)
         ref final_state = self.states.unsafe_get(current)
         return final_state.is_match or final_state.eol_at_end
 
@@ -154,6 +274,7 @@ struct LazyDFA(Copyable, Movable):
         if self.states.unsafe_get(current).is_match:
             last_match = start
 
+        self._begin_run(start)
         var pos = start
         while pos < input_len:
             var byte = input.unsafe_get(pos)
@@ -162,12 +283,13 @@ struct LazyDFA(Copyable, Movable):
             if byte == CHAR_NEWLINE:
                 if self.states.unsafe_get(current).eol_at_newline:
                     last_match = pos
-            current = self._step(nfa, current, byte)
+            current = self._step(nfa, current, byte, pos)
             if current < 0:
                 break
             pos += 1
             if self.states.unsafe_get(current).is_match:
                 last_match = pos
+        self._end_run(pos)
 
         # At end of input, check EOL/EOL_MULTILINE anchors
         if current >= 0 and self.states.unsafe_get(current).eol_at_end:
@@ -223,18 +345,20 @@ struct LazyDFA(Copyable, Movable):
             if self.states.unsafe_get(current).is_match:
                 last_match = pos
 
+            self._begin_run(pos)
             var p = pos
             while p < input_len:
                 var byte = input.unsafe_get(p)
                 if byte == CHAR_NEWLINE:
                     if self.states.unsafe_get(current).eol_at_newline:
                         last_match = p
-                current = self._step(nfa, current, byte)
+                current = self._step(nfa, current, byte, p)
                 if current < 0:
                     break
                 p += 1
                 if self.states.unsafe_get(current).is_match:
                     last_match = p
+            self._end_run(p)
 
             if current >= 0 and self.states.unsafe_get(current).eol_at_end:
                 last_match = p
@@ -256,8 +380,13 @@ struct LazyDFA(Copyable, Movable):
         nfa: NFA,
         current: Int,
         byte: UInt8,
+        pos: Int,
     ) raises -> Int:
-        """Compute or look up DFA transition for the given byte."""
+        """Compute or look up DFA transition for the given byte.
+
+        `pos` is the input offset of `byte`; it only feeds the
+        bytes-per-state accounting on the cache-full path.
+        """
         if current < 0:
             return -1
 
@@ -302,26 +431,30 @@ struct LazyDFA(Copyable, Movable):
         )
         var key = _state_key(closed)
 
-        var next_idx: Int
         var maybe = self.state_map.get(key)
         if maybe:
-            next_idx = maybe.value()
-        else:
-            # Cap DFA states to prevent blowup. Raising (instead of
-            # returning the dead-state sentinel) lets callers fall back to
-            # the Pike VM rather than silently reporting "no match".
-            if len(self.states) >= 4096:
-                raise Error("DFA_STATE_CAP")
-            var eol_end = _check_eol_match(nfa, closed, at_end=True)
-            var eol_nl = _check_eol_match(nfa, closed, at_end=False)
-            var new_state = _DFAState(closed^, has_match, eol_end, eol_nl)
-            next_idx = len(self.states)
-            self.states.append(new_state^)
-            self.state_map[key^] = next_idx
+            var hit = maybe.value()
+            self.states.unsafe_get(current).transitions.unsafe_get(
+                byte_idx
+            ) = hit
+            return hit
 
-        self.states.unsafe_get(current).transitions.unsafe_get(
-            byte_idx
-        ) = next_idx
+        # A new state is needed. A full cache doesn't end the walk: clear
+        # it and carry on, which costs the cached transitions but not the
+        # answer. Giving up raises (instead of returning the dead-state
+        # sentinel) so callers fall back to the Pike VM rather than
+        # silently reporting "no match".
+        var src = current
+        if len(self.states) >= DFA_STATE_CAP:
+            if self._cache_full_gives_up(pos):
+                raise Error("DFA_STATE_CAP")
+            src = self._clear_cache(nfa, current, pos)
+
+        var eol_end = _check_eol_match(nfa, closed, at_end=True)
+        var eol_nl = _check_eol_match(nfa, closed, at_end=False)
+        var next_idx = self._intern(key^, closed^, has_match, eol_end, eol_nl)
+
+        self.states.unsafe_get(src).transitions.unsafe_get(byte_idx) = next_idx
         return next_idx
 
 
