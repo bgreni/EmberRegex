@@ -61,6 +61,7 @@ from .static_dfa import (
     EagerDFA,
     _BIT64,
     _StateBits,
+    _WB_PREV_SALT,
     _bs_set,
     _is_word_byte,
     _lane_word,
@@ -125,6 +126,11 @@ struct LFDFA(Copyable, Movable):
     var astart_after_nl: Int
     var astart_other: Int
     var astart_other_word: Int  # mid-line after a word byte
+    # Debug/test view: the ids (in `d`'s numbering) of the states whose
+    # look-behind class is "word". Exact only when built with
+    # `minimize=False` (minimization may merge such a state with an
+    # equivalent one entered on other bytes).
+    var prev_ids: List[Int]
 
     def __init__(out self):
         self.valid = False
@@ -134,6 +140,7 @@ struct LFDFA(Copyable, Movable):
         self.astart_after_nl = 0
         self.astart_other = 0
         self.astart_other_word = 0
+        self.prev_ids = List[Int]()
 
 
 def _lf_closure(
@@ -220,7 +227,6 @@ def _lf_salt(pos: Int) -> UInt64:
 comptime _LF_RESTART_SALT: UInt64 = 0xC2B2AE3D27D4EB4F
 comptime _LF_TAIL_SALT_O: UInt64 = 0x165667B19E3779F9
 comptime _LF_TAIL_SALT_N: UInt64 = 0x27D4EB2F165667C5
-comptime _LF_PREV_SALT: UInt64 = 0x94D049BB133111EB
 
 
 def _mk_iota64() -> SIMD[DType.uint64, 64]:
@@ -250,7 +256,7 @@ def _lf_memo_closure(
     the slot index."""
     var off = len(pool)
     var cnt = _lf_closure(
-        kinds, out1s, out2s, anchors, t, False, after_newline, pool
+        kinds, out1s, out2s, anchors, t, False, after_newline, pool, WB_PENDING
     )
     var cv = _LFClo(-1)
     if cnt <= _LF_CLO_ELEMS:
@@ -399,7 +405,15 @@ def build_lf_dfa(
     for ctx in range(2):
         var off = len(pool)
         var cnt = _lf_closure(
-            kinds, out1s, out2s, anchors, nfa.start, False, ctx == 1, pool
+            kinds,
+            out1s,
+            out2s,
+            anchors,
+            nfa.start,
+            False,
+            ctx == 1,
+            pool,
+            WB_PENDING,
         )
         if cnt > _LF_MAX_MEMBERS:
             return result^
@@ -475,6 +489,7 @@ def build_lf_dfa(
             ctx == 2,
             ctx >= 1,
             pool,
+            WB_PENDING,
         )
         if cnt > _LF_MAX_MEMBERS:
             return result^
@@ -521,7 +536,7 @@ def build_lf_dfa(
         if new_restart:
             acc_h ^= _LF_RESTART_SALT
         if prev:
-            acc_h ^= _LF_PREV_SALT
+            acc_h ^= _WB_PREV_SALT
         var found = -1
         var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
         for j in range(4):
@@ -767,18 +782,23 @@ def build_lf_dfa(
             # Group the classes by signature; '\n' always stands alone (its
             # context resolves BOL_MULTILINE and pending EOL_MULTILINE).
             # Under a pending word anchor only this variant's classes are
-            # expanded ('\n' is a non-word byte).
+            # expanded ('\n' is a non-word byte). With a word anchor in
+            # the pattern the word class is part of the group key too: a
+            # member accepting both classes (`.`, `\S`, `[\w.-]`) would
+            # otherwise land word and non-word bytes in ONE target state
+            # with ONE look-behind class, and the transition that creates
+            # the pending anchor (`.\b.`) needs a class per byte class.
             var gkeys = SIMD[DType.uint64, 256](0)
+            var gword = SIMD[DType.int8, 256](0)  # word class per group
             var grep = SIMD[DType.int32, 256](-1)  # representative class
             var ngroups = 0
             var cls_group = SIMD[DType.int32, 256](-1)
             for ci in range(nclasses):
                 if ci == nl_class:
                     continue
-                if has_pending:
-                    var cw = (word_cls[ci >> 6] >> UInt64(ci & 63)) & 1 != 0
-                    if cw != variant_word:
-                        continue
+                var cw = (word_cls[ci >> 6] >> UInt64(ci & 63)) & 1 != 0
+                if has_pending and cw != variant_word:
+                    continue
                 var w = ci >> 6
                 var l = ci & 63
                 var key: UInt64
@@ -790,14 +810,16 @@ def build_lf_dfa(
                     key = grp2[l]
                 else:
                     key = grp3[l]
+                var cwi = Int8(1) if (has_wb and cw) else Int8(0)
                 var g = -1
                 for j in range(ngroups):
-                    if gkeys[j] == key:
+                    if gkeys[j] == key and gword[j] == cwi:
                         g = j
                         break
                 if g < 0:
                     g = ngroups
                     gkeys[g] = key
+                    gword[g] = cwi
                     grep[g] = Int32(ci)
                     ngroups += 1
                 cls_group[ci] = Int32(g)
@@ -995,7 +1017,7 @@ def build_lf_dfa(
                 if new_restart:
                     acc_h ^= _LF_RESTART_SALT
                 if prev:
-                    acc_h ^= _LF_PREV_SALT
+                    acc_h ^= _WB_PREV_SALT
                 var found = -1
                 var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
                 for j in range(4):
@@ -1048,9 +1070,17 @@ def build_lf_dfa(
         if st_selfloop[s] and not st_genuine[s]:
             flags[s] |= Int(EDFA_NO_ACCEL)
 
+    # The look-behind-"word" states ride along in `starts` so the finish
+    # (minimization remap + match permutation) renumbers them too.
+    for s in range(len(st_list)):
+        if Int(st_list[s][_LF_PREV_LANE]) != 0:
+            starts.append(s)
+
     var pstarts = _edfa_finish(
         result.d, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize, nctx
     )
+    for k in range(nstart_ctx, len(pstarts)):
+        result.prev_ids.append(pstarts[k])
     if has_wb:
         result.d.start_other_word = pstarts[3]
     if anchored:

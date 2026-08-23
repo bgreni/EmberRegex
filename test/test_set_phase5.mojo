@@ -97,6 +97,33 @@ def test_som_overlapping_ends() raises:
     )
 
 
+def test_som_does_not_step_past_a_pending_bol() raises:
+    # The reverse automaton keeps BOL kinds as pending members; it must
+    # not follow their predecessors on a byte that cannot resolve them
+    # (`x^` never holds mid-input), or the start walks past the true
+    # start. BOL_MULTILINE resolves on the '\n' transition and IS stepped
+    # past there.
+    var db = RegexSet[["(?:x^y|y)", "zzz"]]()
+    var unfa = build_union_nfa(["(?:x^y|y)", "zzz"])
+    assert_spans(
+        db.scan_som("xy"), set_pike_som_scan(unfa, "xy".as_bytes()), "x^y"
+    )
+    assert_spans(db.scan_som("xy"), [SetSpan(0, 1, 2)], "x^y exact")
+    var dbm = RegexSet[["(?m)(?:x^y|y)", "(?m)(?:x\n^y|y)"]]()
+    var unfam = build_union_nfa(["(?m)(?:x^y|y)", "(?m)(?:x\n^y|y)"])
+    for input in ["xy", "x\ny", "xzy", "yx\ny"]:
+        assert_spans(
+            dbm.scan_som(input),
+            set_pike_som_scan(unfam, input.as_bytes()),
+            String("(?m) ", input),
+        )
+    assert_spans(
+        dbm.scan_som("x\ny"),
+        [SetSpan(0, 2, 3), SetSpan(1, 0, 3)],
+        "(?m) x\\ny exact",
+    )
+
+
 def test_som_shared_end() raises:
     # Three ids ending at the same position, each with its own start —
     # one leftward walk serves all of them.

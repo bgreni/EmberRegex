@@ -16,7 +16,7 @@ from std.collections import InlineArray
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
-from .constants import CHAR_NEWLINE
+from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import _probe_rank_table
 from .dfa import _epsilon_closure, _check_eol_match, _reaches_match
@@ -111,23 +111,17 @@ comptime WB_RESOLVE = 2  # resolved against (prev_word, next_word)
 
 
 def _is_word_byte(b: Int) -> Bool:
-    """Comptime: ASCII word byte `[A-Za-z0-9_]` — the `\\b` alphabet of
-    every engine here (bytes >= 0x80 are non-word, UTF-8 mode included)."""
-    return (
-        (b >= 0x61 and b <= 0x7A)
-        or (b >= 0x41 and b <= 0x5A)
-        or (b >= 0x30 and b <= 0x39)
-        or b == 0x5F
-    )
+    """Comptime: ASCII word byte `[A-Za-z0-9_]` — `constants.is_word_byte`
+    over an `Int` byte value (bytes >= 0x80 are non-word, UTF-8 mode
+    included)."""
+    return b >= 0 and b < 256 and is_word_byte(Byte(b))
 
 
 @always_inline
 def edfa_is_word(b: Byte) -> Bool:
-    """Runtime twin of `_is_word_byte` (mirrors `_sbt_is_word_char`)."""
-    var l = b | 0x20
-    return (
-        (l >= 0x61 and l <= 0x7A) or (b >= 0x30 and b <= 0x39) or b == 0x5F
-    )
+    """Runtime twin of `_is_word_byte`: the shared `constants.is_word_byte`
+    every engine's `\\b` check uses."""
+    return is_word_byte(b)
 
 
 def _wb_holds(anchor_kind: Int, prev_word: Bool, next_word: Bool) -> Bool:

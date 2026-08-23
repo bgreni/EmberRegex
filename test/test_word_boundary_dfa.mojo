@@ -18,6 +18,7 @@ from emberregex.static_dfa import (
     EDFA_MATCH_IF_WORD,
     EagerDFA,
     _edfa_has_region,
+    _is_word_byte,
     build_eager_dfa,
     edfa_flags_arr,
     edfa_full_match,
@@ -25,7 +26,7 @@ from emberregex.static_dfa import (
     edfa_match_at,
     edfa_table_arr,
 )
-from emberregex.static_lfdfa import build_lf_dfa, lfdfa_find_end
+from emberregex.static_lfdfa import LFDFA, build_lf_dfa, lfdfa_find_end
 from emberregex.static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
@@ -187,6 +188,41 @@ def test_both_classes_fold_into_a_plain_match() raises:
     assert_true(s >= 0)
     assert_true(s < d.num_match_states)
     assert_false(d.any_wb)
+
+
+def _prev_states_entered_on_word_bytes(lf: LFDFA) -> Bool:
+    """Comptime: the table has look-behind-"word" states and every
+    transition INTO one is on a word byte (built unminimized, so the ids
+    are exact)."""
+    if not lf.valid or len(lf.prev_ids) == 0:
+        return False
+    var n = lf.d.num_states
+    for t in lf.prev_ids:
+        for s in range(n):
+            for b in range(256):
+                if lf.d.table[s * 256 + b] == t and not _is_word_byte(b):
+                    return False
+    return True
+
+
+def _lf_prev_invariant[p: StaticString]() -> Bool:
+    comptime nfa = Regex[p].nfa
+    comptime lf = build_lf_dfa(nfa, True, False, False)
+    comptime ok = _prev_states_entered_on_word_bytes(lf)
+    return ok
+
+
+def test_lf_prev_states_entered_on_word_bytes_only() raises:
+    # Structural form of the look-behind invariant, on the patterns whose
+    # pending anchor follows a both-class atom and on the simple shapes.
+    assert_true(_lf_prev_invariant["\\bfoo\\b"]())
+    assert_true(_lf_prev_invariant[".\\b.|q"]())
+    assert_true(_lf_prev_invariant["\\S+\\bing\\b|q"]())
+    assert_true(_lf_prev_invariant["[\\w.-]+\\bfoo|q"]())
+    assert_true(_lf_prev_invariant["(?s)[a-z .]\\b\\w+|q"]())
+    assert_true(_lf_prev_invariant["\\b(?:foo|bar)\\b"]())
+    assert_true(_lf_prev_invariant["\\w+\\b|q"]())
+    assert_true(_lf_prev_invariant["(?:ab\\B)+c"]())
 
 
 # --- Direct table harness ---------------------------------------------------
@@ -388,6 +424,22 @@ def test_anchor_inside_a_loop() raises:
     _both["(?:ab\\B)+c"]("ababc ab abc", "(?:ab\\B)+c")
 
 
+def test_both_class_atom_before_anchor() raises:
+    # A consuming member that accepts word AND non-word bytes (`.`, `\S`,
+    # `[^\n]`, `[\w.-]`) right before the anchor, from a state with no
+    # pending anchor: the transition creating the pending anchor must
+    # record a different look-behind class for each byte class (the
+    # leftmost-first table groups byte classes by member acceptance, and
+    # the word class has to split such a group).
+    _both[".\\b.|q"]("a b c", ".\\b.|q")
+    _both["\\S+\\bing\\b|q"]("xing x.ing", "\\S+\\bing\\b|q")
+    _both[".+\\bfoo|q"]("afoo a foo", ".+\\bfoo|q")
+    _both["[^\\n]\\bx|q"]("ax x .x", "[^\\n]\\bx|q")
+    _both["(?s)[a-z .]\\b\\w+|q"]("ab cd", "(?s)[a-z .]\\b\\w+|q")
+    _both["[\\w.-]+\\bfoo|q"]("a.foo -foo afoo", "[\\w.-]+\\bfoo|q")
+    _both["\\S+\\Bx|q"]("ax .x a.x", "\\S+\\Bx|q")
+
+
 # --- LCG differential -------------------------------------------------------
 
 
@@ -434,6 +486,7 @@ def _differential[p: StaticString](alphabet: String, label: String) raises:
 # space, newline, and bytes >= 0x80 via 2- and 3-byte characters.
 comptime _ALPHA = "foabr_1 .,\né€"
 comptime _ALPHA_DENSE = "fo oa\n_"
+comptime _ALPHA_ASCII = "foabr_1 .,-\n"
 
 
 def test_differential_literal_anchors() raises:
@@ -458,6 +511,19 @@ def test_differential_line_anchors() raises:
     _differential["(?m)^\\b\\w"](_ALPHA, "(?m)^\\b\\w")
     _differential["a\\b$"](_ALPHA, "a\\b$")
     _differential["(?m)a\\b$"](_ALPHA_DENSE, "(?m)a\\b$")
+
+
+def test_differential_both_class_atoms() raises:
+    # A mixed-class atom immediately before `\b` / `\B`, entered from an
+    # anchor-free state, over inputs mixing word and non-word bytes.
+    # ASCII alphabets only: `.` / `\S` consume single bytes, so a match
+    # could end inside a multi-byte character and findall's String
+    # construction would reject the slice on every lane alike.
+    _differential["[\\w.-]+\\bfoo|q"](_ALPHA_ASCII, "[\\w.-]+\\bfoo|q")
+    _differential["(?s).\\b.|q"](_ALPHA_ASCII, "(?s).\\b.|q")
+    _differential["\\S+\\Bx|q"]("x.a _\n", "\\S+\\Bx|q")
+    _differential[".\\b.|q"](_ALPHA_DENSE, ".\\b.|q")
+    _differential["\\S+\\bing\\b|q"]("ing. x\n", "\\S+\\bing\\b|q")
 
 
 def test_differential_bare_anchors() raises:
