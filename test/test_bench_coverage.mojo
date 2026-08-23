@@ -693,37 +693,38 @@ def test_bench_capture_findall_sparse() raises:
 
 def test_bench_onepass_match_kv() raises:
     # bench onepass_match_kv: the pattern is one-pass AND selected (its
-    # only loop is a general one), the 40-byte input fullmatches, the
-    # groups report the last pair, and the slots are the Pike VM's.
-    comptime S = Regex["(?:([a-z])=(\\d);)+"]
+    # only loop is a short-bodied general one), the 40-byte input
+    # fullmatches, the groups report the last pair, and the slots are
+    # the Pike VM's.
+    comptime S = Regex["(?:([a-z])(\\d))+"]
     assert_true(S._use_onepass)
     var re = S()
-    var input = "a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0;"
+    var input = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"
     assert_equal(input.byte_length(), 40)
     var r = re.match(input)
     assert_true(r.matched)
-    assert_equal(r.group_str(input, 1), "j")
+    assert_equal(r.group_str(input, 1), "t")
     assert_equal(r.group_str(input, 2), "0")
     var p = re._pike_match(input)
     for s in range(4):
         assert_equal(r.slots[s], p.slots[s])
-    assert_false(re.match("a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0").matched)
+    assert_false(re.match("a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t").matched)
 
 
 def test_bench_onepass_findall_2KB() raises:
     # bench onepass_findall_2KB: 64 matches on the one-pass capture lane,
     # group 1 text per match (the last pair's key), same spans and slots
     # as the Pike VM.
-    comptime S = Regex["(?:([a-z])=(\\d);)+"]
+    comptime S = Regex["(?:([a-z])(\\d))+"]
     assert_true(S._use_onepass)
     assert_true(S._use_dfa_span)
     var re = S()
-    var input = String("a=1;b=2;c=3;d=4;e=5;f=6;g=7; ") * 64
+    var input = String("a1b2c3d4e5f6g7h8i9j0k1l2m3n4 ") * 64
     assert_true(input.byte_length() > 1800)
     var all = re.findall(input)
     assert_equal(len(all), 64)
-    assert_equal(all[0], "g")
-    assert_equal(all[63], "g")
+    assert_equal(all[0], "n")
+    assert_equal(all[63], "n")
     var got = re.finditer(input)
     var exp = re._pike_finditer(input)
     assert_equal(len(got), 64)
@@ -732,7 +733,7 @@ def test_bench_onepass_findall_2KB() raises:
         assert_equal(got[i].end, exp[i].end)
         for s in range(4):
             assert_equal(got[i].slots[s], exp[i].slots[s])
-    assert_equal(got[5].group_str(input, 2), "7")
+    assert_equal(got[5].group_str(input, 2), "4")
 
 
 def _bench_counted_haystack(n: Int) -> String:

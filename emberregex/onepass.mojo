@@ -188,22 +188,97 @@ struct OnePass(Copyable, Movable):
         self.accel = EagerDFA()
 
 
+# Longest loop body (consuming states on any path from a general loop's
+# body back to its SPLIT) the one-pass walk is selected for.
+comptime ONEPASS_MAX_BODY = 2
+
+
+def _op_body_len(nfa: NFA, body: Int, split_idx: Int) -> Int:
+    """Comptime: the most consuming states on any path from `body` back
+    to `split_idx` (-1: none). Cycles through other loops are cut at the
+    state already on the path, so a nested loop counts as one pass
+    through it — enough for the `<= ONEPASS_MAX_BODY` question."""
+    var n = len(nfa.states)
+    # -3 unvisited, -2 on the path, -1 no path, else the length.
+    var memo = List[Int](fill=-3, length=n)
+    var st_s: List[Int] = [body]
+    var st_phase: List[Int] = [0]
+    while len(st_s) > 0:
+        var top = len(st_s) - 1
+        var s = st_s[top]
+        if s < 0 or s >= n:
+            _ = st_s.pop()
+            _ = st_phase.pop()
+            continue
+        if s == split_idx:
+            memo[s] = 0
+            _ = st_s.pop()
+            _ = st_phase.pop()
+            continue
+        var kind = nfa.states[s].kind
+        if st_phase[top] == 0:
+            if memo[s] != -3:
+                _ = st_s.pop()
+                _ = st_phase.pop()
+                continue
+            memo[s] = -2
+            st_phase[top] = 1
+            if kind == NFAStateKind.MATCH:
+                continue
+            var c1 = nfa.states[s].out1
+            if c1 >= 0 and c1 < n and memo[c1] == -3:
+                st_s.append(c1)
+                st_phase.append(0)
+            if kind == NFAStateKind.SPLIT:
+                var c2 = nfa.states[s].out2
+                if c2 >= 0 and c2 < n and memo[c2] == -3:
+                    st_s.append(c2)
+                    st_phase.append(0)
+        else:
+            var best = -1
+            var here = 0
+            if (
+                kind == NFAStateKind.CHAR
+                or kind == NFAStateKind.CHARSET
+                or kind == NFAStateKind.ANY
+            ):
+                here = 1
+            if kind != NFAStateKind.MATCH:
+                var c1 = nfa.states[s].out1
+                if c1 >= 0 and c1 < n and memo[c1] >= 0:
+                    best = memo[c1] + here
+                if kind == NFAStateKind.SPLIT:
+                    var c2 = nfa.states[s].out2
+                    if c2 >= 0 and c2 < n and memo[c2] >= 0:
+                        if memo[c2] + here > best:
+                            best = memo[c2] + here
+            memo[s] = best
+            _ = st_s.pop()
+            _ = st_phase.pop()
+    return memo[body] if memo[body] >= 0 else -1
+
+
 def onepass_shape(nfa: NFA) -> Bool:
     """Comptime: the shape on which the one-pass walk beats the
-    specialized backtracker — some loop the backtracker runs by general
-    recursion (a cyclic SPLIT whose body is not one consuming state:
-    `(?:(x)|y)+`, `((a)(b))+`, `(a|b)*c`), and NO simple loop anywhere.
+    specialized backtracker — every loop is one the backtracker runs by
+    general recursion (a cyclic SPLIT whose body is not one consuming
+    state) and consumes at most ONEPASS_MAX_BODY bytes per iteration:
+    `(?:(x)|y)+`, `((a)(b))+`, `(a|b)*c`, `(?:(ab)|(cd))+`.
 
-    Measured (2026-08-23, `match()`, ns per call): the table walk costs
-    ~1.4 ns per byte whatever the pattern; the backtracker costs ~7 ns
-    per general-loop iteration plus SIMD-speed class runs. Where every
-    iteration is a byte or two the walk is 4-5x faster at every length
-    and has no SBT_BUDGET / SBT_MAX_DEPTH cliff (`(?:(x)|y)+`: 58 vs 226
-    ns at 32 bytes, 2.0 vs 7.8 us at 1 KB, Pike VM past 8 KB). Where
-    the iterations carry a simple loop (`(?:(\\w+)=(\\w+);)+`: 30 vs 59
-    ns on 40 bytes; 2.2 vs 6.2 us on a 2 KB findall) the backtracker's
-    recursion is amortized over each run and it wins, as it does on
-    every simple-loop-only shape (`(\\w+)@(\\w+)\\.(\\w+)`: 8 vs 25 ns).
+    Measured (2026-08-23, `match()`, ns per call, one-pass vs
+    backtracker): the table walk costs ~1.8 ns per byte whatever the
+    pattern; the backtracker costs a few ns per general-loop iteration
+    (more per failing alternation arm, and growing with the recursion
+    depth) plus SIMD-speed class runs. Where every iteration is a byte
+    or two the walk wins at every length — `(?:(x)|y)+` 71 vs 326 at 40
+    bytes and 2.0 vs 7.8 us at 1 KB (the backtracker exhausts
+    SBT_BUDGET past 8 KB); `(?:(x)|(y)|z)+` 72 vs 612; `((a)(b))+` 83 vs
+    106 and 2.0 vs 6.5 us; `(?:(ab)|(cd))+` 70 vs 76 and 1.9 vs 5.3 us —
+    and has no SBT_BUDGET / SBT_MAX_DEPTH cliff. A longer body amortizes
+    the recursion: `(?:([a-z])=(\\d);)+` 70 vs 35 at 40 bytes and even
+    at 1 KB; with `(?:;|,)` for the separator 66 vs 48 and 1.9 vs 3.3 us.
+    A simple loop anywhere hands its bytes to the backtracker's SIMD
+    scan: `(?:(\\w+)=(\\w+);)+` 55 vs 30; `(\\w+)@(\\w+)\\.(\\w+)` 25 vs 8.
     """
     var cyclic = split_cycle_flags(nfa)
     var general = False
@@ -215,6 +290,8 @@ def onepass_shape(nfa: NFA) -> Bool:
             continue
         var body = st.out1 if st.greedy else st.out2
         if _sbt_is_simple_body(nfa, i, body):
+            return False
+        if _op_body_len(nfa, body, i) > ONEPASS_MAX_BODY:
             return False
         general = True
     return general

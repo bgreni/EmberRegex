@@ -240,13 +240,13 @@ def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
 def bench_onepass_match_kv(mut b: Bench) raises:
     # One-pass DFA (onepass.mojo): a capture pattern whose NFA admits at
     # most one consuming thread per byte AND whose only loop the
-    # backtracker would run by recursion (a group inside `+`, no simple
-    # loop inside), so match() is one forward table walk writing the
-    # slots as it goes — no recursion, no budget. 40-byte input of ten
-    # `k=v;` pairs; the groups report the last pair (Python's
-    # last-iteration semantics).
-    var re = Regex["(?:([a-z])=(\\d);)+"]()
-    var input = "a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0;"
+    # backtracker would run by recursion, with a short body (see
+    # `onepass_shape`), so match() is one forward table walk writing
+    # the slots as it goes — no recursion, no budget. 40-byte input of
+    # twenty key/value pairs; the groups report the last pair
+    # (Python's last-iteration semantics).
+    var re = Regex["(?:([a-z])(\\d))+"]()
+    var input = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"
 
     @always_inline
     @parameter
@@ -264,9 +264,9 @@ def bench_onepass_match_kv(mut b: Bench) raises:
 
 
 def onepass_findall_input() -> String:
-    """~1.9 KB: 64 space-separated runs of seven `k=v;` pairs — 64
-    matches for `(?:([a-z])=(\\d);)+`."""
-    return String("a=1;b=2;c=3;d=4;e=5;f=6;g=7; ") * 64
+    """~1.9 KB: 64 space-separated runs of 14 key/value pairs — 64
+    matches for `(?:([a-z])(\\d))+`."""
+    return String("a1b2c3d4e5f6g7h8i9j0k1l2m3n4 ") * 64
 
 
 def bench_onepass_findall_2KB(mut b: Bench) raises:
@@ -274,7 +274,7 @@ def bench_onepass_findall_2KB(mut b: Bench) raises:
     # whatever its shape): every candidate is real, so each match is one
     # exact leftmost-first table walk (the anchored attempt), where the
     # backtracker lane ran the recursive loop per pair.
-    var re = Regex["(?:([a-z])=(\\d);)+"]()
+    var re = Regex["(?:([a-z])(\\d))+"]()
     var input = onepass_findall_input()
 
     @always_inline
