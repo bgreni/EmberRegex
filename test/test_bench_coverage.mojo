@@ -546,5 +546,18 @@ def test_bench_lf_dfa_class_run_search() raises:
     assert_equal(r.end, 20 * 1024 + 1)
 
 
+def test_bench_memo_ambiguous_plus_miss() raises:
+    # bench memo_ambiguous_plus_miss_1500: 1500 `a`s then `c`, so there is
+    # no `b` anywhere and every candidate position fails — that is the
+    # search the memo has to carry. Positive control with a `b` appended.
+    var re = Regex["(a|aa)+b"]()
+    var miss = String("a") * 1500 + "c"
+    assert_false(re.search(miss).matched)
+    var hit = re.search(String("a") * 20 + "b")
+    assert_true(hit.matched)
+    assert_equal(hit.start, 0)
+    assert_equal(hit.end, 21)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

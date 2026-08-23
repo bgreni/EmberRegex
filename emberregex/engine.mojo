@@ -55,7 +55,13 @@ from .simd_scan import (
 )
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
-from .backtrack import _sbt_try_match, SBT_BUDGET
+from .backtrack import (
+    SBT_BUDGET,
+    SBT_MEMO_BITS,
+    _sbt_try_match,
+    sbt_memo_ok,
+    sbt_memo_rows,
+)
 from .dfa import LazyDFA
 from .static_dfa import (
     EagerDFA,
@@ -109,6 +115,7 @@ def _sbt_run[
     input: Span[Byte, origin],
     pos: Int,
     mut slots: InlineArray[Int, num_slots],
+    mut memo: List[UInt64],
     end_at: Int = -1,
 ) raises -> Int:
     """Run backtracker with a fresh budget allocation.
@@ -121,6 +128,133 @@ def _sbt_run[
     recursion depth tracks consumed bytes, so a larger budget converts
     the Pike fallback into a stack overflow (measured: `(?:ab)+` on a
     50KB input crashes under -D ASSERT=all).
+
+    `memo` is the caller's (state, pos) bitset — see `_sbt_run_memo`. It
+    starts empty, is filled by the first attempt that would otherwise have
+    been handed to the Pike VM, and is then shared by every later attempt
+    in the same walk: a subtree that failed at some position fails there
+    whatever position the walk started from, so `search` and `findall`
+    pay for the memo once instead of once per candidate.
+    """
+    comptime memo_rows = sbt_memo_rows(nfa)
+    comptime if memo_rows > 0:
+        if len(memo) != 0:
+            # An earlier attempt in this walk already paid for the memo,
+            # so stay on the memoized walker. A buffer sized for a
+            # different input is stale, not a cache — drop it.
+            if len(memo) == _sbt_memo_words(memo_rows, len(input)):
+                return _sbt_run_memoized[
+                    nfa=nfa,
+                    state_idx=state_idx,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, memo, end_at)
+            memo.clear()
+    var budget = SBT_BUDGET
+    var result = _sbt_try_match[
+        nfa=nfa,
+        state_idx=state_idx,
+        num_slots=num_slots,
+        anchored_end=anchored_end,
+        memo_on=False,
+    ](input, pos, slots, budget, memo_addr=0, depth=0, end_at=end_at)
+    if budget < 0:
+        comptime if memo_rows > 0:
+            # The shapes that blow the budget are re-exploring (state,
+            # pos) pairs. Build the memo and retry before conceding the
+            # pattern to the Pike VM. A walk that died on the DEPTH cap
+            # instead gets one wasted retry — the memo prunes repeated
+            # subtrees, it cannot make the deepest one shallower — and
+            # that retry costs at most another SBT_MAX_DEPTH frames.
+            if result < 0:
+                return _sbt_run_memo[
+                    nfa=nfa,
+                    state_idx=state_idx,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, memo, end_at)
+        raise Error("SBT_BUDGET_EXHAUSTED")
+    return result
+
+
+@always_inline
+def _sbt_memo_words(rows: Int, input_len: Int) -> Int:
+    """Words of bitset for `rows` memo rows over an input of `input_len`
+    bytes (positions run 0..input_len inclusive)."""
+    return (rows * (input_len + 1) + 63) >> 6
+
+
+def _sbt_run_memo[
+    origin: Origin,
+    //,
+    nfa: NFA,
+    state_idx: Int,
+    num_slots: Int,
+    anchored_end: Bool = False,
+](
+    input: Span[Byte, origin],
+    pos: Int,
+    mut slots: InlineArray[Int, num_slots],
+    mut memo: List[UInt64],
+    end_at: Int = -1,
+) raises -> Int:
+    """Second attempt at a run that exhausted SBT_BUDGET, this time with a
+    (state, pos) memo (see backtrack.mojo).
+
+    Deliberately not the first attempt. The bitset is
+    `general_splits * (len(input) + 1)` bits that have to be zeroed, and
+    the memoized walker is a whole second instantiation of the
+    backtracker, so runs that fit in the budget — every run of every
+    pattern that is not pathological — keep exactly the code and the cost
+    they had before the memo existed. The buffer is the caller's, so once
+    one attempt has built it, the rest of that walk starts memoized.
+
+    Restarting is safe: the walkers only ever WRITE capture slots, and
+    every SAVE restores its slot when its subtree fails, so the -1 this is
+    called on leaves `slots` as the first attempt found them.
+
+    Invariant the whole scheme rests on: **bits are only ever consulted
+    after an attempt that returned normally.** A bit means "this subtree
+    was explored to completion and failed", but an attempt that runs out
+    of budget or depth marks every general SPLIT it unwinds through, and
+    those subtrees were cut off rather than refuted. `_sbt_run_memoized`
+    therefore throws the buffer away before raising, so no later attempt —
+    in this walk or a future one — can read an aborted attempt's bits.
+    """
+    comptime memo_rows = sbt_memo_rows(nfa)
+    if memo_rows * (len(input) + 1) > SBT_MEMO_BITS:
+        # Wider than the memo cap — hand it to the fallback engine rather
+        # than allocate an unbounded bitset.
+        raise Error("SBT_BUDGET_EXHAUSTED")
+    memo = List[UInt64](fill=0, length=_sbt_memo_words(memo_rows, len(input)))
+    return _sbt_run_memoized[
+        nfa=nfa,
+        state_idx=state_idx,
+        num_slots=num_slots,
+        anchored_end=anchored_end,
+    ](input, pos, slots, memo, end_at)
+
+
+def _sbt_run_memoized[
+    origin: Origin,
+    //,
+    nfa: NFA,
+    state_idx: Int,
+    num_slots: Int,
+    anchored_end: Bool = False,
+](
+    input: Span[Byte, origin],
+    pos: Int,
+    mut slots: InlineArray[Int, num_slots],
+    mut memo: List[UInt64],
+    end_at: Int = -1,
+) raises -> Int:
+    """One attempt on the memoized walker, over a buffer that is already
+    sized and zeroed for this input.
+
+    A separate instantiation from the ordinary walk (`memo_on`), so the
+    memo costs the fast path nothing — not even a branch. Not inlined:
+    this is the pathological lane.
     """
     var budget = SBT_BUDGET
     var result = _sbt_try_match[
@@ -128,8 +262,24 @@ def _sbt_run[
         state_idx=state_idx,
         num_slots=num_slots,
         anchored_end=anchored_end,
-    ](input, pos, slots, budget, 0, end_at)
+        memo_on=True,
+    ](
+        input,
+        pos,
+        slots,
+        budget,
+        memo_addr=Int(memo.unsafe_ptr()),
+        depth=0,
+        end_at=end_at,
+    )
     if budget < 0:
+        # An aborted attempt leaves POISONED bits: every general SPLIT on
+        # the unwind marks itself, but those subtrees were cut off, not
+        # refuted. Drop the whole buffer rather than let a later attempt
+        # read them as failures — the caller is going to the Pike VM
+        # anyway, and a future caller that retried in-place would silently
+        # miss matches.
+        memo.clear()
         raise Error("SBT_BUDGET_EXHAUSTED")
     return result
 
@@ -624,6 +774,9 @@ struct Regex[pattern: String](Copyable, Movable):
     # the NFA, and comptime memoization covers field declarations only.
     # Only the Teddy and LazyDFA search lanes still consult it.
     comptime _lf_end_is_dfa_end = _dfa_end_is_leftmost_first(Self.nfa)
+    # Backtracker (state, pos) memoization is only sound when a subtree's
+    # outcome is a function of (state, pos) — see sbt_memo_ok.
+    comptime _sbt_memo_ok = sbt_memo_ok(Self.nfa)
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
     var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
@@ -849,6 +1002,10 @@ struct Regex[pattern: String](Copyable, Movable):
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_match(input)
         try:
+            # Declared here, not at the top of the method: the sandwich,
+            # SIMD-literal and DFA lanes above all return without ever
+            # reaching the backtracker.
+            var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             # anchored_end: MATCH only accepts at end of input, so
             # alternatives that prefer a shorter match (e.g. `(a|ab)` on
@@ -858,7 +1015,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
                 anchored_end=True,
-            ](input.as_bytes(), 0, slots)
+            ](input.as_bytes(), 0, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1002,10 +1159,13 @@ struct Regex[pattern: String](Copyable, Movable):
 
         # BOL anchor: only try position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            # One attempt, so the buffer lives in this branch alone; the
+            # other two branches own theirs.
+            var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots)
+            ](input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1028,6 +1188,8 @@ struct Regex[pattern: String](Copyable, Movable):
     ) raises -> MatchResult[Self._num_slots]:
         """General search, accelerated by SIMD prefix scan or first-byte bitmap.
         """
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var pos = 0
         while pos <= input_len:
             comptime if Self._use_scan_filter:
@@ -1040,7 +1202,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input, pos, slots)
+            ](input, pos, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1062,6 +1224,8 @@ struct Regex[pattern: String](Copyable, Movable):
         BOL_MULTILINE condition externally and enters the backtracker at the
         post-anchor state, eliminating one NFA state transition per attempt.
         """
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         # Selecting the entry state must happen at compile time so the
         # backtracker is specialized to it.
         comptime entry_state = Self._strategy.post_leading_anchor_start if Self._strategy.post_leading_anchor_start >= 0 else Self._start
@@ -1085,7 +1249,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=entry_state, num_slots=Self._num_slots
-            ](input, pos, slots)
+            ](input, pos, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -1410,6 +1574,8 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def _findall_impl(mut self, input: String) raises -> List[String]:
         """findall() implementation for the backtracker path."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var results = List[String]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1419,7 +1585,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots)
+            ](input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 self._findall_append(results, input, 0, end, slots)
             return results^
@@ -1434,7 +1600,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](input_bytes, pos, slots, sbt_memo)
                     if end >= 0:
                         self._findall_append(results, input, pos, end, slots)
                         if end > pos:
@@ -1478,7 +1644,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](input_bytes, pos, slots, sbt_memo)
                     if end < 0:
                         pos += 1
                         continue
@@ -1557,6 +1723,8 @@ struct Regex[pattern: String](Copyable, Movable):
     ) raises -> List[MatchResult[Self._num_slots]]:
         """finditer() implementation for the backtracker path (carries the
         real capture slots per match)."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var results = List[MatchResult[Self._num_slots]]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1566,7 +1734,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots)
+            ](input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 results.append(
                     MatchResult[Self._num_slots](
@@ -1585,7 +1753,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](input_bytes, pos, slots, sbt_memo)
                     if end >= 0:
                         results.append(
                             MatchResult[Self._num_slots](
@@ -1633,7 +1801,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](input_bytes, pos, slots, sbt_memo)
                     if end < 0:
                         pos += 1
                         continue
@@ -1813,6 +1981,8 @@ struct Regex[pattern: String](Copyable, Movable):
         mut self, input: String, replacement: String
     ) raises -> String:
         """replace() implementation for the backtracker path."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var output = String()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1836,7 +2006,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 nfa=Self.nfa,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
-            ](input_bytes, pos, slots)
+            ](input_bytes, pos, slots, sbt_memo)
             if end < 0:
                 pos += 1
                 continue
@@ -1964,6 +2134,8 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def _split_impl(mut self, input: String) raises -> List[String]:
         """split() implementation for the backtracker path."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var parts = List[String]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1982,7 +2154,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 nfa=Self.nfa,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
-            ](input_bytes, pos, slots)
+            ](input_bytes, pos, slots, sbt_memo)
             if end < 0:
                 pos += 1
                 continue
@@ -2326,12 +2498,16 @@ struct Regex[pattern: String](Copyable, Movable):
             return dfa_end
         else:
             try:
+                # Below the early return: this runs per reported match on
+                # the DFA lanes, and an empty List still costs a few stores
+                # and a destructor edge on a path that never uses it.
+                var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                 var end = _sbt_run[
                     nfa=Self.nfa,
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
-                ](input, start, slots)
+                ](input, start, slots, sbt_memo)
                 if end >= 0:
                     return end
             except:

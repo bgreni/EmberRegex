@@ -178,7 +178,10 @@ def confirm_span[
             state_idx=nfa.start,
             num_slots=NS,
             anchored_end=True,
-        ](input, s, slots, budget, 0, end)
+            memo_on=False,
+            # No memo: a confirm NFA carries exactly the lookaround and
+            # backreferences memoization is unsound for.
+        ](input, s, slots, budget, memo_addr=0, depth=0, end_at=end)
         if budget < 0:
             return True  # pathological: fall back to superset semantics
         if r >= 0:
