@@ -148,9 +148,7 @@ def mdfa_direct_scan[
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
 
 
-def _brute_literal_reports(
-    pats: List[String], input: String
-) -> List[SetMatch]:
+def _brute_literal_reports(pats: List[String], input: String) -> List[SetMatch]:
     """O(n*k) reference for an ALL-LITERAL set: every (id, end) where a
     literal occurs, ordered by (end, id).
 

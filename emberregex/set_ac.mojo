@@ -49,10 +49,14 @@ pair is read instead.
 
 Caps (all comptime, all "decline the lane and fall through"):
 - `AC_MAX` patterns, `AC_ENTRY_MAX` literal entries (alternation arms),
-- `AC_NODE_CAP` trie nodes and `AC_TABLE_CAP` table entries — the second
-  one is really a symbol-length bound: the table travels as an
-  `InlineArray` comptime parameter and Mojo mangles parameter values into
-  symbol names (see RoseView's note in set_rose.mojo),
+- `AC_NODE_CAP` trie nodes, `AC_TABLE_CAP` table entries and
+  `AC_POOL_CAP` report-pool entries — the last two are really
+  symbol-length bounds: both arrays travel as `InlineArray` comptime
+  parameters and Mojo mangles parameter values into symbol names (see
+  RoseView's note in set_rose.mojo). The pool needs its own cap because
+  it is not bounded by the node count: suffix-chained literals (`a`,
+  `aa`, `aaa`, ...) grow it quadratically while the node count stays
+  linear,
 - `AC_CLASS_MAX` byte classes, so the class map stays one byte wide.
 """
 
@@ -78,9 +82,23 @@ comptime AC_ENTRY_MAX = 4 * AC_MAX
 comptime AC_NODE_CAP = 32768
 """Trie nodes. Also keeps state ids inside UInt16."""
 
-comptime AC_TABLE_CAP = 1 << 18
-"""Table entries (states x classes). A symbol-length bound, not a
-memory one — see the module docstring."""
+comptime AC_TABLE_CAP = 1 << 17
+"""Table entries (states x classes). A symbol-length bound, not a memory
+one: the table travels as an `InlineArray` comptime parameter and Mojo
+mangles parameter values into symbol names (~4 chars per element), which
+the linker refuses past a few MB (set_rose.mojo's RoseView note has the
+measurement). 131072 is exactly the largest table proven to link today —
+the multi-accept DFA at MDFA_STATE_CAP is 512 states x 256 bytes =
+131072 entries. Raising it needs a measured link at the new size, not
+arithmetic."""
+
+comptime AC_POOL_CAP = 16384
+"""Flat report-pool entries, i.e. the sum of every state's slice length.
+
+Also a symbol-length bound. Unlike the table this is NOT bounded by the
+node count: literals that chain by suffix (`a`, `aa`, `aaa`, ...) put a
+report on every node of the chain, so the pool grows as O(n^2) in the
+number of literals while the node and table caps stay comfortable."""
 
 comptime AC_CLASS_MAX = 255
 """Byte classes, so the 256-entry class map stays UInt8."""
@@ -216,12 +234,22 @@ def _merge_lists(
     return len(lists) - 1
 
 
-def build_ac(nfa: NFA, num_patterns: Int, enabled: Bool) -> ACSet:
+def build_ac(
+    nfa: NFA,
+    num_patterns: Int,
+    enabled: Bool,
+    pool_cap: Int = AC_POOL_CAP,
+    table_cap: Int = AC_TABLE_CAP,
+) -> ACSet:
     """Comptime: build the Aho-Corasick automaton for an all-literal set.
 
     Returns an invalid placeholder when disabled, when the set is not
     entirely literal, or when any cap is exceeded — the caller then falls
     through to the next lane.
+
+    `pool_cap` / `table_cap` default to the module constants and exist so
+    tests can drive the decline paths on a small set instead of building
+    a 16k-state NFA to trip a real cap.
     """
     var result = ACSet()
     if not enabled:
@@ -259,8 +287,11 @@ def build_ac(nfa: NFA, num_patterns: Int, enabled: Bool) -> ACSet:
         else:
             exact_used[v & 0xFF] = True
     var collapsed = List[Bool](fill=False, length=256)
-    for b in range(256):
-        if fold_used[b] and b >= 32:
+    # Caseless entries always store the LOWERCASE byte of an ASCII letter
+    # pair (_charset_filter_byte guarantees it); the range test says so
+    # out loud rather than relying on that invariant holding forever.
+    for b in range(ord("a"), ord("z") + 1):
+        if fold_used[b]:
             if not exact_used[b] and not exact_used[b - 32]:
                 collapsed[b] = True
 
@@ -337,7 +368,10 @@ def build_ac(nfa: NFA, num_patterns: Int, enabled: Bool) -> ACSet:
                 var nxt = Int(row[c])
                 if nxt == 0:
                     nxt = len(rows)
-                    if nxt >= AC_NODE_CAP:
+                    # Both caps are checked per node rather than after the
+                    # trie: a set that will decline should not build the
+                    # whole automaton first.
+                    if nxt >= AC_NODE_CAP or (nxt + 1) * nclasses > table_cap:
                         return result^
                     rows.append(_Row(0))
                     own.append(0)
@@ -347,8 +381,6 @@ def build_ac(nfa: NFA, num_patterns: Int, enabled: Bool) -> ACSet:
             own[cur] = _merge_id(lists, list_lens, own[cur], rid)
 
     var num_states = len(rows)
-    if num_states * nclasses > AC_TABLE_CAP:
-        return result^
 
     # --- Failure links, goto completion, folded output links ------------
     # Breadth-first, so a node's failure node is finished before the node
@@ -392,6 +424,8 @@ def build_ac(nfa: NFA, num_patterns: Int, enabled: Bool) -> ACSet:
             var ids = lists[k].copy()
             for id in ids:
                 pool.append(id)
+            if len(pool) > pool_cap:
+                return result^  # suffix-chained literals: O(n^2) pool
         rep_off[s] = list_off[k]
         rep_len[s] = list_lens[k]
     if len(pool) == 0:
@@ -532,7 +566,5 @@ def ac_scan[
         pos += 1
         var n_rep = Int(rp.unsafe_get(2 * cur + 1))
         if n_rep != 0:
-            _ac_emit[pool=pool](
-                Int(rp.unsafe_get(2 * cur)), n_rep, pos, out
-            )
+            _ac_emit[pool=pool](Int(rp.unsafe_get(2 * cur)), n_rep, pos, out)
     return out^

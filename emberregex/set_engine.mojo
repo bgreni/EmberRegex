@@ -241,11 +241,12 @@ struct RegexSet[
     # --- Aho-Corasick lane: literal sets past LITSET_MAX --------------------
     # Teddy unrolls verification per literal, so it stops at 64 patterns;
     # one AC automaton carries the rest with a linear build instead of a
-    # subset construction. Extraction bails on the first non-literal
-    # state, so non-literal sets pay almost nothing to ask.
-    comptime _ac = build_ac(
-        Self.nfa, Self.num_patterns, not Self._use_litset
-    )
+    # subset construction. Asking costs one visited-bounded walk of the
+    # union NFA's epsilon region — O(states), including for the epsilon
+    # cycles (`(?:a?)*x`) that a work-budget walk used to grind through
+    # before declining. Cheap first, so comptime `and` short-circuits
+    # this away entirely for a Teddy-claimed set.
+    comptime _ac = build_ac(Self.nfa, Self.num_patterns, not Self._use_litset)
     comptime _use_ac = Self._ac.valid
     comptime _ac_v = ac_view(Self._ac)
     comptime _AC_TABLE = ac_table_arr[

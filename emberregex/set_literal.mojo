@@ -58,6 +58,10 @@ struct LiteralSet(Copyable, Movable):
     var ids: List[Int]
     var min_len: Int
     var buckets: List[List[Int]]
+    var walk_pops: Int
+    """How many states the head walk popped. Diagnostic only — it exists
+    so a test can pin that the walk is bounded by the NFA, not by the
+    entry cap (see the budget note in extract_literal_chains)."""
 
     def __init__(out self):
         self.valid = False
@@ -66,6 +70,7 @@ struct LiteralSet(Copyable, Movable):
         self.ids = List[Int]()
         self.min_len = 0
         self.buckets = List[List[Int]]()
+        self.walk_pops = 0
 
 
 def extract_literal_set(nfa: NFA, num_patterns: Int) -> LiteralSet:
@@ -105,18 +110,36 @@ def extract_literal_chains(
         return result^
     var num_states = len(nfa.states)
 
-    # Expand the SPLIT tree into literal-chain heads. The budget rejects
-    # quantifier cycles (which revisit SPLITs indefinitely).
+    # Expand the SPLIT tree into literal-chain heads.
+    #
+    # A visited set — not a work budget — is what terminates this. An
+    # epsilon cycle (`(?:a?)*x`, `(a*)*`) would otherwise revisit its
+    # SPLITs forever, and a budget large enough for a big literal set is
+    # also large enough to burn tens of seconds of comptime interpreter
+    # on such a pattern before declining. With `seen`, every state is
+    # expanded at most once, so the walk costs O(states) on ANY input and
+    # the AC lane really is cheap to ask about. Revisits are skipped
+    # rather than refused: a diamond in the epsilon region is legitimate
+    # (it just yields a duplicate head), while a real cycle always puts a
+    # two-way SPLIT on some chain, and the chain walk below refuses that.
+    #
+    # The budget survives only as a belt-and-braces bound; `seen` makes
+    # it unreachable.
     var heads = List[Int]()
     var stack: List[Int] = [nfa.start]
-    var budget = 4 * entry_cap
+    var seen = List[Bool](fill=False, length=num_states)
+    var budget = 2 * num_states + 8
     while len(stack) > 0:
         budget -= 1
+        result.walk_pops += 1
         if budget < 0:
             return result^
         var s = stack.pop()
         if s < 0 or s >= num_states:
             return result^
+        if seen[s]:
+            continue
+        seen[s] = True
         var kind = nfa.states[s].kind
         if kind == NFAStateKind.SPLIT:
             if nfa.states[s].out2 == -1:

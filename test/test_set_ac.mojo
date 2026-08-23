@@ -20,6 +20,8 @@ tests one rung down the ladder:
 from emberregex import SetMatch, SetSpan, RegexSet
 from emberregex.set_ac import (
     AC_MAX,
+    AC_POOL_CAP,
+    AC_TABLE_CAP,
     ac_cls_arr,
     ac_pool_arr,
     ac_rep_arr,
@@ -28,6 +30,7 @@ from emberregex.set_ac import (
     ac_view,
     build_ac,
 )
+from emberregex.set_literal import extract_literal_chains
 from emberregex.set_nfa import build_union_nfa
 from emberregex.set_pike import set_pike_scan
 from emberregex.set_semantics import SetFlags
@@ -100,7 +103,7 @@ def make_lits(n: Int, seed: Int, length: Int) -> List[String]:
         var s = String("")
         for _ in range(length):
             x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-            s += alpha[codepoint = (x >> 13) % 8]
+            s += alpha[codepoint=(x >> 13) % 8]
         pats.append(s^)
     return pats^
 
@@ -114,6 +117,7 @@ def with_extra(var pats: List[String], extra: String) -> List[String]:
 def alpha8() -> List[Byte]:
     """The 8 letters make_lits draws from."""
     return [97, 98, 99, 100, 101, 102, 103, 104]
+
 
 comptime LITS_65 = make_lits(65, 7, 5)
 comptime LITS_100 = make_lits(100, 13, 5)
@@ -203,6 +207,110 @@ def test_ac_declines_deeply_caseless_literals() raises:
 
 def test_ac_max_is_pinned() raises:
     assert_equal(AC_MAX, 4096)
+    # The table cap is the largest table PROVEN to link: the multi-accept
+    # DFA at MDFA_STATE_CAP is 512 x 256 = 131072 entries. Raising it
+    # needs a measured link, not arithmetic.
+    assert_equal(AC_TABLE_CAP, 131072)
+    assert_equal(AC_POOL_CAP, 16384)
+
+
+def test_epsilon_cycles_decline_cheaply() raises:
+    """A SPLIT-only cycle must decline in O(states), not O(entry cap).
+
+    The head walk used to be bounded by a work budget scaled to the
+    ENTRY cap, so asking the AC lane about `(?:a?)*x` burned tens of
+    thousands of comptime pops — tens of seconds — before declining. It
+    is bounded by a visited set now, so the pop count is a function of
+    the NFA alone.
+    """
+    comptime PATS: List[String] = ["(?:a?)*x", "zz"]
+    comptime S = RegexSet[PATS]
+    comptime n_states = len(S.nfa.states)
+    comptime ls = extract_literal_chains(S.nfa, 2, AC_MAX, 4 * AC_MAX)
+    comptime ok = ls.valid
+    comptime pops = ls.walk_pops
+    assert_false(ok)
+    # The bound the implementation guarantees; the point is that it does
+    # NOT scale with the entry cap (which would allow 65536 here).
+    assert_true(
+        pops <= 2 * n_states + 8,
+        String("walk popped ", pops, " states for a ", n_states, "-state NFA"),
+    )
+    comptime use_ac = S._use_ac
+    assert_false(use_ac)
+
+    # Same story for the other classic epsilon cycles. (They need a
+    # required byte tacked on: `(a*)*` on its own is vacuous, and a set
+    # refuses that before any lane sees it.)
+    comptime PATS2: List[String] = ["(a*)*b", "zz"]
+    comptime S2 = RegexSet[PATS2]
+    comptime n2 = len(S2.nfa.states)
+    comptime ls2 = extract_literal_chains(S2.nfa, 2, AC_MAX, 4 * AC_MAX)
+    comptime ok2 = ls2.valid
+    comptime pops2 = ls2.walk_pops
+    assert_false(ok2)
+    assert_true(pops2 <= 2 * n2 + 8)
+
+    comptime PATS3: List[String] = ["(?:x?y?)*q", "zz"]
+    comptime S3 = RegexSet[PATS3]
+    comptime n3 = len(S3.nfa.states)
+    comptime ls3 = extract_literal_chains(S3.nfa, 2, AC_MAX, 4 * AC_MAX)
+    comptime ok3 = ls3.valid
+    comptime pops3 = ls3.walk_pops
+    assert_false(ok3)
+    assert_true(pops3 <= 2 * n3 + 8)
+
+
+def _suffix_chain(m: Int) -> List[String]:
+    """`a`, `aa`, `aaa`, ... — every literal is a suffix of the next, so
+    node a^j reports j literals and the pool grows as m(m+1)/2."""
+    var pats = List[String]()
+    var s = String("")
+    for _ in range(m):
+        s += "a"
+        pats.append(s)
+    return pats^
+
+
+def test_suffix_chained_literals_cap_the_report_pool() raises:
+    # 12 literals: 12 nodes, but 78 pool entries. Quadratic in the
+    # literal count while the node and table caps stay comfortable, which
+    # is exactly why the pool needs a cap of its own.
+    comptime PATS = _suffix_chain(12)
+    comptime S = RegexSet[PATS]
+    comptime A = build_ac(S.nfa, S.num_patterns, True)
+    comptime built = A.valid
+    comptime states = A.num_states
+    comptime pool = len(A.pool)
+    assert_true(built)
+    assert_equal(states, 13)  # root + a^1..a^12
+    assert_equal(pool, 78)  # 12 * 13 / 2
+
+    # Every prefix reports at every position: the failure-link output
+    # merge in its purest form.
+    var got = ac_direct_scan[PATS]("aaa".as_bytes())
+    assert_reports(
+        got,
+        [
+            SetMatch(0, 1),
+            SetMatch(0, 2),
+            SetMatch(1, 2),
+            SetMatch(0, 3),
+            SetMatch(1, 3),
+            SetMatch(2, 3),
+        ],
+        "suffix chain",
+    )
+
+    # Same shape past the cap declines. Driven through the injectable cap
+    # so the test does not need the ~16k-state NFA a real trip would take.
+    comptime A2 = build_ac(S.nfa, S.num_patterns, True, pool_cap=32)
+    comptime built2 = A2.valid
+    assert_false(built2)
+    # And the table cap declines the same way.
+    comptime A3 = build_ac(S.nfa, S.num_patterns, True, table_cap=8)
+    comptime built3 = A3.valid
+    assert_false(built3)
 
 
 # --- Contract behaviour -----------------------------------------------------
