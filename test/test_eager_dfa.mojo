@@ -10,6 +10,8 @@ from emberregex.static_dfa import (
     EDFA_DEAD,
     EDFA_STATE_CAP,
     EagerDFA,
+    _MIN_CAP,
+    _minimize,
     build_eager_dfa,
     edfa_id_dtype,
 )
@@ -363,6 +365,55 @@ def test_minimization_keeps_distinguishable_states() raises:
     assert_equal(mini.num_states, raw.num_states)
 
 
+def _minimize_collapses(n: Int) -> Bool:
+    """Comptime: hand `_minimize` n mergeable rows, report whether it did.
+
+    Every row steps to state 0 on the single byte class and every flag
+    byte is 0, so a DFA that gets partitioned collapses to one state.
+    """
+    var rows = List[SIMD[DType.int32, 256]]()
+    for _ in range(n):
+        rows.append(SIMD[DType.int32, 256](0))
+    var flags = List[Int](fill=0, length=n)
+    var starts = List[Int](fill=0, length=3)
+    var rep_lo = SIMD[DType.int32, 256](0)
+    var rep_hi = SIMD[DType.int32, 256](255)
+    _minimize(rows, flags, starts, rep_lo, rep_hi, 1)
+    return len(rows) == 1
+
+
+def test_minimize_declines_oversized_input() raises:
+    # `build_eager_dfa` caps well under _MIN_CAP, but the partition lives
+    # in fixed 128-lane SIMD arrays, so another producer (the
+    # leftmost-first determinizer) handing over more rows than that must
+    # get the DFA back untouched rather than lanes written out of range.
+    comptime at_cap = _minimize_collapses(_MIN_CAP)
+    comptime over_cap = _minimize_collapses(_MIN_CAP + 1)
+    assert_true(at_cap)  # the input really is mergeable...
+    assert_false(over_cap)  # ...and one row more declines instead
+
+
+def test_minimization_merges_on_the_table_walk_lane() raises:
+    # Everything else here is small enough for the shuffle engine, so the
+    # merge is pinned on a big DFA too: 82 -> 66 states, which is past
+    # every Sheng tier in both counts and therefore rides the eager table.
+    comptime raw = build_eager_dfa(Regex[ALT31].nfa, True, minimize=False)
+    comptime S = Regex[ALT31]
+    assert_true(raw.valid)
+    assert_true(S._edfa.num_states < raw.num_states)
+    assert_true(S._strategy.use_eager_dfa)
+    assert_false(S._strategy.use_sheng)
+    var re = S()
+    assert_true(re.match("quail").matched)
+    assert_true(re.match("lynx").matched)
+    assert_true(re.match("803").matched)
+    assert_false(re.match("zebu").matched)
+    var r = re.search("one wasp here")
+    assert_true(r.matched)
+    assert_equal(r.start, 4)
+    assert_equal(r.end, 8)
+
+
 def test_minimization_preserves_eol_flag_distinctions() raises:
     # Two of this DFA's four states take the same continuations but carry
     # different EOL flag bytes, so nothing here may merge. Keying the
@@ -387,10 +438,19 @@ def test_minimization_preserves_eol_flag_distinctions() raises:
 # --- Differential vs the Pike VM reference ---------------------------------
 #
 # Minimization rewrites every state id the walkers see, so each verb has
-# to keep agreeing with the capture-exact Pike VM byte for byte. Every
-# pattern below reaches the eager table (checked in playground.mojo: no
-# arm is a pure literal alternation Teddy would claim), and five of them
-# lose states to the merge.
+# to keep agreeing with the capture-exact Pike VM byte for byte.
+#
+# Coverage this is built for (verified in playground.mojo):
+#   - no arm is a pure literal alternation, so Teddy never claims one and
+#     every pattern reaches a DFA lane;
+#   - five merge states (p2 8->5, p15 6->4, p19 7->5, p20 13->12, p21
+#     82->66) and the rest do not, so both outcomes are exercised;
+#   - p2 merges *and* carries both EOL flags, which is the regime the
+#     full-flag-byte initial partition guards (see
+#     test_minimization_preserves_eol_flag_distinctions);
+#   - p21 is the only one too big for any Sheng tier, so it is what
+#     exercises the eager TABLE walk — the other 20 select the shuffle
+#     engine on a NEON host.
 
 
 def _lcg_text(seed: Int, n: Int, alphabet: String) -> String:
@@ -450,11 +510,20 @@ def _differential[
 
 comptime _ALPHA_WORDS = "abcdefghinoprstuwxyz0123456789. !"
 comptime _ALPHA_LINES = "abcdefghinoprstuwxyz0123456789. !\n"
+comptime _ALPHA_ANIMALS = "crabowdeviffgntjklmhpsuqzxy0123456789 ."
+
+# 31 four-letter arms plus a digit run: 82 raw states, 66 after merging —
+# past SHENG_STATE_CAP either way, so it stays on the eager table walk.
+comptime ALT31 = (
+    "crab|crow|deer|dove|fawn|frog|goat|gull|hare|hawk|ibis|jays|kite"
+    "|lamb|lark|lion|lynx|mole|moth|mule|newt|owls|puma|quail|rook|seal"
+    "|swan|toad|vole|wasp|wolf|[0-9]{3}"
+)
 
 
 def test_differential_suffix_alternations() raises:
     _differential["(?:foo|foobar|fob)\\d"](_ALPHA_WORDS, "p1")
-    _differential["(?:cat|cot|cut|cit)[sz]"](_ALPHA_WORDS, "p2")
+    _differential["(?m)(?:cat|cot|cut|cit)[sz]$"](_ALPHA_LINES, "p2")
     _differential["a(?:bc|bd|be)f"](_ALPHA_WORDS, "p3")
     _differential["(?:go|goo|good)b[yz]e"](_ALPHA_WORDS, "p4")
     _differential["(?:pre|pro)(?:fix|gram)[0-9]"](_ALPHA_WORDS, "p5")
@@ -482,6 +551,13 @@ def test_differential_anchors_and_mixed() raises:
     _differential["^(?:foo|bar)\\d*"](_ALPHA_WORDS, "p18")
     _differential["(?:aa|ab|ba|bb){2}"](_ALPHA_WORDS, "p19")
     _differential["(?:one|two|three|four)[xy]"](_ALPHA_WORDS, "p20")
+
+
+def test_differential_table_walk_big_merge() raises:
+    # 66 states after merging (82 before): past every Sheng tier, so this
+    # is the one pattern here that walks the eager TABLE rather than the
+    # shuffle engine.
+    _differential[ALT31](_ALPHA_ANIMALS, "p21")
 
 
 def main() raises:
