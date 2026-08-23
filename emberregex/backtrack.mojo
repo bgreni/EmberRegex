@@ -15,6 +15,20 @@ independent caps — SBT_BUDGET for total work, SBT_MAX_DEPTH for stack — and
 the simple-loop / simple-lazy rewrites that turn single-character quantifiers
 into iteration. See the comments on those constants.
 
+That same branch carries the (state, pos) memo (RE2's BitState, Davis et
+al.'s selective memoization): one bit per (general cyclic SPLIT, position),
+set when a subtree has been explored to completion and failed. Only
+completed failures are recorded, so a memoized walk returns exactly what
+the unmemoized one would — it just stops re-deriving the same "no".
+
+It costs the ordinary walk nothing because it is a different walk:
+`memo_on` selects a second instantiation of everything below, and
+`_sbt_run` only reaches for it after an attempt has already blown
+SBT_BUDGET — the point at which the caller would otherwise concede the
+pattern to the Pike VM. The bitset then belongs to the whole search, not
+to one attempt, so later candidate positions start with the bits the
+first one paid for.
+
 Charset membership uses the precomputed 256-bit bitmap extracted at compile
 time — the SIMD bitmap materializes cleanly from comptime to runtime, giving
 O(1) ASCII membership tests with zero runtime overhead.
@@ -334,6 +348,78 @@ def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
     return False
 
 
+# Cap on the (state, pos) memo: 2Mi bits = 256KB of zeroed scratch. A walk
+# whose `sbt_memo_rows * (input_len + 1)` exceeds it stays unmemoized — the
+# budget and depth caps still bound it, exactly as before.
+comptime SBT_MEMO_BITS = 2_097_152
+
+# Largest NFA that gets a memoized walker at all. The memoized walk is a
+# SECOND instantiation of the whole specialized backtracker — one function
+# per state — so what it costs is compile time and binary size in
+# proportion to the NFA. The UTF-8 property classes build ~2100-state NFAs
+# (`(?u)\p{L}+`), and instantiating a second walker for those crashed the
+# compiler outright on test_utf8.mojo. Such patterns also exhaust
+# SBT_MEMO_BITS after a couple of hundred input bytes, so there is little
+# to give up: 64 states covers the shapes the memo is for
+# (`(a|aa)+b`, `([a-z]+[0-9]+)+x`, nested captured quantifiers).
+comptime SBT_MEMO_MAX_STATES = 64
+
+
+def sbt_memo_ok(nfa: NFA) -> Bool:
+    """Comptime: True when "this state at this position was explored and
+    failed" is a sound thing to cache for `nfa`.
+
+    The memo keys a subtree's outcome on (state, position) alone, so it
+    holds only when nothing else feeds that outcome. Capture slots do not:
+    the walkers never branch on a slot, they only write one — except at a
+    BACKREF, which reads them. Lookaround is excluded for a different
+    reason: its sub-match re-enters the same states with `anchored_end`
+    forced False, so a failure recorded for the outer (anchored) run would
+    be read back by a walk whose MATCH accepts anywhere.
+    """
+    for i in range(len(nfa.states)):
+        var kind = nfa.states[i].kind
+        if (
+            kind == NFAStateKind.BACKREF
+            or kind == NFAStateKind.LOOKAHEAD
+            or kind == NFAStateKind.LOOKBEHIND
+        ):
+            return False
+    return True
+
+
+def sbt_memo_rows(nfa: NFA) -> Int:
+    """Comptime: how many rows the memo bitset needs, or 0 when this NFA
+    gets no memo at all. Tests read it to pin the gate.
+
+    A pattern only re-explores a (state, pos) pair by going round a cycle,
+    every cycle crosses a SPLIT, and cyclic *simple* loops are compiled to
+    iteration — so a general cyclic SPLIT (exactly what
+    `_sbt_needs_depth_guard` looks for) is the marker for "this pattern can
+    re-explore at all". Patterns without one, the overwhelming majority,
+    get nothing.
+
+    Patterns bigger than SBT_MEMO_MAX_STATES are excluded too — see that
+    constant; a memoized walker is a second instantiation of the whole
+    backtracker.
+
+    The row is then the state index itself, not a dense numbering of the
+    memoized states. Dense numbering would need a per-state scan of the NFA
+    inside every walker instantiation, and comptime memoization keys on the
+    argument list: `(?u)\\p{L}+` has ~800 general SPLITs over ~2100
+    states, and that scan more than doubled test_utf8.mojo's compile time.
+    The bits an unmemoized state wastes cost nothing but address space, and
+    SBT_MEMO_BITS bounds that.
+    """
+    if len(nfa.states) > SBT_MEMO_MAX_STATES:
+        return 0
+    if not sbt_memo_ok(nfa):
+        return 0
+    if not _sbt_needs_depth_guard(nfa):
+        return 0
+    return len(nfa.states)
+
+
 def _sbt_try_match[
     origin: Origin,
     //,
@@ -341,11 +427,13 @@ def _sbt_try_match[
     state_idx: Int,
     num_slots: Int,
     anchored_end: Bool = False,
+    memo_on: Bool = False,
 ](
     input: Span[Byte, origin],
     pos: Int,
     mut slots: InlineArray[Int, num_slots],
     mut budget: Int,
+    memo_addr: Int,
     depth: Int = 0,
     end_at: Int = -1,
 ) -> Int:
@@ -364,6 +452,11 @@ def _sbt_try_match[
     The budget pointer tracks remaining work units. Each call decrements it.
     When exhausted, returns -1 (no match). This bounds pathological patterns
     to O(BUDGET) total operations regardless of nesting structure.
+
+    `memo_addr` is the address of the (state, pos) visited bitset the
+    general-SPLIT branch consults when `memo_on` — 0, and untouched, on
+    every other walk, which is all of them until one exhausts the budget
+    (see `_sbt_run_memo`).
     """
     budget -= 1
     if budget < 0:
@@ -400,7 +493,16 @@ def _sbt_try_match[
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos + 1, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](
+                    input,
+                    pos + 1,
+                    slots,
+                    budget,
+                    memo_addr,
+                    depth + DINC,
+                    end_at,
+                )
             return -1
 
         elif kind == NFAStateKind.ANY:
@@ -412,7 +514,16 @@ def _sbt_try_match[
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos + 1, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](
+                    input,
+                    pos + 1,
+                    slots,
+                    budget,
+                    memo_addr,
+                    depth + DINC,
+                    end_at,
+                )
             return -1
 
         elif kind == NFAStateKind.CHARSET:
@@ -431,7 +542,16 @@ def _sbt_try_match[
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos + 1, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](
+                    input,
+                    pos + 1,
+                    slots,
+                    budget,
+                    memo_addr,
+                    depth + DINC,
+                    end_at,
+                )
             return -1
 
         elif kind == NFAStateKind.SPLIT:
@@ -549,11 +669,13 @@ def _sbt_try_match[
                                 state_idx=out2,
                                 num_slots=num_slots,
                                 anchored_end=anchored_end,
+                                memo_on=memo_on,
                             ](
                                 input,
                                 max_pos,
                                 slots,
                                 budget,
+                                memo_addr,
                                 depth + DINC,
                                 end_at,
                             )
@@ -576,7 +698,16 @@ def _sbt_try_match[
                                 state_idx=out2,
                                 num_slots=num_slots,
                                 anchored_end=anchored_end,
-                            ](input, p, slots, budget, depth + DINC, end_at)
+                                memo_on=memo_on,
+                            ](
+                                input,
+                                p,
+                                slots,
+                                budget,
+                                memo_addr,
+                                depth + DINC,
+                                end_at,
+                            )
                             if result >= 0:
                                 return result
                             p -= 1
@@ -613,7 +744,16 @@ def _sbt_try_match[
                         state_idx=out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
-                    ](input, cur, slots, budget, depth + DINC, end_at)
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        cur,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
                     if result >= 0:
                         return result
                     if cur >= input_len:
@@ -649,15 +789,104 @@ def _sbt_try_match[
                     if depth > SBT_MAX_DEPTH:
                         # Stack bound: signal exhaustion so the caller
                         # falls back to the Pike VM rather than
-                        # overflowing.
+                        # overflowing. Keep the plain -1: parking on a
+                        # large negative sentinel so `_sbt_run` could tell
+                        # stack exhaustion from work exhaustion measured
+                        # 1.7x on `([a-z]+[0-9]+)+x` (5.7 -> 10.0 us), for
+                        # a distinction worth nothing to the caller.
                         budget = -1
                         return -1
+                # (state, pos) memo — the same reasoning as the depth
+                # check, applied to work instead of stack: re-exploration
+                # has to come back through a general cyclic SPLIT, so one
+                # bit per (SPLIT, position) is enough to collapse the
+                # exponential re-walks of `(?:a|aa)+b` into a single visit
+                # each. Every state reaching this branch gets a row —
+                # marking an acyclic alternation too is sound and saves the
+                # comptime scan it would take to exclude it.
+                #
+                # `memo_on` is a comptime switch rather than a runtime test
+                # on the buffer, so the memoized walker is a separate
+                # instantiation and the ordinary path below keeps the exact
+                # shape it had before the memo existed — plain locals,
+                # second call in tail position. Reaching this block through
+                # `if len(memo) > 0` instead measured 1.6x on
+                # `((\w+)(-(\w+))*)@(\w+)`.
+                comptime if memo_on:
+                    var memo_idx = state_idx * (len(input) + 1) + pos
+                    # The bitset arrives as a bare address and is reached
+                    # through an origin borrowed from `slots`. Handing the
+                    # walker the `List` instead — even touched only inside
+                    # this branch, which is dead whenever memo_on is False
+                    # — measured 2.3x on `([a-z]+[0-9]+)+x` (5.7 -> 13.1
+                    # us): a List in the body costs the whole function,
+                    # dead branch or not, while an Int and a pointer cost
+                    # nothing.
+                    var mp = Pointer[UInt64, origin_of(slots)](
+                        unsafe_from_address=memo_addr
+                    )
+                    var word = memo_idx >> 6
+                    var mask = UInt64(1) << UInt64(memo_idx & 63)
+                    if (mp[unsafe_offset=word] & mask) != 0:
+                        # Explored before, to completion, and failed.
+                        # Without backrefs nothing feeding this subtree has
+                        # changed, and a cache hit is not work — hand the
+                        # budget unit back. That does mean SBT_BUDGET stops
+                        # being a hard bound on the number of CALLS: hits
+                        # are free. It still bounds the work, because every
+                        # hit is reached from a frame that did pay, and a
+                        # frame makes at most two calls.
+                        budget += 1
+                        return -1
+                    var memo_r = _sbt_try_match[
+                        nfa=nfa,
+                        state_idx=out1,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
+                    if memo_r >= 0:
+                        return memo_r
+                    memo_r = _sbt_try_match[
+                        nfa=nfa,
+                        state_idx=out2,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
+                    if memo_r < 0:
+                        # Record only a COMPLETED failure. A subtree still
+                        # on the stack stays unmarked, so an epsilon cycle
+                        # re-entering it behaves exactly as before (depth
+                        # guard, then the Pike fallback), and a memoized
+                        # walk returns what the unmemoized one would — same
+                        # match, same captures, just without re-deriving
+                        # the same "no".
+                        mp[unsafe_offset=word] |= mask
+                    return memo_r
                 var result = _sbt_try_match[
                     nfa=nfa,
                     state_idx=out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
                 if result >= 0:
                     return result
                 return _sbt_try_match[
@@ -665,7 +894,8 @@ def _sbt_try_match[
                     state_idx=out2,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
 
         elif kind == NFAStateKind.SAVE:
             comptime slot = state.save_slot
@@ -677,7 +907,8 @@ def _sbt_try_match[
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
                 if result < 0:
                     slots[slot] = old_val
                 return result
@@ -687,7 +918,8 @@ def _sbt_try_match[
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
 
         elif kind == NFAStateKind.ANCHOR:
             if _sbt_check_anchor[anchor_type=state.anchor_type](
@@ -698,7 +930,8 @@ def _sbt_try_match[
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
-                ](input, pos, slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
             return -1
 
         elif kind == NFAStateKind.LOOKAHEAD:
@@ -708,7 +941,8 @@ def _sbt_try_match[
                 state_idx=state.sub_start,
                 num_slots=num_slots,
                 anchored_end=False,
-            ](input, pos, sub_slots, budget, depth + DINC, end_at)
+                memo_on=memo_on,
+            ](input, pos, sub_slots, budget, memo_addr, depth + DINC, end_at)
             var matched = sub_result >= 0
             comptime if state.negated:
                 if not matched:
@@ -717,7 +951,16 @@ def _sbt_try_match[
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
-                    ](input, pos, slots, budget, depth + DINC, end_at)
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
                 return -1
             else:
                 if matched:
@@ -726,7 +969,16 @@ def _sbt_try_match[
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
-                    ](input, pos, slots, budget, depth + DINC, end_at)
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
                 return -1
 
         elif kind == NFAStateKind.LOOKBEHIND:
@@ -739,7 +991,16 @@ def _sbt_try_match[
                     state_idx=state.sub_start,
                     num_slots=num_slots,
                     anchored_end=False,
-                ](input, pos - lb_len, sub_slots, budget, depth + DINC, end_at)
+                    memo_on=memo_on,
+                ](
+                    input,
+                    pos - lb_len,
+                    sub_slots,
+                    budget,
+                    memo_addr,
+                    depth + DINC,
+                    end_at,
+                )
                 matched = sub_result >= 0 and sub_result == pos
             comptime if state.negated:
                 if not matched:
@@ -748,7 +1009,16 @@ def _sbt_try_match[
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
-                    ](input, pos, slots, budget, depth + DINC, end_at)
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
                 return -1
             else:
                 if matched:
@@ -757,7 +1027,16 @@ def _sbt_try_match[
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
-                    ](input, pos, slots, budget, depth + DINC, end_at)
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
                 return -1
 
         elif kind == NFAStateKind.BACKREF:
@@ -786,6 +1065,15 @@ def _sbt_try_match[
                 state_idx=state.out1,
                 num_slots=num_slots,
                 anchored_end=anchored_end,
-            ](input, pos + ref_len, slots, budget, depth + DINC, end_at)
+                memo_on=memo_on,
+            ](
+                input,
+                pos + ref_len,
+                slots,
+                budget,
+                memo_addr,
+                depth + DINC,
+                end_at,
+            )
 
     return -1
