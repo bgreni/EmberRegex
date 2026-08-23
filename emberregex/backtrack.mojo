@@ -853,8 +853,25 @@ def _sbt_try_match[
         #
         # `DINC == 0` is both a correctness gate and a compile-time one:
         # `_sbt_counted_shape` must not be asked about an NFA that recurses
-        # per input byte, and comptime `and` short-circuits, so those
-        # patterns never pay the NFA copy the call would cost.
+        # per input byte, and it takes the NFA by value, which a comptime
+        # call copies (~0.7 ms per 100 states) once per instantiated state.
+        #
+        # This shape is deliberate and was measured. Only `comptime if A
+        # and B` actually short-circuits B; a `comptime` decl in a function
+        # body does not memoize and is re-evaluated per instantiation, so
+        # every "tidier" form pays the call on NFAs that can never use it.
+        # Cold compile of `(?u)\p{L}+`, `(?u)\p{Han}+`, `(?u)\p{Greek}`,
+        # each in an isolated MODULAR_CACHE_DIR (the on-disk cache makes any
+        # other A/B a lie):
+        #
+        #   no branch at all                        137.6 s
+        #   this form                               140.3 s   (+1.9%)
+        #   hoisted to one `comptime` decl          149.2 s   (+8.4%)
+        #
+        # The second call below is NOT redundant work per state: an untaken
+        # `comptime if` body is never elaborated, so the decl only runs
+        # where the branch actually fires — at most one extra evaluation
+        # per counted chain, versus one per state for the hoisted form.
         comptime if DINC == 0 and _sbt_counted_shape(nfa, state_idx).ok:
             comptime counted = _sbt_counted_shape(nfa, state_idx)
             comptime clo = counted.lo
