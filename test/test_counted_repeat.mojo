@@ -89,7 +89,7 @@ def test_shape_refuses_input_depth_recursion() raises:
     Those walks already recurse once per input byte, and the counted loop
     calls its exit from inside the giveback — not a tail position — where
     the body copies it replaces were tail calls costing no frame. Trading
-    free frames for real ones there overflows the stack, and SBT_MAX_DEPTH
+    free frames for real ones there overflows the stack, and a call count
     cannot catch it because it counts CALLS, not stack: measured,
     `(?:a|a{2,3})+b` on 2000 `a`s went from completing to crashing.
     """

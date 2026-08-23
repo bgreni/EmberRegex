@@ -40,11 +40,17 @@ def test_ambiguous_alternation_plus_stays_in_backtracker() raises:
     # no `b` to find, an unmemoized walk explores all of them and burns
     # SBT_BUDGET. Before the memo this call raised — that raise IS the
     # Pike fallback, so a plain -1 is the thing being asserted.
-    # 2000 sits just under SBT_MAX_DEPTH for this shape (~3 frames per
-    # byte); past ~2100 the walk trips the depth cap instead and goes to
-    # the Pike VM either way, so this size is deliberate.
+    #
+    # The size is bounded by SBT_STACK_BUDGET, not by the memo: this
+    # shape recurses ~3 frames per input byte, and a frame measures
+    # ~1480 B under `-D ASSERT=all` (~120 B without), so 500 `a`s spend
+    # ~2.2 MB of the 4 MiB a walk gets. It used to read 2000, which
+    # wanted ~7.4 MB — it passed only because the main-thread stack is 8
+    # MiB, and the same shape with `a{2,}` for the second arm SIGSEGV'd.
+    # What the memo has to make true is unchanged and still asserted:
+    # without it this walk cannot finish at any of these sizes.
     comptime P = "(?:a|aa)+b"
-    var text = String("a") * 2000 + "c"
+    var text = String("a") * 500 + "c"
     assert_equal(_sbt_end[P](text), -1)
 
 

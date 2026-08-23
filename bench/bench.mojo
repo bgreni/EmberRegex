@@ -1782,7 +1782,7 @@ def bench_memo_ambiguous_plus_miss(mut b: Bench) raises:
     # Pike VM. With the (state, pos) memo it stays in the backtracker and
     # the bits carry across candidate positions (see _sbt_run_memo).
     #
-    # 1500 `a`s, not 2000: past ~1900 the recursion trips SBT_MAX_DEPTH
+    # 1500 `a`s, not 2000: past ~1900 the recursion runs out of stack
     # instead, which hands the pattern to the Pike VM again and would make
     # this row bimodal. The group is what keeps it off the DFA lane.
     var re = Regex["(a|aa)+b"]()

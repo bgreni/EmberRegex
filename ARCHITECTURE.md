@@ -203,15 +203,30 @@ What it is *not* is one flat function — `_sbt_try_match` carries no
 `@always_inline`, and could not honour one: a cyclic SPLIT reaches its own
 instantiation, which is unflattenable in principle. So the general-SPLIT
 branch is genuine recursion, and the engine carries **two** independent caps:
-`SBT_BUDGET` bounds total work, while `SBT_MAX_DEPTH` bounds the *stack* —
+`SBT_BUDGET` bounds total work, while `SBT_STACK_BUDGET` bounds the *stack* —
 budget alone does not, since `(?:ab)+` recurses once per byte consumed and has
 overflowed the stack on a 50KB input. Exhausting either falls through to the
-Pike VM. Two cyclic shapes avoid the recursion altogether: a greedy or lazy
-SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
+Pike VM. The stack bound is measured in **bytes**, not calls: the walk records
+the address of a local at `_sbt_run` entry, subtracts `SBT_STACK_BUDGET`
+(4 MiB, half the 8 MiB main-thread default) and concedes when a frame lands
+below that floor. A call count cannot do the job — the same frame measures
+~120 B in a release build and 600-1500 B under `-D ASSERT=all`, a 12x spread,
+plus a further 2.4x between pattern shapes, so the 10,000-call cap this
+replaced was 1.2 MB in one build and 14.6 MB in the other (which is how
+`(?:a|a{2,})+b` on 2000 `a`s came to SIGSEGV under the test flags).
+
+Two cyclic shapes avoid the recursion altogether: a greedy or lazy SPLIT
+whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
 `while` loop (`is_simple_loop` / `is_simple_lazy`), so `a+`, `[a-z]*` and
-`.*?` iterate. `_sbt_needs_depth_guard` keys off exactly that distinction and
-drops depth tracking for patterns where every cyclic split is simple —
-measured 1.25-1.6x on recursion-heavy patterns.
+`.*?` iterate. `sbt_depth_plan` computes whether anything is left that can
+still recurse without bound — a cycle in the *specialized call graph*, which
+models the simple-loop rewrites, so it is exact rather than an
+over-approximation of the NFA — and drops the whole guard (floor included)
+when there is none; measured 1.25-1.6x on recursion-heavy patterns when the
+check was applied unconditionally. The same pass verifies that the
+general-SPLIT states form a feedback vertex set of that graph, which is what
+licenses keeping the check in that one branch instead of on entry to every
+state.
 
 A **counted repetition** over a single byte class gets the same treatment,
 one level up. `nfa.mojo` expands `x{n,m}` into `n` required copies plus

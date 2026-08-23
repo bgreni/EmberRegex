@@ -11,9 +11,12 @@ so chains inline aggressively.
 `_sbt_try_match` is deliberately NOT `@always_inline`, and the interpreter is
 not flattened into one function: a cyclic SPLIT can reach its own
 instantiation, so the general-SPLIT branch is real recursion. Hence the two
-independent caps — SBT_BUDGET for total work, SBT_MAX_DEPTH for stack — and
-the simple-loop / simple-lazy rewrites that turn single-character quantifiers
-into iteration. See the comments on those constants.
+independent caps — SBT_BUDGET for total work, SBT_STACK_BUDGET for stack —
+and the simple-loop / simple-lazy rewrites that turn single-character
+quantifiers into iteration. The stack cap counts BYTES, not calls: a frame
+measures ~120 B in a release build and 600-1500 B under `-D ASSERT=all`, so
+any call count that is safe in one is either a crash or a needless
+concession in the other. See the comments on those constants.
 
 That same branch carries the (state, pos) memo (RE2's BitState, Davis et
 al.'s selective memoization): one bit per (general cyclic SPLIT, position),
@@ -396,9 +399,10 @@ def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
     call and therefore costs no frame. Collapsing `m-n` real SPLIT frames
     into one is a large win when the depth is bounded by the pattern; in a
     walk that already recurses per input byte it trades free frames for
-    real ones, and SBT_MAX_DEPTH cannot catch that because it counts CALLS,
-    not stack. Measured: `(?:a|a{2,3})+b` on 2000 `a`s went from completing
-    to overflowing the stack. Excluding those NFAs also makes `DINC` 0
+    real ones. Measured: `(?:a|a{2,3})+b` on 2000 `a`s went from completing
+    to overflowing the stack — the depth cap of the day could not catch it
+    because it counted CALLS rather than the bytes they cost (the guard now
+    counts bytes, but the trade above is still a bad one). Excluding those NFAs also makes `DINC` 0
     everywhere this branch runs, since the guard and the branch key off the
     same predicate.
 
@@ -651,22 +655,213 @@ def _sbt_class_skip[
 # creates O(n) branches within a single depth level.
 comptime SBT_BUDGET = 200_000
 
-# Recursion-depth cap (stack bound). The budget alone does not bound stack
-# use: a non-simple loop like `(?:ab)+` recurses once per consumed byte, so
-# a straight-chain match of a long input can blow the stack well within
-# budget. Exceeding the cap signals exhaustion (budget = -1) so callers
-# fall back to the Pike VM instead of crashing.
-comptime SBT_MAX_DEPTH = 10_000
+# Stack the walk may consume before it concedes to the Pike VM. The
+# budget above does not bound stack: a non-simple loop like `(?:ab)+`
+# recurses once per consumed byte, so a straight-chain walk over a long
+# input can nest thousands of frames well inside budget. Running out
+# signals exhaustion (budget = -1) so callers fall back instead of
+# crashing.
+#
+# **Why bytes and not a call count.** The cap used to be
+# `SBT_MAX_DEPTH = 10_000` calls, on the assumption that a frame is
+# small. Measured (address of a local at the guard site minus the same
+# at `_sbt_run` entry, divided by the depth reached — the probe sits in
+# the cold branch so it does not itself change the frames):
+#
+#   pattern                 release build     -D ASSERT=all
+#   (?:a|aa)+b              113 B/call        1463 B/call
+#   (?:a|a{2,})+b           113 B/call        1462 B/call
+#   ((?:a|a{2,})+)b         123 B/call         801 B/call
+#   ((?:ab|a)+)c            123 B/call         600 B/call
+#   ((?:a*?b?)+)c           124 B/call         823 B/call
+#
+# A frame therefore spans 600-1500 B under `-D ASSERT=all` (which is how
+# `run_test.py` builds every test) against ~120 B without it: a 12x
+# spread across build flags and a further 2.4x across pattern shapes.
+# 10_000 calls is 1.2 MB in a release build and up to 14.6 MB under
+# assertions — past the 8 MiB main-thread stack, which is exactly how
+# `(?:a|a{2,})+b` on 2000 `a`s came to SIGSEGV. No single call count can
+# be both safe under assertions (which needs ~2700) and permissive
+# enough to keep the shapes the memo lane was built for inside the
+# backtracker (`(a|aa)+b` on 1500 `a`s needs ~3700). Bytes are the
+# resource that actually runs out, so bytes are what the guard counts:
+# the same constant then means the same safety in both builds and for
+# every shape.
+#
+# Half of the 8 MiB main-thread default (macOS and Linux both) leaves
+# the other half for whatever called us and for the fallback engine.
+comptime SBT_STACK_BUDGET = 4 * 1024 * 1024
 
 
-def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
-    """Comptime: True when the NFA contains a cyclic SPLIT that the
-    backtracker runs via general recursion (not one of the iterative
-    simple-loop forms). Only such loops grow the recursion depth with the
-    input, so only they pay for depth tracking — the threading measured
-    ~1.25-1.6x on recursion-heavy patterns when applied unconditionally.
+@always_inline
+def sbt_stack_here() -> Int:
+    """Address of a fresh local in the CALLER's frame (this is
+    `@always_inline`), i.e. a monotonically decreasing witness of how
+    deep the walk has nested. Public so tests can build their own floor.
+    """
+    var slot: Int = 0
+    return Int(Pointer(to=slot))
+
+
+@always_inline
+def sbt_stack_floor[guarded: Bool]() -> Int:
+    """The address the walk must stay above, or 0 when this NFA cannot
+    recurse without bound.
+
+    0 is not a magic number that has to be tested for: every real stack
+    address is far above it, so `sbt_stack_here() < 0` is simply never
+    true and the guard costs the walk nothing but a compare it always
+    wins. `guarded` is comptime, so patterns that cannot recurse do not
+    even materialize the address.
+    """
+    comptime if guarded:
+        return sbt_stack_here() - SBT_STACK_BUDGET
+    else:
+        return 0
+
+
+def _sbt_is_general_split(nfa: NFA, i: Int) -> Bool:
+    """Comptime: True when state `i` is a SPLIT the walker runs through
+    the general (recursive) branch rather than one of the iterative
+    simple-loop rewrites. These are the states that carry the guard."""
+    if i < 0 or i >= len(nfa.states):
+        return False
+    ref s = nfa.states[i]
+    if s.kind != NFAStateKind.SPLIT:
+        return False
+    if s.greedy and _sbt_is_simple_body(nfa, i, s.out1):
+        return False
+    if (not s.greedy) and _sbt_is_simple_body(nfa, i, s.out2):
+        return False
+    return True
+
+
+def _sbt_call_target(nfa: NFA, v: Int, k: Int) -> Int:
+    """Comptime: the `k`-th state `_sbt_try_match[v]` can recursively
+    call, or -2 once `v` has no more. Mirrors the walker's own dispatch,
+    which is what makes the cycle analysis below exact rather than an
+    over-approximation of the NFA graph:
+
+    - a simple greedy loop consumes its body ITERATIVELY and only ever
+      calls its exit (`out2`); a simple lazy loop likewise (`out1`);
+    - MATCH calls nothing;
+    - lookaround calls its sub-NFA and then its continuation;
+    - everything else calls `out1`.
+
+    The counted-repeat rewrite (`_sbt_counted_shape`) is deliberately
+    NOT modelled: it only ever replaces a chain of states by a direct
+    edge to the chain's exit, so ignoring it can add edges but never
+    remove reachability — the conservative direction — and it is gated
+    on this analysis reporting no cycle in the first place.
+    """
+    var n = len(nfa.states)
+    if v < 0 or v >= n:
+        return -2
+    ref s = nfa.states[v]
+    var kind = s.kind
+    if kind == NFAStateKind.MATCH:
+        return -2
+    if kind == NFAStateKind.SPLIT:
+        if s.greedy and _sbt_is_simple_body(nfa, v, s.out1):
+            return s.out2 if k == 0 else -2
+        if (not s.greedy) and _sbt_is_simple_body(nfa, v, s.out2):
+            return s.out1 if k == 0 else -2
+        if k == 0:
+            return s.out1
+        if k == 1:
+            return s.out2
+        return -2
+    if kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND:
+        if k == 0:
+            return s.sub_start
+        if k == 1:
+            return s.out1
+        return -2
+    if k == 0:
+        return s.out1
+    return -2
+
+
+def _sbt_call_graph_has_cycle(nfa: NFA, cut_general_splits: Bool) -> Bool:
+    """Comptime: does the specialized call graph contain a directed
+    cycle? With `cut_general_splits`, the general-SPLIT states are
+    deleted first — so a False answer proves those states form a
+    feedback vertex set, i.e. that every cycle passes through one and a
+    guard placed there alone is enough.
+
+    Iterative three-colour DFS from every state, so entry points other
+    than `nfa.start` (a lookaround's sub-NFA, a caller that starts
+    mid-graph) are covered too. A grey child is a back edge, which is a
+    cycle.
+    """
+    var n = len(nfa.states)
+    var color = List[Int](fill=0, length=n)  # 0 white, 1 grey, 2 black
+    var fs = List[Int]()  # DFS frame: state
+    var fc = List[Int]()  # DFS frame: next child cursor
+    for root in range(n):
+        if color[root] != 0:
+            continue
+        if cut_general_splits and _sbt_is_general_split(nfa, root):
+            color[root] = 2
+            continue
+        color[root] = 1
+        fs.append(root)
+        fc.append(0)
+        while len(fs) > 0:
+            var top = len(fs) - 1
+            var v = fs[top]
+            var child = _sbt_call_target(nfa, v, fc[top])
+            if child == -2:
+                color[v] = 2
+                _ = fs.pop()
+                _ = fc.pop()
+                continue
+            fc[top] = fc[top] + 1
+            if child < 0 or child >= n:
+                continue
+            if cut_general_splits and _sbt_is_general_split(nfa, child):
+                continue
+            if color[child] == 1:
+                return True
+            if color[child] == 0:
+                color[child] = 1
+                fs.append(child)
+                fc.append(0)
+    return False
+
+
+struct SbtDepthPlan(Copyable, Movable):
+    """Where the walker has to watch the stack, decided at compile time."""
+
+    var needs_guard: Bool
+    """The specialized call graph has a cycle, so recursion depth grows
+    with the INPUT rather than with the pattern. Everything about the
+    guard — the floor, the compare — folds away when this is False."""
+    var splits_are_fvs: Bool
+    """Deleting the general-SPLIT states breaks every cycle, so the
+    check may live in that one branch. When False the walker checks on
+    entry to EVERY state instead: correct, and measurably slower, which
+    is why it is computed rather than assumed."""
+
+    def __init__(out self, needs_guard: Bool, splits_are_fvs: Bool):
+        self.needs_guard = needs_guard
+        self.splits_are_fvs = splits_are_fvs
+
+
+def sbt_depth_plan(nfa: NFA) -> SbtDepthPlan:
+    """Comptime: the stack guard's placement for `nfa`.
+
+    `needs_guard` keeps the old predicate as a floor (a cyclic SPLIT the
+    walker runs recursively) OR'd with the computed call-graph answer,
+    so nothing that used to be guarded — or gated off the memo lane and
+    the counted-repeat rewrite, which both key off this — can silently
+    stop being.
+
+    Cost: one memoized pass per NFA, reached through the single call the
+    walker already made per instantiation. Both DFS walks are O(states).
     """
     var cyclic = split_cycle_flags(nfa)
+    var old = False
     for i in range(len(nfa.states)):
         ref s = nfa.states[i]
         if s.kind != NFAStateKind.SPLIT or s.out2 == -1:
@@ -675,8 +870,31 @@ def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
             continue
         var body = s.out1 if s.greedy else s.out2
         if not _sbt_is_simple_body(nfa, i, body):
-            return True
-    return False
+            old = True
+            break
+    if not old and not _sbt_call_graph_has_cycle(nfa, False):
+        return SbtDepthPlan(False, True)
+    return SbtDepthPlan(True, not _sbt_call_graph_has_cycle(nfa, True))
+
+
+def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
+    """Comptime: True when the backtracker can recurse to a depth that
+    grows with the input, so the walk has to watch its stack.
+
+    False for every NFA whose only cycles are the simple greedy/lazy
+    loops the walker compiles to iteration (`a*`, `\\d+`, `.*?`) — the
+    overwhelming majority — and those pay nothing at all: no floor, no
+    compare, no address materialized. Keeping the guard off them
+    measured ~1.25-1.6x on recursion-heavy patterns when it was applied
+    unconditionally.
+
+    Also the gate for the (state, pos) memo (`sbt_memo_rows`), for the
+    counted-repeat rewrite (`_sbt_counted_shape`) and for the
+    leftmost-first lane's anchored backtracker attempt
+    (`_lf_anchored_sbt`): all three want "can this pattern recurse per
+    input byte".
+    """
+    return sbt_depth_plan(nfa).needs_guard
 
 
 # Cap on the (state, pos) memo: 2Mi bits = 256KB of zeroed scratch. A walk
@@ -806,7 +1024,7 @@ def _sbt_try_match[
     mut slots: InlineArray[Int, num_slots],
     mut budget: Int,
     memo_addr: Int,
-    depth: Int = 0,
+    stack_floor: Int = 0,
     end_at: Int = -1,
 ) -> Int:
     """Compile-time specialized backtracking match.
@@ -839,10 +1057,25 @@ def _sbt_try_match[
     else:
         comptime state = nfa.states[state_idx]
         comptime kind = state.kind
-        # Depth tracking is free for NFAs without general cyclic SPLITs:
-        # DINC folds to 0, `depth` stays the constant 0, and the check in
-        # the general-SPLIT branch compiles out.
-        comptime DINC = 1 if _sbt_needs_depth_guard(nfa) else 0
+        # Stack tracking is free for NFAs that cannot recurse without
+        # bound: GUARD folds to False, `stack_floor` stays the constant
+        # 0 its callers pass, and every check below compiles out.
+        comptime PLAN = sbt_depth_plan(nfa)
+        comptime GUARD = PLAN.needs_guard
+        # Where the check goes. General SPLITs are a feedback vertex set
+        # of the call graph for every shape seen so far, so the check
+        # normally lives in that one (already-recursive) branch and the
+        # hot chain states — CHAR/CHARSET/SAVE, whose calls are in tail
+        # position — keep the exact code they had. Checking every state
+        # measured ~1.6x on recursion-heavy patterns, so the walker only
+        # falls back to that when the analysis says the narrow placement
+        # would leave a cycle unchecked.
+        comptime GUARD_AT_SPLIT = GUARD and PLAN.splits_are_fvs
+        comptime GUARD_AT_ENTRY = GUARD and not PLAN.splits_are_fvs
+        comptime if GUARD_AT_ENTRY:
+            if sbt_stack_here() < stack_floor:
+                budget = -1
+                return -1
         # A counted repetition (`x{n,m}`) with a single-state body is
         # compiled to a bounded loop instead of the chain of copies the NFA
         # holds: `hi` bytes consumed iteratively, then handed back one at a
@@ -851,7 +1084,7 @@ def _sbt_try_match[
         # makes `a{1,2000}` compile in seconds rather than minutes, and
         # what keeps its walk one frame deep instead of 2000.
         #
-        # `DINC == 0` is both a correctness gate and a compile-time one:
+        # `not GUARD` is both a correctness gate and a compile-time one:
         # `_sbt_counted_shape` must not be asked about an NFA that recurses
         # per input byte, and it takes the NFA by value, which a comptime
         # call copies (~0.7 ms per 100 states) once per instantiated state.
@@ -872,7 +1105,7 @@ def _sbt_try_match[
         # `comptime if` body is never elaborated, so the decl only runs
         # where the branch actually fires — at most one extra evaluation
         # per counted chain, versus one per state for the hoisted form.
-        comptime if DINC == 0 and _sbt_counted_shape(nfa, state_idx).ok:
+        comptime if not GUARD and _sbt_counted_shape(nfa, state_idx).ok:
             comptime counted = _sbt_counted_shape(nfa, state_idx)
             comptime clo = counted.lo
             comptime chi = counted.hi  # -1 = unbounded
@@ -974,7 +1207,7 @@ def _sbt_try_match[
                                 slots,
                                 budget,
                                 memo_addr,
-                                depth + DINC,
+                                stack_floor,
                                 end_at,
                             )
                         return -1
@@ -1001,7 +1234,7 @@ def _sbt_try_match[
                                 slots,
                                 budget,
                                 memo_addr,
-                                depth + DINC,
+                                stack_floor,
                                 end_at,
                             )
                             if result >= 0:
@@ -1050,7 +1283,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                     if result >= 0:
@@ -1092,7 +1325,7 @@ def _sbt_try_match[
                     slots,
                     budget,
                     memo_addr,
-                    depth + DINC,
+                    stack_floor,
                     end_at,
                 )
             return -1
@@ -1113,7 +1346,7 @@ def _sbt_try_match[
                     slots,
                     budget,
                     memo_addr,
-                    depth + DINC,
+                    stack_floor,
                     end_at,
                 )
             return -1
@@ -1141,7 +1374,7 @@ def _sbt_try_match[
                     slots,
                     budget,
                     memo_addr,
-                    depth + DINC,
+                    stack_floor,
                     end_at,
                 )
             return -1
@@ -1268,7 +1501,7 @@ def _sbt_try_match[
                                 slots,
                                 budget,
                                 memo_addr,
-                                depth + DINC,
+                                stack_floor,
                                 end_at,
                             )
                         return -1
@@ -1297,7 +1530,7 @@ def _sbt_try_match[
                                 slots,
                                 budget,
                                 memo_addr,
-                                depth + DINC,
+                                stack_floor,
                                 end_at,
                             )
                             if result >= 0:
@@ -1343,7 +1576,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                     if result >= 0:
@@ -1371,15 +1604,16 @@ def _sbt_try_match[
                 return -1
             else:
                 # General SPLIT (alternation, complex bodies).
-                # Depth check lives here alone: unbounded recursion depth
-                # requires a cycle, cycles pass through SPLITs, and cyclic
-                # simple loops iterate instead of recursing — so every
-                # ~pattern-size frames of stack growth cross this branch.
-                # Keeping the check off the other (hot, chain-bounded)
-                # states measured ~1.6x on recursion-heavy patterns.
-                comptime if DINC == 1:
-                    if depth > SBT_MAX_DEPTH:
-                        # Stack bound: signal exhaustion so the caller
+                # The stack check lives here alone (see GUARD_AT_SPLIT):
+                # unbounded recursion depth requires a cycle in the call
+                # graph, and `sbt_depth_plan` has verified that deleting
+                # these states leaves that graph acyclic — so no chain of
+                # frames can nest without crossing this branch. Keeping
+                # the check off the other (hot, chain-bounded) states
+                # measured ~1.6x on recursion-heavy patterns.
+                comptime if GUARD_AT_SPLIT:
+                    if sbt_stack_here() < stack_floor:
+                        # Out of stack: signal exhaustion so the caller
                         # falls back to the Pike VM rather than
                         # overflowing. Keep the plain -1: parking on a
                         # large negative sentinel so `_sbt_run` could tell
@@ -1448,7 +1682,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                     if memo_r >= 0:
@@ -1465,7 +1699,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                     if memo_r < 0:
@@ -1484,7 +1718,7 @@ def _sbt_try_match[
                     num_slots=num_slots,
                     anchored_end=anchored_end,
                     memo_on=memo_on,
-                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
+                ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
                 if result >= 0:
                     return result
                 return _sbt_try_match[
@@ -1493,7 +1727,7 @@ def _sbt_try_match[
                     num_slots=num_slots,
                     anchored_end=anchored_end,
                     memo_on=memo_on,
-                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
+                ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
 
         elif kind == NFAStateKind.SAVE:
             comptime slot = state.save_slot
@@ -1506,7 +1740,7 @@ def _sbt_try_match[
                     num_slots=num_slots,
                     anchored_end=anchored_end,
                     memo_on=memo_on,
-                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
+                ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
                 if result < 0:
                     slots[slot] = old_val
                 return result
@@ -1517,7 +1751,7 @@ def _sbt_try_match[
                     num_slots=num_slots,
                     anchored_end=anchored_end,
                     memo_on=memo_on,
-                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
+                ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
 
         elif kind == NFAStateKind.ANCHOR:
             if _sbt_check_anchor[anchor_type=state.anchor_type](
@@ -1529,7 +1763,7 @@ def _sbt_try_match[
                     num_slots=num_slots,
                     anchored_end=anchored_end,
                     memo_on=memo_on,
-                ](input, pos, slots, budget, memo_addr, depth + DINC, end_at)
+                ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
             return -1
 
         elif kind == NFAStateKind.LOOKAHEAD:
@@ -1540,7 +1774,7 @@ def _sbt_try_match[
                 num_slots=num_slots,
                 anchored_end=False,
                 memo_on=memo_on,
-            ](input, pos, sub_slots, budget, memo_addr, depth + DINC, end_at)
+            ](input, pos, sub_slots, budget, memo_addr, stack_floor, end_at)
             var matched = sub_result >= 0
             comptime if state.negated:
                 if not matched:
@@ -1556,7 +1790,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                 return -1
@@ -1574,7 +1808,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                 return -1
@@ -1596,7 +1830,7 @@ def _sbt_try_match[
                     sub_slots,
                     budget,
                     memo_addr,
-                    depth + DINC,
+                    stack_floor,
                     end_at,
                 )
                 matched = sub_result >= 0 and sub_result == pos
@@ -1614,7 +1848,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                 return -1
@@ -1632,7 +1866,7 @@ def _sbt_try_match[
                         slots,
                         budget,
                         memo_addr,
-                        depth + DINC,
+                        stack_floor,
                         end_at,
                     )
                 return -1
@@ -1670,7 +1904,7 @@ def _sbt_try_match[
                 slots,
                 budget,
                 memo_addr,
-                depth + DINC,
+                stack_floor,
                 end_at,
             )
 

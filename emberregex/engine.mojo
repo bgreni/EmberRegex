@@ -57,6 +57,7 @@ from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import (
     _sbt_needs_depth_guard,
+    sbt_stack_floor,
     SBT_BUDGET,
     SBT_MEMO_BITS,
     _sbt_try_match,
@@ -127,14 +128,15 @@ def _sbt_run[
 ) raises -> Int:
     """Run backtracker with a fresh budget allocation.
 
-    Raises if the budget is exhausted (work bound) or the recursion depth
-    cap was hit (stack bound — see SBT_MAX_DEPTH), signaling that the
-    result may be a false negative and a fallback engine should be used.
+    Raises if the budget is exhausted (work bound) or the walk ran out
+    of stack (SBT_STACK_BUDGET), signaling that the result may be a
+    false negative and a fallback engine should be used.
 
     Do NOT scale the budget with input length: for non-simple loops the
-    recursion depth tracks consumed bytes, so a larger budget converts
-    the Pike fallback into a stack overflow (measured: `(?:ab)+` on a
-    50KB input crashes under -D ASSERT=all).
+    recursion depth tracks consumed bytes, so a larger budget just means
+    the walk spends longer before the stack guard concedes (before that
+    guard counted bytes, it meant a stack overflow instead — measured:
+    `(?:ab)+` on a 50KB input crashed under -D ASSERT=all).
 
     `memo` is the caller's (state, pos) bitset — see `_sbt_run_memo`. It
     starts empty, is filled by the first attempt that would otherwise have
@@ -164,15 +166,23 @@ def _sbt_run[
         num_slots=num_slots,
         anchored_end=anchored_end,
         memo_on=False,
-    ](input, pos, slots, budget, memo_addr=0, depth=0, end_at=end_at)
+    ](
+        input,
+        pos,
+        slots,
+        budget,
+        memo_addr=0,
+        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
+        end_at=end_at,
+    )
     if budget < 0:
         comptime if memo_rows > 0:
             # The shapes that blow the budget are re-exploring (state,
             # pos) pairs. Build the memo and retry before conceding the
-            # pattern to the Pike VM. A walk that died on the DEPTH cap
+            # pattern to the Pike VM. A walk that ran out of STACK
             # instead gets one wasted retry — the memo prunes repeated
             # subtrees, it cannot make the deepest one shallower — and
-            # that retry costs at most another SBT_MAX_DEPTH frames.
+            # that retry is bounded by the same SBT_STACK_BUDGET.
             if result < 0:
                 return _sbt_run_memo[
                     nfa=nfa,
@@ -283,7 +293,7 @@ def _sbt_run_memoized[
         slots,
         budget,
         memo_addr=Int(memo.unsafe_ptr()),
-        depth=0,
+        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
         end_at=end_at,
     )
     if budget < 0:
@@ -1020,7 +1030,17 @@ struct Regex[pattern: String](Copyable, Movable):
             num_slots=Self._num_slots,
             anchored_end=False,
             memo_on=False,
-        ](input, start, slots, budget, memo_addr=0, depth=0, end_at=-1)
+        ](
+            input,
+            start,
+            slots,
+            budget,
+            memo_addr=0,
+            stack_floor=sbt_stack_floor[
+                _sbt_needs_depth_guard(Self.nfa)
+            ](),
+            end_at=-1,
+        )
         if budget < 0:
             return -2
         return end

@@ -35,7 +35,12 @@ from std.collections import InlineArray
 from std.os import abort
 
 from .ast import AST, ASTNode, ASTNodeKind
-from .backtrack import SBT_BUDGET, _sbt_try_match
+from .backtrack import (
+    SBT_BUDGET,
+    _sbt_needs_depth_guard,
+    _sbt_try_match,
+    sbt_stack_floor,
+)
 from .nfa import NFA, build_nfa
 from .parser import parse
 
@@ -181,7 +186,15 @@ def confirm_span[
             memo_on=False,
             # No memo: a confirm NFA carries exactly the lookaround and
             # backreferences memoization is unsound for.
-        ](input, s, slots, budget, memo_addr=0, depth=0, end_at=end)
+        ](
+            input,
+            s,
+            slots,
+            budget,
+            memo_addr=0,
+            stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
+            end_at=end,
+        )
         if budget < 0:
             return True  # pathological: fall back to superset semantics
         if r >= 0:
