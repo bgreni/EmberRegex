@@ -400,12 +400,13 @@ def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
     call and therefore costs no frame. Collapsing `m-n` real SPLIT frames
     into one is a large win when the depth is bounded by the pattern; in a
     walk that already recurses per input byte it trades free frames for
-    real ones. Measured: `(?:a|a{2,3})+b` on 2000 `a`s went from completing
-    to overflowing the stack — the depth cap of the day could not catch it
-    because it counted CALLS rather than the bytes they cost (the guard now
-    counts bytes, but the trade above is still a bad one). Excluding those NFAs also makes `DINC` 0
-    everywhere this branch runs, since the guard and the branch key off the
-    same predicate.
+    real ones. Measured: `(?:a|a{2,3})+b` on 2000 `a`s went from
+    completing to overflowing the stack — the cap of the day counted
+    CALLS rather than the bytes they cost, so it could not catch that
+    (the guard counts bytes now, but the trade is still a bad one, and
+    the frames are still real). Excluding those NFAs also makes `GUARD`
+    False everywhere this branch runs, since the guard and the branch
+    key off the same predicate.
 
     The gate lives in the CALLERS (`_sbt_try_match`'s short-circuited
     `comptime if`, and `sbt_counted_shapes`) rather than here, and every
