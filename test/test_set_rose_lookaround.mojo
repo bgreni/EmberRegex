@@ -44,23 +44,76 @@ def assert_reports(
         assert_true(False, msg)
 
 
+@always_inline
+def _lcg_next(x: Int) -> Int:
+    return (x * 1103515245 + 12345) & 0x7FFFFFFF
+
+
+@always_inline
+def _lcg_draw(x: Int, n: Int) -> Int:
+    """Index in [0, n) from the HIGH bits of the state.
+
+    A power-of-two-modulus LCG has period 2^(k+1) in bit k, so `x % n`
+    for a power-of-two `n` reads only the low bits and cycles almost
+    immediately — `alphabet[x % 8]` is literally period-8 output.
+    """
+    return (x >> 16) % n
+
+
 def _lcg_bytes(seed: Int, n: Int, alphabet: List[Byte]) -> List[Byte]:
     var out = List[Byte]()
     var x = seed
     for _ in range(n):
-        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-        out.append(alphabet[x % len(alphabet)])
+        x = _lcg_next(x)
+        out.append(alphabet[_lcg_draw(x, len(alphabet))])
+    return out^
+
+
+def _lcg_tokens(seed: Int, n: Int, tokens: List[String]) -> List[Byte]:
+    """Exactly `n` bytes of tokens drawn from `tokens`, the last one cut
+    to length.
+
+    A uniform draw over single bytes essentially never places a factor:
+    " WARN " out of a 14-symbol alphabet has p ~ 1.9e-7 per position, so
+    a byte-level differential over this file's patterns tests the Teddy
+    front end and nothing behind it. Drawing whole tokens — factors,
+    true-match contexts, and lookalike neighbours — puts the factor in
+    the input constantly, in both the contexts the lookaround must pass
+    and the ones it must reject. Truncating to `n` keeps the sweep over
+    chunk-boundary-adjacent lengths that the vector loop needs.
+    """
+    var out = List[Byte]()
+    var x = seed
+    while len(out) < n:
+        x = _lcg_next(x)
+        ref t = tokens[_lcg_draw(x, len(tokens))]
+        for b in t.as_bytes():
+            out.append(b)
+    out.resize(n, Byte(0))
     return out^
 
 
 def _assert_matches_pike[
     patterns: List[String]
-](data: List[Byte], label: String) raises:
+](data: List[Byte], label: String, count_id: Int = 0) raises -> Int:
+    """Assert the lane agrees with the tagged Pike, and return how many
+    reports the Pike produced FOR `count_id`.
+
+    Per-id, not the total: these sets pair the pattern under test with a
+    plain literal partner (to keep the set off the Teddy lane), and that
+    partner matches often enough to keep a total non-zero all on its own
+    — which would defeat the point of counting.
+    """
     var db = RegexSet[patterns]()
     var got = db.scan(Span(data))
     var unfa = build_union_nfa(materialize[patterns]())
     var expected = set_pike_scan(unfa, Span(data))
     assert_reports(got, expected, label)
+    var n = 0
+    for m in expected:
+        if m.id == count_id:
+            n += 1
+    return n
 
 
 def _assert_str_matches_pike[
@@ -69,18 +122,59 @@ def _assert_str_matches_pike[
     var data = List[Byte]()
     for b in s.as_bytes():
         data.append(b)
-    _assert_matches_pike[patterns](data, label)
+    _ = _assert_matches_pike[patterns](data, label)
+
+
+comptime _LENGTHS: List[Int] = [
+    0,
+    1,
+    2,
+    3,
+    5,
+    8,
+    15,
+    16,
+    17,
+    31,
+    32,
+    33,
+    63,
+    64,
+    65,
+    130,
+]
 
 
 def _differential[
     patterns: List[String]
 ](alphabet: List[Byte], label: String) raises:
+    """Byte-level fuzz: no factor coverage to speak of, but it is the
+    only thing that reaches arbitrary byte values."""
     for seed in [7, 31, 97]:
-        for n in [0, 1, 2, 3, 5, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 130]:
+        for n in materialize[_LENGTHS]():
             var data = _lcg_bytes(seed, n, alphabet)
-            _assert_matches_pike[patterns](
+            _ = _assert_matches_pike[patterns](
                 data, String(label, " seed=", seed, " n=", n)
             )
+
+
+def _token_differential[
+    patterns: List[String]
+](tokens: List[String], label: String) raises:
+    """Token-level fuzz over the same length sweep, asserting the run was
+    not vacuous: without the count check a token list that stops placing
+    the factor would silently turn this back into a Teddy-only test."""
+    var reports = 0
+    for seed in [7, 31, 97, 1234]:
+        for n in materialize[_LENGTHS]():
+            var data = _lcg_tokens(seed, n, tokens)
+            reports += _assert_matches_pike[patterns](
+                data, String(label, " seed=", seed, " n=", n)
+            )
+    assert_true(
+        reports > 0,
+        String(label, ": pattern 0 never matched — the token list is stale"),
+    )
 
 
 # --- Comptime views of the extracted records --------------------------------
@@ -236,6 +330,107 @@ def test_variable_offset_factor_forward_records() raises:
     assert_true(comptime(_look_accepts(S._rose, 0, 3, ord("2"))))
 
 
+def test_lcg_draw_is_not_degenerate() raises:
+    # Regression guard for the fuzz harness itself: `x % 8` on a
+    # power-of-two-modulus LCG reads the low 3 bits, whose period is 8,
+    # so an 8-symbol alphabet produced a literally repeating sequence and
+    # every "random" input was 8 bytes of entropy wearing a hat.
+    var alphabet: List[Byte] = [97, 98, 99, 100, 101, 102, 103, 104]
+    var data = _lcg_bytes(7, 64, alphabet)
+    var periodic = True
+    for i in range(8, len(data)):
+        if data[i] != data[i - 8]:
+            periodic = False
+            break
+    assert_false(periodic, "LCG draw degenerated to period 8")
+
+
+def _entry_with_offset(r: RoseSet, pid: Int, off: Int) -> Int:
+    """Comptime: the entry for pattern `pid` at factor offset `off`, or
+    -1. Entry order follows the arm walk, so shapes with several arms are
+    looked up rather than indexed."""
+    for i in range(len(r.lit.lits)):
+        if r.lit.ids[i] == pid and r.offsets[i] == off:
+            return i
+    return -1
+
+
+# The SPLIT stop is what makes the whole mechanism sound: a chain position
+# is only required if the walk could not have branched away before it.
+# These three shapes put a branch immediately after the factor, so nothing
+# forward may be recorded — recording the `[0-9]` of `error[0-9]?` would
+# lose the match of "error" that takes the empty arm.
+
+
+def test_optional_continuation_records_nothing() raises:
+    comptime PATS: List[String] = ["error[0-9]?", "zebra"]
+    comptime S = RegexSet[PATS]
+    comptime use_rose = S._use_rose
+    assert_true(use_rose)
+    comptime n = _look_n(S._rose, 0)
+    assert_equal(n, 0, "a `?` after the factor is not a required byte")
+    var db = RegexSet[PATS]()
+    # The arm that skips the optional part still reports.
+    assert_reports(db.scan("error"), [SetMatch(0, 5)], "empty arm survives")
+    assert_reports(
+        db.scan("error7"),
+        [SetMatch(0, 5), SetMatch(0, 6)],
+        "both arms report",
+    )
+
+
+def test_alternation_continuation_records_nothing() raises:
+    comptime PATS: List[String] = ["error(?:AB|CD)", "zebra"]
+    comptime S = RegexSet[PATS]
+    comptime use_rose = S._use_rose
+    assert_true(use_rose)
+    comptime n = _look_n(S._rose, 0)
+    assert_equal(n, 0, "an alternation after the factor is not one class")
+    var db = RegexSet[PATS]()
+    assert_reports(db.scan("errorAB"), [SetMatch(0, 7)], "first arm")
+    assert_reports(db.scan("errorCD"), [SetMatch(0, 7)], "second arm")
+    assert_reports(db.scan("errorAC"), List[SetMatch](), "neither arm")
+
+
+def test_bounded_repeat_continuation_records_nothing() raises:
+    comptime PATS: List[String] = ["error[0-9]{0,2}", "zebra"]
+    comptime S = RegexSet[PATS]
+    comptime use_rose = S._use_rose
+    assert_true(use_rose)
+    comptime n = _look_n(S._rose, 0)
+    assert_equal(n, 0, "{0,2} after the factor is not a required byte")
+    var db = RegexSet[PATS]()
+    assert_reports(db.scan("error"), [SetMatch(0, 5)], "zero repeats")
+
+
+def test_optional_part_before_the_factor() raises:
+    # The mirror: `[0-9]?` before the factor splits into two ARMS, each
+    # with its own entry. The arm that takes the digit carries a `-1`
+    # record and a factor at offset 1; the arm that skips it carries
+    # neither. Rejecting one arm's entry can never hide the other's,
+    # which is the per-entry soundness argument in miniature.
+    comptime PATS: List[String] = ["[0-9]?error!", "zebra"]
+    comptime S = RegexSet[PATS]
+    comptime use_rose = S._use_rose
+    assert_true(use_rose)
+    comptime with_digit = _entry_with_offset(S._rose, 0, 1)
+    comptime without = _entry_with_offset(S._rose, 0, 0)
+    assert_true(with_digit >= 0, "the digit arm has an entry")
+    assert_true(without >= 0, "the empty arm has an entry")
+    comptime n_with = _look_n(S._rose, with_digit)
+    comptime n_without = _look_n(S._rose, without)
+    assert_equal(n_with, 1)
+    assert_equal(n_without, 0, "the empty arm requires nothing before")
+    assert_true(comptime(_look_has(S._rose, with_digit, -1)))
+    assert_true(comptime(_look_accepts(S._rose, with_digit, -1, ord("5"))))
+    assert_false(comptime(_look_accepts(S._rose, with_digit, -1, ord("x"))))
+
+    var db = RegexSet[PATS]()
+    assert_reports(db.scan("error!"), [SetMatch(0, 6)], "empty arm at 0")
+    assert_reports(db.scan("5error!"), [SetMatch(0, 7)], "digit arm")
+    assert_reports(db.scan("xerror!"), [SetMatch(0, 7)], "empty arm mid-input")
+
+
 # --- Behaviour --------------------------------------------------------------
 
 
@@ -303,50 +498,80 @@ def test_caseless_factor_behaviour() raises:
 
 
 # --- Differentials ----------------------------------------------------------
+#
+# Token lists mix three things on purpose: whole true matches (so the
+# count assertion can never be vacuous), the bare factor (so the
+# lookaround is asked to REJECT), and neighbour lookalikes (so it is
+# asked to reject for the right reason).
 
 
 def test_differential_factor_between_charsets() raises:
-    var alphabet: List[Byte] = [
-        49,  # 1
-        50,  # 2
-        58,  # :
-        32,  # space
-        87,  # W
-        65,  # A
-        82,  # R
-        78,  # N
-        120,  # x
-        122,  # z
-        101,  # e
-        98,  # b
-        114,  # r
-        97,  # a
+    var tokens: List[String] = [
+        "12:34 WARN q",  # a whole match
+        " WARN ",  # the bare factor: neighbours must reject
+        "12:34",  # the right prefix, maybe not adjacent
+        "ab:34",  # prefix with a non-digit
+        "12x34",  # prefix with the wrong separator
+        ":",
+        "x",
+        " ",
+        "7",
+        "zebra",
     ]
-    _differential[WARN_PATS](alphabet, "warn between charsets")
+    _token_differential[WARN_PATS](tokens, "warn between charsets")
+    # ...and the byte-level sweep as well, for arbitrary byte values.
+    var alphabet: List[Byte] = [49, 50, 58, 32, 87, 65, 82, 78, 120, 122, 10]
+    _differential[WARN_PATS](alphabet, "warn bytes")
 
 
 def test_differential_offset_window() raises:
     comptime PATS: List[String] = ["[0-9]{6}-END[a-f]", "zebra"]
-    var alphabet: List[Byte] = [48, 49, 45, 69, 78, 68, 97, 98, 122]
-    _differential[PATS](alphabet, "offset window")
+    var tokens: List[String] = [
+        "123456-ENDa",  # a whole match
+        "-END",  # the bare factor
+        "123456",
+        "12ab56",  # non-digits inside the window
+        "-END9",  # factor with a non-[a-f] tail
+        "b",
+        "x",
+        "zebra",
+    ]
+    _token_differential[PATS](tokens, "offset window")
 
 
 def test_differential_wide_class_gap() raises:
     comptime PATS: List[String] = ["ab.[0-9]", "zebra"]
+    var tokens: List[String] = ["abz4", "ab", "abzz", "ab\n4", "z", "4", "zebra"]
+    _token_differential[PATS](tokens, "wide class gap")
     var alphabet: List[Byte] = [97, 98, 48, 49, 10, 122, 101]
-    _differential[PATS](alphabet, "wide class gap")
+    _differential[PATS](alphabet, "wide class gap bytes")
 
 
 def test_differential_var_offset_forward() raises:
     comptime PATS: List[String] = ["[a-z]+@ex[0-9]", "zebra"]
-    var alphabet: List[Byte] = [97, 101, 120, 64, 48, 122, 98, 114]
-    _differential[PATS](alphabet, "var offset forward")
+    var tokens: List[String] = [
+        "abc@ex7",  # a whole match
+        "@ex",  # the bare factor: nothing before, nothing after
+        "@exz",  # factor with a non-digit after
+        "abc",
+        "7",
+        "zebra",
+    ]
+    _token_differential[PATS](tokens, "var offset forward")
 
 
 def test_differential_caseless_lookaround() raises:
     comptime PATS: List[String] = ["(?i)error[0-9]", "(?i)warn"]
-    var alphabet: List[Byte] = [69, 101, 82, 114, 79, 111, 87, 119, 97, 110, 48]
-    _differential[PATS](alphabet, "caseless lookaround")
+    var tokens: List[String] = [
+        "ErRoR7",  # a whole match, mixed case
+        "ERROR",  # the bare factor
+        "errorX",  # factor with a non-digit after
+        "WaRn",
+        "error",
+        "7",
+        "n",
+    ]
+    _token_differential[PATS](tokens, "caseless lookaround")
 
 
 def main() raises:

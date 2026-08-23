@@ -71,7 +71,6 @@ accept state that also carries an EOL slice) and collapse in the final
 sort+dedup.
 """
 
-from std.bit import pop_count
 from std.collections import InlineArray
 from std.math import min
 from std.sys import simd_width_of
@@ -548,48 +547,78 @@ def _flush_run(
     cur_cl.clear()
 
 
-def _look_record(nfa: NFA, state: Int, rel: Int) -> List[Int]:
-    """Comptime: one lookaround record — `rel`, then the byte set of the
-    consuming state at that chain position as 8 x 32-bit words.
+def _class_words(nfa: NFA, state: Int) -> List[Int]:
+    """Comptime: 8 x 32-bit words naming the bytes a consuming state
+    accepts, or an empty list when the state is not a one-byte consumer.
 
-    Empty when the state is not a one-byte consumer, or when its class is
-    too wide to be worth checking (ROSE_LOOK_MAX_POP). The byte set is the
-    one static_dfa's `_accepts` tests, since that is what the confirm DFA
-    was built from — CHARSET reads the parsed 256-bit bitmap straight out
-    of the CharSet, because SIMD ops are interpreter-native at comptime
-    and a 256-step `contains` loop is not.
+    This is exactly what static_dfa's `_accepts` tests, which is what the
+    confirm DFA was built from. CHARSET reads the parsed 256-bit bitmap
+    straight off the CharSet — comptime SIMD lane reads are
+    interpreter-native (~1us) and a 256-step `contains` loop is not
+    (35-70us per List step) — and complements it when negated, which is
+    what `contains` does for a byte once the bitmap is built.
     """
-    var out = List[Int](fill=0, length=_LOOK_STRIDE)
-    out[0] = rel
+    var out = List[Int](fill=0, length=8)
     var kind = nfa.states[state].kind
     if kind == NFAStateKind.CHAR:
         var cv = Int(nfa.states[state].char_value)
         if cv >= 256:
             return List[Int]()  # a codepoint, not a byte
-        out[1 + (cv >> 5)] = 1 << (cv & 31)
+        out[cv >> 5] = 1 << (cv & 31)
         return out^
     elif kind == NFAStateKind.ANY:
-        return List[Int]()  # 255 of 256 bytes: never worth a load
+        for w in range(8):
+            out[w] = 0xFFFFFFFF
+        var nl = Int(CHAR_NEWLINE)
+        out[nl >> 5] &= 0xFFFFFFFF ^ (1 << (nl & 31))
+        return out^
     elif kind == NFAStateKind.CHARSET:
         ref cs = nfa.charsets[nfa.states[state].charset_index]
-        if not cs.bitmap_valid:
-            # Every charset reaching an NFA has one (parse() finalizes
-            # them), but a wrong class here would UNDER-report, so this
-            # one assumption is checked rather than inherited.
-            return List[Int]()
-        var pop = Int(pop_count(cs.bitmap).reduce_add())
-        if cs.negated:
-            pop = 256 - pop
-        if pop == 0 or pop > ROSE_LOOK_MAX_POP:
-            return List[Int]()
-        # The bitmap is 32 bytes, byte j holding chars 8j..8j+7.
-        for j in range(BITMAP_WIDTH):
-            out[1 + (j >> 2)] |= Int(cs.bitmap[j]) << (8 * (j & 3))
-        if cs.negated:
-            for w in range(8):
-                out[1 + w] ^= 0xFFFFFFFF
+        if cs.bitmap_valid:
+            # 32 bytes, byte j holding chars 8j..8j+7.
+            for j in range(BITMAP_WIDTH):
+                out[j >> 2] |= Int(cs.bitmap[j]) << (8 * (j & 3))
+            if cs.negated:
+                for w in range(8):
+                    out[w] ^= 0xFFFFFFFF
+        else:
+            # parse() finalizes every bitmap, so this never runs; kept
+            # because `contains` is the authority and a wrong class here
+            # would UNDER-report rather than merely lose filtering.
+            for b in range(256):
+                if cs.contains(UInt32(b)):
+                    out[b >> 5] |= 1 << (b & 31)
         return out^
     return List[Int]()
+
+
+def _look_record(nfa: NFA, state: Int, rel: Int) -> List[Int]:
+    """Comptime: one lookaround record — `rel`, then the state's byte set
+    as 8 x 32-bit words.
+
+    Empty when the state is not a one-byte consumer, or when its class is
+    too wide to be worth checking: a class accepting more than
+    ROSE_LOOK_MAX_POP bytes (`.` at 255, `\\S`, `[^,]`) rejects too
+    little to pay for the load. Counting stops as soon as that is known.
+    """
+    var words = _class_words(nfa, state)
+    if len(words) == 0:
+        return List[Int]()
+    var pop = 0
+    for w in range(8):
+        var v = words[w]
+        while v != 0:
+            v &= v - 1  # clear the lowest set bit (Kernighan)
+            pop += 1
+            if pop > ROSE_LOOK_MAX_POP:
+                return List[Int]()
+    if pop == 0:
+        return List[Int]()  # matches nothing; the confirm DFA is dead too
+    var out = List[Int](fill=0, length=_LOOK_STRIDE)
+    out[0] = rel
+    for w in range(8):
+        out[1 + w] = words[w]
+    return out^
 
 
 def _chain_look(
@@ -703,28 +732,6 @@ def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     return result^
 
 
-def _class_bitmap(nfa: NFA, state: Int) -> List[Int]:
-    """8 x 32-bit words naming the bytes a consuming state accepts, or an
-    empty list when the state is not consuming."""
-    var out = List[Int](fill=0, length=8)
-    var kind = nfa.states[state].kind
-    for b in range(256):
-        var ok: Bool
-        if kind == NFAStateKind.CHAR:
-            ok = UInt32(b) == nfa.states[state].char_value
-        elif kind == NFAStateKind.ANY:
-            ok = b != Int(CHAR_NEWLINE)
-        elif kind == NFAStateKind.CHARSET:
-            ok = nfa.charsets[nfa.states[state].charset_index].contains(
-                UInt32(b)
-            )
-        else:
-            return List[Int]()
-        if ok:
-            out[b >> 5] |= 1 << (b & 31)
-    return out^
-
-
 def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     """Comptime: the `CLASS+ LITERAL` / `CLASS* LITERAL` shape, whose
     literal is required but sits at a VARIABLE distance from the start.
@@ -782,7 +789,7 @@ def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
 
     if exit_state < 0 or exit_state >= n:
         return result^
-    var cls = _class_bitmap(nfa, loop_state)
+    var cls = _class_words(nfa, loop_state)
     if len(cls) == 0:
         return result^
 
@@ -1501,7 +1508,7 @@ def _rose_verify_at[
                     comptime k2 = Int(meta[_M_STRIDE * i + _M_KOTHER])
                     comptime skip = meta[_M_STRIDE * i + _M_SKIP] != 0
                     comptime kb = Int(meta[_M_STRIDE * i + _M_LOOKB])
-                    comptime kn_ = Int(meta[_M_STRIDE * i + _M_LOOKN])
+                    comptime n_look = Int(meta[_M_STRIDE * i + _M_LOOKN])
                     comptime if bc >= 0:
                         # Variable-offset factor: the match start is the
                         # start of the maximal run of the loop's byte set
@@ -1509,7 +1516,7 @@ def _rose_verify_at[
                         # this literal in the same automaton state, so one
                         # confirm from the earliest yields every end.
                         if _lit_at[lit=lit, cl=cli](input, at) and _look_ok[
-                            look=look, base=kb, n=kn_
+                            look=look, base=kb, n=n_look
                         ](input, at):
                             var s0 = at
                             while s0 > 0 and _in_class[words=bcls, base=bc](
@@ -1532,7 +1539,7 @@ def _rose_verify_at[
                         if (
                             at >= off
                             and _lit_at[lit=lit, cl=cli](input, at)
-                            and _look_ok[look=look, base=kb, n=kn_](input, at)
+                            and _look_ok[look=look, base=kb, n=n_look](input, at)
                         ):
                             var cur: Int
                             if at == 0:
@@ -1555,7 +1562,7 @@ def _rose_verify_at[
                         if (
                             at >= off
                             and _lit_at[lit=lit, cl=cli](input, at)
-                            and _look_ok[look=look, base=kb, n=kn_](input, at)
+                            and _look_ok[look=look, base=kb, n=n_look](input, at)
                         ):
                             _rose_confirm[
                                 r=r,
