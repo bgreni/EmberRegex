@@ -390,11 +390,14 @@ At compile time, EmberRegex selects the fastest engine for the pattern:
 | pattern is a literal string | SIMD literal scan |
 | `prefix + .* + suffix` | sandwich (startswith/endswith) |
 | alternation of literals | Teddy nibble shuffles |
-| ≤ 16 DFA states, shuffle-capable target | Sheng |
-| `can_use_dfa`, ≤ `EDFA_STATE_CAP` states | eager comptime DFA |
-| `can_use_dfa`, larger | lazy DFA |
-| backrefs / lookaround / captures | specialized backtracker |
-| backtracker budget exhausted | Pike VM |
+| DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng |
+| `can_use_dfa`, ≤ `EDFA_STATE_CAP` states, `match()` | eager comptime DFA |
+| the same pattern's search-family verbs | leftmost-first DFA for the end + reverse DFA for the start |
+| `can_use_dfa`, classic table larger than the cap | lazy DFA |
+| captures, one-pass NFA with an alternation loop | one-pass DFA |
+| captures, same shape, search-family verbs | DFA-bounded span, then the slots filled on that span |
+| backrefs / lookaround / other capture shapes | specialized backtracker |
+| backtracker budget or stack bound exhausted | Pike VM |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full selection logic and the
 multi-pattern (`RegexSet`) engine ladder.

@@ -37,19 +37,21 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 def test_plan_off_for_patterns_without_a_recursive_cycle() raises:
     # Simple loops compile to iteration, so their cycle never reaches the
     # call graph and the whole guard — floor included — folds away.
-    assert_false(comptime(_sbt_needs_depth_guard(Regex["a+b"].nfa)))
-    assert_false(comptime(_sbt_needs_depth_guard(Regex["(cat|dog)food"].nfa)))
-    assert_false(comptime(_sbt_needs_depth_guard(Regex["([a-z]+)@(\\w+)"].nfa)))
-    assert_false(comptime(_sbt_needs_depth_guard(Regex["<(.+?)>"].nfa)))
+    assert_false(comptime (_sbt_needs_depth_guard(Regex["a+b"].nfa)))
+    assert_false(comptime (_sbt_needs_depth_guard(Regex["(cat|dog)food"].nfa)))
+    assert_false(
+        comptime (_sbt_needs_depth_guard(Regex["([a-z]+)@(\\w+)"].nfa))
+    )
+    assert_false(comptime (_sbt_needs_depth_guard(Regex["<(.+?)>"].nfa)))
     assert_equal(sbt_stack_floor[False](), 0)
 
 
 def test_plan_on_for_recursive_cycles() raises:
-    assert_true(comptime(_sbt_needs_depth_guard(Regex["((?:ab)+)c"].nfa)))
-    assert_true(comptime(_sbt_needs_depth_guard(Regex["((?:a|a{2,})+)b"].nfa)))
-    assert_true(comptime(_sbt_needs_depth_guard(Regex["((?:a|aa)+)b"].nfa)))
-    assert_true(comptime(_sbt_needs_depth_guard(Regex["((?:a*?b?)+)c"].nfa)))
-    assert_true(comptime(_sbt_needs_depth_guard(Regex["((?:ab|a)+)c"].nfa)))
+    assert_true(comptime (_sbt_needs_depth_guard(Regex["((?:ab)+)c"].nfa)))
+    assert_true(comptime (_sbt_needs_depth_guard(Regex["((?:a|a{2,})+)b"].nfa)))
+    assert_true(comptime (_sbt_needs_depth_guard(Regex["((?:a|aa)+)b"].nfa)))
+    assert_true(comptime (_sbt_needs_depth_guard(Regex["((?:a*?b?)+)c"].nfa)))
+    assert_true(comptime (_sbt_needs_depth_guard(Regex["((?:ab|a)+)c"].nfa)))
 
 
 def test_general_splits_cut_every_cycle() raises:
@@ -57,18 +59,20 @@ def test_general_splits_cut_every_cycle() raises:
     # only sound while deleting those states makes the call graph
     # acyclic. That is computed, not assumed — pin it for every shape
     # this file walks deeply.
-    assert_true(comptime(sbt_depth_plan(Regex["((?:ab)+)c"].nfa).splits_are_fvs))
     assert_true(
-        comptime(sbt_depth_plan(Regex["((?:a|a{2,})+)b"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan(Regex["((?:ab)+)c"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime(sbt_depth_plan(Regex["((?:a*?b?)+)c"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan(Regex["((?:a|a{2,})+)b"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime(sbt_depth_plan(Regex["((x?){1,})y"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan(Regex["((?:a*?b?)+)c"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime(sbt_depth_plan(Regex["((?:a+)+)b"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan(Regex["((x?){1,})y"].nfa).splits_are_fvs)
+    )
+    assert_true(
+        comptime (sbt_depth_plan(Regex["((?:a+)+)b"].nfa).splits_are_fvs)
     )
 
 
@@ -82,7 +86,7 @@ def test_guard_trips_and_is_not_luck() raises:
     comptime P = "((?:ab)+)c"
     comptime R = Regex[P]
     assert_false(R._strategy.use_dfa)
-    assert_true(comptime(_sbt_needs_depth_guard(R.nfa)))
+    assert_true(comptime (_sbt_needs_depth_guard(R.nfa)))
     var text = String("ab") * 800
 
     # (1) floor 0 disables the guard (every real address is above it).
@@ -223,7 +227,7 @@ def _check[p: String](text: String) raises:
     if want.matched:
         assert_equal(got.start, want.start)
         assert_equal(got.end, want.end)
-        for g in range(comptime(2 * R.nfa.group_count)):
+        for g in range(comptime (2 * R.nfa.group_count)):
             assert_equal(got.slots[g], want.slots[g])
 
     # The backtracker, from position 0, on the same bytes. It may return

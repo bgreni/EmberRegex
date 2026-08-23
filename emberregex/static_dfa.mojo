@@ -408,7 +408,10 @@ def _wb_cont_reaches_bol(nfa: NFA) -> Bool:
         if nfa.states[i].kind != NFAStateKind.ANCHOR:
             continue
         var at = nfa.states[i].anchor_type
-        if at != AnchorKind.WORD_BOUNDARY and at != AnchorKind.NOT_WORD_BOUNDARY:
+        if (
+            at != AnchorKind.WORD_BOUNDARY
+            and at != AnchorKind.NOT_WORD_BOUNDARY
+        ):
             continue
         var visited = List[Bool](length=num_states, fill=False)
         var stack: List[Int] = [nfa.states[i].out1]
@@ -1135,8 +1138,10 @@ def _minimize(
                         block_of[s2] = Int32(z)
                 # Y already queued -> queue Z as well; otherwise queue
                 # the smaller half (Hopcroft's n log n argument).
-                var queued = ((inwl0 >> UInt64(y)) & 1) != 0 if y < 64 else (
-                    ((inwl1 >> UInt64(y - 64)) & 1) != 0
+                var queued = (
+                    ((inwl0 >> UInt64(y)) & 1)
+                    != 0 if y
+                    < 64 else (((inwl1 >> UInt64(y - 64)) & 1) != 0)
                 )
                 var push = z
                 var d_size = pop_count(d0) + pop_count(d1)
@@ -1185,9 +1190,7 @@ def _minimize(
     flags = new_flags^
 
 
-def build_eager_dfa(
-    nfa: NFA, enabled: Bool, minimize: Bool = True
-) -> EagerDFA:
+def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     """Full subset construction — runs at compile time.
 
     Returns an invalid placeholder when `enabled` is False (pattern doesn't
@@ -1290,7 +1293,9 @@ def build_eager_dfa(
     var word_cls = SIMD[DType.uint64, 4](0)  # classes of word bytes
     for ci in range(nclasses):
         if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (
+                UInt64(1) << UInt64(ci & 63)
+            )
 
     # --- State-set bookkeeping: bitsets, hashes in SIMD lanes, flags. ---
     var sets_bits = List[_StateBits]()
@@ -1345,9 +1350,7 @@ def build_eager_dfa(
                 sets_rw.append(closed)
                 sets_rn.append(closed)
             flags.append(
-                _classic_flags(
-                    r_w, r_n, match_bits, eol_end_ok, eol_nl_ok
-                )
+                _classic_flags(r_w, r_n, match_bits, eol_end_ok, eol_nl_ok)
             )
             found = len(sets_bits)
             hashv[found] = h
@@ -1465,10 +1468,24 @@ def build_eager_dfa(
                 var n_n = closed
                 if has_wb and _bs_any(closed & wb_bits):
                     n_w = _wb_resolve(
-                        kinds, out1s, out2s, anchors, wb_bits, closed, prev, True
+                        kinds,
+                        out1s,
+                        out2s,
+                        anchors,
+                        wb_bits,
+                        closed,
+                        prev,
+                        True,
                     )
                     n_n = _wb_resolve(
-                        kinds, out1s, out2s, anchors, wb_bits, closed, prev, False
+                        kinds,
+                        out1s,
+                        out2s,
+                        anchors,
+                        wb_bits,
+                        closed,
+                        prev,
+                        False,
                     )
                     sets_rw.append(n_w)
                     sets_rn.append(n_n)
@@ -1476,9 +1493,7 @@ def build_eager_dfa(
                     sets_rw.append(closed)
                     sets_rn.append(closed)
                 flags.append(
-                    _classic_flags(
-                        n_w, n_n, match_bits, eol_end_ok, eol_nl_ok
-                    )
+                    _classic_flags(n_w, n_n, match_bits, eol_end_ok, eol_nl_ok)
                 )
                 if len(sets_bits) >= EDFA_STATE_CAP + 1:
                     return result^  # state blowup: stay invalid, use LazyDFA
@@ -1550,9 +1565,12 @@ def _edfa_finish(
             next_id += 1
     var num_match = next_id
     for s in range(nsets):
-        if Int(perm[s]) < 0 and flags.unsafe_get(s) & (
-            Int(EDFA_MATCH_IF_WORD) | Int(EDFA_MATCH_IF_NONWORD)
-        ) != 0:
+        if (
+            Int(perm[s]) < 0
+            and flags.unsafe_get(s)
+            & (Int(EDFA_MATCH_IF_WORD) | Int(EDFA_MATCH_IF_NONWORD))
+            != 0
+        ):
             perm[s] = Int32(next_id)
             next_id += 1
     var num_cond = next_id - num_match

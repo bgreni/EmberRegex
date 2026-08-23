@@ -330,14 +330,13 @@ def _sbt_body_eq(nfa: NFA, a: Int, b: Int, kind: Int) -> Bool:
             return True
         if nfa.charsets[ia].negated != nfa.charsets[ib].negated:
             return False
-        return (nfa.charsets[ia].bitmap ^ nfa.charsets[ib].bitmap).reduce_or(
-        ) == 0
+        return (
+            nfa.charsets[ia].bitmap ^ nfa.charsets[ib].bitmap
+        ).reduce_or() == 0
     return True  # ANY
 
 
-def _sbt_body_bits(
-    nfa: NFA, idx: Int
-) -> SIMD[DType.uint8, BITMAP_WIDTH]:
+def _sbt_body_bits(nfa: NFA, idx: Int) -> SIMD[DType.uint8, BITMAP_WIDTH]:
     """Compile-time: the charset bitmap a CHARSET body tests against, or an
     empty one for CHAR/ANY bodies (which the walker tests differently)."""
     if _sbt_is_body_state(nfa, idx):
@@ -569,10 +568,7 @@ def sbt_counted_shapes(nfa: NFA) -> List[Int]:
             stack.append(nfa.states[s].out1)
             stack.append(nfa.states[s].out2)
             continue
-        if (
-            kind == NFAStateKind.LOOKAHEAD
-            or kind == NFAStateKind.LOOKBEHIND
-        ):
+        if kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND:
             stack.append(nfa.states[s].sub_start)
         stack.append(nfa.states[s].out1)
     var out = List[Int]()
@@ -1423,9 +1419,7 @@ def _sbt_try_match[
                 comptime stop_bits = lf.stop_bits
                 while True:
                     comptime if skip:
-                        cur = _sbt_class_skip[stop_bitmap=stop_bits](
-                            input, cur
-                        )
+                        cur = _sbt_class_skip[stop_bitmap=stop_bits](input, cur)
                         # Past `limit` every remaining candidate was a body
                         # byte the exit cannot start on, so all of them are
                         # refuted at once.

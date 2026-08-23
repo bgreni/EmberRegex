@@ -228,20 +228,20 @@ def test_lookaround_both_sides_extracted() raises:
     # at rel 6.
     comptime n = _look_n(S._rose, 0)
     assert_equal(n, 5)
-    assert_true(comptime(_look_has(S._rose, 0, -1)), "digit before the factor")
-    assert_true(comptime(_look_has(S._rose, 0, -2)), "digit two before")
-    assert_true(comptime(_look_has(S._rose, 0, -3)), "the colon")
-    assert_true(comptime(_look_has(S._rose, 0, -4)), "digit four before")
-    assert_true(comptime(_look_has(S._rose, 0, 6)), "\\w after the factor")
+    assert_true(comptime (_look_has(S._rose, 0, -1)), "digit before the factor")
+    assert_true(comptime (_look_has(S._rose, 0, -2)), "digit two before")
+    assert_true(comptime (_look_has(S._rose, 0, -3)), "the colon")
+    assert_true(comptime (_look_has(S._rose, 0, -4)), "digit four before")
+    assert_true(comptime (_look_has(S._rose, 0, 6)), "\\w after the factor")
 
     # ...and the classes are the right ones.
-    assert_true(comptime(_look_accepts(S._rose, 0, -1, ord("7"))))
-    assert_false(comptime(_look_accepts(S._rose, 0, -1, ord("x"))))
-    assert_true(comptime(_look_accepts(S._rose, 0, -3, ord(":"))))
-    assert_false(comptime(_look_accepts(S._rose, 0, -3, ord("9"))))
-    assert_true(comptime(_look_accepts(S._rose, 0, 6, ord("_"))))
-    assert_true(comptime(_look_accepts(S._rose, 0, 6, ord("a"))))
-    assert_false(comptime(_look_accepts(S._rose, 0, 6, ord(" "))))
+    assert_true(comptime (_look_accepts(S._rose, 0, -1, ord("7"))))
+    assert_false(comptime (_look_accepts(S._rose, 0, -1, ord("x"))))
+    assert_true(comptime (_look_accepts(S._rose, 0, -3, ord(":"))))
+    assert_false(comptime (_look_accepts(S._rose, 0, -3, ord("9"))))
+    assert_true(comptime (_look_accepts(S._rose, 0, 6, ord("_"))))
+    assert_true(comptime (_look_accepts(S._rose, 0, 6, ord("a"))))
+    assert_false(comptime (_look_accepts(S._rose, 0, 6, ord(" "))))
 
 
 def test_lookaround_window_is_bounded() raises:
@@ -253,9 +253,13 @@ def test_lookaround_window_is_bounded() raises:
     assert_true(use_rose)
     comptime off0 = S._rose.offsets[0]
     assert_equal(off0, 6)
-    assert_true(comptime(_look_has(S._rose, 0, -4)))
-    assert_false(comptime(_look_has(S._rose, 0, -5)), "window stops at 4 bytes")
-    assert_false(comptime(_look_has(S._rose, 0, -6)), "window stops at 4 bytes")
+    assert_true(comptime (_look_has(S._rose, 0, -4)))
+    assert_false(
+        comptime (_look_has(S._rose, 0, -5)), "window stops at 4 bytes"
+    )
+    assert_false(
+        comptime (_look_has(S._rose, 0, -6)), "window stops at 4 bytes"
+    )
 
 
 def test_wide_classes_are_dropped_but_not_terminal() raises:
@@ -268,10 +272,12 @@ def test_wide_classes_are_dropped_but_not_terminal() raises:
     assert_true(use_rose)
     comptime n = _look_n(S._rose, 0)
     assert_equal(n, 1)
-    assert_false(comptime(_look_has(S._rose, 0, 2)), "`.` filters nothing")
-    assert_true(comptime(_look_has(S._rose, 0, 3)), "the digit behind it survives")
-    assert_true(comptime(_look_accepts(S._rose, 0, 3, ord("4"))))
-    assert_false(comptime(_look_accepts(S._rose, 0, 3, ord("z"))))
+    assert_false(comptime (_look_has(S._rose, 0, 2)), "`.` filters nothing")
+    assert_true(
+        comptime (_look_has(S._rose, 0, 3)), "the digit behind it survives"
+    )
+    assert_true(comptime (_look_accepts(S._rose, 0, 3, ord("4"))))
+    assert_false(comptime (_look_accepts(S._rose, 0, 3, ord("z"))))
 
 
 def test_lookaround_on_the_skip_path() raises:
@@ -283,9 +289,9 @@ def test_lookaround_on_the_skip_path() raises:
     assert_true(skip0)
     comptime n = _look_n(S._rose, 0)
     assert_equal(n, 1)
-    assert_true(comptime(_look_has(S._rose, 0, 5)))
-    assert_true(comptime(_look_accepts(S._rose, 0, 5, ord("0"))))
-    assert_false(comptime(_look_accepts(S._rose, 0, 5, ord("="))))
+    assert_true(comptime (_look_has(S._rose, 0, 5)))
+    assert_true(comptime (_look_accepts(S._rose, 0, 5, ord("0"))))
+    assert_false(comptime (_look_accepts(S._rose, 0, 5, ord("="))))
 
 
 def test_caseless_factor_lookaround() raises:
@@ -297,9 +303,9 @@ def test_caseless_factor_lookaround() raises:
     assert_true(use_rose)
     comptime n = _look_n(S._rose, 0)
     assert_equal(n, 1)
-    assert_true(comptime(_look_has(S._rose, 0, 5)))
-    assert_true(comptime(_look_accepts(S._rose, 0, 5, ord("7"))))
-    assert_false(comptime(_look_accepts(S._rose, 0, 5, ord("X"))))
+    assert_true(comptime (_look_has(S._rose, 0, 5)))
+    assert_true(comptime (_look_accepts(S._rose, 0, 5, ord("7"))))
+    assert_false(comptime (_look_accepts(S._rose, 0, 5, ord("X"))))
 
 
 def test_variable_offset_factor_has_no_backward_records() raises:
@@ -325,9 +331,9 @@ def test_variable_offset_factor_forward_records() raises:
     assert_equal(off0, -1)
     comptime n = _look_n(S._rose, 0)
     assert_equal(n, 1)
-    assert_true(comptime(_look_has(S._rose, 0, 3)))
-    assert_false(comptime(_look_has(S._rose, 0, -1)), "no backward record")
-    assert_true(comptime(_look_accepts(S._rose, 0, 3, ord("2"))))
+    assert_true(comptime (_look_has(S._rose, 0, 3)))
+    assert_false(comptime (_look_has(S._rose, 0, -1)), "no backward record")
+    assert_true(comptime (_look_accepts(S._rose, 0, 3, ord("2"))))
 
 
 def test_lcg_draw_is_not_degenerate() raises:
@@ -421,9 +427,9 @@ def test_optional_part_before_the_factor() raises:
     comptime n_without = _look_n(S._rose, without)
     assert_equal(n_with, 1)
     assert_equal(n_without, 0, "the empty arm requires nothing before")
-    assert_true(comptime(_look_has(S._rose, with_digit, -1)))
-    assert_true(comptime(_look_accepts(S._rose, with_digit, -1, ord("5"))))
-    assert_false(comptime(_look_accepts(S._rose, with_digit, -1, ord("x"))))
+    assert_true(comptime (_look_has(S._rose, with_digit, -1)))
+    assert_true(comptime (_look_accepts(S._rose, with_digit, -1, ord("5"))))
+    assert_false(comptime (_look_accepts(S._rose, with_digit, -1, ord("x"))))
 
     var db = RegexSet[PATS]()
     assert_reports(db.scan("error!"), [SetMatch(0, 6)], "empty arm at 0")
@@ -541,7 +547,15 @@ def test_differential_offset_window() raises:
 
 def test_differential_wide_class_gap() raises:
     comptime PATS: List[String] = ["ab.[0-9]", "zebra"]
-    var tokens: List[String] = ["abz4", "ab", "abzz", "ab\n4", "z", "4", "zebra"]
+    var tokens: List[String] = [
+        "abz4",
+        "ab",
+        "abzz",
+        "ab\n4",
+        "z",
+        "4",
+        "zebra",
+    ]
     _token_differential[PATS](tokens, "wide class gap")
     var alphabet: List[Byte] = [97, 98, 48, 49, 10, 122, 101]
     _differential[PATS](alphabet, "wide class gap bytes")

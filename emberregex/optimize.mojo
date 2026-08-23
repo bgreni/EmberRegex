@@ -1046,9 +1046,7 @@ def extract_inner_literal(nfa: NFA) -> InnerLiteral:
         res.caseless.append(run_cl[best][k])
     res.min_offset = run_min[best]
     res.max_offset = run_max[best]
-    res.is_suffix = (
-        best == len(run_bytes) - 1 and suffix_flag and not truncated
-    )
+    res.is_suffix = best == len(run_bytes) - 1 and suffix_flag and not truncated
     res.valid = True
     return res^
 

@@ -107,7 +107,6 @@ comptime _LFClo = SIMD[DType.int16, _LF_CLO_W]
 comptime _LF_SIG_BITS = 56
 
 
-
 struct LFDFA(Copyable, Movable):
     """Comptime-computed leftmost-first DFA.
 
@@ -386,7 +385,9 @@ def build_lf_dfa(
     var word_cls = SIMD[DType.uint64, 4](0)  # classes of word bytes
     for ci in range(nclasses):
         if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (
+                UInt64(1) << UInt64(ci & 63)
+            )
 
     # The restart closures (mid-line / after '\n') as lane vectors, with
     # their flag bytes, whether they end in MATCH, and their pending word
@@ -582,7 +583,9 @@ def build_lf_dfa(
         var lrestart = st_restart.unsafe_get(cur)
         var ltail = st_tail.unsafe_get(cur)
         var lprev = Int(lv0[_LF_PREV_LANE]) != 0
-        var thread_len0 = llen0  # members below this are the state's own threads
+        var thread_len0 = (
+            llen0  # members below this are the state's own threads
+        )
 
         # Materialize the restart tail: the tail context's start closure
         # minus what the thread-derived list already holds, in closure
@@ -691,7 +694,9 @@ def build_lf_dfa(
             var grp1 = SIMD[DType.uint64, 64](0)
             var grp2 = SIMD[DType.uint64, 64](0)
             var grp3 = SIMD[DType.uint64, 64](0)
-            var first_eol_nl_pos = llen  # first pending EOL_MULTILINE that resolves
+            var first_eol_nl_pos = (
+                llen  # first pending EOL_MULTILINE that resolves
+            )
             var ncons = 0
             var nbits = 0
             # A resolved list can carry MATCH (an anchor's continuation)
@@ -711,7 +716,15 @@ def build_lf_dfa(
                     var so = cslot_o.unsafe_get(t)
                     if so < 0:
                         so = _lf_memo_closure(
-                            kinds, out1s, out2s, anchors, t, False, pool, clo_vec, clo_off
+                            kinds,
+                            out1s,
+                            out2s,
+                            anchors,
+                            t,
+                            False,
+                            pool,
+                            clo_vec,
+                            clo_off,
                         )
                         cslot_o[t] = so
                     slot_o[i] = Int32(so)
@@ -719,7 +732,15 @@ def build_lf_dfa(
                         var sn = cslot_n.unsafe_get(t)
                         if sn < 0:
                             sn = _lf_memo_closure(
-                                kinds, out1s, out2s, anchors, t, True, pool, clo_vec, clo_off
+                                kinds,
+                                out1s,
+                                out2s,
+                                anchors,
+                                t,
+                                True,
+                                pool,
+                                clo_vec,
+                                clo_off,
                             )
                             cslot_n[t] = sn
                         slot_n[i] = Int32(sn)
@@ -972,7 +993,9 @@ def build_lf_dfa(
                 # byte, recorded only when a word anchor is pending in the
                 # threads or the restart tail.
                 var tail_wb = (
-                    len(r_wb_n) > 0 if tail == 2 else (len(r_wb_o) > 0 if tail == 1 else False)
+                    len(r_wb_n)
+                    > 0 if tail
+                    == 2 else (len(r_wb_o) > 0 if tail == 1 else False)
                 )
                 var prev = False
                 if acc_wb or tail_wb:
@@ -1088,9 +1111,9 @@ def build_lf_dfa(
         result.astart_other = pstarts[nctx]
         result.astart_after_nl = pstarts[nctx + 1]
         result.astart_at_0 = pstarts[nctx + 2]
-        result.astart_other_word = (
-            pstarts[nctx + 3] if has_wb else result.astart_other
-        )
+        result.astart_other_word = pstarts[
+            nctx + 3
+        ] if has_wb else result.astart_other
     else:
         result.astart_other = result.d.start_other
         result.astart_after_nl = result.d.start_after_nl

@@ -505,9 +505,7 @@ def _assert_pike_agreement[
         )
 
 
-def _differential[
-    p: StaticString
-](alphabet: String, label: String) raises:
+def _differential[p: StaticString](alphabet: String, label: String) raises:
     """3 seeds x 10 lengths = 30 inputs against one pattern."""
     for seed in [1, 7, 4242]:
         for n in [0, 1, 3, 7, 16, 17, 33, 64, 65, 200]:

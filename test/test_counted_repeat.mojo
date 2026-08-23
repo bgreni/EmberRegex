@@ -340,7 +340,9 @@ def test_counted_against_pike() raises:
     )
     # The chain runs straight into MATCH, which both loops fold: the greedy
     # one returns its longest reach without calling the exit at all.
-    _sweep["(x)a{2,4}"](alpha, "exit-is-match", ["xaa", "xa", "xaaaa", "xaaaaa"])
+    _sweep["(x)a{2,4}"](
+        alpha, "exit-is-match", ["xaa", "xa", "xaaaa", "xaaaaa"]
+    )
 
 
 def _assert_pike_spans_agree[

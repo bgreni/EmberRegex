@@ -102,13 +102,13 @@ Selected fastest-first at compile time:
 | pattern is a literal string | SIMD literal scan | `simd_scan.mojo` |
 | `prefix + .* + suffix` | sandwich (startswith/endswith) | `optimize.mojo` |
 | alternation of literals | Teddy nibble shuffles | `teddy.mojo` |
-| ≤ 16 DFA states, shuffle target | Sheng | `sheng.mojo` |
+| DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng | `sheng.mojo` |
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
-| `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
+| `can_use_dfa`, CLASSIC table over `EDFA_STATE_CAP` | lazy DFA | `dfa.mojo` |
 | captures, one-pass NFA with an alternation loop | one-pass DFA: `match()`, and the span confirm of the lane below (`_use_onepass`) | `onepass.mojo` |
 | captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
-| backrefs / lookaround / captures (`match()`, not one-pass) | specialized backtracker | `backtrack.mojo` |
+| backrefs / lookaround / captures (`match()`, not one-pass); also a greedy pattern whose classic table fits but whose leftmost-first table overflowed | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
 
 **The eager DFA is the interesting one.** Subset construction runs in the
@@ -160,8 +160,10 @@ The wasted walk is bounded by the scan's own walk over the same bytes (the
 scan keeps the failed attempt's threads alive, at top priority, until
 they die), so the lane stays linear; `a.*?b` over a 64 KB run with no `b`
 is 3.7 µs here against 2.3 s on the backtracker alone. One attempt per
-match, never one per candidate. Every materialized table is padded to
-`EDFA_TABLE_MIN_BYTES` (1 KB): below that the comptime constant lowers to
+match, never one per candidate. Every materialized table holds its state
+ids in the narrowest integer type that fits them (`edfa_id_dtype`:
+`Int8`, `Int16` or `Int32` — the table is the walk's hot data) and is
+padded to `EDFA_TABLE_MIN_BYTES` (1 KB): below that the constant lowers to
 a per-call stack copy inside the walker, which cost more than the walk
 itself on 3-state tables.
 

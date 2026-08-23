@@ -665,14 +665,12 @@ def test_anchored_lf_dfa_match_at() raises:
     # Unanchored from 0 on an input where only a later start matches.
     var input2 = String("xxbd")
     var bytes2 = input2.as_bytes()
-    assert_equal(
-        lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 0
-    )
+    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 0)
     comptime Q = "b[cd]"
     comptime lfq = build_lf_dfa(Regex[Q].nfa, True, anchored=True)
-    comptime tq = edfa_table_arr[lfq.d.num_states * 256, edfa_id_dtype(
-        lfq.d.num_states
-    )](lfq.d)
+    comptime tq = edfa_table_arr[
+        lfq.d.num_states * 256, edfa_id_dtype(lfq.d.num_states)
+    ](lfq.d)
     comptime fq = edfa_flags_arr[lfq.d.num_states](lfq.d)
     assert_equal(lfdfa_find_end[lf=lfq, table=tq, flags=fq](bytes2, 0), 4)
     assert_equal(lfdfa_match_at[lf=lfq, table=tq, flags=fq](bytes2, 0), -1)
@@ -708,9 +706,7 @@ def test_wide_list_signature_renumbering() raises:
     assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes, 21), -1)
     var input2 = String("!!!!!!!!!!!!!!!!!!!!7!!")
     var bytes2 = input2.as_bytes()
-    assert_equal(
-        lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 21
-    )
+    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 21)
     # And on the engine: a class arm keeps Teddy off, so the same lists
     # drive search/findall through the lane.
     comptime W = Regex[_WIDE_ALT + "|[!?]{2}"]

@@ -1130,9 +1130,7 @@ struct Regex[pattern: String](Copyable, Movable):
         Self.nfa, Self._group_count > 0 and Self._onepass_shape
     )
     comptime _use_onepass = (
-        Self._group_count > 0
-        and Self._onepass_shape
-        and Self._onepass.valid
+        Self._group_count > 0 and Self._onepass_shape and Self._onepass.valid
     )
     comptime _OP_TN = onepass_table_len(Self._onepass)
     comptime _OP_TABLE = onepass_table_arr[Self._OP_TN](Self._onepass)
@@ -1344,9 +1342,9 @@ struct Regex[pattern: String](Copyable, Movable):
             slots,
             budget,
             memo_addr=0,
-            stack_floor=sbt_stack_floor[
-                _sbt_needs_depth_guard(Self.nfa)
-            ](self._stack_lo, self._stack_hi),
+            stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(Self.nfa)](
+                self._stack_lo, self._stack_hi
+            ),
             end_at=-1,
         )
         if budget < 0:
@@ -1496,8 +1494,8 @@ struct Regex[pattern: String](Copyable, Movable):
                 var lit_pos = simd_find_literal_rare[
                     lit=Self._IL_LIT,
                     cl=Self._IL_CL,
-                    off_a = Self._IL_PROBES[0],
-                    off_b = Self._IL_PROBES[1],
+                    off_a=Self._IL_PROBES[0],
+                    off_b=Self._IL_PROBES[1],
                 ](input, p + Self._inner_lit.min_offset)
                 if lit_pos < 0:
                     return (-1, -1)
@@ -2482,13 +2480,13 @@ struct Regex[pattern: String](Copyable, Movable):
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end >= 0:
                         self._findall_append(results, input, pos, end, slots)
                         if end > pos:
@@ -2533,13 +2531,13 @@ struct Regex[pattern: String](Copyable, Movable):
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end < 0:
                         pos += 1
                         continue
@@ -2656,13 +2654,13 @@ struct Regex[pattern: String](Copyable, Movable):
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end >= 0:
                         results.append(
                             MatchResult[Self._num_slots](
@@ -2711,13 +2709,13 @@ struct Regex[pattern: String](Copyable, Movable):
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end < 0:
                         pos += 1
                         continue
@@ -3180,8 +3178,8 @@ struct Regex[pattern: String](Copyable, Movable):
             return simd_find_literal_rare[
                 lit=Self._FPRE_LIT,
                 cl=Self._FPRE_CL,
-                off_a = probes[0],
-                off_b = probes[1],
+                off_a=probes[0],
+                off_b=probes[1],
             ](input, start)
 
     @always_inline
@@ -3311,13 +3309,13 @@ struct Regex[pattern: String](Copyable, Movable):
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
                 ](
-                input,
-                start,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+                    input,
+                    start,
+                    slots,
+                    sbt_memo,
+                    stack_lo=self._stack_lo,
+                    stack_hi=self._stack_hi,
+                )
                 if end >= 0:
                     return end
             except:
