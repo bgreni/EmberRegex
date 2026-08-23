@@ -75,6 +75,7 @@ from .static_dfa import (
     edfa_flags_arr,
     edfa_id_dtype,
     edfa_full_match,
+    edfa_match_at,
     pivot_first_candidate,
 )
 from .static_lfdfa import (
@@ -92,6 +93,7 @@ from .sheng import (
     sheng_cap_for,
     sheng_full_match,
     sheng_masks_arr,
+    sheng_match_at,
     sheng_viable,
 )
 from .simd_kernels import (
@@ -809,6 +811,10 @@ struct Regex[pattern: String](Copyable, Movable):
     # the NFA, and comptime memoization covers field declarations only.
     # Only the Teddy and LazyDFA search lanes still consult it.
     comptime _lf_end_is_dfa_end = _dfa_end_is_leftmost_first(Self.nfa)
+    # Leftmost-first lane, anchored-first attempt on the classic table
+    # (see _lf_next_match): sound exactly when the classic table's
+    # leftmost-longest end IS the leftmost-first end.
+    comptime _lf_anchored_classic = Self._lf_end_is_dfa_end
     # Backtracker (state, pos) memoization is only sound when a subtree's
     # outcome is a function of (state, pos) — see sbt_memo_ok.
     comptime _sbt_memo_ok = sbt_memo_ok(Self.nfa)
@@ -918,6 +924,41 @@ struct Regex[pattern: String](Copyable, Movable):
             ](input, pos)
 
     @always_inline
+    def _edfa_match_at[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], start: Int) -> Int:
+        """Anchored attempt at `start` on the classic comptime table:
+        the leftmost-longest end, or -1. Only meaningful when
+        use_eager_dfa."""
+        comptime if Self._strategy.use_sheng:
+            return sheng_match_at[
+                d=Self._edfa,
+                masks=Self._SHENG_MASKS,
+                flags=Self._EDFA_FLAGS,
+            ](input, start)
+        else:
+            return edfa_match_at[
+                d=Self._edfa,
+                table=Self._EDFA_TABLE,
+                flags=Self._EDFA_FLAGS,
+            ](input, start)
+
+    @always_inline
+    def _lf_candidate[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
+        """First position >= `pos` where a match can begin according to
+        the comptime-selected prefilter (filter prefix / Teddy
+        alternation prefix / pivot class-run start), `pos` itself when
+        there is none, or -1 when no candidate remains."""
+        comptime if Self._use_scan_filter:
+            return self._scan_candidate(input, input_len, pos)
+        elif Self._lf_pivot[0] >= 0:
+            return pivot_first_candidate[d=Self._edfa](input, pos)
+        else:
+            return pos
+
+    @always_inline
     def _lf_next_match[
         origin: Origin, //
     ](self, input: Span[Byte, origin], pos: Int) -> Tuple[Int, Int]:
@@ -933,6 +974,21 @@ struct Regex[pattern: String](Copyable, Movable):
         A `^`-anchored pattern has no restart threads (nothing can begin
         mid-input), so its scan from 0 is the anchored attempt and its
         start needs no reverse walk.
+
+        Anchored-first attempt: when the pattern's shape makes the
+        classic table's leftmost-longest end the leftmost-first end
+        (`_lf_anchored_classic`, one greedy loop at most — `[a-z]+x`,
+        `.*x`), the first candidate is tried ANCHORED on the classic
+        table before anything else. A success is the match outright:
+        its start is the candidate, so the reverse walk — which would
+        re-walk the whole match, twice the work on a long class run — is
+        skipped. A failure proves nothing starts there, and the
+        unanchored scan takes over from the next candidate; that one
+        wasted walk is bounded by the scan's own walk over the same
+        bytes (the scan keeps every thread of the failed attempt alive,
+        at top priority, until it dies), so the lane stays linear where
+        the old per-candidate loop was quadratic. One attempt per call,
+        never one per candidate.
         """
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             if pos > 0:
@@ -943,13 +999,16 @@ struct Regex[pattern: String](Copyable, Movable):
             return (0, end)
         else:
             var input_len = len(input)
-            var s0 = pos
-            comptime if Self._use_scan_filter:
-                s0 = self._scan_candidate(input, input_len, pos)
-                if s0 < 0:
+            var s0 = self._lf_candidate(input, input_len, pos)
+            if s0 < 0:
+                return (-1, -1)
+            comptime if Self._lf_anchored_classic:
+                var aend = self._edfa_match_at(input, s0)
+                if aend >= 0:
+                    return (s0, aend)
+                if s0 >= input_len:
                     return (-1, -1)
-            elif Self._lf_pivot[0] >= 0:
-                s0 = pivot_first_candidate[d=Self._edfa](input, pos)
+                s0 = self._lf_candidate(input, input_len, s0 + 1)
                 if s0 < 0:
                     return (-1, -1)
             var end = self._lf_find_end(input, s0)

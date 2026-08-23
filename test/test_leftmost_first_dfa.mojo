@@ -307,6 +307,42 @@ def test_tiny_tables_materialize_as_shared_data() raises:
     assert_true(3 * t_one < t_nine)
 
 
+def test_anchored_first_attempt_on_classic_table() raises:
+    # One greedy loop, branch-free suffix: the classic table's longest
+    # end is the leftmost-first end, so the first candidate is tried
+    # anchored there and a success skips the reverse walk entirely.
+    comptime S = Regex["[a-z]+x[0-9]"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._lf_anchored_classic)
+    var re = S()
+    # Success at the first candidate: start is the candidate itself.
+    var r = re.search("  abcx7 zzx")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 7)
+    # The attempt at 0 walks "aaax" and dies on ' ': nothing starts
+    # there, and the unanchored scan + reverse walk find the later one.
+    var r2 = re.search("aaax aax1")
+    assert_equal(r2.start, 5)
+    assert_equal(r2.end, 9)
+    # Failed attempt whose walk ends exactly at end of input.
+    assert_false(re.search("aaaax").matched)
+    assert_false(re.search("x").matched)
+    assert_false(re.search("").matched)
+    var all = re.findall("ax1 bx ax2 x3 cx")
+    assert_equal(len(all), 2)
+    assert_equal(all[0], "ax1")
+    assert_equal(all[1], "ax2")
+    # Shapes with two loops or an alternation keep the pure lane.
+    comptime T = Regex["[a-z]+@[a-z]+"]
+    assert_true(T._use_lf_dfa)
+    assert_false(T._lf_anchored_classic)
+    comptime U = Regex["<.*?>"]
+    assert_false(U._lf_anchored_classic)
+    # The bench shapes ride it.
+    assert_true(Regex["[a-z]+x"]._lf_anchored_classic)
+    assert_true(Regex[".*x"]._lf_anchored_classic)
+
+
 def test_eol_in_priority_order() raises:
     # `ab$|a`: on "ab" the first arm resolves at end of input (2); on
     # "abc" it dies and the second arm's recorded end (1) stands.
