@@ -10,7 +10,13 @@ every result still agrees with the Pike VM.
 """
 
 from emberregex import Regex
-from emberregex.backtrack import sbt_memo_rows
+from emberregex.backtrack import (
+    SBT_BUDGET,
+    SBT_MEMO_BUDGET_FACTOR,
+    SBT_MEMO_BUDGET_MIN,
+    sbt_memo_budget,
+    sbt_memo_rows,
+)
 from emberregex.engine import _sbt_run
 from std.collections import InlineArray
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
@@ -226,6 +232,72 @@ def test_aborted_attempt_leaves_no_poisoned_bits() raises:
     assert_true(got.matched)
     assert_equal(got.start, want.start)
     assert_equal(got.end, want.end)
+
+
+def _sbt_concedes[p: String](input: String) raises -> Bool:
+    """True when the backtracker gives up on `input` and the caller falls
+    back to the Pike VM."""
+    try:
+        _ = _sbt_end[p](input)
+        return False
+    except:
+        return True
+
+
+def test_memo_budget_is_table_proportional() raises:
+    # The memo lane is a retry of a walk that already spent SBT_BUDGET,
+    # and the engine it is trying to avoid (the Pike VM) costs one pass
+    # over the same rows x positions table. So the allowance is a small
+    # multiple of that table, clamped at both ends.
+    assert_equal(sbt_memo_budget(8, 1000), SBT_MEMO_BUDGET_FACTOR * 8 * 1001)
+    # Short inputs fall to the floor, not to a handful of units.
+    assert_equal(sbt_memo_budget(4, 3), SBT_MEMO_BUDGET_MIN)
+    # And it never exceeds the budget the first attempt already blew.
+    assert_equal(sbt_memo_budget(64, 1_000_000), SBT_BUDGET)
+
+
+def test_memo_concedes_when_it_cannot_collapse_the_search() raises:
+    # `(a+)+b` re-explores through a general SPLIT, so it gets a memo —
+    # but its blow-up is the *iterative* giveback of the inner `a+`, which
+    # the memo cannot collapse: every memoized visit still hands back one
+    # byte at a time, so the memoized walk is O(n^2) where the Pike VM is
+    # O(states x n). Finishing it lost: `search` on 600 `a`s measured
+    # 833us memoized against 137us for conceding. The budget in
+    # `sbt_memo_budget` exists to make the walk concede here, and this
+    # test is what pins that (before it, this returned -1 without ever
+    # raising, and the whole search stayed in the backtracker).
+    comptime P = "(a+)+b"
+    assert_true(_sbt_concedes[P](String("a") * 600))
+    # The concession is not a wrong answer: the fallback still agrees.
+    var re = Regex[P]()
+    var texts = [
+        String("a") * 600,
+        String("a") * 600 + "b",
+        String("a") * 300 + "b" + String("a") * 300,
+        String("aab"),
+        String("b"),
+        String(""),
+    ]
+    for i in range(len(texts)):
+        ref text = texts[i]
+        var got = re.search(text)
+        var want = re._pike_search(text)
+        assert_equal(got.matched, want.matched)
+        if want.matched:
+            assert_equal(got.start, want.start)
+            assert_equal(got.end, want.end)
+            assert_equal(got.group_str(text, 1), want.group_str(text, 1))
+
+
+def test_memo_still_collapses_the_shape_it_is_for() raises:
+    # The other side of the same boundary: `(a|aa)+b` has no simple loop
+    # inside its cycle, so one visit per (SPLIT, position) is all it needs
+    # and it finishes well inside the table-proportional budget. If a
+    # future tightening of `sbt_memo_budget` starves this, the row
+    # `memo_ambiguous_plus_miss_1500` loses its ~2x and this fails first.
+    comptime P = "(a|aa)+b"
+    assert_false(_sbt_concedes[P](String("a") * 1500 + "c"))
+    assert_equal(_sbt_end[P](String("a") * 1500 + "c"), -1)
 
 
 def main() raises:

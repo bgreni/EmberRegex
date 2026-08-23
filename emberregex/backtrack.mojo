@@ -360,6 +360,47 @@ comptime SBT_MEMO_BITS = 2_097_152
 # (`(a|aa)+b`, `([a-z]+[0-9]+)+x`, nested captured quantifiers).
 comptime SBT_MEMO_MAX_STATES = 64
 
+# How much work a memoized attempt may spend per cell of its own memo
+# table before it is abandoned to the Pike VM.
+#
+# The memo lane is a GAMBLE: it is only reached after a walk already blew
+# SBT_BUDGET, and it pays off only when memoization collapses the search
+# to roughly one visit per (state, position) pair. The Pike VM — the
+# engine we fall back to if the gamble fails — costs O(rows * (n+1))
+# state visits by construction, i.e. one pass over exactly the same
+# table. So a memoized attempt that spends more than a small multiple of
+# its table size has already lost: finishing it cannot beat the fallback
+# it is trying to avoid, and every further unit is pure waste.
+#
+# Measured on the two shapes that define the trade (see
+# `sbt_memo_budget`): `(a|aa)+b` on 1500 `a`s — the shape the memo exists
+# for — completes its first walk in 15,002 units against a table of
+# 9*1501 cells, i.e. ~1.1 units per cell. `(a+)+b` on 600 `a`s — a shape
+# whose blow-up is the *iterative* giveback of `a+`, which the memo
+# cannot collapse — never completes: it burned the whole 200,000-unit
+# budget and then went to the Pike VM anyway, turning a 137us search into
+# 833us. Factor 4 leaves the first ~3.6x headroom (54,036 allowed against
+# 15,002 used) and cuts the second's doomed attempt to 16,828 units, ~8%
+# of what it used to waste.
+comptime SBT_MEMO_BUDGET_FACTOR = 4
+
+# Floor under the memo budget: `rows * (n+1)` is tiny for short inputs,
+# where the Pike VM's own fixed costs (thread lists, slot vectors) are
+# what dominate rather than its asymptotic pass. A few thousand units is
+# below the noise of one fallback either way.
+comptime SBT_MEMO_BUDGET_MIN = 4096
+
+
+@always_inline
+def sbt_memo_budget(rows: Int, input_len: Int) -> Int:
+    """Work units a memoized attempt gets — see SBT_MEMO_BUDGET_FACTOR.
+
+    Never more than SBT_BUDGET: the memo lane is a retry of a walk that
+    already spent that much, not an extension of it.
+    """
+    var by_table = SBT_MEMO_BUDGET_FACTOR * rows * (input_len + 1)
+    return min(SBT_BUDGET, max(SBT_MEMO_BUDGET_MIN, by_table))
+
 
 def sbt_memo_ok(nfa: NFA) -> Bool:
     """Comptime: True when "this state at this position was explored and
@@ -825,14 +866,20 @@ def _sbt_try_match[
                     var mask = UInt64(1) << UInt64(memo_idx & 63)
                     if (mp[unsafe_offset=word] & mask) != 0:
                         # Explored before, to completion, and failed.
-                        # Without backrefs nothing feeding this subtree has
-                        # changed, and a cache hit is not work — hand the
-                        # budget unit back. That does mean SBT_BUDGET stops
-                        # being a hard bound on the number of CALLS: hits
-                        # are free. It still bounds the work, because every
-                        # hit is reached from a frame that did pay, and a
-                        # frame makes at most two calls.
-                        budget += 1
+                        # Without backrefs nothing feeding this subtree
+                        # has changed, so answer straight from the bit.
+                        #
+                        # The unit this call already charged is NOT handed
+                        # back. An earlier revision refunded it on the
+                        # grounds that a hit is not work, which silently
+                        # removed the memo lane's only work bound: the
+                        # simple-loop giveback above issues up to one call
+                        # per input byte from a SINGLE frame, so refunded hits
+                        # let `(a+)+b` on 600 `a`s run 540k free calls —
+                        # 833us against 137us for just conceding to the
+                        # Pike VM. Charging hits makes the budget a true
+                        # bound again, and `sbt_memo_budget` sets it where
+                        # conceding is the better bet.
                         return -1
                     var memo_r = _sbt_try_match[
                         nfa=nfa,

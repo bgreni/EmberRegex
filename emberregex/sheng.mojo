@@ -27,7 +27,10 @@ HAS_FAST_BYTE_SHUFFLE, and other targets keep the eager table walk.
 
 The walkers mirror the eager DFA walkers exactly (start contexts, EOL
 flags, acceleration, per-walk accel dispatch) — only the transition
-mechanism differs. Search-family verbs no longer walk per candidate
+mechanism differs. The one exception is an anchored full match on an
+input too short to amortize the shuffle's fixed costs, which walks the
+same mask table one scalar load per byte instead (`sheng_short_input`,
+`_sheng_scalar_full_match`). Search-family verbs no longer walk per candidate
 position: the leftmost-first DFA (static_lfdfa.mojo) runs one
 unanchored `sheng_walk_from` pass, so there is no shuffle-engine
 search_forward here any more.
@@ -160,6 +163,96 @@ def _sheng_step[
 comptime _SHENG_DEAD_CHECK_STRIDE = 64
 
 
+def sheng_short_input(cap: Int) -> Int:
+    """Comptime: input length below which an anchored full match walks the
+    mask table scalar-wise (`_sheng_scalar_full_match`) instead of
+    shuffling. 0 disables the scalar lane for that tier.
+
+    Per tier, because the tiers are not equally priced. One `tbl4` step
+    loads 64 bytes of mask, one `tbl2` loads 32 and one `tbl` loads 16,
+    against one byte for the scalar walk — so the wider the tier, the
+    longer the input has to be before the shuffle's throughput pays for
+    its fixed costs.
+
+    Measured with `match` over 8 rotating inputs per length (so the calls
+    cannot CSE), ns/op, shuffle vs scalar:
+
+    | len | 6 states (16) | 19 states (32) | 34 states (64) |
+    | --- | --- | --- | --- |
+    |  3 | 1.72 / 1.97 | 2.38 / 2.11 | 2.11 / 1.97 |
+    |  6 | 2.46 / 2.71 | 3.17 / 2.91 | 3.08 / 2.71 |
+    |  9 | 3.20 / 3.53 | 3.97 / 3.80 | 4.74 / 3.54 |
+    | 12 | 3.95 / 4.69 | 4.76 / 5.03 | 6.70 / 4.69 |
+    | 15 | 4.68 / 6.00 | 5.55 / 6.46 | 9.01 / 6.03 |
+
+    So the 16-lane tier never wants the scalar walk (its shuffle is one
+    load and one `tbl`), the 32-lane tier crosses over around 10 bytes,
+    and the 64-lane tier is still ahead at 15 — the bound there is set at
+    16 because that is where this was measured, not because it is the
+    crossover.
+    """
+    if cap >= 64:
+        return 16
+    if cap >= 32:
+        return 10
+    return 0
+
+
+@always_inline
+def _sheng_scalar_full_match[
+    origin: Origin,
+    ns: Int,
+    ml: Int,
+    //,
+    d: EagerDFA,
+    masks: InlineArray[UInt8, ml],
+    flags: InlineArray[UInt8, ns],
+](input: Span[Byte, origin]) -> Bool:
+    """The same anchored full match, walked one scalar load per byte.
+
+    The mask table IS a DFA transition table — byte-major instead of
+    state-major, `UInt8` instead of `Int32` — so a scalar walk over it
+    needs no new constant data, just a different way of reading the table
+    the shuffle already carries. (Calling `edfa_full_match` instead would
+    have meant emitting the eager `num_states x 256` Int32 table
+    alongside the masks for every Sheng pattern.)
+
+    Why it exists: the shuffle's costs are not all per-byte. Entering it
+    broadcasts the start state across the index register and leaving it
+    extracts lane 0 back to a GPR, and at the 64-lane tier every step
+    loads 64 bytes of mask (four vector loads) to feed one `tbl4`. Against
+    that, the dead-state check is deferred by `_SHENG_DEAD_CHECK_STRIDE`
+    bytes, so a two-byte input that dies on its first byte still shuffles
+    both. On a long walk the per-byte dependency chain is all that matters
+    and the shuffle wins; on a two-byte `match` the fixed costs are the
+    whole measurement — `alternation_16_miss` went from 0.25 ns/op on the
+    pre-Sheng table walk to 2.32 when its 34-state DFA moved onto
+    Sheng-64.
+
+    `sheng_short_input` holds the per-tier bound and the measurements it
+    came from.
+    """
+    comptime cap = ml // 256
+    comptime dead = UInt8(d.num_states)
+    var msk = materialize[masks]()
+    var flg = materialize[flags]()
+    var cur = UInt8(d.start_at_0)
+    var input_len = len(input)
+    var pos = 0
+    while pos < input_len:
+        cur = msk.unsafe_get(Int(input.unsafe_get(pos)) * cap + Int(cur))
+        if cur == dead:
+            return False
+        pos += 1
+    comptime if d.any_eol_end:
+        return (
+            Int(cur) < d.num_match_states
+            or (flg.unsafe_get(Int(cur)) & EDFA_EOL_AT_END) != 0
+        )
+    else:
+        return Int(cur) < d.num_match_states
+
+
 @always_inline
 def _sheng_full_match_impl[
     origin: Origin,
@@ -229,7 +322,20 @@ def sheng_full_match[
     masks: InlineArray[UInt8, ml],
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
-    """Anchored full match (mirrors edfa_full_match)."""
+    """Anchored full match (mirrors edfa_full_match).
+
+    Three lanes, dispatched once per walk: an input too short to amortize
+    the shuffle's fixed costs walks the mask table scalar-wise
+    (`_sheng_scalar_full_match`), one too short for a vector chunk skips
+    the acceleration checks, and the rest shuffle. The first bound is per
+    tier and is 0 — no scalar lane, nothing emitted — at 16 lanes.
+    """
+    comptime short = sheng_short_input(ml // 256)
+    comptime if short > 0:
+        if len(input) < short:
+            return _sheng_scalar_full_match[d=d, masks=masks, flags=flags](
+                input
+            )
     comptime if _edfa_has_accel(d):
         comptime W = simd_width_of[DType.uint8]()
         if len(input) >= W:
