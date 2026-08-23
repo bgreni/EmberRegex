@@ -70,13 +70,11 @@ from .static_dfa import (
     pivot_first_candidate,
 )
 from .static_lfdfa import (
-    LFDFA,
     build_lf_dfa,
     lfdfa_find_end,
     sheng_lfdfa_find_end,
 )
 from .static_rdfa import (
-    RDFA,
     build_reverse_dfa,
     rdfa_find_start,
     rdfa_flags_arr,

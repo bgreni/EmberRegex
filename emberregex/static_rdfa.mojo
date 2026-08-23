@@ -120,39 +120,56 @@ struct RDFA(Copyable, Movable):
 
 
 def _rev_bol_reaches_start(
-    nfa: NFA, preds: List[List[Int]], members: List[Int], at_zero: Bool
+    kinds: List[Int],
+    anchors: List[Int],
+    pred_data: List[Int],
+    pred_off: List[Int],
+    pred_len: List[Int],
+    start: Int,
+    members: _StateBits,
+    at_zero: Bool,
 ) -> Bool:
     """Comptime: resolving the BOL anchors in this reverse set (both
     kinds at position 0, BOL_MULTILINE only after a '\\n') and walking
     their epsilon predecessors — can the pattern's entry be reached?
-    Mirrors `_bol_start_ids` for a single entry state."""
-    var n = len(nfa.states)
-    var visited = List[Bool](fill=False, length=n)
+    Mirrors `_bol_start_ids` for a single entry state, over the flat
+    views (this runs twice per reverse state; the NFA and its nested
+    predecessor lists would be copied on every call)."""
+    var n = len(kinds)
+    var visited = _StateBits(0)
     var stack = List[Int]()
-    for s in members:
-        if nfa.states[s].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[s].anchor_type
-        var holds: Bool
-        if at_zero:
-            holds = at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE
-        else:
-            holds = at == AnchorKind.BOL_MULTILINE
-        if holds:
-            stack.append(s)
+    for l in range(64):
+        var w = members[l]
+        while w != 0:
+            var s = 64 * l + Int(count_trailing_zeros(w))
+            w &= w - 1
+            if kinds.unsafe_get(s) != NFAStateKind.ANCHOR:
+                continue
+            var at = anchors.unsafe_get(s)
+            var holds: Bool
+            if at_zero:
+                holds = at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE
+            else:
+                holds = at == AnchorKind.BOL_MULTILINE
+            if holds:
+                stack.append(s)
     while len(stack) > 0:
         var s = stack.pop()
-        if s < 0 or s >= n or visited[s]:
+        if s < 0 or s >= n:
             continue
-        visited[s] = True
-        if s == nfa.start:
+        if (visited[s >> 6] >> UInt64(s & 63)) & 1 != 0:
+            continue
+        _bs_set(visited, s)
+        if s == start:
             return True
-        for p in preds[s]:
-            var pk = nfa.states[p].kind
+        var off = pred_off.unsafe_get(s)
+        for k in range(pred_len.unsafe_get(s)):
+            var p = pred_data.unsafe_get(off + k)
+            var pk = kinds.unsafe_get(p)
             if pk == NFAStateKind.SPLIT or pk == NFAStateKind.SAVE:
                 stack.append(p)
             elif pk == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[p].anchor_type
+                var at2 = anchors.unsafe_get(p)
                 var h2: Bool
                 if at_zero:
                     h2 = at2 == AnchorKind.BOL or at2 == AnchorKind.BOL_MULTILINE
@@ -373,23 +390,31 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var st_is_bol = st_kind == NFAStateKind.ANCHOR and (
         st_at == AnchorKind.BOL or st_at == AnchorKind.BOL_MULTILINE
     )
+    # BOL anchors are the only members the resolution walk starts from;
+    # a set without one (most, in most patterns) needs no walk at all.
+    var bol_bits = _StateBits(0)
+    for s in range(n):
+        if kinds.unsafe_get(s) != NFAStateKind.ANCHOR:
+            continue
+        var at = anchors.unsafe_get(s)
+        if at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE:
+            _bs_set(bol_bits, s)
     for si in range(n_sets):
         var bits = sets_bits.unsafe_get(si)
-        var members = List[Int]()
-        for l in range(64):
-            var w = bits[l]
-            while w != 0:
-                members.append(64 * l + Int(count_trailing_zeros(w)))
-                w &= w - 1
         var f = 0
         # The entry is "entered" here only if it is not itself an
         # unresolved BOL anchor (kept in the set, not walked past).
         if not st_is_bol and (bits[st >> 6] >> UInt64(st & 63)) & 1 != 0:
             f |= Int(RDFA_NORM)
-        if _rev_bol_reaches_start(nfa, preds, members, True):
-            f |= Int(RDFA_BOL0)
-        if _rev_bol_reaches_start(nfa, preds, members, False):
-            f |= Int(RDFA_BOLNL)
+        if _bs_any(bits & bol_bits):
+            if _rev_bol_reaches_start(
+                kinds, anchors, pred_data, pred_off, pred_len, st, bits, True
+            ):
+                f |= Int(RDFA_BOL0)
+            if _rev_bol_reaches_start(
+                kinds, anchors, pred_data, pred_off, pred_len, st, bits, False
+            ):
+                f |= Int(RDFA_BOLNL)
         flags.append(f)
 
     _minimize(rows, flags, starts, rep_lo, rep_hi, nclasses)
@@ -410,12 +435,16 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
         if flags[si] & (Int(RDFA_BOL0) | Int(RDFA_BOLNL)) != 0:
             continue
         var row = rows.unsafe_get(si)
+        var exit_count = 0
+        for byte in range(256):
+            if Int(row[byte]) != si:
+                exit_count += 1
+        if exit_count == 0 or exit_count == 256:
+            continue  # never exits / never self-loops: nothing to skip
         var exits = List[Int]()
         for byte in range(256):
             if Int(row[byte]) != si:
                 exits.append(byte)
-        if len(exits) == 0 or len(exits) == 256:
-            continue
         if len(exits) <= 2:
             result.accel_states.append(si)
             result.accel_exit1.append(exits[0])

@@ -13,7 +13,6 @@ newlines and bytes >= 0x80.
 
 from emberregex import Regex
 from emberregex.static_dfa import (
-    EDFA_STATE_CAP,
     EagerDFA,
     edfa_flags_arr,
     edfa_id_dtype,
@@ -21,13 +20,10 @@ from emberregex.static_dfa import (
 )
 from emberregex.static_lfdfa import (
     LF_LIST_CAP,
-    LFDFA,
     build_lf_dfa,
     lfdfa_find_end,
     lfdfa_match_at,
 )
-from emberregex.static_rdfa import build_reverse_dfa
-from std.collections import InlineArray
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 from std.time import perf_counter_ns
 
@@ -409,6 +405,48 @@ def test_anchored_lf_dfa_match_at() raises:
     # The default build carries no anchored starts.
     comptime lfu = build_lf_dfa(Regex[Q].nfa, True)
     assert_false(lfu.has_anchored)
+
+
+# 62 single-byte arms: every unanchored state carries 62 consuming
+# members, past the _LF_SIG_BITS point where the per-class member
+# bitstrings are renumbered to dense ids mid-list.
+comptime _WIDE_ALT = (
+    "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z"
+    "|A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q|R|S|T|U|V|W|X|Y|Z"
+    "|0|1|2|3|4|5|6|7|8|9"
+)
+
+
+def test_wide_list_signature_renumbering() raises:
+    # Built directly: the pattern itself is Teddy-claimed, so the engine
+    # never asks for this table, but the determinizer must still handle
+    # lists wider than the signature bitstring.
+    comptime lf = build_lf_dfa(Regex[_WIDE_ALT].nfa, True)
+    assert_true(lf.valid)
+    comptime tn = lf.d.num_states * 256
+    comptime dt = edfa_id_dtype(lf.d.num_states)
+    comptime table = edfa_table_arr[tn, dt](lf.d)
+    comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
+    var input = String("!!!!!!!!!!!!!!!!!!!!q!!")
+    var bytes = input.as_bytes()
+    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes, 0), 21)
+    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes, 21), -1)
+    var input2 = String("!!!!!!!!!!!!!!!!!!!!7!!")
+    var bytes2 = input2.as_bytes()
+    assert_equal(
+        lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 21
+    )
+    # And on the engine: a class arm keeps Teddy off, so the same lists
+    # drive search/findall through the lane.
+    comptime W = Regex[_WIDE_ALT + "|[!?]{2}"]
+    assert_true(W._strategy.use_lf_dfa)
+    var re = W()
+    var all = re.findall("??q 7!!")
+    assert_equal(len(all), 4)
+    assert_equal(all[0], "??")
+    assert_equal(all[1], "q")
+    assert_equal(all[2], "7")
+    assert_equal(all[3], "!!")
 
 
 def test_list_cap_overflow_stays_off_lane() raises:

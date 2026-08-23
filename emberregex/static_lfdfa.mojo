@@ -44,7 +44,7 @@ is built once per distinct behaviour rather than once per class.
 Continuation closures are memoized per target state in one flat pool.
 """
 
-from std.bit import count_trailing_zeros
+from std.bit import count_leading_zeros, count_trailing_zeros
 from std.collections import InlineArray
 
 from .ast import AnchorKind
@@ -60,8 +60,8 @@ from .static_dfa import (
     EagerDFA,
     _BIT64,
     _StateBits,
-    _bs_eq,
     _bs_set,
+    _lane_word,
     _byte_classes,
     _edfa_finish,
     _flatten_nfa,
@@ -69,16 +69,30 @@ from .static_dfa import (
 )
 from .sheng import sheng_walk_from
 
-# Longest ordered list a DFA state may hold. A state with more threads
-# than this (only the big Unicode classes get near it) leaves the pattern
-# off the leftmost-first lane rather than overrunning the vector.
+# Lanes of a state's ordered-list vector. The last two lanes are the
+# tail-kind and restart markers, so a state holds at most LF_LIST_CAP - 2
+# threads; more than that (only the big Unicode classes get near it)
+# leaves the pattern off the leftmost-first lane rather than overrunning
+# the vector.
 comptime LF_LIST_CAP = 512
 comptime _LFList = SIMD[DType.int16, LF_LIST_CAP]
+comptime _LF_TAIL_LANE = LF_LIST_CAP - 1
+comptime _LF_RESTART_LANE = LF_LIST_CAP - 2
+comptime _LF_MAX_MEMBERS = LF_LIST_CAP - 2
 
-# Consuming members folded into a class bitstring before it is renumbered
-# to dense ids (8 bits suffice for <= 256 classes), so the 64-bit lane
-# never overflows.
+# Memoized closure chunk: up to _LF_CLO_ELEMS elements in lanes, the
+# count in the last lane. One List read per closure instead of one per
+# element; longer closures read from the flat pool.
+comptime _LF_CLO_W = 64
+comptime _LF_CLO_ELEMS = _LF_CLO_W - 1
+comptime _LFClo = SIMD[DType.int16, _LF_CLO_W]
+
+# Consuming members folded into a class signature word before it is
+# renumbered to dense ids (8 bits suffice for <= 256 classes), so the
+# 64-bit lane never overflows. Below this the word doubles as the exact
+# per-member acceptance bitstring.
 comptime _LF_SIG_BITS = 56
+
 
 
 struct LFDFA(Copyable, Movable):
@@ -174,6 +188,8 @@ def _lf_salt(pos: Int) -> UInt64:
 
 
 comptime _LF_RESTART_SALT: UInt64 = 0xC2B2AE3D27D4EB4F
+comptime _LF_TAIL_SALT_O: UInt64 = 0x165667B19E3779F9
+comptime _LF_TAIL_SALT_N: UInt64 = 0x27D4EB2F165667C5
 
 
 def _mk_iota64() -> SIMD[DType.uint64, 64]:
@@ -186,6 +202,35 @@ def _mk_iota64() -> SIMD[DType.uint64, 64]:
 comptime _IOTA64 = _mk_iota64()
 
 
+def _lf_memo_closure(
+    kinds: List[Int],
+    out1s: List[Int],
+    out2s: List[Int],
+    anchors: List[Int],
+    t: Int,
+    after_newline: Bool,
+    mut pool: List[Int],
+    mut clo_vec: List[_LFClo],
+    mut clo_off: List[Int],
+) -> Int:
+    """Memoize the ordered closure of `t` (mid-line or after-'\\n'
+    context) as a chunk: elements in lanes when they fit, the count in
+    the last lane, the pool offset recorded for the long case. Returns
+    the slot index."""
+    var off = len(pool)
+    var cnt = _lf_closure(
+        kinds, out1s, out2s, anchors, t, False, after_newline, pool
+    )
+    var cv = _LFClo(-1)
+    if cnt <= _LF_CLO_ELEMS:
+        for k in range(cnt):
+            cv[k] = Int16(pool[off + k])
+    cv[_LF_CLO_W - 1] = Int16(cnt)
+    clo_vec.append(cv)
+    clo_off.append(off)
+    return len(clo_vec) - 1
+
+
 def build_lf_dfa(
     nfa: NFA,
     enabled: Bool,
@@ -196,8 +241,8 @@ def build_lf_dfa(
 
     Returns an invalid placeholder when `enabled` is False, when the NFA
     cannot be bitset-indexed, when some state's ordered list would exceed
-    LF_LIST_CAP, or when the state count exceeds EDFA_STATE_CAP (callers
-    then use the lazy DFA, or the backtracker for lazy patterns).
+    the lane capacity, or when the state count exceeds EDFA_STATE_CAP
+    (callers then use the lazy DFA, or the backtracker for lazy patterns).
 
     Start contexts: the three unanchored ones (restart bit set) always;
     the three anchored ones (restart clear) when `anchored` is set. The
@@ -205,14 +250,26 @@ def build_lf_dfa(
     non-empty — for a `^`-anchored pattern nothing can start mid-input,
     so its unanchored states are its anchored states.
 
+    Data layout, for the comptime interpreter (see the module docstring):
+    a state is stored as the THREAD-derived part of its ordered list in
+    one `_LFList` vector plus two marker lanes — the restart bit and the
+    "tail kind". The restart tail appended on the last transition is the
+    context's start closure minus the members already present, a pure
+    function of (list, context), so it never needs storing or appending:
+    it is materialized into lanes only when the state is expanded, and
+    the vector compare with the markers is the whole identity test.
+    Memoized closures are `_LFClo` chunks (one List read per closure,
+    elements in lanes) with a flat pool behind them for the rare long
+    closure, and while a state has at most _LF_SIG_BITS consuming
+    members, "does member k accept class c" is a bit of the class's
+    signature word rather than a List read.
+
     `minimize` is a test hook, as in `build_eager_dfa`.
     """
     var result = LFDFA()
     if not enabled:
         return result^
     var n = len(nfa.states)
-    # Bit `n` of a state's bitset is the restart marker, so the NFA needs
-    # one spare bit below the bitset capacity.
     if n >= EDFA_NFA_CAP:
         return result^
 
@@ -270,30 +327,63 @@ def build_lf_dfa(
         ):
             _bs_set(eol_nl_ok, s)
 
-    # --- Ordered closures, memoized per target state in one flat pool. ---
+    # --- Ordered closures, memoized per (target, context) as chunks. ---
     var pool = List[Int]()
-    var coff_o = List[Int](fill=-1, length=n)
-    var clen_o = List[Int](fill=0, length=n)
-    var coff_n = List[Int](fill=-1, length=n)
-    var clen_n = List[Int](fill=0, length=n)
+    var clo_vec = List[_LFClo]()
+    var clo_off = List[Int]()
+    var cslot_o = List[Int](fill=-1, length=n)
+    var cslot_n = List[Int](fill=-1, length=n)
 
-    # The restart closures (mid-line / after '\n').
-    var r_off_o = len(pool)
-    var r_len_o = _lf_closure(
-        kinds, out1s, out2s, anchors, nfa.start, False, False, pool
-    )
-    var r_off_n = len(pool)
-    var r_len_n = _lf_closure(
-        kinds, out1s, out2s, anchors, nfa.start, False, True, pool
-    )
+    # The restart closures (mid-line / after '\n') as lane vectors, with
+    # their flag bytes and whether they end in MATCH.
+    var rv_o = _LFList(-1)
+    var rv_n = _LFList(-1)
+    var r_len_o = 0
+    var r_len_n = 0
+    var r_fl_o = 0
+    var r_fl_n = 0
+    var r_trunc_o = False
+    var r_trunc_n = False
+    for ctx in range(2):
+        var off = len(pool)
+        var cnt = _lf_closure(
+            kinds, out1s, out2s, anchors, nfa.start, False, ctx == 1, pool
+        )
+        if cnt > _LF_MAX_MEMBERS:
+            return result^
+        var fl = 0
+        var tr = False
+        for k in range(cnt):
+            var x = pool.unsafe_get(off + k)
+            if ctx == 1:
+                rv_n[k] = Int16(x)
+            else:
+                rv_o[k] = Int16(x)
+            if (match_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
+                fl |= Int(EDFA_MATCH)
+                tr = True
+            elif (eol_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
+                if (eol_end_ok[x >> 6] >> UInt64(x & 63)) & 1 != 0:
+                    fl |= Int(EDFA_EOL_AT_END)
+                if (eol_nl_ok[x >> 6] >> UInt64(x & 63)) & 1 != 0:
+                    fl |= Int(EDFA_EOL_AT_NEWLINE)
+        if ctx == 1:
+            r_len_n = cnt
+            r_fl_n = fl
+            r_trunc_n = tr
+        else:
+            r_len_o = cnt
+            r_fl_o = fl
+            r_trunc_o = tr
     var has_restart = r_len_o > 0 or r_len_n > 0
-    var restart_bit = n
 
-    # --- State store. ---
+    # --- State store: the thread-derived list per state with the markers
+    # in its last lanes, order-sensitive hashes in lanes, flags, and the
+    # scalars the expansion needs again. ---
     var st_list = List[_LFList]()
-    var st_bits = List[_StateBits]()
     var st_len = List[Int]()
     var st_restart = List[Bool]()
+    var st_tail = List[Int]()
     var flags = List[Int]()
     var hashv = SIMD[DType.uint64, 256](0)
 
@@ -314,17 +404,15 @@ def build_lf_dfa(
             ctx >= 1,
             pool,
         )
-        if cnt > LF_LIST_CAP:
+        if cnt > _LF_MAX_MEMBERS:
             return result^
         var acc = _LFList(-1)
-        var acc_bits = _StateBits(0)
         var acc_h = UInt64(0)
         var acc_fl = 0
         var trunc = False
         for i in range(cnt):
             var x = pool.unsafe_get(off + i)
             acc[i] = Int16(x)
-            _bs_set(acc_bits, x)
             acc_h += UInt64(x + 1) * _lf_salt(i)
             if (match_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
                 acc_fl |= Int(EDFA_MATCH)
@@ -335,27 +423,39 @@ def build_lf_dfa(
                 if (eol_nl_ok[x >> 6] >> UInt64(x & 63)) & 1 != 0:
                     acc_fl |= Int(EDFA_EOL_AT_NEWLINE)
         var new_restart = with_restart and not trunc
+        acc[_LF_TAIL_LANE] = 0
+        acc[_LF_RESTART_LANE] = 1 if new_restart else 0
         if new_restart:
-            _bs_set(acc_bits, restart_bit)
             acc_h ^= _LF_RESTART_SALT
         var found = -1
-        for s in range(len(st_list)):
-            if hashv[s] != acc_h:
-                continue
-            if not _bs_eq(st_bits.unsafe_get(s), acc_bits):
-                continue
-            if st_len.unsafe_get(s) != cnt:
-                continue
-            if ((st_list.unsafe_get(s) ^ acc).reduce_or()) == 0:
-                found = s
+        var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
+        for j in range(4):
+            if found >= 0:
                 break
+            var word: UInt64
+            if j == 0:
+                word = _lane_word(eqm.slice[64, offset=0]())
+            elif j == 1:
+                word = _lane_word(eqm.slice[64, offset=64]())
+            elif j == 2:
+                word = _lane_word(eqm.slice[64, offset=128]())
+            else:
+                word = _lane_word(eqm.slice[64, offset=192]())
+            while word != 0:
+                var cand = 64 * j + Int(count_trailing_zeros(word))
+                word &= word - 1
+                if cand >= len(st_list):
+                    break
+                if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
+                    found = cand
+                    break
         if found < 0:
             found = len(st_list)
             hashv[found] = acc_h
             st_list.append(acc)
-            st_bits.append(acc_bits)
             st_len.append(cnt)
             st_restart.append(new_restart)
+            st_tail.append(0)
             flags.append(acc_fl)
         starts.append(found)
 
@@ -368,29 +468,75 @@ def build_lf_dfa(
         var lv = st_list.unsafe_get(cur)
         var llen = st_len.unsafe_get(cur)
         var lrestart = st_restart.unsafe_get(cur)
+        var ltail = st_tail.unsafe_get(cur)
 
-        # Per-position accepted-class words (lane reads in the group
-        # pass instead of List reads), and per-class member bitstrings:
+        # Materialize the restart tail: the tail context's start closure
+        # minus what the thread-derived list already holds, in closure
+        # order, after it.
+        if ltail > 0:
+            var lbits = _StateBits(0)
+            for i in range(llen):
+                _bs_set(lbits, Int(lv[i]))
+            var rlen = r_len_n if ltail == 2 else r_len_o
+            for k in range(rlen):
+                var x = Int(rv_n[k]) if ltail == 2 else Int(rv_o[k])
+                if (lbits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
+                    continue
+                if llen >= _LF_MAX_MEMBERS:
+                    return result^
+                lv[llen] = Int16(x)
+                llen += 1
+
+        # Per-position prep: consuming index (or -1), memoized closure
+        # slots for both contexts, and the per-class signature words —
         # lane ci of grp[w] is, over the consuming members in order, 1
-        # where the member accepts class 64*w + ci.
-        var cmw0 = SIMD[DType.uint64, LF_LIST_CAP](0)
-        var cmw1 = SIMD[DType.uint64, LF_LIST_CAP](0)
-        var cmw2 = SIMD[DType.uint64, LF_LIST_CAP](0)
-        var cmw3 = SIMD[DType.uint64, LF_LIST_CAP](0)
+        # where the member accepts class 64*w + ci. Exact while the
+        # member count fits the word; past _LF_SIG_BITS the words are
+        # renumbered to dense ids (still an exact grouping key) and
+        # acceptance falls back to the class-mask List.
+        var cidx = SIMD[DType.int16, LF_LIST_CAP](-1)
+        var cpos = SIMD[DType.int16, 64](-1)  # consuming index -> position
+        var slot_o = SIMD[DType.int32, LF_LIST_CAP](-1)
+        var slot_n = SIMD[DType.int32, LF_LIST_CAP](-1)
         var grp0 = SIMD[DType.uint64, 64](0)
         var grp1 = SIMD[DType.uint64, 64](0)
         var grp2 = SIMD[DType.uint64, 64](0)
         var grp3 = SIMD[DType.uint64, 64](0)
+        var first_eol_nl_pos = llen  # first pending EOL_MULTILINE that resolves
+        var ncons = 0
         var nbits = 0
+        var fast = True
         for i in range(llen):
             var s = Int(lv[i])
             if (consuming_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
+                if (
+                    first_eol_nl_pos == llen
+                    and (eol_nl_ok[s >> 6] >> UInt64(s & 63)) & 1 != 0
+                ):
+                    first_eol_nl_pos = i
                 continue
+            var t = out1s.unsafe_get(s)
+            if t >= 0:
+                var so = cslot_o.unsafe_get(t)
+                if so < 0:
+                    so = _lf_memo_closure(
+                        kinds, out1s, out2s, anchors, t, False, pool, clo_vec, clo_off
+                    )
+                    cslot_o[t] = so
+                slot_o[i] = Int32(so)
+                if has_bol_ml:
+                    var sn = cslot_n.unsafe_get(t)
+                    if sn < 0:
+                        sn = _lf_memo_closure(
+                            kinds, out1s, out2s, anchors, t, True, pool, clo_vec, clo_off
+                        )
+                        cslot_n[t] = sn
+                    slot_n[i] = Int32(sn)
+            cidx[i] = Int16(ncons)
+            if ncons < 64:
+                cpos[ncons] = Int16(i)
+            ncons += 1
             var cm = cls_mask.unsafe_get(s)
-            cmw0[i] = cm[0]
-            cmw1[i] = cm[1]
-            cmw2[i] = cm[2]
-            cmw3[i] = cm[3]
             grp0 = (grp0 << 1) | (
                 (SIMD[DType.uint64, 64](cm[0]) & _BIT64) >> _IOTA64
             )
@@ -408,7 +554,7 @@ def build_lf_dfa(
                 )
             nbits += 1
             if nbits >= _LF_SIG_BITS:
-                # Renumber to dense ids so the bitstring never overflows.
+                fast = False
                 var keys = SIMD[DType.uint64, 256](0)
                 var nkeys = 0
                 for ci in range(nclasses):
@@ -442,7 +588,7 @@ def build_lf_dfa(
                         grp3[l] = UInt64(id)
                 nbits = 8
 
-        # Group the classes by bitstring; '\n' always stands alone (its
+        # Group the classes by signature; '\n' always stands alone (its
         # context resolves BOL_MULTILINE and pending EOL_MULTILINE).
         var gkeys = SIMD[DType.uint64, 256](0)
         var grep = SIMD[DType.int32, 256](-1)  # representative class
@@ -484,6 +630,15 @@ def build_lf_dfa(
             var after_nl = rc == nl_class
             var rcw = rc >> 6
             var rcb = UInt64(rc & 63)
+            var sig: UInt64
+            if rcw == 0:
+                sig = grp0[rc & 63]
+            elif rcw == 1:
+                sig = grp1[rc & 63]
+            elif rcw == 2:
+                sig = grp2[rc & 63]
+            else:
+                sig = grp3[rc & 63]
             var acc = _LFList(-1)
             var acc_bits = _StateBits(0)
             var acc_len = 0
@@ -491,90 +646,79 @@ def build_lf_dfa(
             var acc_fl = 0
             var trunc = False
             var overflow = False
-            for i in range(llen):
-                if trunc:
-                    break
-                var s = Int(lv[i])
-                var accepts: Bool
-                if rcw == 0:
-                    accepts = (cmw0[i] >> rcb) & 1 != 0
-                elif rcw == 1:
-                    accepts = (cmw1[i] >> rcb) & 1 != 0
-                elif rcw == 2:
-                    accepts = (cmw2[i] >> rcb) & 1 != 0
-                else:
-                    accepts = (cmw3[i] >> rcb) & 1 != 0
-                if accepts:
-                    var t = out1s.unsafe_get(s)
-                    if t < 0:
-                        continue  # dangling out — accepts into nothing
-                    var off: Int
-                    var cnt: Int
-                    if after_nl and has_bol_ml:
-                        off = coff_n.unsafe_get(t)
-                        if off < 0:
-                            off = len(pool)
-                            cnt = _lf_closure(
-                                kinds, out1s, out2s, anchors, t, False, True, pool
-                            )
-                            coff_n[t] = off
-                            clen_n[t] = cnt
-                        else:
-                            cnt = clen_n.unsafe_get(t)
+            # Walk the members in priority order — on the fast path only
+            # those the signature says accept `rc`, highest bit (first
+            # member) first — and append each one's closure.
+            var bits = sig
+            var step = 0
+            while not trunc:
+                var i = -1
+                var ended = False
+                if fast:
+                    if bits == 0:
+                        ended = True
                     else:
-                        off = coff_o.unsafe_get(t)
-                        if off < 0:
-                            off = len(pool)
-                            cnt = _lf_closure(
-                                kinds, out1s, out2s, anchors, t, False, False, pool
-                            )
-                            coff_o[t] = off
-                            clen_o[t] = cnt
-                        else:
-                            cnt = clen_o.unsafe_get(t)
-                    for k in range(cnt):
-                        var x = pool.unsafe_get(off + k)
-                        if (acc_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
-                            continue
-                        if acc_len >= LF_LIST_CAP:
-                            overflow = True
-                            break
-                        _bs_set(acc_bits, x)
-                        acc[acc_len] = Int16(x)
-                        acc_h += UInt64(x + 1) * _lf_salt(acc_len)
-                        acc_len += 1
-                        if (match_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
-                            acc_fl |= Int(EDFA_MATCH)
+                        var top = 63 - Int(count_leading_zeros(bits))
+                        bits &= ~(UInt64(1) << UInt64(top))
+                        i = Int(cpos[ncons - 1 - top])
+                        if after_nl and i > first_eol_nl_pos:
+                            ended = True  # below the resolving EOL
+                elif step >= llen:
+                    ended = True
+                else:
+                    i = step
+                    step += 1
+                    var s = Int(lv[i])
+                    var k = Int(cidx[i])
+                    if k >= 0:
+                        var cm = cls_mask.unsafe_get(s)
+                        if (cm[rcw] >> rcb) & 1 == 0:
+                            i = -1
+                    else:
+                        i = -1
+                        if (match_bits[s >> 6] >> UInt64(s & 63)) & 1 != 0:
+                            # A thread matched at the current position:
+                            # nothing below it continues.
                             trunc = True
-                            break
-                        elif (eol_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
-                            if (eol_end_ok[x >> 6] >> UInt64(x & 63)) & 1 != 0:
-                                acc_fl |= Int(EDFA_EOL_AT_END)
-                            if (eol_nl_ok[x >> 6] >> UInt64(x & 63)) & 1 != 0:
-                                acc_fl |= Int(EDFA_EOL_AT_NEWLINE)
-                    if overflow:
-                        break
-                elif (match_bits[s >> 6] >> UInt64(s & 63)) & 1 != 0:
-                    # A thread matched at the current position: nothing
-                    # below it may continue (its own list already ends
-                    # here, this just keeps the restart off).
-                    trunc = True
-                elif after_nl and (eol_nl_ok[s >> 6] >> UInt64(s & 63)) & 1 != 0:
-                    # Pending EOL_MULTILINE resolving at this '\n': its
-                    # continuation reaches MATCH without consuming (the
-                    # walker recorded the end via EDFA_EOL_AT_NEWLINE),
-                    # so everything below it is dropped.
-                    trunc = True
-            if overflow:
-                return result^
-            if lrestart and not trunc:
-                var off = r_off_n if after_nl else r_off_o
-                var cnt = r_len_n if after_nl else r_len_o
+                        elif (
+                            after_nl
+                            and (eol_nl_ok[s >> 6] >> UInt64(s & 63)) & 1
+                            != 0
+                        ):
+                            # Pending EOL_MULTILINE resolving at this
+                            # '\n': its continuation reaches MATCH
+                            # without consuming (the walker recorded the
+                            # end via EDFA_EOL_AT_NEWLINE), so everything
+                            # below it is dropped.
+                            trunc = True
+                if ended:
+                    if fast and after_nl and first_eol_nl_pos < llen:
+                        trunc = True
+                    break
+                if i < 0:
+                    continue
+                var slot: Int
+                if after_nl and has_bol_ml:
+                    slot = Int(slot_n[i])
+                else:
+                    slot = Int(slot_o[i])
+                if slot < 0:
+                    continue
+                var cv = clo_vec.unsafe_get(slot)
+                var cnt = Int(cv[_LF_CLO_W - 1])
+                var in_lanes = cnt <= _LF_CLO_ELEMS
+                var off = 0
+                if not in_lanes:
+                    off = clo_off.unsafe_get(slot)
                 for k in range(cnt):
-                    var x = pool.unsafe_get(off + k)
+                    var x: Int
+                    if in_lanes:
+                        x = Int(cv[k])
+                    else:
+                        x = pool.unsafe_get(off + k)
                     if (acc_bits[x >> 6] >> UInt64(x & 63)) & 1 != 0:
                         continue
-                    if acc_len >= LF_LIST_CAP:
+                    if acc_len >= _LF_MAX_MEMBERS:
                         overflow = True
                         break
                     _bs_set(acc_bits, x)
@@ -592,32 +736,57 @@ def build_lf_dfa(
                             acc_fl |= Int(EDFA_EOL_AT_NEWLINE)
                 if overflow:
                     return result^
+            # The restart tail (lowest priority) when the state restarts
+            # and nothing truncated: recorded as a kind, never appended.
+            var tail = 0
+            if lrestart and not trunc:
+                tail = 2 if after_nl else 1
+                acc_fl |= r_fl_n if after_nl else r_fl_o
+                var rtr = r_trunc_n if after_nl else r_trunc_o
+                if rtr:
+                    trunc = True
             var new_restart = lrestart and not trunc
             if acc_len == 0 and not new_restart:
                 continue  # dead transition: the group's lanes stay -1
+            acc[_LF_TAIL_LANE] = Int16(tail)
+            acc[_LF_RESTART_LANE] = 1 if new_restart else 0
+            if tail == 1:
+                acc_h ^= _LF_TAIL_SALT_O
+            elif tail == 2:
+                acc_h ^= _LF_TAIL_SALT_N
             if new_restart:
-                _bs_set(acc_bits, restart_bit)
                 acc_h ^= _LF_RESTART_SALT
             var found = -1
-            for s in range(len(st_list)):
-                if hashv[s] != acc_h:
-                    continue
-                if not _bs_eq(st_bits.unsafe_get(s), acc_bits):
-                    continue
-                if st_len.unsafe_get(s) != acc_len:
-                    continue
-                if ((st_list.unsafe_get(s) ^ acc).reduce_or()) == 0:
-                    found = s
+            var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
+            for j in range(4):
+                if found >= 0:
                     break
+                var word: UInt64
+                if j == 0:
+                    word = _lane_word(eqm.slice[64, offset=0]())
+                elif j == 1:
+                    word = _lane_word(eqm.slice[64, offset=64]())
+                elif j == 2:
+                    word = _lane_word(eqm.slice[64, offset=128]())
+                else:
+                    word = _lane_word(eqm.slice[64, offset=192]())
+                while word != 0:
+                    var cand = 64 * j + Int(count_trailing_zeros(word))
+                    word &= word - 1
+                    if cand >= len(st_list):
+                        break
+                    if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
+                        found = cand
+                        break
             if found < 0:
                 if len(st_list) >= EDFA_STATE_CAP + 1:
                     return result^  # state blowup: stay invalid
                 found = len(st_list)
                 hashv[found] = acc_h
                 st_list.append(acc)
-                st_bits.append(acc_bits)
                 st_len.append(acc_len)
                 st_restart.append(new_restart)
+                st_tail.append(tail)
                 flags.append(acc_fl)
             for ci in range(nclasses):
                 if Int(cls_group[ci]) != g:
