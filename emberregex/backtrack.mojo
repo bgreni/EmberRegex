@@ -714,7 +714,11 @@ def sbt_stack_here() -> Int:
     went from ~2.2 KB per byte to ~4.4 KB.
     """
     return Int(
-        llvm_intrinsic["llvm.stacksave.p0", Pointer[UInt8, ImmStaticOrigin]]()
+        llvm_intrinsic[
+            "llvm.stacksave.p0",
+            Pointer[UInt8, ImmStaticOrigin],
+            has_side_effect=False,
+        ]()
     )
 
 
