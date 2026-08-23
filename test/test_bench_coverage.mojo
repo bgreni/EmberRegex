@@ -7,6 +7,7 @@ meaningless numbers. When you add a new bench, add a corresponding test here.
 """
 
 from emberregex import Regex
+from emberregex.simd_kernels import HAS_WIDE_BYTE_SHUFFLE
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -280,6 +281,37 @@ def test_bench_alternation_4_search_2KB() raises:
     assert_equal(r.end, input.byte_length())
     assert_equal(r.start, input.byte_length() - 5)
     assert_false(re.search(lines).matched)
+
+
+def test_bench_sheng64_alt_32_search_2KB() raises:
+    # Mirrors bench_sheng64_alt_32_search_2KB: the 44-state DFA must ride
+    # the 64-lane Sheng tier (that is what the row measures), the haystack
+    # must contain exactly the one intended match, and it must be at the
+    # very end so the row times a full scan.
+    comptime P = (
+        "cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+        "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap"
+        "|[0-9]{3}"
+    )
+    comptime S = Regex[P]
+    assert_false(S._strategy.use_teddy)
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+        assert_equal(S._SHENG_CAP, 64)
+    var re = S()
+    var lines = String("")
+    for i in range(80):
+        if i > 0:
+            lines += "\n"
+        lines += "line " + String(i) + " some text here"
+    var input = lines + " tap"
+    assert_true(input.byte_length() > 1500)
+    assert_false(re.search(lines).matched)
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, input.byte_length() - 3)
+    assert_equal(r.end, input.byte_length())
+    assert_equal(len(re.findall(input)), 1)
 
 
 def test_bench_alternation_16() raises:

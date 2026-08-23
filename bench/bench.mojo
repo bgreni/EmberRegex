@@ -1354,6 +1354,34 @@ def bench_alternation_16(mut b: Bench) raises:
     b.bench_function[go](BenchId("alternation_16"))
 
 
+# 32-arm alternation with a class arm so Teddy can't claim it: 44 DFA
+# states, i.e. past the 16-lane shuffle tier and onto the 64-lane one
+# (Sheng tbl4) where it used to fall back to the eager table walk.
+comptime SHENG64_ALT_32 = (
+    "cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+    "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap|[0-9]{3}"
+)
+
+
+def bench_sheng64_alt_32_search_2KB(mut b: Bench) raises:
+    var re = Regex[SHENG64_ALT_32]()
+    var input = make_lines(80) + " tap"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("sheng64_alt_32_search_2KB"))
+
+
 def bench_alternation_miss(mut b: Bench) raises:
     var re = Regex[
         "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
@@ -2042,6 +2070,7 @@ def main() raises:
     bench_alternation_4(b)
     bench_alternation_4_search_2KB(b)
     bench_alternation_16(b)
+    bench_sheng64_alt_32_search_2KB(b)
     bench_alternation_miss(b)
 
     # Findall scaling
