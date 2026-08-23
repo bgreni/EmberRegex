@@ -1039,12 +1039,16 @@ struct Regex[pattern: String](Copyable, Movable):
     )
     # Reverse-suffix / reverse-inner required literal (Rust regex's
     # ReverseSuffix/ReverseInner, effects (a)+(b) — see _lf_next_match's
-    # docstring). Only worth a memmem when no candidate scanner exists:
-    # the filter prefix and the Teddy alternation prefix are
-    # start-anchored and at least as selective. The pivot prefilter may
-    # coexist — the literal test runs first, and the pivot then scans a
-    # region the literal has vouched for. The `and` chain elaborates the
-    # extraction only for LF-lane patterns without a scanner.
+    # docstring). Only used when no candidate scanner exists: the filter
+    # prefix and the Teddy alternation prefix are start-anchored, so
+    # their candidate scan already bounds the work per position, and a
+    # second memmem was not worth its extra pass in the shapes measured
+    # (a 1-byte prefix CAN be less selective than the literal — running
+    # both is the unmeasured alternative, not a soundness question). The
+    # pivot prefilter may coexist — the literal test runs first, and the
+    # pivot then scans a region the literal has vouched for. The `and`
+    # chain elaborates the extraction only for LF-lane patterns without
+    # a scanner.
     comptime _inner_lit = extract_inner_literal(Self.nfa)
     comptime _use_rev_literal = (
         Self._use_lf_lane
@@ -1445,6 +1449,13 @@ struct Regex[pattern: String](Copyable, Movable):
         failed attempt alive, at top priority, until it dies), so the
         lane stays linear where the old per-candidate loop was
         quadratic. One attempt per call, never one per candidate.
+
+        Ahead of everything, `_use_rev_literal` patterns run the
+        required-literal prefilter: no occurrence of the inner literal at
+        or after `pos + min_offset` answers the call outright with
+        (-1, -1) — no candidates, no scan — and with a comptime-bounded
+        pre-literal gap the whole candidate pipeline starts at
+        `lit_pos - max_offset` (see the block below).
 
         The backtracker attempt is speculative: it gets
         LF_SBT_ATTEMPT_BUDGET steps, and running out decides nothing —

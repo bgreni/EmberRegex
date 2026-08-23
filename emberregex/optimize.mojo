@@ -648,8 +648,10 @@ struct InnerLiteral(Copyable, Movable):
     (extract_literal_prefix / extract_filter_prefix / extract_alt_prefix).
 
     `is_suffix` marks a run that ends every match (no bytes are consumed
-    after it). `valid` requires a run of >= 2 bytes: a single required
-    byte is already covered by extract_required_byte.
+    after it); it is extracted and pinned but unused by the engine until
+    a suffix end-window verifier (effect (c)) exists. `valid` requires a
+    run of >= 2 bytes: a single required byte is already covered by
+    extract_required_byte.
 
     The engine uses this as a prefilter (Rust regex's ReverseSuffix /
     ReverseInner, effects (a)+(b)): no occurrence of `bytes` at or after

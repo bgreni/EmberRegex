@@ -76,7 +76,10 @@ def test_extraction_inner_run() raises:
 
 
 def test_extraction_alternation_gap() raises:
-    # Both arms consume exactly 3 bytes: the gap is bounded (effect (b)).
+    # EXTRACTION pins only: at the engine level these literal
+    # alternations are Teddy-owned (see test_strategy_on_for_bounded_gap
+    # for the shapes that actually run effect (b)).
+    # Both arms consume exactly 3 bytes: the gap is bounded.
     _assert_inner["(foo|bar)\\.txt", ".txt", 3, 3, True]()
     _assert_inner["(?:foo|bar)\\.txt", ".txt", 3, 3, True]()
     # Arms of different lengths: min 1, max 2; trailing charset means the
@@ -88,6 +91,17 @@ def test_extraction_alternation_gap() raises:
     # a single required byte is `required_byte`'s territory, not a
     # literal worth a memmem.
     _assert_no_inner["(foo|bar)x"]()
+
+
+def test_extraction_bounded_counted_gap() raises:
+    # {m,n} compiles to required copies + a ?-ladder; the ladder's splits
+    # compose min/max through the alternation walk. These four shapes
+    # also HOLD the strategy at the engine level (unlike the literal
+    # alternations above) — they are the effect-(b) test fleet.
+    _assert_inner["[ab]{0,3}foo", "foo", 0, 3, True]()
+    _assert_inner["[0-9]{2,5}xy", "xy", 2, 5, True]()
+    _assert_inner[".{0,2}foo", "foo", 0, 2, True]()
+    _assert_inner["[ab]?[cd]?foo", "foo", 0, 2, True]()
 
 
 def test_extraction_rejects_prefix_and_short_runs() raises:
@@ -150,6 +164,26 @@ def test_strategy_on_for_capture_lane() raises:
     comptime S = Regex["(\\w+)@(\\w+)\\.com"]
     assert_true(S._use_dfa_span)
     assert_true(S._use_rev_literal)
+
+
+def test_strategy_on_for_bounded_gap() raises:
+    # The effect-(b) lane: a bounded max_offset AND the strategy held.
+    # Pinned so the scan-start skip cannot silently lose its coverage
+    # again (the review found every bounded-gap test pattern was
+    # Teddy-owned and never reached the skip).
+    comptime A = Regex["[ab]{0,3}foo"]
+    assert_true(A._use_rev_literal)
+    assert_equal(A._inner_lit.max_offset, 3)
+    comptime B = Regex["[0-9]{2,5}xy"]
+    assert_true(B._use_rev_literal)
+    assert_equal(B._inner_lit.max_offset, 5)
+    assert_true(Regex[".{0,2}foo"]._use_rev_literal)
+    assert_true(Regex["[ab]?[cd]?foo"]._use_rev_literal)
+    # Controls: same bounded extraction, but the whole pattern is a
+    # literal alternation Teddy claims — off-lane, no strategy.
+    assert_false(Regex["(?:foo|bar)\\.txt"]._use_rev_literal)
+    assert_false(Regex["(?:a|bb|ccc)\\.txt"]._use_rev_literal)
+    assert_false(Regex["(a|bb)cde[0-9]"]._use_rev_literal)
 
 
 def test_strategy_off_when_a_scanner_exists() raises:
@@ -289,9 +323,17 @@ def test_literal_occurrence_outside_any_match() raises:
     _agree["\\d+\\.txt"]("abc.txt", "letters before .txt")
     _agree["\\d+\\.txt"](".txt", ".txt alone")
     _agree["\\d+\\.txt"]("a.txt 9.txt b.txt", "mixed hits and misses")
-    # The pre-pos occurrence is skipped; the match later is found.
-    _agree["(foo|bar)\\.txt"]("xx.txt foo.txt", "early false literal")
-    _agree["(foo|bar)\\.txt"]("fo.txt bar.txt", "almost-arm literal")
+    # Bounded-gap (effect (b)) patterns with literal occurrences the
+    # skip must step over or land on — strategy pinned ON.
+    assert_true(Regex["[0-9]{2,5}xy"]._use_rev_literal)
+    _agree["[0-9]{2,5}xy"]("xy 1xy 12xy", "bare and short xy")
+    _agree["[0-9]{2,5}xy"]("axy bxy 123xy xy", "letters before xy")
+    assert_true(Regex["[ab]{0,3}foo"]._use_rev_literal)
+    _agree["[ab]{0,3}foo"]("zzfoo abfoo", "non-class bytes before foo")
+    # Off-lane control (Teddy owns the literal alternation): same input
+    # shape, different engine, same answers.
+    assert_false(Regex["(foo|bar)\\.txt"]._use_rev_literal)
+    _agree["(foo|bar)\\.txt"]("xx.txt foo.txt", "control: early false literal")
 
 
 def test_matches_at_edges_and_adjacent() raises:
@@ -332,16 +374,41 @@ def test_long_gap_stays_linear() raises:
 
 
 def test_bounded_gap_skip_finds_leftmost() raises:
-    # Effect (b): the scan start moves to lit_pos - max_offset. The
-    # leftmost match must survive the skip.
-    var re = Regex["(foo|bar)\\.txt"]()
-    var input = String("..txt ") * 30 + "foo.txt bar.txt"
+    # Effect (b): the candidate pipeline starts at lit_pos - max_offset.
+    # The pattern must actually HOLD the strategy (an earlier version
+    # used a Teddy-owned alternation here and never reached the skip).
+    comptime S = Regex["[0-9]{2,5}xy"]
+    assert_true(S._use_rev_literal)
+    assert_equal(S._inner_lit.max_offset, 5)
+    var re = S()
+    # A bare "xy" (never a match: no digits before it) every 6 bytes,
+    # then real matches: every _lf_next_match call skips ahead of a
+    # false literal occurrence and must still report the leftmost match.
+    var input = String("xy ab ") * 30 + "12345xy 99xy tail"
     var spans = re.finditer(input)
     var exp = re._pike_finditer(input)
     assert_equal(len(spans), len(exp))
     for i in range(len(spans)):
         assert_equal(spans[i].start, exp[i].start)
         assert_equal(spans[i].end, exp[i].end)
+    # A match whose start is EXACTLY lit_pos - max_offset survives the
+    # skip landing right on it.
+    var edge = String("......") + "12345xy"
+    var r = re.search(edge)
+    assert_true(r.matched)
+    assert_equal(r.start, 6)
+    assert_equal(r.end, 13)
+    # And a min_offset == 0 shape, where the literal alone is a match.
+    comptime T = Regex["[ab]{0,3}foo"]
+    assert_true(T._use_rev_literal)
+    var re2 = T()
+    var input2 = String("zzfoo abfoo foo")
+    var s2 = re2.finditer(input2)
+    var e2 = re2._pike_finditer(input2)
+    assert_equal(len(s2), len(e2))
+    for i in range(len(s2)):
+        assert_equal(s2[i].start, e2[i].start)
+        assert_equal(s2[i].end, e2[i].end)
 
 
 # --- Differentials vs the Pike VM -------------------------------------------
@@ -461,15 +528,35 @@ def test_differential_inner_literal() raises:
 
 
 def test_differential_bounded_gap() raises:
-    _differential["(?:foo|bar)\\.txt"](
-        ["f", "o", "b", "a", "r", ".", " ", "\n", "foo", "bar", ".txt",
-         "foo.txt", "bar.txt", "é"],
-        "(?:foo|bar)\\.txt",
-    )
-    _differential["(?:a|bb)cde[0-9]"](
-        ["a", "b", "c", "d", "e", "1", " ", "\n", "cde", "acde1", "bbcde",
+    # Effect (b) live on every pattern here — strategy pinned, so the
+    # coverage cannot silently reopen. (The literal alternations that
+    # LOOK bounded, `(?:foo|bar)\\.txt`, are Teddy-owned; one lives in
+    # the controls test.)
+    assert_true(Regex["[ab]{0,3}foo"]._use_rev_literal)
+    _differential["[ab]{0,3}foo"](
+        ["a", "b", "f", "o", " ", "\n", "foo", "afoo", "bbfoo", "fo",
          "é"],
-        "(?:a|bb)cde[0-9]",
+        "[ab]{0,3}foo",
+    )
+    assert_true(Regex["[0-9]{2,5}xy"]._use_rev_literal)
+    _differential["[0-9]{2,5}xy"](
+        ["0", "1", "9", "x", "y", " ", "\n", "xy", "12xy", "999999xy",
+         "axy", "é"],
+        "[0-9]{2,5}xy",
+    )
+    assert_true(Regex[".{0,2}foo"]._use_rev_literal)
+    # ASCII-only alphabet: `.` consumes single bytes, so a match could
+    # otherwise start inside a multi-byte character and findall's String
+    # slice would be rejected under -D ASSERT=all on every lane alike.
+    _differential[".{0,2}foo"](
+        ["a", "z", "f", "o", ".", " ", "\n", "foo", "xfoo", "ofo"],
+        ".{0,2}foo",
+    )
+    assert_true(Regex["[ab]?[cd]?foo"]._use_rev_literal)
+    _differential["[ab]?[cd]?foo"](
+        ["a", "b", "c", "d", "f", "o", " ", "\n", "foo", "acfoo",
+         "bfoo", "é"],
+        "[ab]?[cd]?foo",
     )
 
 
@@ -500,6 +587,13 @@ def test_differential_controls_off_strategy() raises:
         ["h", "t", "p", ":", "/", "a", " ", "\n", "http://ab", "http:/",
          "é"],
         "http://[a-z]+",
+    )
+    # Bounded-gap-LOOKING literal alternation: Teddy-owned, off-strategy.
+    assert_false(Regex["(?:foo|bar)\\.txt"]._use_rev_literal)
+    _differential["(?:foo|bar)\\.txt"](
+        ["f", "o", "b", "a", "r", ".", " ", "\n", "foo", "bar", ".txt",
+         "foo.txt", "bar.txt", "é"],
+        "(?:foo|bar)\\.txt",
     )
 
 

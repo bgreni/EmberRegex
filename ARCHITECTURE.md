@@ -181,7 +181,7 @@ filter-prefix scanner delegates to) before anything else: no occurrence
 at or after `pos + min_offset` is proof of no match — one SIMD pass
 answers the call (the `reverse_suffix_search_64KB` /
 `reverse_inner_search_64KB` rows measure ~40x on miss-heavy 64 KB) — and
-when the pre-literal gap is comptime-bounded (`(foo|bar)\.txt`: 3 bytes)
+when the pre-literal gap is comptime-bounded (`[ab]{0,3}foo`: at most 3 bytes)
 the candidate pipeline starts at `lit_pos - max_offset`. With an
 unbounded gap the scan still starts at `pos`: recovering a start by
 walking leftward from the literal is the quadratic trap Rust bounds with

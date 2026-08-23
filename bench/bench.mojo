@@ -280,7 +280,7 @@ def reverse_inner_miss_input() -> String:
     probe pair) but "://" never occurs."""
     var filler = "svc: api / level: info /x msg: ok :/ trace: nine "
     var input = String("")
-    for _ in range(64 * 1024 // 50):
+    for _ in range(64 * 1024 // 49):  # filler is 49 bytes
         input += filler
     return input
 
