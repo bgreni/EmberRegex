@@ -691,5 +691,71 @@ def test_bench_capture_findall_sparse() raises:
     )
 
 
+def _bench_counted_haystack(n: Int) -> String:
+    """Mirror of `make_counted_haystack` in bench/bench.mojo."""
+    var parts = List[String]()
+    for i in range(n):
+        if i == 59 or i == 74 or i == 89:
+            parts.append("code" + String(i % 10) + " and more words")
+        else:
+            parts.append("plain words here again")
+    return String(" ").join(parts)
+
+
+def test_bench_counted_repeat_search_2KB() raises:
+    # bench counted_repeat_search_2KB: the capture keeps it on the
+    # backtracker (a capture-free `[a-z]{3,7}\d` goes to a DFA lane and the
+    # row would time the wrong engine), the haystack is ~2 KB, and the
+    # first match is far enough in that the row really walks it.
+    comptime S = Regex["([a-z]{3,7})\\d"]
+    assert_false(S._strategy.use_dfa)
+    var re = S()
+    var input = _bench_counted_haystack(90)
+    assert_true(input.byte_length() > 1800)
+    assert_true(input.byte_length() < 2400)
+    var r = re.search(input)
+    assert_true(r.matched)
+    # "code9" — token 59 of 90, two thirds of the way in.
+    assert_true(r.start > input.byte_length() // 2)
+    assert_equal(r.end - r.start, 5)
+    assert_equal(r.group_str(input, 1), "code")
+    # A few matches, not one: findall must see all three.
+    assert_equal(len(re.findall(input)), 3)
+
+
+def _bench_giveback_haystack(n: Int) -> String:
+    """Mirror of `make_giveback_haystack` in bench/bench.mojo."""
+    var parts = List[String]()
+    for i in range(n):
+        if i == 59 or i == 74 or i == 89:
+            parts.append("abcdefgx")
+        else:
+            parts.append("abcdefg")
+    return String(" ").join(parts)
+
+
+def test_bench_counted_repeat_giveback_2KB() raises:
+    # bench counted_repeat_giveback_2KB: the exit starts on the body's own
+    # class, so the counted loop cannot possessify and really hands bytes
+    # back. Pin that the row is on the backtracker, that the giveback mode
+    # really is SBT_GIVEBACK_ALL, and that the match is the SHORTER count
+    # (6, not 7) — which is exactly what a hand-back produces.
+    comptime S = Regex["([a-z]{3,7})[a-z]x"]
+    assert_false(S._strategy.use_dfa)
+    var re = S()
+    var input = _bench_giveback_haystack(90)
+    assert_true(input.byte_length() > 600)
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_true(r.start > input.byte_length() // 2)
+    # "abcdefgx": the loop reaches 7, the exit fails, and it gives one
+    # byte back so `[a-z]x` can take "g" then "x".
+    assert_equal(r.group_str(input, 1), "abcdef")
+    assert_equal(r.end - r.start, 8)
+    assert_equal(len(re.findall(input)), 3)
+    # A 7-letter run with no `x` is refuted at every count from 7 to 3.
+    assert_false(re.search("abcdefg qrstuvw").matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

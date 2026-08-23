@@ -257,6 +257,341 @@ def sbt_loop_modes(nfa: NFA) -> List[Int]:
     return modes^
 
 
+struct SbtCounted(Copyable, Movable):
+    """Comptime description of a counted repetition (`x{n,m}`) whose body is
+    a single consuming state, rooted at one NFA state.
+
+    `hi == -1` means unbounded (`x{n,}`). `body` is any one of the chain's
+    interchangeable body copies — the walker only ever needs its byte set.
+    `exit` is the state the chain hands control to once it has committed to
+    a count.
+    """
+
+    var ok: Bool
+    """True when the shape was recognised AND is worth compiling to a loop
+    (see `_sbt_counted_shape` for the gate)."""
+    var lo: Int
+    var hi: Int
+    var body: Int
+    var exit: Int
+    var greedy: Bool
+
+    def __init__(
+        out self,
+        ok: Bool,
+        lo: Int,
+        hi: Int,
+        body: Int,
+        exit: Int,
+        greedy: Bool,
+    ):
+        self.ok = ok
+        self.lo = lo
+        self.hi = hi
+        self.body = body
+        self.exit = exit
+        self.greedy = greedy
+
+
+def _sbt_is_body_state(nfa: NFA, idx: Int) -> Bool:
+    """Compile-time: True when `idx` is a single consuming state — the only
+    kind of body a counted chain can be compiled from."""
+    if idx < 0 or idx >= len(nfa.states):
+        return False
+    var k = nfa.states[idx].kind
+    return (
+        k == NFAStateKind.CHAR
+        or k == NFAStateKind.CHARSET
+        or k == NFAStateKind.ANY
+    )
+
+
+def _sbt_body_eq(nfa: NFA, a: Int, b: Int, kind: Int) -> Bool:
+    """Compile-time: True when two states of the SAME `kind` consume exactly
+    the same byte set. The caller has already compared kinds.
+
+    Charsets are compared by CONTENT, not by pool index: `_build_repetition`
+    calls `_build_fragment` once per copy, and each copy interns its own
+    entry in the charset pool, so `[a-z]{3}`'s three states carry three
+    different `charset_index` values for the same 256-bit set.
+    """
+    if kind == NFAStateKind.CHAR:
+        return nfa.states[a].char_value == nfa.states[b].char_value
+    if kind == NFAStateKind.CHARSET:
+        var ia = nfa.states[a].charset_index
+        var ib = nfa.states[b].charset_index
+        if ia == ib:
+            return True
+        if nfa.charsets[ia].negated != nfa.charsets[ib].negated:
+            return False
+        return (nfa.charsets[ia].bitmap ^ nfa.charsets[ib].bitmap).reduce_or(
+        ) == 0
+    return True  # ANY
+
+
+def _sbt_body_bits(
+    nfa: NFA, idx: Int
+) -> SIMD[DType.uint8, BITMAP_WIDTH]:
+    """Compile-time: the charset bitmap a CHARSET body tests against, or an
+    empty one for CHAR/ANY bodies (which the walker tests differently)."""
+    if _sbt_is_body_state(nfa, idx):
+        if nfa.states[idx].kind == NFAStateKind.CHARSET:
+            return nfa.charsets[nfa.states[idx].charset_index].bitmap
+    return SIMD[DType.uint8, BITMAP_WIDTH](0)
+
+
+def _sbt_body_negated(nfa: NFA, idx: Int) -> Bool:
+    """Compile-time companion to `_sbt_body_bits`."""
+    if _sbt_is_body_state(nfa, idx):
+        if nfa.states[idx].kind == NFAStateKind.CHARSET:
+            return nfa.charsets[nfa.states[idx].charset_index].negated
+    return False
+
+
+def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
+    """Compile-time: recognise the chain `_build_repetition` emits for
+    `x{n,m}` with a single-state body, rooted at `state_idx`.
+
+    The NFA keeps the expansion — the DFA lanes need it, and it costs them
+    nothing: determinizing a counted repeat over ONE byte class is linear,
+    `m+1` states, so it stays under EDFA_STATE_CAP for m up to ~100 and
+    falls to the lazy DFA above that. Only the backtracker, which pays a
+    function instantiation and a stack frame per copy, needs the chain
+    read back as a count.
+
+    The shape (nfa.mojo `_build_repetition`) is `n` required copies of the
+    body concatenated, followed by either
+
+    - a star loop over the same body (`{n,}`): a SPLIT whose body arm loops
+      straight back to it, or
+    - `(m-n)` optional copies (`{n,m}`), each a `?` SPLIT whose body arm is
+      one copy whose `out1` is the SPLIT's other arm — a ladder.
+
+    Both are recognised locally: "consume one body byte, go to `next`" and
+    "optionally consume one body byte, go to `next`" mean exactly that
+    wherever they appear, so the walk needs no assumption about which
+    surface syntax produced them (`a?a?b` is `a{0,2}b` and is compiled as
+    one). What it does need is that the whole chain is INTERCHANGEABLE:
+    every copy consumes the same byte set and none of them writes a capture
+    slot. Then every path through the chain that consumes k bytes leaves
+    exactly the same (position, slots), and the recursive enumeration —
+    which visits subsets of the optional copies in binary order — reduces
+    to visiting counts in order: `hi` down to `lo` for a greedy chain,
+    `lo` up to `hi` for a lazy one. That is what makes the iterative form
+    exact rather than merely equivalent-up-to-reordering.
+
+    A SAVE anywhere in the chain (`(a){3}`) fails `_sbt_is_body_state`, so
+    captured bodies drop out here and keep the general path.
+
+    Mixed greediness (`a{0,2}?a{0,2}`) stops the ladder at the change: the
+    two runs enumerate independently, exactly as the recursion does, and
+    each gets its own instantiation.
+
+    **Callers must not ask unless `_sbt_needs_depth_guard(nfa)` is False.**
+    That is the first gate, and it is on the NFA rather than the chain: a
+    pattern with a general cyclic SPLIT recurses to a depth that grows with
+    the INPUT rather than with the pattern. The counted loop calls its exit
+    from inside the giveback loop, which is not a tail position, while the
+    body copies it replaces are states whose own recursive call IS a tail
+    call and therefore costs no frame. Collapsing `m-n` real SPLIT frames
+    into one is a large win when the depth is bounded by the pattern; in a
+    walk that already recurses per input byte it trades free frames for
+    real ones, and SBT_MAX_DEPTH cannot catch that because it counts CALLS,
+    not stack. Measured: `(?:a|a{2,3})+b` on 2000 `a`s went from completing
+    to overflowing the stack. Excluding those NFAs also makes `DINC` 0
+    everywhere this branch runs, since the guard and the branch key off the
+    same predicate.
+
+    The gate lives in the CALLERS (`_sbt_try_match`'s short-circuited
+    `comptime if`, and `sbt_counted_shapes`) rather than here, and every
+    walk below is written out instead of delegated to the
+    `_sbt_is_body_state` / `_sbt_body_eq` predicates. Both are comptime
+    cost, not style: `_sbt_needs_depth_guard` runs a whole Tarjan pass, a
+    call inside a function body is NOT memoized (only `comptime` decls
+    are), and any call passing the NFA copies it — ~0.7 ms per 100 states.
+    Measured on the ~2100-state NFAs the UTF-8 property classes build
+    (`(?u)\\p{L}+`, `(?u)\\p{Han}+`, `(?u)\\p{Greek}`): asking here cost 149 s
+    of compile CPU against 135 s for the unmodified engine; asking in the
+    caller, short-circuited, brings it to 144 s.
+
+    The second gate is `hi != lo and (lo >= 2 or hi > lo + 1)`, where an
+    unbounded `hi` does not satisfy `hi > lo + 1` on its own. What it
+    rejects:
+
+    - `a+`, `a*`, `a?`, `a{1,2}` — already iterative in the SPLIT branch,
+      which additionally carries folded-exit specialisations this one
+      would have to duplicate.
+    - **Every fixed chain** (`hi == lo`: `a{3}`, and any literal run of
+      the same byte). There is no giveback to collapse — one end position
+      is reachable — so all the counted form could buy is instantiations,
+      and it would replace a chain of tail-position recursive calls with
+      a loop body that its callers can inline. What was actually measured
+      is the outcome, not the mechanism: with fixed chains admitted,
+      `(a|aa)+b` and `(?:a|aa)+b` on 2000 `a`s stopped conceding to the
+      Pike VM and started overflowing the stack instead.
+    """
+    var none = SbtCounted(False, 0, 0, -1, -1, True)
+    var n = len(nfa.states)
+    if state_idx < 0 or state_idx >= n:
+        return none^
+    var k0 = nfa.states[state_idx].kind
+
+    var body = -1
+    var body_kind = -1
+    var lo = 0
+    var cur = state_idx
+
+    if (
+        k0 == NFAStateKind.CHAR
+        or k0 == NFAStateKind.CHARSET
+        or k0 == NFAStateKind.ANY
+    ):
+        body = state_idx
+        body_kind = k0
+        # Required copies: a straight out1-chain of identical body states.
+        # The ladder's copies hang off SPLIT.out1 and so are never walked
+        # into here. Both walks are bounded by the state count: they only
+        # ever move forward through distinct states, but a malformed NFA
+        # must not be able to hang the compiler.
+        while cur >= 0 and cur < n and lo < n:
+            if nfa.states[cur].kind != body_kind:
+                break
+            if not _sbt_body_eq(nfa, cur, body, body_kind):
+                break
+            lo += 1
+            cur = nfa.states[cur].out1
+    elif k0 != NFAStateKind.SPLIT:
+        return none^
+
+    if cur < 0 or cur >= n:
+        return none^
+
+    var hi = lo
+    var greedy = True
+    var have_greedy = False
+    var steps = 0
+    while (
+        cur >= 0
+        and cur < n
+        and steps < n
+        and nfa.states[cur].kind == NFAStateKind.SPLIT
+    ):
+        steps += 1
+        var sg = nfa.states[cur].greedy
+        # Greedy SPLITs carry the body in out1 and the continuation in
+        # out2; lazy ones the other way round.
+        var arm = nfa.states[cur].out1 if sg else nfa.states[cur].out2
+        var nxt = nfa.states[cur].out2 if sg else nfa.states[cur].out1
+        if nxt < 0 or nxt >= n or arm < 0 or arm >= n:
+            break
+        var ka = nfa.states[arm].kind
+        if (
+            ka != NFAStateKind.CHAR
+            and ka != NFAStateKind.CHARSET
+            and ka != NFAStateKind.ANY
+        ):
+            break
+        if body < 0:
+            body = arm
+            body_kind = ka
+        elif ka != body_kind or not _sbt_body_eq(nfa, arm, body, body_kind):
+            break
+        if have_greedy and sg != greedy:
+            break
+        if nfa.states[arm].out1 == cur:
+            # Star loop over the same body: the tail is unbounded and this
+            # SPLIT is the end of the chain.
+            greedy = sg
+            hi = -1
+            cur = nxt
+            break
+        if nfa.states[arm].out1 != nxt:
+            break
+        greedy = sg
+        have_greedy = True
+        hi += 1
+        cur = nxt
+
+    if body < 0 or cur < 0 or cur >= n:
+        return none^
+    if hi == lo:
+        return none^
+    if not (lo >= 2 or (hi >= 0 and hi > lo + 1)):
+        return none^
+    return SbtCounted(True, lo, hi, body, cur, greedy)
+
+
+def sbt_counted_shapes(nfa: NFA) -> List[Int]:
+    """Compile-time introspection: flat `[state, lo, hi, ...]` triples for
+    every state at which the walker is instantiated AND takes the counted
+    branch, in state order.
+
+    Only tests read this — the walker derives the same shape inline, per
+    instantiation. It exists so a regression that silently stops
+    recognising a counted chain fails a test instead of only a benchmark.
+    """
+    if _sbt_needs_depth_guard(nfa):
+        # The walker never takes the branch in these NFAs — see
+        # `_sbt_counted_shape`. Asked once here, not once per state.
+        return List[Int]()
+    var n = len(nfa.states)
+    var seen = List[Bool](fill=False, length=n)
+    var fired = List[Bool](fill=False, length=n)
+    var los = List[Int](fill=0, length=n)
+    var his = List[Int](fill=0, length=n)
+    var stack = List[Int]()
+    stack.append(nfa.start)
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= n or seen[s]:
+            continue
+        seen[s] = True
+        var c = _sbt_counted_shape(nfa, s)
+        if c.ok:
+            fired[s] = True
+            los[s] = c.lo
+            his[s] = c.hi
+            # The chain's interior states get no instantiation at all.
+            stack.append(c.exit)
+            continue
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.MATCH:
+            continue
+        if kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[s].out1)
+            stack.append(nfa.states[s].out2)
+            continue
+        if (
+            kind == NFAStateKind.LOOKAHEAD
+            or kind == NFAStateKind.LOOKBEHIND
+        ):
+            stack.append(nfa.states[s].sub_start)
+        stack.append(nfa.states[s].out1)
+    var out = List[Int]()
+    for i in range(n):
+        if fired[i]:
+            out.append(i)
+            out.append(los[i])
+            out.append(his[i])
+    return out^
+
+
+@always_inline
+def _sbt_body_byte[
+    bkind: Int,
+    bchar: UInt32,
+    bbits: SIMD[DType.uint8, BITMAP_WIDTH],
+    bneg: Bool,
+](b: Byte) -> Bool:
+    """One counted-chain body copy's byte test, with its class baked in."""
+    comptime if bkind == NFAStateKind.ANY:
+        return b != CHAR_NEWLINE
+    elif bkind == NFAStateKind.CHAR:
+        return UInt32(b) == bchar
+    else:
+        return _sbt_bitmap_check(bbits, bneg, UInt32(b))
+
+
 def _sbt_single_byte(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Int:
     """Compile-time: the only byte in `bitmap`, or -1 when it holds none or
     more than one. Most continuations start with one literal byte (`>`, `@`,
@@ -508,8 +843,228 @@ def _sbt_try_match[
         # DINC folds to 0, `depth` stays the constant 0, and the check in
         # the general-SPLIT branch compiles out.
         comptime DINC = 1 if _sbt_needs_depth_guard(nfa) else 0
+        # A counted repetition (`x{n,m}`) with a single-state body is
+        # compiled to a bounded loop instead of the chain of copies the NFA
+        # holds: `hi` bytes consumed iteratively, then handed back one at a
+        # time down to `lo`. Recognised at the chain's FIRST state, so the
+        # rest of the chain gets no instantiation at all — that is what
+        # makes `a{1,2000}` compile in seconds rather than minutes, and
+        # what keeps its walk one frame deep instead of 2000.
+        #
+        # `DINC == 0` is both a correctness gate and a compile-time one:
+        # `_sbt_counted_shape` must not be asked about an NFA that recurses
+        # per input byte, and it takes the NFA by value, which a comptime
+        # call copies (~0.7 ms per 100 states) once per instantiated state.
+        #
+        # This shape is deliberate and was measured. Only `comptime if A
+        # and B` actually short-circuits B; a `comptime` decl in a function
+        # body does not memoize and is re-evaluated per instantiation, so
+        # every "tidier" form pays the call on NFAs that can never use it.
+        # Cold compile of `(?u)\p{L}+`, `(?u)\p{Han}+`, `(?u)\p{Greek}`,
+        # each in an isolated MODULAR_CACHE_DIR (the on-disk cache makes any
+        # other A/B a lie):
+        #
+        #   no branch at all                        137.6 s
+        #   this form                               140.3 s   (+1.9%)
+        #   hoisted to one `comptime` decl          149.2 s   (+8.4%)
+        #
+        # The second call below is NOT redundant work per state: an untaken
+        # `comptime if` body is never elaborated, so the decl only runs
+        # where the branch actually fires — at most one extra evaluation
+        # per counted chain, versus one per state for the hoisted form.
+        comptime if DINC == 0 and _sbt_counted_shape(nfa, state_idx).ok:
+            comptime counted = _sbt_counted_shape(nfa, state_idx)
+            comptime clo = counted.lo
+            comptime chi = counted.hi  # -1 = unbounded
+            comptime cexit = counted.exit
+            comptime bkind = nfa.states[counted.body].kind
+            comptime bchar = nfa.states[counted.body].char_value
+            comptime bbits = _sbt_body_bits(nfa, counted.body)
+            comptime bneg = _sbt_body_negated(nfa, counted.body)
+            var input_len = len(input)
+            var min_pos = pos + clo
 
-        comptime if kind == NFAStateKind.MATCH:
+            # `hi != lo` is guaranteed by the gate, so both forms below
+            # really do hand positions to the exit one at a time. Where
+            # they call it per position they use the simple loop's
+            # giveback analysis (`_sbt_loop_filter`): a position holding a
+            # byte the body ate that the exit cannot START on is a
+            # guaranteed failure and is skipped without being run. The
+            # greedy form only needs that analysis on the path that
+            # actually calls the exit, so it is scoped into that branch.
+            comptime if counted.greedy:
+                var limit = input_len
+                comptime if chi >= 0:
+                    if pos + chi < limit:
+                        limit = pos + chi
+                var max_pos = pos
+                while max_pos < limit and _sbt_body_byte[
+                    bkind, bchar, bbits, bneg
+                ](input.unsafe_get(max_pos)):
+                    max_pos += 1
+                if max_pos < min_pos:
+                    return -1
+                # The folded-exit forms below are the simple loop's, with
+                # `pos` replaced by `min_pos`: the chain may not hand back
+                # past its required copies.
+                comptime exit_is_match = _exit_is_match(nfa, cexit)
+                comptime exit_is_eol_then_match = _exit_is_eol_then_match(
+                    nfa, cexit
+                )
+                comptime if exit_is_match and anchored_end:
+                    var target = end_at if end_at >= 0 else input_len
+                    if min_pos <= target and target <= max_pos:
+                        return target
+                    return -1
+                elif exit_is_match:
+                    return max_pos
+                elif exit_is_eol_then_match and anchored_end:
+                    comptime a_eol_ml = (
+                        nfa.states[cexit].anchor_type
+                        == AnchorKind.EOL_MULTILINE
+                    )
+                    var target = end_at if end_at >= 0 else input_len
+                    if min_pos <= target and target <= max_pos:
+                        if target == input_len:
+                            return target
+                        comptime if a_eol_ml:
+                            if input.unsafe_get(target) == CHAR_NEWLINE:
+                                return target
+                    return -1
+                elif exit_is_eol_then_match:
+                    comptime is_ml_eol = (
+                        nfa.states[cexit].anchor_type
+                        == AnchorKind.EOL_MULTILINE
+                    )
+                    var p = max_pos
+                    while p >= min_pos:
+                        comptime if is_ml_eol:
+                            if (
+                                p == input_len
+                                or input.unsafe_get(p) == CHAR_NEWLINE
+                            ):
+                                return p
+                        else:
+                            if p == input_len:
+                                return p
+                        p -= 1
+                    return -1
+                else:
+                    # Scoped here, not above: `_sbt_loop_filter` walks the
+                    # NFA through `first_byte_bitmap_of`, and the folded
+                    # forms above never read it.
+                    comptime lf = _sbt_loop_filter(nfa, counted.body, cexit)
+                    comptime mode = lf.mode
+                    comptime exit_bits = lf.exit_bits
+                    comptime exit_byte = _sbt_single_byte(exit_bits)
+                    comptime if mode == SBT_GIVEBACK_POSSESSIVE:
+                        # Nothing in [min_pos, max_pos) can start the exit,
+                        # and the mode also proves the exit consumes a
+                        # byte, so end of input cannot match either.
+                        if max_pos < input_len:
+                            return _sbt_try_match[
+                                nfa=nfa,
+                                state_idx=cexit,
+                                num_slots=num_slots,
+                                anchored_end=anchored_end,
+                                memo_on=memo_on,
+                            ](
+                                input,
+                                max_pos,
+                                slots,
+                                budget,
+                                memo_addr,
+                                depth + DINC,
+                                end_at,
+                            )
+                        return -1
+                    else:
+                        var p = max_pos
+                        while p >= min_pos:
+                            if budget < 0:
+                                return -1
+                            comptime if mode == SBT_GIVEBACK_FILTER:
+                                if p >= input_len or not _sbt_first_byte_test[
+                                    exit_bits, exit_byte
+                                ](input.unsafe_get(p)):
+                                    p -= 1
+                                    continue
+                            var result = _sbt_try_match[
+                                nfa=nfa,
+                                state_idx=cexit,
+                                num_slots=num_slots,
+                                anchored_end=anchored_end,
+                                memo_on=memo_on,
+                            ](
+                                input,
+                                p,
+                                slots,
+                                budget,
+                                memo_addr,
+                                depth + DINC,
+                                end_at,
+                            )
+                            if result >= 0:
+                                return result
+                            p -= 1
+                        return -1
+            else:
+                # Lazy: take the required copies, then try the exit after
+                # each further copy — shortest count first, the mirror of
+                # the greedy giveback and of the simple lazy loop.
+                comptime lf = _sbt_loop_filter(nfa, counted.body, cexit)
+                var limit = input_len
+                comptime if chi >= 0:
+                    if pos + chi < limit:
+                        limit = pos + chi
+                var cur = pos
+                while cur < min_pos:
+                    if cur >= input_len or not _sbt_body_byte[
+                        bkind, bchar, bbits, bneg
+                    ](input.unsafe_get(cur)):
+                        return -1
+                    cur += 1
+                comptime skip = lf.mode != SBT_GIVEBACK_ALL
+                comptime stop_bits = lf.stop_bits
+                while True:
+                    comptime if skip:
+                        cur = _sbt_class_skip[stop_bitmap=stop_bits](
+                            input, cur
+                        )
+                        # Past `limit` every remaining candidate was a body
+                        # byte the exit cannot start on, so all of them are
+                        # refuted at once.
+                        if cur >= input_len or cur > limit:
+                            return -1
+                    if budget < 0:
+                        return -1
+                    var result = _sbt_try_match[
+                        nfa=nfa,
+                        state_idx=cexit,
+                        num_slots=num_slots,
+                        anchored_end=anchored_end,
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        cur,
+                        slots,
+                        budget,
+                        memo_addr,
+                        depth + DINC,
+                        end_at,
+                    )
+                    if result >= 0:
+                        return result
+                    if cur >= limit:
+                        break
+                    if not _sbt_body_byte[bkind, bchar, bbits, bneg](
+                        input.unsafe_get(cur)
+                    ):
+                        break
+                    cur += 1
+                return -1
+
+        elif kind == NFAStateKind.MATCH:
             comptime if anchored_end:
                 # `end_at` lets a caller demand a match ending at a
                 # specific offset while still seeing the WHOLE input, so
