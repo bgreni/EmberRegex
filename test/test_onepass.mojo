@@ -1,0 +1,501 @@
+"""Tests for the one-pass DFA capture engine (`emberregex/onepass.mojo`,
+`Regex._use_onepass`).
+
+A one-pass pattern — at most one NFA thread can consume each byte — has
+a unique path through the NFA for any input, so its capture slots can be
+written during a single forward table walk. `match()` (fullmatch) runs
+that walk over the whole input; the DFA-bounded capture lane's span
+confirm (`_span_fill_slots`) runs it over the exact span. Every slot must
+equal the capture-exact Pike VM's, slot for slot.
+"""
+
+from emberregex import Regex
+from emberregex.onepass import (
+    OnePass,
+    OP_MATCH,
+    OP_NEED_EOL,
+    OP_NEED_NONWORD,
+    OP_NEED_WORD,
+    ONEPASS_STATE_CAP,
+    build_onepass,
+)
+from emberregex.engine import _build_static_nfa
+from emberregex.result import MatchResult
+from std.testing import assert_true, assert_false, assert_equal, TestSuite
+
+
+# --- Validity pins -----------------------------------------------------------
+
+
+def test_onepass_valid_patterns() raises:
+    assert_true(Regex["(\\d+)-(\\d+)"]._use_onepass)
+    assert_true(Regex["(\\w+)@(\\w+)\\.com"]._use_onepass)
+    assert_true(Regex["(?P<k>[^=]+)=(?P<v>[^;]*)"]._use_onepass)
+    assert_true(Regex["((a)(b))"]._use_onepass)
+    assert_true(Regex["(a)?b"]._use_onepass)
+    assert_true(Regex["(x)|(y)"]._use_onepass)
+    assert_true(Regex["([a-c]+)([d-f]+)"]._use_onepass)
+    assert_true(Regex["()"]._use_onepass)
+    assert_true(Regex["(a*)"]._use_onepass)
+    assert_true(Regex["(a*?)"]._use_onepass)
+    # After `x` the loop re-enters the alternation; `(x)` and `y` consume
+    # different bytes, so this IS one-pass.
+    assert_true(Regex["(?:(x)|y)+"]._use_onepass)
+    # Anchors resolve at build time (BOL kinds against the context, the
+    # end conditions as per-state match flags).
+    assert_true(Regex["^(\\w+)$"]._use_onepass)
+    assert_true(Regex["(?m)^(\\w+)$"]._use_onepass)
+    assert_true(Regex["\\b(\\w+)\\b"]._use_onepass)
+    assert_true(Regex["(a)\\b"]._use_onepass)
+    # The bench rows.
+    assert_true(Regex["(\\w+)@(\\w+)\\.(\\w+)"]._use_onepass)
+    assert_true(Regex["(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"]._use_onepass)
+    assert_true(Regex["(https?|ftp)://([^/\\s]+)(/[^\\s]*)?"]._use_onepass)
+    assert_true(Regex["(\\w+)=(\\S+)"]._use_onepass)
+
+
+def test_onepass_invalid_patterns() raises:
+    # Two threads can consume the same byte: the capture assignment
+    # depends on bytes not yet seen.
+    assert_false(Regex["(a|ab)(c|bcd)(d*)"]._use_onepass)
+    assert_false(Regex["(a*)(a*)"]._use_onepass)
+    assert_false(Regex["(a+)(a+)"]._use_onepass)
+    assert_false(Regex["(.*)(.*)"]._use_onepass)
+    assert_false(Regex["(a?)(a?)b"]._use_onepass)
+    assert_false(Regex["(a|aa)+b"]._use_onepass)
+    # Both arms consume `a`; which one wins depends on the byte after.
+    assert_false(Regex["(a)\\b|(a)"]._use_onepass)
+    assert_false(Regex["(a)$|(a)"]._use_onepass)
+    # Constructs no table models.
+    assert_false(Regex["(\\d+)\\1"]._use_onepass)
+    assert_false(Regex["(?=a)(b)"]._use_onepass)
+    assert_false(Regex["(a)(?<=a)"]._use_onepass)
+    # Capture-free patterns never take this engine (the DFA lanes and
+    # the classic table serve them).
+    assert_false(Regex["\\d+-\\d+"]._use_onepass)
+    assert_false(Regex["a|ab"]._use_onepass)
+
+
+def _match_states_need(op: OnePass, need: Int, absent: Int) -> Bool:
+    """Comptime: every match state of `op` carries the `need` bits and
+    none of the `absent` bits (and there is at least one)."""
+    var saw = False
+    for s in range(op.num_states):
+        var f = op.match_flags[s]
+        if f & Int(OP_MATCH) == 0:
+            continue
+        saw = True
+        if f & need != need or f & absent != 0:
+            return False
+    return saw
+
+
+def test_onepass_builder_direct() raises:
+    # The builder's own view: state count, the slot writes and the
+    # per-state flags of a small automaton.
+    comptime nfa = _build_static_nfa("(\\d+)-(\\d+)")
+    comptime op = build_onepass(nfa, True)
+    assert_true(op.valid)
+    assert_equal(op.num_states, 4)
+    # Disabled builds are invalid placeholders.
+    comptime off = build_onepass(nfa, False)
+    assert_false(off.valid)
+    # End conditions become match flags.
+    comptime op_eol = build_onepass(_build_static_nfa("(a)$"), True)
+    assert_true(op_eol.valid)
+    comptime eol_ok = _match_states_need(op_eol, Int(OP_NEED_EOL), 0)
+    assert_true(eol_ok)
+    # After a word byte, `\b` needs a non-word next byte.
+    comptime op_wb = build_onepass(_build_static_nfa("(a)\\b"), True)
+    assert_true(op_wb.valid)
+    comptime wb_ok = _match_states_need(
+        op_wb, Int(OP_NEED_NONWORD), Int(OP_NEED_WORD)
+    )
+    assert_true(wb_ok)
+
+
+def test_onepass_state_cap() raises:
+    # A Unicode `\w` trie has far more transition targets than the cap.
+    comptime op = build_onepass(_build_static_nfa("(*UTF8)(\\w+)"), True)
+    assert_true(op.num_states <= ONEPASS_STATE_CAP)
+    # Whatever the builder decided, the verbs agree with the Pike VM
+    # (checked in the differential below).
+
+
+# --- Hand-picked capture semantics -------------------------------------------
+
+
+def _assert_groups[
+    n: Int
+](got: MatchResult[n], exp: MatchResult[n], label: String) raises:
+    assert_equal(got.matched, exp.matched, String(label, " matched"))
+    if not exp.matched:
+        return
+    assert_equal(got.start, exp.start, String(label, " start"))
+    assert_equal(got.end, exp.end, String(label, " end"))
+    for s in range(n):
+        assert_equal(
+            got.slots[s], exp.slots[s], String(label, " slot[", s, "]")
+        )
+
+
+def test_match_digits_pair() raises:
+    var re = Regex["(\\d+)-(\\d+)"]()
+    var r = re.match("123-4567")
+    assert_true(r.matched)
+    assert_equal(r.group_str("123-4567", 1), "123")
+    assert_equal(r.group_str("123-4567", 2), "4567")
+    assert_false(re.match("123-").matched)
+    assert_false(re.match("123-4567x").matched)
+    assert_false(re.match("-4567").matched)
+    assert_false(re.match("").matched)
+    _assert_groups(re.match("123-4567"), re._pike_match("123-4567"), "pair")
+
+
+def test_match_empty_groups() raises:
+    var re = Regex["()"]()
+    var r = re.match("")
+    assert_true(r.matched)
+    assert_equal(r.group_span(1)[0], 0)
+    assert_equal(r.group_span(1)[1], 0)
+    var re2 = Regex["(a*)"]()
+    var r2 = re2.match("")
+    assert_true(r2.matched)
+    assert_equal(r2.group_span(1)[0], 0)
+    assert_equal(r2.group_span(1)[1], 0)
+    var r3 = re2.match("aaa")
+    assert_true(r3.matched)
+    assert_equal(r3.group_span(1)[0], 0)
+    assert_equal(r3.group_span(1)[1], 3)
+    # Fullmatch is language membership, not leftmost-first: the lazy
+    # loop must still consume the whole input.
+    var re3 = Regex["(a*?)"]()
+    var r4 = re3.match("aaa")
+    assert_true(r4.matched)
+    assert_equal(r4.group_span(1)[1], 3)
+    _assert_groups(re3.match("aaa"), re3._pike_match("aaa"), "lazy full")
+
+
+def test_match_unmatched_optional_group() raises:
+    var re = Regex["(a)?b"]()
+    var r = re.match("b")
+    assert_true(r.matched)
+    assert_equal(r.slots[0], -1)
+    assert_equal(r.slots[1], -1)
+    var r2 = re.match("ab")
+    assert_true(r2.matched)
+    assert_equal(r2.slots[0], 0)
+    assert_equal(r2.slots[1], 1)
+    var re2 = Regex["(x)|(y)"]()
+    var ry = re2.match("y")
+    assert_true(ry.matched)
+    assert_equal(ry.slots[0], -1)
+    assert_equal(ry.slots[1], -1)
+    assert_equal(ry.slots[2], 0)
+    assert_equal(ry.slots[3], 1)
+
+
+def test_match_last_iteration_capture() raises:
+    # Python reports the LAST iteration's capture; an iteration through
+    # the other arm does not clear it.
+    var re = Regex["(?:(x)|y)+"]()
+    var r = re.match("xyx")
+    assert_true(r.matched)
+    assert_equal(r.slots[0], 2)
+    assert_equal(r.slots[1], 3)
+    var r2 = re.match("xy")
+    assert_true(r2.matched)
+    assert_equal(r2.slots[0], 0)
+    assert_equal(r2.slots[1], 1)
+    var r3 = re.match("yy")
+    assert_true(r3.matched)
+    assert_equal(r3.slots[0], -1)
+    _assert_groups(re.match("xyx"), re._pike_match("xyx"), "xyx")
+    _assert_groups(re.match("xy"), re._pike_match("xy"), "xy")
+
+
+def test_match_nested_groups() raises:
+    var re = Regex["((a)(b))"]()
+    var r = re.match("ab")
+    assert_true(r.matched)
+    assert_equal(r.group_str("ab", 1), "ab")
+    assert_equal(r.group_str("ab", 2), "a")
+    assert_equal(r.group_str("ab", 3), "b")
+    _assert_groups(re.match("ab"), re._pike_match("ab"), "nested")
+
+
+def test_match_anchors() raises:
+    var re = Regex["^(\\w+)$"]()
+    _assert_groups(re.match("hello"), re._pike_match("hello"), "bol eol")
+    assert_false(re.match("hel lo").matched)
+    var rm = Regex["(?m)^(\\w+)$"]()
+    _assert_groups(rm.match("hello"), rm._pike_match("hello"), "ml")
+    assert_false(rm.match("hello\n").matched)
+    var rb = Regex["\\b(\\w+)\\b"]()
+    _assert_groups(rb.match("hello"), rb._pike_match("hello"), "wb")
+    var rnb = Regex["(\\w+)\\B"]()
+    assert_false(rnb.match("hello").matched)
+    # `(a)\b|(a)` on "a": the first arm holds at end of input.
+    var ra = Regex["(a)\\b|(a)"]()
+    _assert_groups(ra.match("a"), ra._pike_match("a"), "a wb")
+
+
+def test_match_no_backtracker_budget() raises:
+    # A one-pass pattern's match() is one table walk: the pathological
+    # shape `(a*)*b` is not one-pass, but a long run through a one-pass
+    # loop nest must not hit any budget. (`(?:(x)|y)+` over 200 KB would
+    # recurse past SBT_MAX_DEPTH on the backtracker.)
+    var re = Regex["(?:(x)|y)+"]()
+    var input = String("xy") * 100_000
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.end, 200_000)
+    assert_equal(r.slots[0], 199_998)
+    assert_equal(r.slots[1], 199_999)
+
+
+def test_search_uses_span_confirm() raises:
+    # The capture lane's span confirm runs the one-pass walk on the exact
+    # span; `$` and `\b` at the span end see the real neighbour.
+    var re = Regex["(a)$|(a)"]()
+    assert_true(re._use_dfa_span)
+    _assert_groups(re.search("ab"), re._pike_search("ab"), "a$ ab")
+    _assert_groups(re.search("ba"), re._pike_search("ba"), "a$ ba")
+    var rb = Regex["(a)\\b|(a)"]()
+    _assert_groups(rb.search("ab"), rb._pike_search("ab"), "a\\b ab")
+    _assert_groups(rb.search("a b"), rb._pike_search("a b"), "a\\b a b")
+    var rs = Regex["(\\d+)-(\\d+)"]()
+    var input = String("lorem 42 ipsum ") * 300 + "123-4567" + String(" x 7 ") * 200
+    var got = rs.finditer(input)
+    var exp = rs._pike_finditer(input)
+    assert_equal(len(got), len(exp))
+    for i in range(len(got)):
+        _assert_groups(got[i], exp[i], String("sparse[", i, "]"))
+
+
+def test_utf8_mode() raises:
+    var re = Regex["(*UTF8)(\\w+)"]()
+    _assert_groups(re.match("héllo"), re._pike_match("héllo"), "utf8")
+    _assert_groups(re.search("  héllo"), re._pike_search("  héllo"), "utf8 s")
+    var re2 = Regex["(*UTF8)([^\\d]+)(\\d+)"]()
+    _assert_groups(re2.match("é€x42"), re2._pike_match("é€x42"), "utf8 neg")
+
+
+# --- Differential vs the Pike VM reference ---------------------------------
+
+
+def _lcg_text(seed: Int, n: Int, alphabet: List[String]) -> String:
+    """LCG-driven pseudo-random text of exactly `n` bytes, symbols off
+    the HIGH bits; multi-byte symbols keep the text valid UTF-8 (the
+    first symbol must be a single byte: it pads the tail)."""
+    var out = List[Byte]()
+    var x = seed
+    while len(out) < n:
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        var i = (x >> 16) % len(alphabet)
+        if len(out) + alphabet[i].byte_length() > n:
+            i = 0
+        for b in alphabet[i].as_bytes():
+            out.append(b)
+    return String(unsafe_from_utf8=Span(out))
+
+
+def _assert_pike_agreement[
+    p: StaticString
+](input: String, label: String) raises:
+    var re = Regex[p]()
+    _assert_groups(re.match(input), re._pike_match(input), label + " match")
+    _assert_groups(re.search(input), re._pike_search(input), label + " search")
+
+    var got_f = re.finditer(input)
+    var exp_f = re._pike_finditer(input)
+    assert_equal(len(got_f), len(exp_f), String(label, " finditer len"))
+    var any_empty = False
+    for i in range(len(got_f)):
+        _assert_groups(got_f[i], exp_f[i], String(label, " finditer[", i, "]"))
+        if exp_f[i].end == exp_f[i].start:
+            any_empty = True
+
+    var got_a = re.findall(input)
+    var exp_a = re._pike_findall(input)
+    assert_equal(len(got_a), len(exp_a), String(label, " findall len"))
+    for i in range(len(got_a)):
+        assert_equal(got_a[i], exp_a[i], String(label, " findall[", i, "]"))
+
+    # An empty match inside a multi-byte character makes replace/split
+    # slice mid-character — the same bytes on every lane, but not a
+    # String under -D ASSERT=all.
+    if any_empty:
+        return
+
+    assert_equal(
+        re.replace(input, "<\\1>"),
+        re._pike_replace(input, "<\\1>"),
+        String(label, " replace"),
+    )
+    assert_equal(
+        re.replace(input, "-"), re._pike_replace(input, "-"), label + " lit"
+    )
+
+    var got_p = re.split(input)
+    var exp_p = re._pike_split(input)
+    assert_equal(len(got_p), len(exp_p), String(label, " split len"))
+    for i in range(len(got_p)):
+        assert_equal(got_p[i], exp_p[i], String(label, " split[", i, "]"))
+
+
+def _differential[
+    p: StaticString
+](alphabet: List[String], label: String) raises:
+    """3 seeds x 11 lengths = 33 inputs against one pattern, plus the
+    match() of every prefix-shaped input the pattern fullmatches."""
+    for seed in [1, 7, 4242]:
+        for n in [15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 1000]:
+            var data = _lcg_text(seed, n, alphabet)
+            _assert_pike_agreement[p](
+                data, String(label, " seed=", seed, " n=", n)
+            )
+
+
+def _fullmatch_differential[
+    p: StaticString
+](inputs: List[String], label: String) raises:
+    """match() slot for slot on inputs the pattern is likely to
+    fullmatch (the random texts above mostly fail match() at once)."""
+    var re = Regex[p]()
+    for i in range(len(inputs)):
+        _assert_groups(
+            re.match(inputs[i]),
+            re._pike_match(inputs[i]),
+            String(label, " match[", i, "]"),
+        )
+
+
+# Newline and bytes >= 0x80 (2- and 3-byte UTF-8) in every alphabet so the
+# walks cross high bytes in every SIMD chunk; multi-character symbols make
+# matches frequent in random text.
+def _alpha_digits() -> List[String]:
+    return ["1", "2", "3", "-", "45", "-6", "x", " ", "\n", "é", "€"]
+
+
+def _alpha_email() -> List[String]:
+    return [
+        "a",
+        "b",
+        "@",
+        ".com",
+        "a@b.com",
+        "ab@cd.co",
+        ".",
+        " ",
+        "\n",
+        "é",
+        "€",
+    ]
+
+
+def _alpha_kv() -> List[String]:
+    return ["a", "b", "=", ";", "k=v;", "ab=;", " ", "\n", "é", "€"]
+
+
+def _alpha_ab() -> List[String]:
+    return ["a", "b", "ab", "x", " ", "\n", "é", "€"]
+
+
+def _alpha_xy() -> List[String]:
+    return ["x", "y", "xy", " ", "\n", "é", "€"]
+
+
+def _alpha_words() -> List[String]:
+    return ["a", "b", "ab", "q", " ", "\n", ".", "é", "€", "_", "1"]
+
+
+def _alpha_abcdef() -> List[String]:
+    return ["a", "b", "c", "d", "e", "f", "abd", "cef", " ", "\n", "é", "€"]
+
+
+def test_differential_digit_pairs() raises:
+    _differential["(\\d+)-(\\d+)"](_alpha_digits(), "(\\d+)-(\\d+)")
+    _differential["(\\d{1,2})-(\\d)"](_alpha_digits(), "(\\d{1,2})-(\\d)")
+    _fullmatch_differential["(\\d+)-(\\d+)"](
+        ["1-2", "123-4567", "1-", "-1", "12-34-56", ""], "pair full"
+    )
+
+
+def test_differential_email() raises:
+    _differential["(\\w+)@(\\w+)\\.com"](_alpha_email(), "email")
+    _differential["(?P<user>\\w+)@(?P<host>\\w+)"](_alpha_email(), "named")
+    _fullmatch_differential["(\\w+)@(\\w+)\\.com"](
+        ["a@b.com", "ab@cd.com", "a@b.co", "@b.com", "a@.com"], "email full"
+    )
+
+
+def test_differential_key_value() raises:
+    _differential["(?P<k>[^=]+)=(?P<v>[^;]*)"](_alpha_kv(), "kv")
+    _fullmatch_differential["(?P<k>[^=]+)=(?P<v>[^;]*)"](
+        ["k=v", "ab=", "=v", "k=v;", "k=v=w", "kk=vv"], "kv full"
+    )
+
+
+def test_differential_optional_and_alternation() raises:
+    _differential["(a)?b"](_alpha_ab(), "(a)?b")
+    _differential["(x)|(y)"](_alpha_xy(), "(x)|(y)")
+    _differential["(a)?b|(x)"](_alpha_ab(), "(a)?b|(x)")
+    _fullmatch_differential["(a)?b"](["b", "ab", "aab", "a", ""], "opt full")
+
+
+def test_differential_class_runs() raises:
+    _differential["([a-c]+)([d-f]+)"](_alpha_abcdef(), "class runs")
+    _fullmatch_differential["([a-c]+)([d-f]+)"](
+        ["ad", "abcdef", "abc", "def", "abdcef", ""], "class full"
+    )
+
+
+def test_differential_loops() raises:
+    _differential["(?:(x)|y)+"](_alpha_xy(), "(?:(x)|y)+")
+    _differential["((a)(b))+|q"](_alpha_ab(), "((a)(b))+|q")
+    _differential["(a*)"](_alpha_ab(), "(a*)")
+    _differential["(a*?)b"](_alpha_ab(), "(a*?)b")
+    _fullmatch_differential["(?:(x)|y)+"](
+        ["x", "y", "xy", "yx", "xyx", "xyy", "yyx", "xx", ""], "loop full"
+    )
+    _fullmatch_differential["(a*?)b"](["b", "ab", "aab", "a", ""], "lazy full")
+
+
+def test_differential_not_onepass_still_agrees() raises:
+    # Not one-pass: the backtracker / Pike ladder still serves these.
+    _differential["(a|ab)(c|bcd)(d*)"](
+        ["a", "b", "c", "d", "ab", "bcd", "abcd", " ", "\n", "é", "€"],
+        "(a|ab)(c|bcd)(d*)",
+    )
+    _differential["(a*)(a*)"](_alpha_ab(), "(a*)(a*)")
+    _fullmatch_differential["(a|ab)(c|bcd)(d*)"](
+        ["abcd", "acd", "abc", "ad", "abcdd"], "priority full"
+    )
+
+
+def test_differential_anchors() raises:
+    _differential["(?m)^(\\w+)$"](_alpha_words(), "(?m)^(\\w+)$")
+    _differential["(?m)^(\\w+)$|q"](_alpha_words(), "(?m)^(\\w+)$|q")
+    _differential["\\b(\\w+)\\b"](_alpha_words(), "\\b(\\w+)\\b")
+    _differential["\\b(\\w+)\\b|q"](_alpha_words(), "\\b(\\w+)\\b|q")
+    _differential["(a)$|(a)"](_alpha_ab(), "(a)$|(a)")
+    _differential["(a)\\b|(a)"](_alpha_ab(), "(a)\\b|(a)")
+    _differential["^(a|ab)(b*)"](_alpha_ab(), "^(a|ab)(b*)")
+    _differential["(a)\\B(b)"](_alpha_ab(), "(a)\\B(b)")
+    _fullmatch_differential["(?m)^(\\w+)$"](
+        ["ab", "ab\n", "\nab", "a b", ""], "ml full"
+    )
+    _fullmatch_differential["\\b(\\w+)\\b"](["ab", "ab ", " ab", ""], "wb full")
+
+
+def test_differential_utf8() raises:
+    _differential["(*UTF8)(\\w+)"](_alpha_words(), "(*UTF8)(\\w+)")
+    _differential["(*UTF8)([^\\d]+)(\\d+)"](_alpha_words(), "(*UTF8) neg")
+    _fullmatch_differential["(*UTF8)(\\w+)"](
+        ["héllo", "ab", "é", "€", "a b", ""], "utf8 full"
+    )
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()

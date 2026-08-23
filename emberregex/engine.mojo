@@ -107,6 +107,18 @@ from .simd_kernels import (
     stops_from_bitmap,
 )
 from .executor import PikeVM, _VMBuffers
+from .onepass import (
+    OnePass,
+    build_onepass,
+    onepass_class_arr,
+    onepass_eps_arr,
+    onepass_eps_len,
+    onepass_match,
+    onepass_state_arr,
+    onepass_state_len,
+    onepass_table_arr,
+    onepass_table_len,
+)
 from std.collections import InlineArray
 
 
@@ -1016,6 +1028,24 @@ struct Regex[pattern: String](Copyable, Movable):
     # Backtracker (state, pos) memoization is only sound when a subtree's
     # outcome is a function of (state, pos) — see sbt_memo_ok.
     comptime _sbt_memo_ok = sbt_memo_ok(Self.nfa)
+    # The one-pass DFA (onepass.mojo): capture extraction in a single
+    # forward table walk for patterns where at most one thread can
+    # consume each byte. Serves match() (fullmatch over the whole input)
+    # and the capture lane's span confirm (`_span_fill_slots`). Its own
+    # field, referenced by `_use_onepass` alone and never by `_strategy`:
+    # every argument into `_compute_strategy` is elaborated for every
+    # pattern, and this build is only worth paying for where a capture
+    # verb runs. Capture-free patterns have the classic table and the
+    # leftmost-first lane; they never build it.
+    comptime _onepass = build_onepass(Self.nfa, Self._group_count > 0)
+    comptime _use_onepass = Self._group_count > 0 and Self._onepass.valid
+    comptime _OP_TN = onepass_table_len(Self._onepass)
+    comptime _OP_TABLE = onepass_table_arr[Self._OP_TN](Self._onepass)
+    comptime _OP_CLASSES = onepass_class_arr(Self._onepass)
+    comptime _OP_NE = onepass_eps_len(Self._onepass)
+    comptime _OP_EPS = onepass_eps_arr[Self._OP_NE](Self._onepass)
+    comptime _OP_NS = onepass_state_len(Self._onepass)
+    comptime _OP_STATES = onepass_state_arr[Self._OP_NS](Self._onepass)
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
     var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
@@ -1449,26 +1479,62 @@ struct Regex[pattern: String](Copyable, Movable):
         left all `-1`: the span is still reported, only its groups read
         as unset — the lane never drops a match the tables found.
         """
-        if pike[].sbt_ok:
-            try:
-                var memo = List[UInt64]()
-                var got = _sbt_run[
-                    nfa=Self.nfa,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                    anchored_end=True,
-                ](input, start, slots, memo, end_at=end)
-                if got == end:
-                    return
-                debug_assert(
-                    got < 0, "anchored_end backtracker returned another end"
-                )
-            except:
-                pass
-            pike[].sbt_ok = False
+        comptime if Self._use_onepass:
+            # One table walk over the span, exact: a -1 here means the
+            # tables and the one-pass automaton disagree about the span
+            # (never, by construction — flagged under ASSERT), and the
+            # Pike VM below is the same escape hatch as for the
+            # backtracker's disagreement.
+            var got = self._onepass_walk(input, start, end, slots)
+            if got == end:
+                return
+            debug_assert(False, "one-pass DFA rejects the DFA span")
+            for s in range(Self._num_slots):
+                slots[s] = -1
+        else:
+            if pike[].sbt_ok:
+                try:
+                    var memo = List[UInt64]()
+                    var got = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                        anchored_end=True,
+                    ](input, start, slots, memo, end_at=end)
+                    if got == end:
+                        return
+                    debug_assert(
+                        got < 0,
+                        "anchored_end backtracker returned another end",
+                    )
+                except:
+                    pass
+                pike[].sbt_ok = False
         # Slots may hold a partial walk's writes: the Pike result
         # replaces every one of them.
         self._pike_span(input, start, end, slots, pike)
+
+    @always_inline
+    def _onepass_walk[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        end_pin: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+    ) -> Int:
+        """The one-pass DFA over exactly `[start, end_pin)` (see
+        `onepass_match`): `end_pin` with the slots written, else -1.
+        Only meaningful when `_use_onepass`."""
+        return onepass_match[
+            op=Self._onepass,
+            table=Self._OP_TABLE,
+            classes=Self._OP_CLASSES,
+            eps=Self._OP_EPS,
+            states=Self._OP_STATES,
+            num_slots=Self._num_slots,
+        ](input, start, end_pin, slots)
 
     def _pike_span[
         origin: Origin, wo: MutOrigin, //
@@ -1581,6 +1647,18 @@ struct Regex[pattern: String](Copyable, Movable):
             except:
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_match(input)
+        elif Self._use_onepass:
+            # One-pass capture pattern: one forward table walk writes the
+            # slots; a dead walk is a definitive no-match (no budget, no
+            # fallback engine).
+            var bytes = input.as_bytes()
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+            var end = self._onepass_walk(bytes, 0, len(bytes), slots)
+            if end >= 0:
+                return MatchResult[Self._num_slots](
+                    matched=True, start=0, end=end, slots=slots^
+                )
+            return MatchResult[Self._num_slots].no_match()
         try:
             # Declared here, not at the top of the method: the sandwich,
             # SIMD-literal and DFA lanes above all return without ever
