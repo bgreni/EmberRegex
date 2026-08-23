@@ -43,9 +43,13 @@ from .constants import CHAR_NEWLINE
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
+    EDFA_MATCH_IF_WORD,
     EagerDFA,
     _edfa_accel_skip,
     _edfa_has_accel,
+    _edfa_has_region,
+    _edfa_region_skip,
+    edfa_is_word,
 )
 from .simd_kernels import (
     NIBBLE_TABLE_SIZE,
@@ -273,6 +277,11 @@ def _sheng_full_match_impl[
         while pos < input_len:
             var unused = -1
             var skipped = _edfa_accel_skip[d=d](input, cur, pos, unused)
+            comptime if _edfa_has_region(d):
+                var before = cur
+                skipped = _edfa_region_skip[d=d](input, cur, skipped)
+                if cur != before:
+                    cur_vec = _ShengState(UInt8(cur))
             pos = skipped
             if pos >= input_len:
                 break
@@ -351,6 +360,7 @@ def _sheng_walk_impl[
     s_at0: Int,
     s_nl: Int,
     s_other: Int,
+    s_other_w: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
     comptime dead = d.num_states
     var msk = materialize[masks]()
@@ -361,7 +371,12 @@ def _sheng_walk_impl[
     elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
         cur = s_nl
     else:
-        cur = s_other
+        comptime if s_other_w != s_other:
+            cur = s_other_w if edfa_is_word(
+                input.unsafe_get(start - 1)
+            ) else s_other
+        else:
+            cur = s_other
     var cur_vec = _ShengState(UInt8(cur))
 
     var last_match = -1
@@ -372,7 +387,13 @@ def _sheng_walk_impl[
     var input_len = len(input)
     while pos < input_len:
         comptime if accel:
-            pos = _edfa_accel_skip[d=d](input, cur, pos, last_match)
+            var skipped = _edfa_accel_skip[d=d](input, cur, pos, last_match)
+            comptime if _edfa_has_region(d):
+                var before = cur
+                skipped = _edfa_region_skip[d=d](input, cur, skipped)
+                if cur != before:
+                    cur_vec = _ShengState(UInt8(cur))
+            pos = skipped
             if pos >= input_len:
                 break
         var b = input.unsafe_get(pos)
@@ -382,6 +403,11 @@ def _sheng_walk_impl[
                 and (flg.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
             ):
                 last_match = pos
+        comptime if d.any_wb:
+            if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
+                var f = flg.unsafe_get(cur)
+                if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
+                    last_match = pos
         cur_vec = _sheng_step(msk, b, cur_vec)
         cur = Int(cur_vec[0])
         if cur == dead:
@@ -409,6 +435,7 @@ def sheng_walk_from[
     s_at0: Int,
     s_nl: Int,
     s_other: Int,
+    s_other_w: Int = s_other,
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Shuffle walk from `start` in explicit start states (mirrors
     edfa_walk_from), with the same per-walk accelerated/plain dispatch."""
@@ -423,6 +450,7 @@ def sheng_walk_from[
                 s_at0=s_at0,
                 s_nl=s_nl,
                 s_other=s_other,
+                s_other_w=s_other_w,
             ](input, start)
     return _sheng_walk_impl[
         d=d,
@@ -432,6 +460,7 @@ def sheng_walk_from[
         s_at0=s_at0,
         s_nl=s_nl,
         s_other=s_other,
+        s_other_w=s_other_w,
     ](input, start)
 
 
@@ -454,4 +483,5 @@ def sheng_match_at[
         s_at0=d.start_at_0,
         s_nl=d.start_after_nl,
         s_other=d.start_other,
+        s_other_w=d.start_other_word,
     ](input, start)

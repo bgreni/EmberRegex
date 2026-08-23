@@ -78,7 +78,7 @@ def approx_supported(base: NFA) -> Bool:
             or k == NFAStateKind.BACKREF
         ):
             return False
-    return base.can_use_dfa
+    return base.can_use_dfa and not base.has_word_boundary
 
 
 def approx_nfa(base: NFA, k: Int, hamming: Bool) -> NFA:
@@ -216,6 +216,7 @@ def approx_nfa(base: NFA, k: Int, hamming: Bool) -> NFA:
     out.group_count = 0
     out.can_use_dfa = base.can_use_dfa
     out.has_lazy = base.has_lazy
+    out.has_word_boundary = base.has_word_boundary
     return out^
 
 
@@ -247,4 +248,6 @@ def splice_nfa(mut dst: NFA, src: NFA) -> Int:
         dst.can_use_dfa = False
     if src.has_lazy:
         dst.has_lazy = True
+    if src.has_word_boundary:
+        dst.has_word_boundary = True
     return src.start + state_off

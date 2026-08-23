@@ -163,6 +163,32 @@ match, never one per candidate. Every materialized table is padded to
 a per-call stack copy inside the walker, which cost more than the walk
 itself on 3-state tables.
 
+**Word boundaries ride all three tables.** `\b` needs the byte on both
+sides, and a closure only knows the one behind it, so — regex-automata's
+approach — a DFA state carries the look-behind: the word class of the
+byte that led to it, recorded only while a word anchor is pending in the
+set (so `\b`-free tables are byte-identical to before). The anchor stays
+a pending member, like an EOL anchor; creating a state resolves it twice,
+for a word and for a non-word next byte, and the two resolved sets feed
+the word and the non-word byte classes of its transitions (the classes
+are cut at the `[A-Za-z0-9_]` edges when an anchor exists). A resolved
+continuation that reaches MATCH becomes a *conditional* match flag
+(`EDFA_MATCH_IF_WORD` / `_NONWORD`) the walker checks against the next
+byte before consuming it, exactly like `EDFA_EOL_AT_NEWLINE`; end of
+input counts as non-word. The mid-line start context splits the same
+way (`start_other` / `start_other_word`), and the reverse DFA mirrors it
+with the roles swapped: the byte just consumed is the look-ahead, the
+byte about to be consumed the look-behind, and the entry's liveness
+becomes `RDFA_WB_LEFT_WORD` / `_NONWORD`. The split restart states of the
+leftmost-first table no longer self-loop on prose (one takes word runs,
+the other non-word runs), so they are accelerated as a **region**: a set
+of flag-free states whose rows agree on every byte outside a sparse exit
+set — the walker scans to the next exit byte and lands in whichever
+member the last skipped byte selects. Engine selection is unchanged
+otherwise; a word anchor whose continuation reaches a BOL kind (`\b^`)
+stays off the lanes, as does the runtime lazy DFA, which does not model
+the anchor. Sets keep word-boundary patterns off their DFA lanes.
+
 The **specialized backtracker** is comptime-specialized per NFA state: each
 `_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind
 with all fields baked in. The body is a `comptime if` chain over the kind, so

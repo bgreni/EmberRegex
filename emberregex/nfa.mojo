@@ -164,6 +164,11 @@ struct NFA(Copyable):
     var group_count: Int
     var has_lazy: Bool
     var can_use_dfa: Bool
+    var has_word_boundary: Bool
+    """Some ANCHOR state is a WORD_BOUNDARY / NOT_WORD_BOUNDARY. The
+    single-pattern DFA lanes model these with a per-state look-behind
+    class (static_dfa.mojo); the set lanes do not, and clear
+    `can_use_dfa` for such unions themselves (set_nfa.mojo)."""
     var start_anchor: Int  # AnchorKind at pattern start, or -1
     var start_after_leading_anchor: Int
     """State index reached after the leading ANCHOR (when start_anchor != -1).
@@ -187,6 +192,7 @@ struct NFA(Copyable):
         self.group_count = 0
         self.has_lazy = False
         self.can_use_dfa = True
+        self.has_word_boundary = False
         self.start_anchor = -1
         self.start_after_leading_anchor = -1
         self.pattern_starts = List[Int]()
@@ -887,12 +893,15 @@ def _build_fragment(
                 anchor_type = AnchorKind.BOL_MULTILINE
             elif anchor_type == AnchorKind.EOL:
                 anchor_type = AnchorKind.EOL_MULTILINE
-        # Simple line anchors are handled by the DFA; word boundaries are not
+        # Line anchors and word boundaries are both DFA-representable for
+        # a single pattern (the DFA lanes carry the look-behind byte class
+        # per state); the flag lets engine selection and the set lanes
+        # tell the two apart.
         if (
             anchor_type == AnchorKind.WORD_BOUNDARY
             or anchor_type == AnchorKind.NOT_WORD_BOUNDARY
         ):
-            nfa.can_use_dfa = False
+            nfa.has_word_boundary = True
         var state_idx = nfa.add_state(NFAState.anchor_state(anchor_type))
         var frag = NFAFragment(state_idx)
         frag.add_out(state_idx, 1)

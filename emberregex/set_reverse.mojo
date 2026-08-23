@@ -28,10 +28,12 @@ way the forward lanes defer EOL:
   - `bolnl` — ids reachable by resolving BOL_MULTILINE only
               (p > 0 and input[p-1] == '\\n')
 
-Word boundaries would need both neighbours at once; they already keep a
-set off the DFA lanes (`can_use_dfa`), and such sets take the SOM-carrying
-Pike instead (`set_pike.som_scan`), so the reverse lane never has to model
-them.
+Word boundaries need both neighbours at once; they keep a SET off the DFA
+lanes (`can_use_dfa` is cleared for such unions in set_nfa.mojo), and such
+sets take the SOM-carrying Pike instead (`set_pike.som_scan`), so this
+reverse lane never models them. The single-pattern reverse DFA
+(static_rdfa.mojo) does, with a per-state look-ahead class — the same
+trick would lift the restriction here.
 
 Cost is one leftward walk per distinct reported end, each bounded by the
 reverse automaton dying — i.e. by the longest match that can end there,
@@ -63,6 +65,10 @@ from .static_dfa import (
     _bs_set,
     _byte_classes,
     _flatten_nfa,
+    _wb_holds,
+    WB_DROP,
+    WB_PENDING,
+    WB_RESOLVE,
 )
 
 # Mirrors MDFA_STATE_CAP: the reverse table is the same shape and the same
@@ -275,6 +281,17 @@ def _rev_step(
     # and zero-filled once per (reverse-DFA state x byte class).
     var out = List[Int]()
     for t in states:
+        # A pending BOL kind is stepped past only where it resolves:
+        # BOL_MULTILINE on a '\n' (the byte about to be consumed is the
+        # one before the anchor's position), BOL never mid-input. Its
+        # predecessors must not feed the step otherwise, or `(?:x^y|y)`
+        # on "xy" walks to start 0 through an anchor that never held.
+        if nfa.states[t].kind == NFAStateKind.ANCHOR:
+            var tat = nfa.states[t].anchor_type
+            if tat == AnchorKind.BOL:
+                continue
+            if tat == AnchorKind.BOL_MULTILINE and byte != Int(CHAR_NEWLINE):
+                continue
         for p in preds[t]:
             var pk = nfa.states[p].kind
             var ok: Bool
@@ -315,6 +332,9 @@ def _rev_flat_closure(
     seeds: List[Int],
     at_end: Bool,
     on_newline: Bool,
+    wb_mode: Int = WB_DROP,
+    left_word: Bool = False,
+    right_word: Bool = False,
 ) -> _StateBits:
     """`_rev_closure` over flat views, as a bitset.
 
@@ -323,6 +343,12 @@ def _rev_flat_closure(
     and anchors whose kind holds in this context (EOL at end, EOL_ML at
     end or on a newline, BOL kinds always pushed so the slices can find
     them).
+
+    Word anchors follow `wb_mode`: walked past by default, like
+    `_rev_closure` (the set lanes never determinize one); kept but not
+    walked past (`WB_PENDING`) for the single-pattern reverse DFA; or
+    resolved (`WB_RESOLVE`): one that holds between `left_word` /
+    `right_word` is walked past and one that does not is dropped.
     """
     var n = len(kinds)
     var bits = _StateBits(0)
@@ -341,6 +367,18 @@ def _rev_flat_closure(
             var sat = anchors.unsafe_get(s)
             if sat == AnchorKind.BOL or sat == AnchorKind.BOL_MULTILINE:
                 continue  # kept, not walked past
+            if (
+                sat == AnchorKind.WORD_BOUNDARY
+                or sat == AnchorKind.NOT_WORD_BOUNDARY
+            ):
+                if wb_mode == WB_PENDING:
+                    continue  # kept, not walked past
+                if wb_mode == WB_RESOLVE and not _wb_holds(
+                    sat, left_word, right_word
+                ):
+                    # Dropped: clear the membership set above.
+                    bits[s >> 6] = bits[s >> 6] & ~(UInt64(1) << UInt64(s & 63))
+                    continue
         var off = pred_off.unsafe_get(s)
         for k in range(pred_len.unsafe_get(s)):
             var p = pred_data.unsafe_get(off + k)
@@ -474,6 +512,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         match_states,
         True,
         True,
+        WB_DROP,
     )
     var s_end = _rbs_find_or_add(c_end, sets_bits, hashes, index)
     var c_nl = _rev_flat_closure(
@@ -485,6 +524,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         match_states,
         False,
         True,
+        WB_DROP,
     )
     var s_nl = _rbs_find_or_add(c_nl, sets_bits, hashes, index)
     var c_other = _rev_flat_closure(
@@ -496,6 +536,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         match_states,
         False,
         False,
+        WB_DROP,
     )
     var s_other = _rbs_find_or_add(c_other, sets_bits, hashes, index)
 
@@ -506,27 +547,50 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
     var gval_n = List[_StateBits]()
     var one_seed = List[Int](fill=0, length=1)
 
+    # Pending BOL kinds are stepped past only where they resolve (see
+    # `_rev_step`): never for BOL, on the '\n' class for BOL_MULTILINE.
+    var bol_bits = _StateBits(0)
+    var bol_ml_bits = _StateBits(0)
+    for s in range(n):
+        if kinds.unsafe_get(s) != NFAStateKind.ANCHOR:
+            continue
+        var at = anchors.unsafe_get(s)
+        if at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE:
+            _bs_set(bol_bits, s)
+        if at == AnchorKind.BOL_MULTILINE:
+            _bs_set(bol_ml_bits, s)
+
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0
     while cur < len(sets_bits):
         if len(sets_bits) > RDFA_STATE_CAP:
             return result^
-        # Union of predecessors of every member.
+        # Union of predecessors of every member that may be stepped past.
         var cur_bits = sets_bits.unsafe_get(cur)
+        var step_bits = cur_bits & ~bol_bits
         var pu = _StateBits(0)
         for l in range(64):
-            var w = cur_bits[l]
+            var w = step_bits[l]
             while w != 0:
                 var t = 64 * l + Int(count_trailing_zeros(w))
                 w &= w - 1
                 pu = pu | pred_bits.unsafe_get(t)
+        var pu_nl = pu
+        if has_bol_ml:
+            var bm = cur_bits & bol_ml_bits
+            for l in range(64):
+                var w = bm[l]
+                while w != 0:
+                    var t = 64 * l + Int(count_trailing_zeros(w))
+                    w &= w - 1
+                    pu_nl = pu_nl | pred_bits.unsafe_get(t)
 
         var row = SIMD[DType.int32, 256](-1)
         for ci in range(nclasses):
-            var raw = pu & acc.unsafe_get(ci)
+            var is_nl = ci == nl_class
+            var raw = (pu_nl if is_nl else pu) & acc.unsafe_get(ci)
             if not _bs_any(raw):
                 continue  # dead: the walk stops here
-            var is_nl = ci == nl_class
             var closed = _StateBits(0)
             for l in range(64):
                 var w = raw[l]
@@ -545,6 +609,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
                             one_seed,
                             False,
                             False,
+                            WB_DROP,
                         )
                         var g_n = g_o
                         if has_bol_ml or _bs_any(eol_bits):
@@ -557,6 +622,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
                                 one_seed,
                                 False,
                                 True,
+                                WB_DROP,
                             )
                         gval_o.append(g_o)
                         gval_n.append(g_n)
