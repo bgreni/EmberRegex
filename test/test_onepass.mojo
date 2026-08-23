@@ -18,6 +18,15 @@ from emberregex.onepass import (
     OP_NEED_WORD,
     ONEPASS_STATE_CAP,
     build_onepass,
+    onepass_class_arr,
+    onepass_eps_arr,
+    onepass_eps_len,
+    onepass_find_end,
+    onepass_match,
+    onepass_state_arr,
+    onepass_state_len,
+    onepass_table_arr,
+    onepass_table_len,
 )
 from emberregex.engine import _build_static_nfa
 from emberregex.result import MatchResult
@@ -160,6 +169,51 @@ def test_onepass_builder_direct() raises:
         op_wb, Int(OP_NEED_NONWORD), Int(OP_NEED_WORD)
     )
     assert_true(wb_ok)
+
+
+def test_onepass_walker_acceleration() raises:
+    # A valid (but simple-loop, so not engine-selected) pattern with an
+    # accelerating self-loop state: the walkers must SIMD-skip the run
+    # and land with the right slots. Built and walked directly, since
+    # the shape gate keeps such patterns off `_use_onepass`.
+    comptime op = build_onepass(_build_static_nfa("(a)([^;]*);(b)"), True)
+    assert_true(op.valid)
+    comptime accel = len(op.accel.accel_states) + len(op.accel.accel_nib_states)
+    assert_true(accel >= 1)
+    comptime TN = onepass_table_len(op)
+    comptime TBL = onepass_table_arr[TN](op)
+    comptime CLS = onepass_class_arr(op)
+    comptime NE = onepass_eps_len(op)
+    comptime EPS = onepass_eps_arr[NE](op)
+    comptime NS = onepass_state_len(op)
+    comptime ST = onepass_state_arr[NS](op)
+    # 40-byte middle run so the 16-byte-vector acceleration fires.
+    var s = String("a") + String("x") * 38 + ";b"
+    var slots = InlineArray[Int, 8](fill=-1)
+    var e = onepass_match[
+        op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
+    ](s.as_bytes(), 0, s.byte_length(), slots)
+    assert_equal(e, s.byte_length())
+    assert_equal(slots[0], 0)  # (a)
+    assert_equal(slots[1], 1)
+    assert_equal(slots[2], 1)  # ([^;]*)
+    assert_equal(slots[3], 39)
+    assert_equal(slots[4], 40)  # (b)
+    assert_equal(slots[5], 41)
+    var slots2 = InlineArray[Int, 8](fill=-1)
+    var steps = 0
+    var e2 = onepass_find_end[
+        op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
+    ](s.as_bytes(), 0, slots2, steps)
+    assert_equal(e2, s.byte_length())
+    assert_equal(slots2[3], 39)
+    # A dead walk: no ';' → no match.
+    var miss = String("a") + String("x") * 40
+    var slots3 = InlineArray[Int, 8](fill=-1)
+    var e3 = onepass_match[
+        op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
+    ](miss.as_bytes(), 0, miss.byte_length(), slots3)
+    assert_equal(e3, -1)
 
 
 def test_onepass_state_cap() raises:
