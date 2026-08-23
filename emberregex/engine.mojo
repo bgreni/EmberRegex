@@ -59,6 +59,7 @@ from .backtrack import (
     SBT_BUDGET,
     SBT_MEMO_BITS,
     _sbt_try_match,
+    sbt_memo_budget,
     sbt_memo_ok,
     sbt_memo_rows,
 )
@@ -255,8 +256,15 @@ def _sbt_run_memoized[
     A separate instantiation from the ordinary walk (`memo_on`), so the
     memo costs the fast path nothing — not even a branch. Not inlined:
     this is the pathological lane.
+
+    The budget here is NOT SBT_BUDGET. This attempt is a gamble placed
+    against a fallback (the Pike VM) whose cost is one pass over the same
+    (state, position) table, so it gets a table-proportional allowance and
+    concedes once it is clear memoization is not collapsing the search —
+    see `sbt_memo_budget`.
     """
-    var budget = SBT_BUDGET
+    comptime memo_rows = sbt_memo_rows(nfa)
+    var budget = sbt_memo_budget(memo_rows, len(input))
     var result = _sbt_try_match[
         nfa=nfa,
         state_idx=state_idx,
