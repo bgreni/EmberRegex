@@ -71,6 +71,7 @@ from .static_dfa import (
     _pivot_prefilter,
     build_eager_dfa,
     edfa_table_arr,
+    edfa_table_len,
     edfa_flags_arr,
     edfa_id_dtype,
     edfa_full_match,
@@ -755,9 +756,11 @@ struct Regex[pattern: String](Copyable, Movable):
         and not Self._strategy.use_eager_dfa
         and not Self._strategy.use_teddy
     )
-    comptime _EDFA_TN = Self._edfa.num_states * 256
     # The table is the walk's hot data, so it materializes in the
-    # narrowest element type the ids fit (see edfa_id_dtype).
+    # narrowest element type the ids fit (see edfa_id_dtype), padded to
+    # EDFA_TABLE_MIN_BYTES so the constant lowers to shared data instead
+    # of a per-call stack copy (see edfa_table_len).
+    comptime _EDFA_TN = edfa_table_len(Self._edfa.num_states)
     comptime _EDFA_DT = edfa_id_dtype(Self._edfa.num_states)
     comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN, Self._EDFA_DT](
         Self._edfa
@@ -770,7 +773,7 @@ struct Regex[pattern: String](Copyable, Movable):
         Self._edfa, Self._strategy.use_sheng
     )
     # Leftmost-first lane tables (same materialization rules as above).
-    comptime _LFDFA_TN = Self._lfdfa.d.num_states * 256
+    comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.d.num_states)
     comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.d.num_states)
     comptime _LFDFA_TABLE = edfa_table_arr[Self._LFDFA_TN, Self._LFDFA_DT](
         Self._lfdfa.d
@@ -782,7 +785,7 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _LF_SHENG_MASKS = sheng_masks_arr[Self._LF_SHENG_CAP](
         Self._lfdfa.d, Self._use_lf_sheng
     )
-    comptime _RDFA_TN = Self._rdfa.num_states * 256
+    comptime _RDFA_TN = edfa_table_len(Self._rdfa.num_states)
     comptime _RDFA_DT = edfa_id_dtype(Self._rdfa.num_states)
     comptime _RDFA_TABLE = rdfa_table_arr[Self._RDFA_TN, Self._RDFA_DT](
         Self._rdfa

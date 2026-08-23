@@ -475,9 +475,14 @@ def rdfa_table_arr[
     n: Int, dt: DType
 ](d: RDFA) -> InlineArray[Scalar[dt], n]:
     """Comptime conversion of the flat table to a materializable array
-    (narrow id type from `edfa_id_dtype`, EDFA_DEAD survives)."""
+    (narrow id type from `edfa_id_dtype`, `n` from `edfa_table_len` so a
+    tiny table is padded with dead rows to EDFA_TABLE_MIN_BYTES,
+    EDFA_DEAD survives)."""
     var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
-    for i in range(n):
+    var m = len(d.table)
+    if n < m:
+        m = n
+    for i in range(m):
         arr[i] = Scalar[dt](d.table[i])
     return arr^
 

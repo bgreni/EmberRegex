@@ -90,6 +90,36 @@ def edfa_id_dtype(num_states: Int) -> DType:
     return DType.int32
 
 
+# Smallest materialized table, in bytes. A comptime constant aggregate
+# below this size lowers to a per-call STACK COPY inside every walker that
+# `materialize`s it (the compiler expands the initializer into stores);
+# at this size and above it lowers to one shared global and the walk
+# indexes the constant directly. Measured 2026-08-23 on a 3-state reverse
+# table (768 B): 13.5 ns per 5-byte walk against 2.5 ns once padded to
+# 1024 B — the fixed cost that made `<.*?>` findall 2.4x slower than the
+# backtracker. Tables are padded with dead rows up to this size
+# (`edfa_table_len`); the padding is never indexed.
+comptime EDFA_TABLE_MIN_BYTES = 1024
+
+
+def edfa_table_len(num_states: Int) -> Int:
+    """Comptime: element count of the materialized transition table for
+    `num_states` rows of `edfa_id_dtype(num_states)` ids — the rows
+    themselves, padded with dead rows up to EDFA_TABLE_MIN_BYTES (see
+    there). 0 for an empty (disabled) DFA."""
+    var n = num_states * 256
+    if n == 0:
+        return 0
+    var dt = edfa_id_dtype(num_states)
+    var elem_bytes = 1
+    if dt == DType.int16:
+        elem_bytes = 2
+    elif dt == DType.int32:
+        elem_bytes = 4
+    var min_n = EDFA_TABLE_MIN_BYTES // elem_bytes
+    return n if n > min_n else min_n
+
+
 # NFA state sets as SIMD bitsets. The comptime interpreter models SIMD
 # natively (whole-vector ops and lane accesses cost about as much as scalar
 # arithmetic, ~1us), while every List element access costs ~40us and every
@@ -1192,11 +1222,15 @@ def edfa_table_arr[
 ](d: EagerDFA) -> InlineArray[Scalar[dt], n]:
     """Comptime conversion of the flat table to a materializable array.
 
-    `dt` comes from `edfa_id_dtype`; EDFA_DEAD (-1) survives the
-    narrowing, so the walkers keep their sign-bit dead test.
+    `dt` comes from `edfa_id_dtype`, `n` from `edfa_table_len` (it may
+    exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
+    survives the narrowing, so the walkers keep their sign-bit dead test.
     """
     var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
-    for i in range(n):
+    var m = len(d.table)
+    if n < m:
+        m = n
+    for i in range(m):
         arr[i] = Scalar[dt](d.table[i])
     return arr^
 

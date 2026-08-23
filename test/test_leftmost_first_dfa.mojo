@@ -13,17 +13,20 @@ newlines and bytes >= 0x80.
 
 from emberregex import Regex
 from emberregex.static_dfa import (
+    EDFA_TABLE_MIN_BYTES,
     EagerDFA,
     edfa_flags_arr,
     edfa_id_dtype,
     edfa_table_arr,
 )
+from emberregex.static_rdfa import rdfa_find_start
 from emberregex.static_lfdfa import (
     LF_LIST_CAP,
     build_lf_dfa,
     lfdfa_find_end,
     lfdfa_match_at,
 )
+from std.benchmark import keep
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 from std.time import perf_counter_ns
 
@@ -262,6 +265,46 @@ def test_lazy_scan_does_not_walk_the_line() raises:
         t_big = min(t_big, t1 - t0)
         t_small = min(t_small, t2 - t1)
     assert_true(t_big < 50 * t_small + 200_000)
+
+
+def test_tiny_tables_materialize_as_shared_data() raises:
+    # A comptime table below EDFA_TABLE_MIN_BYTES lowers to a per-call
+    # stack copy inside the walker (~11 ns per call for a 3-state table,
+    # which was 60% of the per-match cost of `<.*?>` findall). The
+    # materialized arrays are padded to that size, so the constant is a
+    # shared global and a short walk costs per-byte work only.
+    comptime S = Regex["<.*?>"]
+    comptime assert S._lfdfa.d.num_states * 256 < EDFA_TABLE_MIN_BYTES
+    comptime assert S._LFDFA_TN >= EDFA_TABLE_MIN_BYTES
+    comptime assert S._RDFA_TN >= EDFA_TABLE_MIN_BYTES
+    comptime assert S._EDFA_TN >= EDFA_TABLE_MIN_BYTES
+    var s = "<abcdefg> " * 64
+    var b = s.as_bytes()
+    # A 1-byte reverse walk against a 9-byte scalar one: with the copy
+    # the fixed cost dominates both (measured 11.5 vs 12.8 ns per call),
+    # without it the walk is per-byte work (1.0 vs 8.9 ns). Min of
+    # several timings; inputs alternate so the call cannot be hoisted.
+    var t_one = 1 << 62
+    var t_nine = 1 << 62
+    for _ in range(7):
+        var t0 = perf_counter_ns()
+        var acc = 0
+        for k in range(20000):
+            var e = 9 + (k & 1) * 10
+            acc += rdfa_find_start[
+                d=S._rdfa, table=S._RDFA_TABLE, flags=S._RDFA_FLAGS
+            ](b, e, e - 1)
+        var t1 = perf_counter_ns()
+        for k in range(20000):
+            var e = 9 + (k & 1) * 10
+            acc += rdfa_find_start[
+                d=S._rdfa, table=S._RDFA_TABLE, flags=S._RDFA_FLAGS
+            ](b, e, e - 9)
+        var t2 = perf_counter_ns()
+        keep(acc)
+        t_one = min(t_one, t1 - t0)
+        t_nine = min(t_nine, t2 - t1)
+    assert_true(3 * t_one < t_nine)
 
 
 def test_eol_in_priority_order() raises:
