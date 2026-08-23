@@ -5,7 +5,7 @@ skip-ahead. A literal prefix is the sequence of bytes that every
 match must start with.
 """
 
-from .constants import CHAR_A_UPPER, CHAR_Z_UPPER
+from .constants import CHAR_A_UPPER, CHAR_NEWLINE, CHAR_Z_UPPER
 from .nfa import NFA, NFAStateKind
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
@@ -754,3 +754,146 @@ def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:
             return SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
 
     return bitmap
+
+
+struct FirstByteSet(Copyable, Movable):
+    """The bytes a state can consume FIRST, plus whether it can be left
+    without consuming anything at all.
+
+    `bitmap` is always a SUPERSET of the truly acceptable first bytes, so a
+    caller may use "this byte is absent" as proof that the state cannot match
+    here — never the converse.
+
+    `can_be_empty` is the stop-reasoning flag: it is set when MATCH, a
+    lookaround or a backreference is reachable through zero-width states, i.e.
+    when the state might succeed (or might consume bytes that are only known
+    at run time) without eating a byte. Every "the next byte must be in
+    `bitmap`" inference is invalid when it is set.
+
+    Invariant: `can_be_empty` always comes with an all-ones `bitmap`, so a
+    caller that forgets to check the flag still cannot narrow anything. The
+    flag is what callers should test — the redundancy is a safety net, not a
+    licence to skip it.
+    """
+
+    var bitmap: SIMD[DType.uint8, BITMAP_WIDTH]
+    var can_be_empty: Bool
+
+    def __init__(
+        out self, bitmap: SIMD[DType.uint8, BITMAP_WIDTH], can_be_empty: Bool
+    ):
+        self.bitmap = bitmap
+        self.can_be_empty = can_be_empty
+
+
+def _any_byte_bitmap() -> SIMD[DType.uint8, BITMAP_WIDTH]:
+    """The bytes ANY accepts: everything but `\\n` (DOTALL `.` is compiled to
+    a CHARSET, not ANY, so this stays exact)."""
+    var m = SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
+    var nl = Int(CHAR_NEWLINE)
+    m[nl >> 3] = m[nl >> 3] & ~(UInt8(1) << UInt8(nl & 7))
+    return m
+
+
+def _unknown_first_bytes() -> FirstByteSet:
+    return FirstByteSet(SIMD[DType.uint8, BITMAP_WIDTH](0xFF), True)
+
+
+def first_byte_bitmap_of(nfa: NFA, state_idx: Int) -> FirstByteSet:
+    """Bytes that can be consumed FIRST once execution enters `state_idx`.
+
+    The same epsilon walk as `extract_first_byte_bitmap`, but rooted at an
+    arbitrary state and reporting whether the walk found a way out that
+    consumes nothing. SPLIT (both arms), SAVE and ANCHOR are transparent:
+    anchors are zero-width and may hold at the position under test, so a
+    conservative walk passes straight through them. CHAR/CHARSET/ANY
+    contribute their byte set and stop the walk. MATCH, LOOKAHEAD,
+    LOOKBEHIND and BACKREF end the analysis with `can_be_empty` — the first
+    because it consumes nothing, the rest because what they accept is not a
+    fixed byte set.
+
+    Used by the backtracker to auto-possessify simple loops (PCRE2's
+    `auto_possessify`) and to skip giveback positions that cannot start the
+    loop's continuation.
+    """
+    if state_idx < 0 or state_idx >= len(nfa.states):
+        return _unknown_first_bytes()
+
+    var bitmap = SIMD[DType.uint8, BITMAP_WIDTH](0)
+    var visited = List[Bool](fill=False, length=len(nfa.states))
+    var stack = List[Int]()
+    stack.append(state_idx)
+    var stack_top = len(stack)
+
+    while stack_top > 0:
+        stack_top -= 1
+        var s = stack[stack_top]
+        if s < 0 or s >= len(nfa.states):
+            # Dangling out-edge: nothing can be proven about this state.
+            return _unknown_first_bytes()
+        if visited[s]:
+            continue
+        visited[s] = True
+
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[s].out1)
+            # out2 == -1 marks a no-op SPLIT (single live arm).
+            if nfa.states[s].out2 >= 0:
+                stack.append(nfa.states[s].out2)
+            stack_top = len(stack)
+        elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            stack.append(nfa.states[s].out1)
+            stack_top = len(stack)
+        elif kind == NFAStateKind.CHAR:
+            var ch = Int(nfa.states[s].char_value)
+            if ch >= 256:
+                # Not nameable in a byte bitmap — stay conservative.
+                bitmap = SIMD[DType.uint8, BITMAP_WIDTH](0xFF)
+            else:
+                bitmap[ch >> 3] = bitmap[ch >> 3] | (UInt8(1) << UInt8(ch & 7))
+        elif kind == NFAStateKind.CHARSET:
+            var cs_idx = nfa.states[s].charset_index
+            var cs_bitmap = nfa.charsets[cs_idx].bitmap
+            if nfa.charsets[cs_idx].negated:
+                cs_bitmap = ~cs_bitmap
+            bitmap = bitmap | cs_bitmap
+        elif kind == NFAStateKind.ANY:
+            bitmap = bitmap | _any_byte_bitmap()
+        else:
+            # MATCH / LOOKAHEAD / LOOKBEHIND / BACKREF (and any kind added
+            # later): reachable without consuming a nameable byte.
+            return _unknown_first_bytes()
+
+    return FirstByteSet(bitmap, False)
+
+
+def loop_body_bitmap(
+    nfa: NFA, state_idx: Int
+) -> SIMD[DType.uint8, BITMAP_WIDTH]:
+    """The byte set of a single consuming state — the body of a simple
+    quantifier loop (`a*`, `\\d+`, `.*?`).
+
+    Empty for every other kind, which reads as "nothing known" to callers
+    and disables the optimizations built on it.
+    """
+    if state_idx < 0 or state_idx >= len(nfa.states):
+        return SIMD[DType.uint8, BITMAP_WIDTH](0)
+    var kind = nfa.states[state_idx].kind
+    if kind == NFAStateKind.CHAR:
+        var ch = Int(nfa.states[state_idx].char_value)
+        if ch >= 256:
+            # Cannot equal any input byte; matches nothing.
+            return SIMD[DType.uint8, BITMAP_WIDTH](0)
+        var m = SIMD[DType.uint8, BITMAP_WIDTH](0)
+        m[ch >> 3] = UInt8(1) << UInt8(ch & 7)
+        return m
+    elif kind == NFAStateKind.CHARSET:
+        var cs_idx = nfa.states[state_idx].charset_index
+        var cs_bitmap = nfa.charsets[cs_idx].bitmap
+        if nfa.charsets[cs_idx].negated:
+            return ~cs_bitmap
+        return cs_bitmap
+    elif kind == NFAStateKind.ANY:
+        return _any_byte_bitmap()
+    return SIMD[DType.uint8, BITMAP_WIDTH](0)
