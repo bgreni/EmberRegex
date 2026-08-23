@@ -239,13 +239,14 @@ def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
 
 def bench_onepass_match_kv(mut b: Bench) raises:
     # One-pass DFA (onepass.mojo): a capture pattern whose NFA admits at
-    # most one consuming thread per byte AND whose loop the backtracker
-    # would run by recursion (a group inside `+`), so match() is one
-    # forward table walk writing the slots as it goes — no recursion, no
-    # budget. 40-byte input of four key=value pairs; the groups report
-    # the last pair (Python's last-iteration semantics).
-    var re = Regex["(?:(\\w+)=(\\w+);)+"]()
-    var input = "host=db01;port=5432;user=admin;retry=55;"
+    # most one consuming thread per byte AND whose only loop the
+    # backtracker would run by recursion (a group inside `+`, no simple
+    # loop inside), so match() is one forward table walk writing the
+    # slots as it goes — no recursion, no budget. 40-byte input of ten
+    # `k=v;` pairs; the groups report the last pair (Python's
+    # last-iteration semantics).
+    var re = Regex["(?:([a-z])=(\\d);)+"]()
+    var input = "a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0;"
 
     @always_inline
     @parameter
@@ -263,16 +264,17 @@ def bench_onepass_match_kv(mut b: Bench) raises:
 
 
 def onepass_findall_input() -> String:
-    """~2 KB: 62 space-separated runs of three `k=v;` pairs — 62 matches
-    for `(?:(\\w+)=(\\w+);)+`."""
-    return String("host=db01;port=5432;user=admin; ") * 62
+    """~1.9 KB: 64 space-separated runs of seven `k=v;` pairs — 64
+    matches for `(?:([a-z])=(\\d);)+`."""
+    return String("a=1;b=2;c=3;d=4;e=5;f=6;g=7; ") * 64
 
 
 def bench_onepass_findall_2KB(mut b: Bench) raises:
-    # The capture lane on the one-pass DFA: every candidate is real, so
-    # each match is one exact leftmost-first table walk (the anchored
-    # attempt), where the backtracker attempt recursed per pair.
-    var re = Regex["(?:(\\w+)=(\\w+);)+"]()
+    # The capture lane on the one-pass DFA (a one-pass pattern rides it
+    # whatever its shape): every candidate is real, so each match is one
+    # exact leftmost-first table walk (the anchored attempt), where the
+    # backtracker lane ran the recursive loop per pair.
+    var re = Regex["(?:([a-z])=(\\d);)+"]()
     var input = onepass_findall_input()
 
     @always_inline

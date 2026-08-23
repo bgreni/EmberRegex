@@ -110,6 +110,7 @@ from .executor import PikeVM, _VMBuffers
 from .onepass import (
     OnePass,
     build_onepass,
+    onepass_shape,
     onepass_class_arr,
     onepass_eps_arr,
     onepass_eps_len,
@@ -547,7 +548,7 @@ def _nfa_has_backref(nfa: NFA) -> Bool:
     return False
 
 
-def _dfa_candidate(nfa: NFA) -> Bool:
+def _dfa_candidate(nfa: NFA, admit_shape: Bool = False) -> Bool:
     """True when the pattern's SHAPE should run on a DFA engine (eager or
     lazy): capture-free, this is the classic/leftmost-first lanes
     (`Regex._use_dfa_candidate`); with captures, the DFA-bounded capture
@@ -576,6 +577,13 @@ def _dfa_candidate(nfa: NFA) -> Bool:
     since the LazyDFA (dfa.mojo) does not model word anchors,
     `_compute_strategy` requires the eager table to have built.
 
+    `admit_shape` skips the shape test (the guards stay): the capture
+    lane passes `Regex._use_onepass` so a one-pass capture pattern
+    whose only loop is a lone general one (`((a)(b))+`,
+    `(?:([a-z])=(\\d);)+`) rides the lane, where its anchored attempt is
+    the exact one-pass walk, instead of the backtracker lane, where the
+    same loop recurses per iteration.
+
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
     `_use_dfa_candidate` and threads the result — each evaluation walks
@@ -586,7 +594,7 @@ def _dfa_candidate(nfa: NFA) -> Bool:
     if nfa.has_word_boundary and _wb_cont_reaches_bol(nfa):
         return False
     var cyclic = split_cycle_flags(nfa)
-    if not (
+    if not admit_shape and not (
         _has_alternation_splits(nfa, cyclic)
         or _quantifier_has_suffix(nfa, cyclic)
     ):
@@ -829,8 +837,10 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _lit_alt = extract_literal_alternation(Self.nfa)
     # Evaluated once as a field: _dfa_candidate walks the NFA several
     # times, and comptime memoization covers field declarations, not
-    # repeated internal calls.
-    comptime _dfa_shape_ok = _dfa_candidate(Self.nfa)
+    # repeated internal calls. A one-pass capture pattern is admitted
+    # whatever its shape (see `admit_shape`); `_use_onepass` is False
+    # at its first operand for every capture-free pattern.
+    comptime _dfa_shape_ok = _dfa_candidate(Self.nfa, Self._use_onepass)
     # Capture-free: the classic table serves match(), the leftmost-first
     # lane the search verbs. With captures: the DFA-bounded capture lane
     # (`_use_dfa_span`) for the search verbs only — match() keeps the
@@ -1037,31 +1047,32 @@ struct Regex[pattern: String](Copyable, Movable):
     # The one-pass DFA (onepass.mojo): capture extraction in a single
     # forward table walk for patterns where at most one thread can
     # consume each byte. Serves match() (fullmatch over the whole input)
-    # and the capture lane's span confirm (`_span_fill_slots`). Its own
-    # field, referenced by `_use_onepass` alone and never by `_strategy`:
+    # and, on the capture lane, both the anchored-first attempt
+    # (`_onepass_match_at`, leftmost-first) and the span confirm
+    # (`_span_fill_slots`, pinned). Its own field, referenced by
+    # `_use_onepass` alone and never by `_strategy`:
     # every argument into `_compute_strategy` is elaborated for every
     # pattern, and this build is only worth paying for where a capture
     # verb runs. Capture-free patterns have the classic table and the
     # leftmost-first lane; they never build it.
     #
-    # Selection is by shape, not by validity alone: the one-pass walk
-    # costs ~1.5 ns per byte (a table load on the critical path), and on
-    # shapes whose loops are all simple the specialized backtracker is
-    # straight-line code with SIMD class scans — measured 2-3x faster on
-    # the 10-40-byte `match()` rows (`(\w+)@(\w+)\.(\w+)` on 16 bytes:
-    # 8 ns vs 25 ns) and only ~1.3x slower past ~60 bytes. Where the
-    # backtracker recurses per iteration (`_sbt_general_loop`: a loop
-    # whose body is an alternation, a group, or another loop) the walk
-    # is 4-5x faster at every length and has no SBT_BUDGET /
-    # SBT_MAX_DEPTH cliff (`(?:(x)|y)+` over 8 KB exhausts the budget and
-    # falls to the Pike VM on the backtracker). The build is gated on the
-    # same predicate so the simple shapes pay no comptime for it.
+    # Selection is by shape, not by validity alone (`onepass_shape`,
+    # with the measurements): the walk costs ~1.4 ns per byte (a table
+    # load on the critical path), the specialized backtracker ~7 ns per
+    # general-loop iteration plus SIMD-speed class runs. So the walk
+    # takes the patterns whose loops are all general and short-bodied
+    # (`(?:(x)|y)+`, `((a)(b))+`: 4-5x faster at every length, and no
+    # SBT_BUDGET / SBT_MAX_DEPTH cliff), and the backtracker keeps every
+    # shape with a simple loop (`(\w+)@(\w+)\.(\w+)`: 8 vs 25 ns on 16
+    # bytes; `(?:(\w+)=(\w+);)+`: 30 vs 59 ns). The build is gated on
+    # the same predicate so the other shapes pay no comptime for it.
+    comptime _onepass_shape = onepass_shape(Self.nfa)
     comptime _onepass = build_onepass(
-        Self.nfa, Self._group_count > 0 and Self._sbt_general_loop
+        Self.nfa, Self._group_count > 0 and Self._onepass_shape
     )
     comptime _use_onepass = (
         Self._group_count > 0
-        and Self._sbt_general_loop
+        and Self._onepass_shape
         and Self._onepass.valid
     )
     comptime _OP_TN = onepass_table_len(Self._onepass)
@@ -1354,6 +1365,11 @@ struct Regex[pattern: String](Copyable, Movable):
         lane stays linear where the old per-candidate loop was
         quadratic. One attempt per call, never one per candidate.
 
+        On a one-pass pattern (`_use_onepass`) the attempt is the
+        one-pass DFA's leftmost-first walk instead: exact (a -1 proves
+        nothing starts at the candidate), never out of budget, and its
+        bytes are charged to the same per-call allowance.
+
         The backtracker attempt is speculative: it gets
         LF_SBT_ATTEMPT_BUDGET steps, and running out decides nothing —
         the scan starts from the same candidate, and `speculate` is
@@ -1481,11 +1497,13 @@ struct Regex[pattern: String](Copyable, Movable):
         pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
     ):
         """Capture slots of the leftmost-first match `[start, end)` —
-        step three of the DFA-bounded capture lane: the specialized
-        backtracker anchored at `start` and pinned to end at `end`
-        (`anchored_end` + `end_at`, the confirm shape set_prefilter.mojo
-        also uses), over the WHOLE input so `$` and `\b` see the real
-        neighbours of the span.
+        step three of the DFA-bounded capture lane: the one-pass DFA
+        walked over exactly that span when the pattern takes it
+        (`_use_onepass`: exact, one table step per byte, no budget),
+        else the specialized backtracker anchored at `start` and pinned
+        to end at `end` (`anchored_end` + `end_at`, the confirm shape
+        set_prefilter.mojo also uses); both over the WHOLE input so `$`
+        and `\b` see the real neighbours of the span.
 
         Why its first success is Python's capture assignment: the span
         is the leftmost-first match, i.e. the first path in NFA priority

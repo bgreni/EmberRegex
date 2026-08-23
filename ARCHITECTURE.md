@@ -106,7 +106,7 @@ Selected fastest-first at compile time:
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
 | `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
-| captures, one-pass NFA | one-pass DFA: `match()`, and the slots of the lane below (`_use_onepass`) | `onepass.mojo` |
+| captures, one-pass NFA with a general loop | one-pass DFA: `match()`, and the attempt + confirm of the lane below (`_use_onepass`) | `onepass.mojo` |
 | captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
 | backrefs / lookaround / captures (`match()`, not one-pass) | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
@@ -217,10 +217,22 @@ BOL kinds resolve against the context at build time, `$` / `(?m)$` /
 conditions on the byte after the end remain as per-state match flags
 checked once at `end_pin` against the whole input. States that self-loop
 on all but a few bytes with no slot writes take the eager DFA's SIMD
-acceleration, so `(\w+)@(\w+)\.com` is two class scans and a few table
-steps. The build is its own comptime field, read only by `match()` and
-`_span_fill_slots`, so a capture pattern that only runs search verbs on
-the backtracker lane never pays for it.
+acceleration. A third walker, `onepass_find_end`, is the leftmost-first
+search regex-automata runs (a match state records its end and a slot
+snapshot; a transition whose slot-set word carries `match_wins` — MATCH
+outranked the consuming thread — stops the walk); it is the capture
+lane's anchored-first attempt for these patterns.
+
+Selection is by shape, not validity alone (`_use_onepass` requires
+`_sbt_general_loop`): the walk costs ~1.5 ns per byte, and on shapes
+whose loops are all simple the specialized backtracker is straight-line
+SIMD code — 2-3x faster on 10-40-byte `match()` inputs, ~1.3x slower past
+60 bytes. Where the backtracker recurses per iteration (a loop whose body
+is an alternation, a group or another loop — `(?:(x)|y)+`,
+`(?:(\w+)=(\w+);)+`) the walk is 4-5x faster at every length and has no
+SBT_BUDGET / SBT_MAX_DEPTH cliff. The build is gated on the same
+predicate and is its own comptime field, so the simple shapes — and
+capture-free patterns — never pay for it.
 
 **Word boundaries ride all three tables.** `\b` needs the byte on both
 sides, and a closure only knows the one behind it, so — regex-automata's

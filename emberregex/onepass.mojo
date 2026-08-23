@@ -73,8 +73,9 @@ from std.collections import InlineArray
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
+from .backtrack import _sbt_is_simple_body
 from .constants import CHAR_NEWLINE
-from .nfa import NFA, NFAStateKind
+from .nfa import NFA, NFAStateKind, split_cycle_flags
 from .static_dfa import (
     EDFA_NFA_CAP,
     EDFA_TABLE_MIN_BYTES,
@@ -185,6 +186,38 @@ struct OnePass(Copyable, Movable):
         self.start_word = 0
         self.any_need = False
         self.accel = EagerDFA()
+
+
+def onepass_shape(nfa: NFA) -> Bool:
+    """Comptime: the shape on which the one-pass walk beats the
+    specialized backtracker — some loop the backtracker runs by general
+    recursion (a cyclic SPLIT whose body is not one consuming state:
+    `(?:(x)|y)+`, `((a)(b))+`, `(a|b)*c`), and NO simple loop anywhere.
+
+    Measured (2026-08-23, `match()`, ns per call): the table walk costs
+    ~1.4 ns per byte whatever the pattern; the backtracker costs ~7 ns
+    per general-loop iteration plus SIMD-speed class runs. Where every
+    iteration is a byte or two the walk is 4-5x faster at every length
+    and has no SBT_BUDGET / SBT_MAX_DEPTH cliff (`(?:(x)|y)+`: 58 vs 226
+    ns at 32 bytes, 2.0 vs 7.8 us at 1 KB, Pike VM past 8 KB). Where
+    the iterations carry a simple loop (`(?:(\\w+)=(\\w+);)+`: 30 vs 59
+    ns on 40 bytes; 2.2 vs 6.2 us on a 2 KB findall) the backtracker's
+    recursion is amortized over each run and it wins, as it does on
+    every simple-loop-only shape (`(\\w+)@(\\w+)\\.(\\w+)`: 8 vs 25 ns).
+    """
+    var cyclic = split_cycle_flags(nfa)
+    var general = False
+    for i in range(len(nfa.states)):
+        ref st = nfa.states[i]
+        if st.kind != NFAStateKind.SPLIT or st.out2 == -1:
+            continue
+        if not cyclic[i]:
+            continue
+        var body = st.out1 if st.greedy else st.out2
+        if _sbt_is_simple_body(nfa, i, body):
+            return False
+        general = True
+    return general
 
 
 def _op_norm_ctx(ctx: Int, has_bol: Bool, has_bol_ml: Bool, has_wb: Bool) -> Int:

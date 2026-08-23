@@ -83,27 +83,32 @@ def test_onepass_invalid_patterns() raises:
 
 
 def test_onepass_selection() raises:
-    # Selected exactly where the backtracker recurses per iteration (a
-    # cyclic SPLIT whose body is not a single state) and the pattern is
-    # one-pass: those shapes are 4-5x faster on the table walk and lose
-    # the SBT_BUDGET / SBT_MAX_DEPTH cliff. Simple-loop shapes keep the
-    # straight-line backtracker, which is 2-3x faster on short inputs.
+    # Selected exactly where the one-pass walk beats the backtracker
+    # (`onepass_shape`): every loop is one the backtracker runs by
+    # recursion (a cyclic SPLIT whose body is not a single state) —
+    # 4-5x faster at every length, and no SBT_BUDGET / SBT_MAX_DEPTH
+    # cliff. Any simple loop (`\w+`) keeps the pattern on the
+    # backtracker, whose SIMD class runs win there.
     assert_true(Regex["(?:(x)|y)+"]._use_onepass)
     assert_true(Regex["((a)(b))+"]._use_onepass)
     assert_true(Regex["((a)(b))+|q"]._use_onepass)
-    assert_true(Regex["(?:(\\w+)=(\\w+);)+"]._use_onepass)
+    assert_true(Regex["(?:([a-z])=(\\d);)+"]._use_onepass)
     assert_true(Regex["(a|b)*(c)"]._use_onepass)
-    assert_true(Regex["(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?"]._use_onepass)
+    assert_true(Regex["(?:(a)|b)+$"]._use_onepass)
+    assert_true(Regex["(?:(x)|y)+"]._onepass_shape)
     assert_true(Regex["(?:(x)|y)+"]._sbt_general_loop)
-    # One-pass but all loops simple: backtracker.
+    # One-pass but with simple loops: backtracker.
     assert_false(Regex["(\\d+)-(\\d+)"]._use_onepass)
-    assert_false(Regex["(\\d+)-(\\d+)"]._sbt_general_loop)
+    assert_false(Regex["(\\d+)-(\\d+)"]._onepass_shape)
     assert_false(Regex["(\\w+)@(\\w+)\\.com"]._use_onepass)
     assert_false(Regex["(?P<k>[^=]+)=(?P<v>[^;]*)"]._use_onepass)
     assert_false(Regex["(a)?b"]._use_onepass)
+    assert_false(Regex["(?:(\\w+)=(\\w+);)+"]._use_onepass)
+    assert_true(Regex["(?:(\\w+)=(\\w+);)+"]._sbt_general_loop)
+    assert_false(Regex["(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?"]._use_onepass)
     # General loop but not one-pass: backtracker (Pike when it gives up).
     assert_false(Regex["(a|aa)+b"]._use_onepass)
-    assert_true(Regex["(a|aa)+b"]._sbt_general_loop)
+    assert_true(Regex["(a|aa)+b"]._onepass_shape)
     assert_false(Regex["((\\w+)\\s)+\\w+"]._use_onepass)
     # Capture-free patterns never take this engine (the DFA lanes and
     # the classic table serve them).
@@ -276,15 +281,21 @@ def test_match_anchors() raises:
 
 
 def test_match_general_loop_shapes() raises:
-    var re = Regex["(?:(\\w+)=(\\w+);)+"]()
+    var re = Regex["(?:([a-z])=(\\d);)+"]()
     assert_true(re._use_onepass)
-    var input = "host=db01;port=5432;user=admin;retry=55;"
+    var input = "a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0;"
     var r = re.match(input)
     assert_true(r.matched)
-    assert_equal(r.group_str(input, 1), "retry")
-    assert_equal(r.group_str(input, 2), "55")
+    assert_equal(r.group_str(input, 1), "j")
+    assert_equal(r.group_str(input, 2), "0")
     _assert_groups(re.match(input), re._pike_match(input), "kv loop")
-    assert_false(re.match("host=db01;port=5432;user=admin;retry=55").matched)
+    assert_false(re.match("a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0").matched)
+    # The same shape with simple loops inside stays on the backtracker
+    # with the same answers.
+    var rw = Regex["(?:(\\w+)=(\\w+);)+"]()
+    assert_false(rw._use_onepass)
+    var inw = "host=db01;port=5432;user=admin;retry=55;"
+    _assert_groups(rw.match(inw), rw._pike_match(inw), "kv words")
     var ra = Regex["(a|b)*(c)"]()
     _assert_groups(ra.match("ababc"), ra._pike_match("ababc"), "altstar")
     _assert_groups(ra.match("c"), ra._pike_match("c"), "altstar empty")
@@ -318,10 +329,10 @@ def test_search_uses_span_confirm() raises:
     assert_true(rb._use_onepass)
     _assert_groups(rb.search("xab c"), rb._pike_search("xab c"), "ab\\b")
     _assert_groups(rb.search("xabc"), rb._pike_search("xabc"), "abc\\b")
-    var rs = Regex["(?:(\\w+)=(\\w+);)+"]()
+    var rs = Regex["(?:([a-z])=(\\d);)+"]()
     assert_true(rs._use_onepass)
     assert_true(rs._use_dfa_span)
-    var input = String("lorem 42 ipsum ") * 300 + "a=1;bb=22;" + String(" x=7 ") * 200 + "c=3;"
+    var input = String("lorem 42 ipsum ") * 300 + "a=1;b=2;" + String(" x=7 ") * 200 + "c=3;"
     var got = rs.finditer(input)
     var exp = rs._pike_finditer(input)
     assert_equal(len(got), len(exp))
@@ -329,7 +340,7 @@ def test_search_uses_span_confirm() raises:
         _assert_groups(got[i], exp[i], String("sparse[", i, "]"))
     # A match longer than the backtracker attempt's budget: the one-pass
     # attempt is exact and has none.
-    var long = String("k=v;") * 3000 + " tail"
+    var long = String("k=7;") * 3000 + " tail"
     var gl = rs.finditer(long)
     var el = rs._pike_finditer(long)
     assert_equal(len(gl), 1)
@@ -532,7 +543,7 @@ def test_differential_class_runs() raises:
 
 
 def _alpha_kvloop() -> List[String]:
-    return ["a", "b", "=", ";", "k=v;", "ab=1;", "=;", " ", "\n", "é", "€"]
+    return ["a", "b", "=", ";", "k=7;", "ab=1;", "=;", "1", " ", "\n", "é", "€"]
 
 
 def test_differential_loops() raises:
@@ -540,6 +551,7 @@ def test_differential_loops() raises:
     _differential["((a)(b))+|q"](_alpha_ab(), "((a)(b))+|q")
     _differential["((a)(b))+"](_alpha_ab(), "((a)(b))+")
     _differential["(?:(\\w+)=(\\w+);)+"](_alpha_kvloop(), "kv loop")
+    _differential["(?:([a-z])=(\\d);)+"](_alpha_kvloop(), "kv1 loop")
     _differential["(a|b)*(c)"](_alpha_abcdef(), "(a|b)*(c)")
     _differential["(?:(a)|b)+$"](_alpha_ab(), "(?:(a)|b)+$")
     _differential["(?:(a)|b)+\\b"](_alpha_ab(), "(?:(a)|b)+\\b")
@@ -552,6 +564,9 @@ def test_differential_loops() raises:
     )
     _fullmatch_differential["(?:(\\w+)=(\\w+);)+"](
         ["a=1;", "a=1;b=2;", "a=1;b=2", "=1;", "a=;", ""], "kv loop full"
+    )
+    _fullmatch_differential["(?:([a-z])=(\\d);)+"](
+        ["a=1;", "a=1;b=2;", "a=1;b=2", "=1;", "a=;", "", "ab=1;"], "kv1 full"
     )
     _fullmatch_differential["(?:(x)|y)+?z"](
         ["xz", "yz", "xyxz", "z", "xy"], "lazy loop full"

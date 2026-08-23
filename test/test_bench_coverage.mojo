@@ -692,47 +692,47 @@ def test_bench_capture_findall_sparse() raises:
 
 
 def test_bench_onepass_match_kv() raises:
-    # bench onepass_match_kv: the pattern is one-pass AND selected (a
-    # general loop), the 40-byte input fullmatches, the groups report the
-    # last pair, and the slots are the Pike VM's.
-    comptime S = Regex["(?:(\\w+)=(\\w+);)+"]
+    # bench onepass_match_kv: the pattern is one-pass AND selected (its
+    # only loop is a general one), the 40-byte input fullmatches, the
+    # groups report the last pair, and the slots are the Pike VM's.
+    comptime S = Regex["(?:([a-z])=(\\d);)+"]
     assert_true(S._use_onepass)
     var re = S()
-    var input = "host=db01;port=5432;user=admin;retry=55;"
+    var input = "a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0;"
     assert_equal(input.byte_length(), 40)
     var r = re.match(input)
     assert_true(r.matched)
-    assert_equal(r.group_str(input, 1), "retry")
-    assert_equal(r.group_str(input, 2), "55")
+    assert_equal(r.group_str(input, 1), "j")
+    assert_equal(r.group_str(input, 2), "0")
     var p = re._pike_match(input)
     for s in range(4):
         assert_equal(r.slots[s], p.slots[s])
-    assert_false(re.match("host=db01;port=5432;user=admin;retry=55").matched)
+    assert_false(re.match("a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=0").matched)
 
 
 def test_bench_onepass_findall_2KB() raises:
-    # bench onepass_findall_2KB: 62 matches on the one-pass capture lane,
+    # bench onepass_findall_2KB: 64 matches on the one-pass capture lane,
     # group 1 text per match (the last pair's key), same spans and slots
     # as the Pike VM.
-    comptime S = Regex["(?:(\\w+)=(\\w+);)+"]
+    comptime S = Regex["(?:([a-z])=(\\d);)+"]
     assert_true(S._use_onepass)
     assert_true(S._use_dfa_span)
     var re = S()
-    var input = String("host=db01;port=5432;user=admin; ") * 62
-    assert_true(input.byte_length() > 1900)
+    var input = String("a=1;b=2;c=3;d=4;e=5;f=6;g=7; ") * 64
+    assert_true(input.byte_length() > 1800)
     var all = re.findall(input)
-    assert_equal(len(all), 62)
-    assert_equal(all[0], "user")
-    assert_equal(all[61], "user")
+    assert_equal(len(all), 64)
+    assert_equal(all[0], "g")
+    assert_equal(all[63], "g")
     var got = re.finditer(input)
     var exp = re._pike_finditer(input)
-    assert_equal(len(got), 62)
-    for i in range(62):
+    assert_equal(len(got), 64)
+    for i in range(64):
         assert_equal(got[i].start, exp[i].start)
         assert_equal(got[i].end, exp[i].end)
         for s in range(4):
             assert_equal(got[i].slots[s], exp[i].slots[s])
-    assert_equal(got[5].group_str(input, 2), "admin")
+    assert_equal(got[5].group_str(input, 2), "7")
 
 
 def _bench_counted_haystack(n: Int) -> String:
