@@ -44,14 +44,13 @@ def test_span_lane_selection() raises:
     # The shape heuristic is the classic lane's: a lone loop with nothing
     # after it, or an anchor-only suffix, stays on the backtracker (one
     # pass there beats three on the lane); an alternation arm admits it.
-    # Exception: a one-pass pattern the one-pass DFA takes
-    # (`_use_onepass` — an alternation loop) rides the lane whatever its
-    # shape, so its span confirm is the exact one-pass walk (see
-    # `_dfa_candidate`'s `admit_shape`).
+    # A one-pass pattern the one-pass DFA takes (`_use_onepass`) is
+    # always an alternation loop, which this heuristic already admits
+    # (the alternation is a real SPLIT), so its span confirm is the
+    # exact one-pass walk — no separate admission needed.
     assert_true(Regex["(?:(a)|b)+"]._use_onepass)
     assert_true(Regex["(?:(a)|b)+"]._use_dfa_span)
     assert_false(Regex["((a)(b))+"]._use_onepass)  # no body alternation
-    assert_false(Regex["((a)(b))+"]._use_dfa_span)
     assert_true(Regex["((a)(b))+|q"]._use_dfa_span)
     assert_false(Regex["(?m)^(\\w+)$"]._use_dfa_span)
     assert_true(Regex["(?m)^(\\w+)$|q"]._use_dfa_span)

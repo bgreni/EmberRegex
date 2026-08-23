@@ -547,7 +547,7 @@ def _nfa_has_backref(nfa: NFA) -> Bool:
     return False
 
 
-def _dfa_candidate(nfa: NFA, admit_shape: Bool = False) -> Bool:
+def _dfa_candidate(nfa: NFA) -> Bool:
     """True when the pattern's SHAPE should run on a DFA engine (eager or
     lazy): capture-free, this is the classic/leftmost-first lanes
     (`Regex._use_dfa_candidate`); with captures, the DFA-bounded capture
@@ -576,11 +576,11 @@ def _dfa_candidate(nfa: NFA, admit_shape: Bool = False) -> Bool:
     since the LazyDFA (dfa.mojo) does not model word anchors,
     `_compute_strategy` requires the eager table to have built.
 
-    `admit_shape` skips the shape test (the guards stay): the capture
-    lane passes `Regex._use_onepass` so a one-pass capture pattern of
-    the alternation-loop shape (`(?:(x)|y)+`, `(a|b)*(c)`) rides the
-    lane whatever its C1 shape, and its span confirm is the exact
-    one-pass walk instead of the backtracker + Pike ladder.
+    A one-pass capture pattern the one-pass DFA takes (`_use_onepass`)
+    is always an alternation-loop shape, which this heuristic already
+    admits (the alternation is a real SPLIT), so its search verbs ride
+    the capture lane and their span confirm is the exact one-pass walk
+    — no separate admission is needed.
 
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
@@ -592,7 +592,7 @@ def _dfa_candidate(nfa: NFA, admit_shape: Bool = False) -> Bool:
     if nfa.has_word_boundary and _wb_cont_reaches_bol(nfa):
         return False
     var cyclic = split_cycle_flags(nfa)
-    if not admit_shape and not (
+    if not (
         _has_alternation_splits(nfa, cyclic)
         or _quantifier_has_suffix(nfa, cyclic)
     ):
@@ -835,10 +835,8 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _lit_alt = extract_literal_alternation(Self.nfa)
     # Evaluated once as a field: _dfa_candidate walks the NFA several
     # times, and comptime memoization covers field declarations, not
-    # repeated internal calls. A one-pass capture pattern is admitted
-    # whatever its shape (see `admit_shape`); `_use_onepass` is False
-    # at its first operand for every capture-free pattern.
-    comptime _dfa_shape_ok = _dfa_candidate(Self.nfa, Self._use_onepass)
+    # repeated internal calls.
+    comptime _dfa_shape_ok = _dfa_candidate(Self.nfa)
     # Capture-free: the classic table serves match(), the leftmost-first
     # lane the search verbs. With captures: the DFA-bounded capture lane
     # (`_use_dfa_span`) for the search verbs only — match() keeps the
