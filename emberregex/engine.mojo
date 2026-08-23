@@ -910,13 +910,23 @@ struct Regex[pattern: String](Copyable, Movable):
     # Leftmost-first lane, anchored-first attempt on the classic table
     # (see _lf_next_match): sound exactly when the classic table's
     # leftmost-longest end IS the leftmost-first end.
-    comptime _lf_anchored_classic = Self._lf_end_is_dfa_end
+    comptime _lf_anchored_classic = (
+        Self._lf_end_is_dfa_end and not Self._use_dfa_span
+    )
     # ...and on the backtracker for lazy patterns whose every loop is a
     # simple (iterative, SIMD-skipping) loop — `<.*?>`, `"[^"]*?"`: the
     # attempt is a literal check plus one class scan, cheaper than the
-    # scan + reverse walk it replaces on a success.
-    comptime _lf_anchored_sbt = Self.nfa.has_lazy and not (
-        _sbt_needs_depth_guard(Self.nfa)
+    # scan + reverse walk it replaces on a success. On the capture lane
+    # the attempt is made for EVERY shape, and takes precedence over the
+    # classic-table attempt: a success carries the slots, so it replaces
+    # the scan, the reverse walk AND the span confirm — one backtracker
+    # pass, exactly the old lane's cost on a true candidate (measured:
+    # without it the three passes cost 1.2-1.7x on the short-input
+    # findall rows, `<(\w+)[^>]*>` over 110 bytes). A failure is bounded
+    # as before: `-1` by the scan's walk over the same bytes, `-2` by
+    # LF_SBT_ATTEMPT_BUDGET once per walk (the `speculate` latch).
+    comptime _lf_anchored_sbt = Self._use_dfa_span or (
+        Self.nfa.has_lazy and not _sbt_needs_depth_guard(Self.nfa)
     )
     # Backtracker (state, pos) memoization is only sound when a subtree's
     # outcome is a function of (state, pos) — see sbt_memo_ok.
@@ -1103,6 +1113,15 @@ struct Regex[pattern: String](Copyable, Movable):
             return self._scan_candidate(input, input_len, pos)
         elif Self._lf_pivot[0] >= 0:
             return pivot_first_candidate[d=Self._edfa](input, pos)
+        elif Self._use_dfa_span and Self._strategy.first_byte_useful:
+            # Capture lane only: the candidate feeds a backtracker
+            # attempt whose success skips two DFA passes, so it is worth
+            # a SIMD class scan to land it on a byte the pattern can
+            # start with. (The capture-free lane keeps its scan's own
+            # accelerated restart state as the prefilter.) Returns
+            # input_len, never -1, when no such byte remains — the
+            # attempt/scan at input_len answers empty matches.
+            return self._next_candidate_pos(input, input_len, pos)
         else:
             return pos
 

@@ -106,7 +106,8 @@ Selected fastest-first at compile time:
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
 | `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
-| backrefs / lookaround / captures | specialized backtracker | `backtrack.mojo` |
+| captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
+| backrefs / lookaround / captures (`match()`) | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
 
 **The eager DFA is the interesting one.** Subset construction runs in the
@@ -162,6 +163,32 @@ match, never one per candidate. Every materialized table is padded to
 `EDFA_TABLE_MIN_BYTES` (1 KB): below that the comptime constant lowers to
 a per-call stack copy inside the walker, which cost more than the walk
 itself on 3-state tables.
+
+Capture groups do not keep a pattern off these tables — SAVE states are
+epsilon to every determinizer — only backreferences and lookaround do. A
+capture pattern of the admitted shape runs its search-family verbs on the
+**DFA-bounded capture lane** (`Regex._use_dfa_span`, regex-automata's
+"Core" strategy): the same forward scan and reverse walk give the span,
+and the specialized backtracker then runs anchored at the start and pinned
+to end at the end (`anchored_end` + `end_at`, over the whole input so `$`
+and `\b` see the real neighbours) to fill the slots. Its first success on
+that span is Python's capture assignment: the span is the leftmost-first
+match, every path before it in NFA priority order fails to reach MATCH at
+all, and the backtracker explores in that order — so the pinned walk costs
+what an unpinned walk from the start costs and never reaches the
+lower-priority assignments with the same span. The lane's miss path is the
+DFA scan alone (the backtracker-per-candidate lane re-ran `(\w+)@(\w+)\.com`
+from every word byte). On this lane the anchored-first attempt on the
+backtracker is made for every shape, not only lazy ones: a success carries
+the slots, so a true first candidate costs one backtracker pass — the old
+lane's cost — and only a false one pays the scan, the reverse walk and the
+confirm (without the attempt the short-input findall rows measured
+1.2-1.7x). The lane's candidate comes from the literal/pivot prefilters or,
+failing those, a SIMD first-byte class scan. `split` and a `replace`
+without backreferences skip the fill. When the backtracker gives
+up on a span (budget or depth) the Pike VM runs on exactly that span with
+the same end pin, never on the whole input. `match()` with captures stays
+on the backtracker.
 
 **Word boundaries ride all three tables.** `\b` needs the byte on both
 sides, and a closure only knows the one behind it, so — regex-automata's

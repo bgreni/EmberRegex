@@ -169,6 +169,60 @@ def bench_static_nested_groups(mut b: Bench) raises:
     b.bench_function[go](BenchId("static_nested_groups"))
 
 
+def bench_capture_search_miss_100KB(mut b: Bench) raises:
+    # DFA-bounded capture lane, miss-heavy input: 100 KB of `@`-bearing
+    # tokens with no `.com`, so the required-byte (`.`) prescan and the
+    # `@` pivot both pass and the engines have to do real work. The
+    # backtracker lane re-runs `(\\w+)@(\\w+)\\.com` from every word byte
+    # (giving `\w+` back a byte at a time); the lane is one unanchored
+    # DFA scan reporting no end. (A token set without `@` would measure
+    # the 3 us required-byte scan on both lanes.)
+    var re = Regex["(\\w+)@(\\w+)\\.com"]()
+    var input = String("user@example.org ") * (100 * 1024 // 17)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("capture_search_miss_100KB"))
+
+
+def capture_sparse_input() -> String:
+    """64 KB: 50 `123-4567` matches for `(\\d+)-(\\d+)`, each after ~1.3 KB
+    of prose carrying a digit run (`42`) in every phrase — a false
+    first-byte candidate for the backtracker lane every 30 bytes, while
+    the lane's `-` pivot hops straight to the next real match."""
+    var filler = String("lorem ipsum 42 dolor sit amet ") * 43
+    return repeat_with_sep("123-4567", filler, 50) + filler
+
+
+def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
+    var re = Regex["(\\d+)-(\\d+)"]()
+    var input = capture_sparse_input()
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.findall(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("capture_findall_sparse_64KB"))
+
+
 def bench_static_greedy_vs_lazy(mut b: Bench) raises:
     var re_greedy = Regex["<(.+)>"]()
     var re_lazy = Regex["<(.+?)>"]()
@@ -1770,7 +1824,14 @@ def bench_memo_ambiguous_plus_miss(mut b: Bench) raises:
     #
     # 1500 `a`s, not 2000: past ~1900 the recursion trips SBT_MAX_DEPTH
     # instead, which hands the pattern to the Pike VM again and would make
-    # this row bimodal. The group is what keeps it off the DFA lane.
+    # this row bimodal.
+    #
+    # Since the DFA-bounded capture lane this row no longer reaches the
+    # backtracker: the leftmost-first scan reports the miss in one pass
+    # (captures no longer keep a pattern off the DFA tables). The
+    # cross-position memo carry it used to time is only reachable through
+    # the public verbs for patterns the tables refuse; the memo's in-span
+    # work is timed by `memo_ambiguous_plus_in_span_1500` below.
     var re = Regex["(a|aa)+b"]()
     var input = String("a") * 1500 + "c"
 
@@ -1787,6 +1848,32 @@ def bench_memo_ambiguous_plus_miss(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("memo_ambiguous_plus_miss_1500"))
+
+
+def bench_memo_ambiguous_plus_in_span(mut b: Bench) raises:
+    # The memo inside the DFA-bounded capture lane's span confirm: the
+    # leftmost-first tables find the span `[0, 1501)` of `(a|aa)+c|a+b`
+    # on 1500 `a`s then `b` in one scan, and the backtracker pinned to
+    # that span must refute the first arm (Fibonacci-many `(a|aa)+`
+    # paths, no `c`) before the second arm matches. Without the memo that
+    # refutation exhausts SBT_BUDGET and the Pike VM takes the span; with
+    # it the backtracker finishes and fills group 1 = -1.
+    var re = Regex["(a|aa)+c|a+b"]()
+    var input = String("a") * 1500 + "b"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("memo_ambiguous_plus_in_span_1500"))
 
 
 # ---------------------------------------------------------------------------
@@ -2135,6 +2222,8 @@ def main() raises:
     # Capture group matching (static_ prefix IDs)
     bench_static_capture_simple(b)
     bench_static_nested_groups(b)
+    bench_capture_search_miss_100KB(b)
+    bench_capture_findall_sparse_64KB(b)
     bench_static_greedy_vs_lazy(b)
 
     # Backtracking (static_ prefix IDs)
@@ -2243,6 +2332,7 @@ def main() raises:
     bench_pathological_backref_repeated(b)
     bench_pathological_nested_quantifier_miss(b)
     bench_memo_ambiguous_plus_miss(b)
+    bench_memo_ambiguous_plus_in_span(b)
 
     # Real-world
     bench_url_parse(b)

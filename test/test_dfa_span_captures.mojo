@@ -188,6 +188,50 @@ def test_anchors_see_the_real_neighbours() raises:
     assert_equal(r2.slots[2], 0)
 
 
+def test_anchored_first_attempt_paths() raises:
+    # The capture lane tries its first candidate anchored on the
+    # backtracker before scanning (one pass when it succeeds). Pin the
+    # flag, then each outcome of the attempt:
+    assert_true(Regex["(\\d+)-(\\d+)"]._lf_anchored_sbt)
+    assert_true(Regex["(\\w+)@(\\w+)\\.com"]._lf_anchored_sbt)
+    assert_false(Regex["(\\w+)@(\\w+)\\.com"]._lf_anchored_classic)
+    var re = Regex["(\\w+)@(\\w+)\\.com"]()
+    # Success at the first candidate (the pivot's word start).
+    var hit = "ab@cd.com x"
+    var r = re.search(hit)
+    assert_equal(r.start, 0)
+    assert_equal(r.group_str(hit, 2), "cd")
+    # -1 at the first candidate (`.org`), the scan + reverse walk +
+    # confirm recover the later match with its slots.
+    var late = "ab@cd.org x@yz.com"
+    var r2 = re.search(late)
+    assert_equal(r2.start, 10)
+    assert_equal(r2.end, 18)
+    assert_equal(r2.group_str(late, 1), "x")
+    assert_equal(r2.group_str(late, 2), "yz")
+    _assert_groups(r2, re._pike_search(late), "late")
+    # -2 (LF_SBT_ATTEMPT_BUDGET spent): `(a|aa)+c|a+b` on 3000 `a`s then
+    # `b` — the attempt cannot refute the first arm in 2048 steps, the
+    # scan finds the span and the pinned confirm (with its memo) fills
+    # group 1 = unset. The flag says the attempt was made.
+    var amb = Regex["(a|aa)+c|a+b"]()
+    assert_true(Regex["(a|aa)+c|a+b"]._lf_anchored_sbt)
+    var input = String("a") * 3000 + "b"
+    assert_equal(amb._sbt_match_at(input.as_bytes(), 0), -2)
+    var r3 = amb.search(input)
+    assert_true(r3.matched)
+    assert_equal(r3.end, 3001)
+    assert_equal(r3.slots[0], -1)
+    _assert_groups(r3, amb._pike_search(input), "ambiguous")
+    # No literal prefilter: the first-byte class scan places the
+    # candidate (`(a|ab)(c|bcd)(d*)` starts with `a`).
+    var fb = Regex["(a|ab)(c|bcd)(d*)"]()
+    var text = "zzzz abcd"
+    var r4 = fb.search(text)
+    assert_equal(r4.start, 5)
+    assert_equal(r4.group_str(text, 2), "bcd")
+
+
 def test_lazy_group() raises:
     var re = Regex["<(.*?)>"]()
     var input = "x<a><bb> <c\n<dd>"
@@ -275,9 +319,7 @@ def _assert_pike_agreement[
     assert_equal(len(got_f), len(exp_f), String(label, " finditer len"))
     var any_empty = False
     for i in range(len(got_f)):
-        _assert_groups(
-            got_f[i], exp_f[i], String(label, " finditer[", i, "]")
-        )
+        _assert_groups(got_f[i], exp_f[i], String(label, " finditer[", i, "]"))
         if exp_f[i].end == exp_f[i].start:
             any_empty = True
 
@@ -309,7 +351,9 @@ def _assert_pike_agreement[
         assert_equal(got_p[i], exp_p[i], String(label, " split[", i, "]"))
 
 
-def _differential[p: StaticString](alphabet: List[String], label: String) raises:
+def _differential[
+    p: StaticString
+](alphabet: List[String], label: String) raises:
     """3 seeds x 11 lengths = 33 inputs against one pattern."""
     for seed in [1, 7, 4242]:
         for n in [15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 1000]:
