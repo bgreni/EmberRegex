@@ -691,6 +691,44 @@ def test_bench_capture_findall_sparse() raises:
     )
 
 
+def test_bench_onepass_match_kv() raises:
+    # bench onepass_match_kv: one-pass AND selected (an alternation loop),
+    # the 40-byte input fullmatches, the groups report the last
+    # letter/digit token, and the slots are the Pike VM's.
+    comptime S = Regex["(?:([a-z])|(\\d)|[=;&])+"]
+    assert_true(S._use_onepass)
+    var re = S()
+    var input = "host=db01&port=5432&user=admin&retry=55&"
+    assert_equal(input.byte_length(), 40)
+    var r = re.match(input)
+    assert_true(r.matched)
+    var p = re._pike_match(input)
+    for s in range(4):
+        assert_equal(r.slots[s], p.slots[s])
+    assert_false(re.match("host=db01&port=5432&user=admin&retry=55!").matched)
+
+
+def test_bench_onepass_findall_2KB() raises:
+    # bench onepass_findall_2KB: two long alternation-loop matches on the
+    # one-pass capture lane, same spans and slots as the Pike VM.
+    comptime S = Regex["(?:(x)|(y)|z)+"]
+    assert_true(S._use_onepass)
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = String("xyz") * 340 + " " + String("zyx") * 340
+    assert_true(input.byte_length() > 2000)
+    var got = re.finditer(input)
+    var exp = re._pike_finditer(input)
+    assert_equal(len(got), len(exp))
+    assert_equal(len(got), 2)
+    for i in range(len(got)):
+        assert_equal(got[i].start, exp[i].start)
+        assert_equal(got[i].end, exp[i].end)
+        for s in range(4):
+            assert_equal(got[i].slots[s], exp[i].slots[s])
+    assert_equal(got[0].end - got[0].start, 1020)
+
+
 def _bench_counted_haystack(n: Int) -> String:
     """Mirror of `make_counted_haystack` in bench/bench.mojo."""
     var parts = List[String]()

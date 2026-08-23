@@ -237,6 +237,67 @@ def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
     b.bench_function[go](BenchId("capture_findall_sparse_64KB"))
 
 
+def bench_onepass_match_kv(mut b: Bench) raises:
+    # One-pass DFA (onepass.mojo): a capture pattern whose NFA admits at
+    # most one consuming thread per byte AND whose loop the backtracker
+    # runs by recursion with an ALTERNATION in its body (see
+    # `onepass_shape`) — where the backtracker re-tries an arm per
+    # character. match() is one forward table walk writing the slots as
+    # it goes; the backtracker recurses and re-scans per arm. 40-byte
+    # key/value token run; the groups report the last letter/digit token.
+    # (Not the design note's `(?P<k>[^=]+)=(?P<v>[^;]*)`: that shape's
+    # loops are simple, so the gate keeps it on the backtracker, which
+    # measured 1.7x faster than the walk there — see `onepass_shape`.)
+    var re = Regex["(?:([a-z])|(\\d)|[=;&])+"]()
+    var input = "host=db01&port=5432&user=admin&retry=55&"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("onepass_match_kv"))
+
+
+def onepass_findall_input() -> String:
+    """~2 KB: two ~1 KB alternation-loop matches for `(?:(x)|(y)|z)+`,
+    each far longer than the backtracker's per-attempt step budget so
+    its span confirm exhausts and (on the base) falls to the Pike VM,
+    while the one-pass confirm walks the span exactly."""
+    return String("xyz") * 340 + " " + String("zyx") * 340
+
+
+def bench_onepass_findall_2KB(mut b: Bench) raises:
+    # The one-pass span confirm on the capture lane: each long match's
+    # anchored backtracker attempt exhausts LF_SBT_ATTEMPT_BUDGET and
+    # latches, so the lane scans for the end and confirms the span —
+    # one-pass (exact, O(span)) here, the backtracker-then-Pike ladder
+    # on the base.
+    var re = Regex["(?:(x)|(y)|z)+"]()
+    var input = onepass_findall_input()
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.findall(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("onepass_findall_2KB"))
+
+
 def bench_static_greedy_vs_lazy(mut b: Bench) raises:
     var re_greedy = Regex["<(.+)>"]()
     var re_lazy = Regex["<(.+?)>"]()
@@ -2318,6 +2379,8 @@ def main() raises:
     bench_static_nested_groups(b)
     bench_capture_search_miss_100KB(b)
     bench_capture_findall_sparse_64KB(b)
+    bench_onepass_match_kv(b)
+    bench_onepass_findall_2KB(b)
     bench_static_greedy_vs_lazy(b)
 
     # Backtracking (static_ prefix IDs)

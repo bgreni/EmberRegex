@@ -106,8 +106,9 @@ Selected fastest-first at compile time:
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
 | `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
+| captures, one-pass NFA with an alternation loop | one-pass DFA: `match()`, and the span confirm of the lane below (`_use_onepass`) | `onepass.mojo` |
 | captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
-| backrefs / lookaround / captures (`match()`) | specialized backtracker | `backtrack.mojo` |
+| backrefs / lookaround / captures (`match()`, not one-pass) | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
 
 **The eager DFA is the interesting one.** Subset construction runs in the
@@ -191,7 +192,48 @@ the same end pin, never on the whole input — and the walk latches: every
 later span of the same call goes straight to that VM, built once per
 walk, so a pattern whose confirm always gives up (`(a*)*b`) pays one
 budget per call, not one per match. `match()` with captures stays on the
-backtracker.
+backtracker unless the pattern is one-pass (next paragraph).
+
+**One-pass DFA** (`onepass.mojo`, `Regex._use_onepass`, regex-automata's
+`onepass`): when at most one NFA thread can consume each byte, the path
+through the NFA for any input is unique, and the capture slots can be
+written during a single forward table walk with no backtracking. A DFA
+state is one NFA state (a transition target) plus a position context
+(start / after `\n` / mid-line, split by the look-behind word class for
+`\b` patterns); expanding it walks the epsilon closure in priority order
+carrying the SAVE slots passed, and every consuming member contributes
+transitions tagged with those slot writes. The pattern is NOT one-pass
+when a later member wants a byte class an earlier one already claimed
+with a different target or slot set (`(a|ab)(c|bcd)`, `(a*)(a*)`,
+`(a)\b|(a)`), or when it carries a backreference or lookaround, or when
+the automaton exceeds `ONEPASS_STATE_CAP` (128) / 63 slots. Unlike
+regex-automata the closure does not stop at MATCH: `match()` is
+`fullmatch` (language membership: `(a*?)` must fullmatch "aaa") and the
+capture lane's span confirm already knows its end, so both walkers
+(`onepass_match`, pinned to a known `[start, end)`) run to the pin and
+require a match state there — the unique path's slot writes are then the
+only assignment. BOL kinds resolve against the context at build time,
+`$` / `(?m)$` / `\b` before a consuming state restrict its byte classes,
+and only the conditions on the byte after the end remain as per-state
+match flags checked once against the whole input.
+
+The one-pass walk replaces the backtracker in exactly two places, both
+gated on `_use_onepass`: `match()` (the whole input), and the capture
+lane's span confirm (`_span_fill_slots`, over a span the forward/reverse
+DFAs already found — exact and O(span), so a one-pass pattern's search
+verbs never fall to the Pike VM on a pathological confirm). Selection is
+by SHAPE, not validity alone (`onepass_shape`): the walk costs ~1.8 ns
+per byte, so it is taken only where the backtracker is much slower — a
+general loop (a cyclic SPLIT the backtracker runs by recursion) whose
+body carries an ALTERNATION, where the backtracker re-tries an arm per
+character (`(?:(x)|y)+`, `(?:(x)|(y)|z)+`, `(a|b)*c`, `(?:(ab)|(cd))+`):
+4-9x faster at every length, and no SBT_BUDGET / SBT_STACK_BUDGET cliff. A
+simple loop anywhere, or a general loop without a body alternation
+(`((a)(b))+`, `(?:([a-z])(\d))+`), keeps the backtracker, whose SIMD
+class runs and cheap short-body recursion win there. The build is its
+own comptime field, read only where `_use_onepass` can hold (a capture
+pattern of the alternation-loop shape), so simple shapes and
+capture-free patterns never pay for it.
 
 **Word boundaries ride all three tables.** `\b` needs the byte on both
 sides, and a closure only knows the one behind it, so — regex-automata's

@@ -109,6 +109,19 @@ from .simd_kernels import (
     stops_from_bitmap,
 )
 from .executor import PikeVM, _VMBuffers
+from .onepass import (
+    OnePass,
+    build_onepass,
+    onepass_shape,
+    onepass_class_arr,
+    onepass_eps_arr,
+    onepass_eps_len,
+    onepass_match,
+    onepass_state_arr,
+    onepass_state_len,
+    onepass_table_arr,
+    onepass_table_len,
+)
 from std.collections import InlineArray
 
 
@@ -584,6 +597,12 @@ def _dfa_candidate(nfa: NFA) -> Bool:
     since the LazyDFA (dfa.mojo) does not model word anchors,
     `_compute_strategy` requires the eager table to have built.
 
+    A one-pass capture pattern the one-pass DFA takes (`_use_onepass`)
+    is always an alternation-loop shape, which this heuristic already
+    admits (the alternation is a real SPLIT), so its search verbs ride
+    the capture lane and their span confirm is the exact one-pass walk
+    — no separate admission is needed.
+
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
     `_use_dfa_candidate` and threads the result — each evaluation walks
@@ -942,6 +961,17 @@ struct Regex[pattern: String](Copyable, Movable):
         )
     )
     comptime _use_lf_lane = Self._use_lf_dfa or Self._use_dfa_span
+    # The `span` type parameter of the lane's per-walk state (`_SpanPike`
+    # / `_LFWalk`): on the lane, "fills slots" is exactly "has captures"
+    # (the two lanes are mutually exclusive on `_group_count`), and this
+    # LEAF expression is what must appear in the type. Mojo mangles a
+    # comptime Bool parameter as its defining EXPRESSION, not its value,
+    # so `_use_dfa_span` there — whose tree repeats `_dfa_shape_ok`, and
+    # through it the one-pass predicates, at every short-circuit — gave
+    # the three `@no_inline` lane methods 2 MB symbol names and a linker
+    # assertion (`ld: name.size() <= maxLength`). Only ever read where
+    # `_use_lf_lane` holds.
+    comptime _span_lane = Self._group_count > 0
     comptime _use_lf_sheng = (
         Self._use_lf_lane
         and sheng_viable(Self._lfdfa.d)
@@ -1031,12 +1061,60 @@ struct Regex[pattern: String](Copyable, Movable):
     # findall rows, `<(\w+)[^>]*>` over 110 bytes). A failure is bounded
     # as before: `-1` by the scan's walk over the same bytes, `-2` by
     # LF_SBT_ATTEMPT_BUDGET once per walk (the `speculate` latch).
+    # A cyclic SPLIT the backtracker runs by general recursion (a loop
+    # whose body is not one ANY/CHAR/CHARSET state): its depth then
+    # tracks the input, and so does its cost. Field, not a call: the
+    # check walks the NFA, and two fields read it.
+    comptime _sbt_general_loop = _sbt_needs_depth_guard(Self.nfa)
     comptime _lf_anchored_sbt = Self._use_dfa_span or (
-        Self.nfa.has_lazy and not _sbt_needs_depth_guard(Self.nfa)
+        Self.nfa.has_lazy and not Self._sbt_general_loop
     )
     # Backtracker (state, pos) memoization is only sound when a subtree's
     # outcome is a function of (state, pos) — see sbt_memo_ok.
     comptime _sbt_memo_ok = sbt_memo_ok(Self.nfa)
+    # The one-pass DFA (onepass.mojo): capture extraction in a single
+    # forward table walk for patterns where at most one thread can
+    # consume each byte. Serves match() (fullmatch over the whole input)
+    # and the capture lane's span confirm (`_span_fill_slots`, pinned).
+    # Its own field, referenced by `_use_onepass` alone and never by
+    # `_strategy`:
+    # every argument into `_compute_strategy` is elaborated for every
+    # pattern, and this build is only worth paying for where a capture
+    # verb runs. Capture-free patterns have the classic table and the
+    # leftmost-first lane; they never build it.
+    #
+    # Selection is by shape, not by validity alone (`onepass_shape`,
+    # with the measurements): the walk costs ~1.8 ns per byte (a table
+    # load on the critical path), the backtracker pays that per arm it
+    # tries. So the walk takes a general loop (one the backtracker runs
+    # by recursion) whose body carries an ALTERNATION, where the
+    # backtracker re-tries an arm per character (`(?:(x)|y)+`,
+    # `(?:(x)|(y)|z)+`, `(a|b)*c`): 4-9x faster at every length, and no
+    # SBT_BUDGET / SBT_STACK_BUDGET cliff. A simple loop, or a general loop
+    # with no body alternation (`((a)(b))+`, `(?:([a-z])(\d))+`), keeps
+    # the backtracker, whose SIMD class runs and cheap short-body
+    # recursion win. The build is gated on the same predicate so the
+    # other shapes pay no comptime for it. Used in exactly two places
+    # (both `_use_onepass`): match() and `_span_fill_slots`; the capture
+    # lane's anchored attempt stays on the backtracker (an
+    # unbounded-end one-pass walk's per-match slot snapshots make it
+    # slower on short dense inputs).
+    comptime _onepass_shape = onepass_shape(Self.nfa)
+    comptime _onepass = build_onepass(
+        Self.nfa, Self._group_count > 0 and Self._onepass_shape
+    )
+    comptime _use_onepass = (
+        Self._group_count > 0
+        and Self._onepass_shape
+        and Self._onepass.valid
+    )
+    comptime _OP_TN = onepass_table_len(Self._onepass)
+    comptime _OP_TABLE = onepass_table_arr[Self._OP_TN](Self._onepass)
+    comptime _OP_CLASSES = onepass_class_arr(Self._onepass)
+    comptime _OP_NE = onepass_eps_len(Self._onepass)
+    comptime _OP_EPS = onepass_eps_arr[Self._OP_NE](Self._onepass)
+    comptime _OP_NS = onepass_state_len(Self._onepass)
+    comptime _OP_STATES = onepass_state_arr[Self._OP_NS](Self._onepass)
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
     var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
@@ -1300,7 +1378,7 @@ struct Regex[pattern: String](Copyable, Movable):
         self,
         input: Span[Byte, origin],
         pos: Int,
-        mut walk: _LFWalk[Self._num_slots, Self._use_dfa_span, wo],
+        mut walk: _LFWalk[Self._num_slots, Self._span_lane, wo],
         mut slots: InlineArray[Int, Self._num_slots],
         fill: Bool,
     ) -> Tuple[Int, Int]:
@@ -1429,7 +1507,7 @@ struct Regex[pattern: String](Copyable, Movable):
         self,
         input: Span[Byte, origin],
         s0: Int,
-        pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
         mut slots: InlineArray[Int, Self._num_slots],
         fill: Bool,
     ) -> Tuple[Int, Int]:
@@ -1461,14 +1539,16 @@ struct Regex[pattern: String](Copyable, Movable):
         start: Int,
         end: Int,
         mut slots: InlineArray[Int, Self._num_slots],
-        pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
     ):
         """Capture slots of the leftmost-first match `[start, end)` —
-        step three of the DFA-bounded capture lane: the specialized
-        backtracker anchored at `start` and pinned to end at `end`
-        (`anchored_end` + `end_at`, the confirm shape set_prefilter.mojo
-        also uses), over the WHOLE input so `$` and `\b` see the real
-        neighbours of the span.
+        step three of the DFA-bounded capture lane: the one-pass DFA
+        walked over exactly that span when the pattern takes it
+        (`_use_onepass`: exact, one table step per byte, no budget),
+        else the specialized backtracker anchored at `start` and pinned
+        to end at `end` (`anchored_end` + `end_at`, the confirm shape
+        set_prefilter.mojo also uses); both over the WHOLE input so `$`
+        and `\b` see the real neighbours of the span.
 
         Why its first success is Python's capture assignment: the span
         is the leftmost-first match, i.e. the first path in NFA priority
@@ -1496,34 +1576,70 @@ struct Regex[pattern: String](Copyable, Movable):
         left all `-1`: the span is still reported, only its groups read
         as unset — the lane never drops a match the tables found.
         """
-        if pike[].sbt_ok:
-            try:
-                var memo = List[UInt64]()
-                var got = _sbt_run[
-                    nfa=Self.nfa,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                    anchored_end=True,
-                ](
-                input,
-                start,
-                slots,
-                memo,
-                end_at=end,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
-                if got == end:
-                    return
-                debug_assert(
-                    got < 0, "anchored_end backtracker returned another end"
-                )
-            except:
-                pass
-            pike[].sbt_ok = False
+        comptime if Self._use_onepass:
+            # One table walk over the span, exact: a -1 here means the
+            # tables and the one-pass automaton disagree about the span
+            # (never, by construction — flagged under ASSERT), and the
+            # Pike VM below is the same escape hatch as for the
+            # backtracker's disagreement.
+            var got = self._onepass_walk(input, start, end, slots)
+            if got == end:
+                return
+            debug_assert(False, "one-pass DFA rejects the DFA span")
+            for s in range(Self._num_slots):
+                slots[s] = -1
+        else:
+            if pike[].sbt_ok:
+                try:
+                    var memo = List[UInt64]()
+                    var got = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                        anchored_end=True,
+                    ](
+                        input,
+                        start,
+                        slots,
+                        memo,
+                        end_at=end,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
+                    if got == end:
+                        return
+                    debug_assert(
+                        got < 0,
+                        "anchored_end backtracker returned another end",
+                    )
+                except:
+                    pass
+                pike[].sbt_ok = False
         # Slots may hold a partial walk's writes: the Pike result
         # replaces every one of them.
         self._pike_span(input, start, end, slots, pike)
+
+    @always_inline
+    def _onepass_walk[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        end_pin: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+    ) -> Int:
+        """The one-pass DFA over exactly `[start, end_pin)` (see
+        `onepass_match`): `end_pin` with the slots written, else -1.
+        Only meaningful when `_use_onepass`."""
+        return onepass_match[
+            op=Self._onepass,
+            table=Self._OP_TABLE,
+            classes=Self._OP_CLASSES,
+            eps=Self._OP_EPS,
+            states=Self._OP_STATES,
+            num_slots=Self._num_slots,
+        ](input, start, end_pin, slots)
 
     def _pike_span[
         origin: Origin, wo: MutOrigin, //
@@ -1533,7 +1649,7 @@ struct Regex[pattern: String](Copyable, Movable):
         start: Int,
         end: Int,
         mut slots: InlineArray[Int, Self._num_slots],
-        pike: Pointer[_SpanPike[Self._num_slots, Self._use_dfa_span], wo],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
     ):
         """Pike VM on the exact span `[start, end)`: anchored at `start`,
         MATCH accepted only at `end`, anchors resolved against the whole
@@ -1636,6 +1752,18 @@ struct Regex[pattern: String](Copyable, Movable):
             except:
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_match(input)
+        elif Self._use_onepass:
+            # One-pass capture pattern: one forward table walk writes the
+            # slots; a dead walk is a definitive no-match (no budget, no
+            # fallback engine).
+            var bytes = input.as_bytes()
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+            var end = self._onepass_walk(bytes, 0, len(bytes), slots)
+            if end >= 0:
+                return MatchResult[Self._num_slots](
+                    matched=True, start=0, end=end, slots=slots^
+                )
+            return MatchResult[Self._num_slots].no_match()
         try:
             # Declared here, not at the top of the method: the sandwich,
             # SIMD-literal and DFA lanes above all return without ever
@@ -1700,7 +1828,7 @@ struct Regex[pattern: String](Copyable, Movable):
             # verb: the walk's state lives in the verb's frame and the
             # walk carries a pointer to it — see `_LFWalk`'s docstring
             # for why it is shaped this way.
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var rng = self._lf_next_match(
@@ -1981,7 +2109,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             while pos <= input_len:
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2136,7 +2264,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             var pos = 0
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             while pos <= input_len:
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2612,7 +2740,7 @@ struct Regex[pattern: String](Copyable, Movable):
         )
         var prev_end = 0
         var pos = 0
-        var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+        var pike = _SpanPike[Self._num_slots, Self._span_lane]()
         var walk = _LFWalk(Pointer(to=pike))
         while pos <= input_len:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2787,7 +2915,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var input_len = input.byte_length()
             var pos = 0
             var prev_end = 0
-            var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
             var walk = _LFWalk(Pointer(to=pike))
             while pos <= input_len:
                 # split() never reports groups: the span alone.
