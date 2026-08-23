@@ -145,6 +145,24 @@ match, both linear; the old lane's per-position anchored attempts were
 quadratic on `[a-z]+x` over a long class run, and its backtracker re-run
 for the leftmost-first end is gone from this lane.
 
+The reverse walk is a second pass over every match, and on a short match
+it is most of the per-match cost, so the lane tries the first prefilter
+candidate **anchored first** whenever a cheap anchored engine exists for
+the shape: the classic table when its leftmost-longest end is provably
+the leftmost-first end (one greedy loop at most — `[a-z]+x`, `.*x`), the
+specialized backtracker for a lazy pattern whose loops are all simple
+(`<.*?>`: a byte compare and one SIMD class scan). A success is the match
+with its start known — no reverse walk; a failure proves nothing starts
+at that candidate and the unanchored scan takes over from the next one.
+The wasted walk is bounded by the scan's own walk over the same bytes (the
+scan keeps the failed attempt's threads alive, at top priority, until
+they die), so the lane stays linear; `a.*?b` over a 64 KB run with no `b`
+is 3.7 µs here against 2.3 s on the backtracker alone. One attempt per
+match, never one per candidate. Every materialized table is padded to
+`EDFA_TABLE_MIN_BYTES` (1 KB): below that the comptime constant lowers to
+a per-call stack copy inside the walker, which cost more than the walk
+itself on 3-state tables.
+
 The **specialized backtracker** is comptime-specialized per NFA state: each
 `_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind
 with all fields baked in. The body is a `comptime if` chain over the kind, so
