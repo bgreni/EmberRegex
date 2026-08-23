@@ -233,15 +233,56 @@ What it is *not* is one flat function — `_sbt_try_match` carries no
 `@always_inline`, and could not honour one: a cyclic SPLIT reaches its own
 instantiation, which is unflattenable in principle. So the general-SPLIT
 branch is genuine recursion, and the engine carries **two** independent caps:
-`SBT_BUDGET` bounds total work, while `SBT_MAX_DEPTH` bounds the *stack* —
+`SBT_BUDGET` bounds total work, while `SBT_STACK_BUDGET` bounds the *stack* —
 budget alone does not, since `(?:ab)+` recurses once per byte consumed and has
 overflowed the stack on a 50KB input. Exhausting either falls through to the
-Pike VM. Two cyclic shapes avoid the recursion altogether: a greedy or lazy
-SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
+Pike VM. The stack bound is measured in **bytes**, not calls: the walk reads
+the stack pointer at the checked frames and concedes when it drops below a
+floor taken at `_sbt_run` entry. A call count cannot do the job — the same
+frame measures ~120 B in a release build and 600-1500 B under
+`-D ASSERT=all`, a 12x spread, plus a further 2.4x between pattern shapes, so
+the 10,000-call cap this replaced was 1.2 MB in one build and 14.6 MB in the
+other (which is how `(?:a|a{2,})+b` on 2000 `a`s came to SIGSEGV under the
+test flags).
+
+The floor is the higher of two rules, and both are needed:
+
+- **relative** — `sp - SBT_STACK_BUDGET` (4 MiB, half the 8 MiB main-thread
+  default) bounds what *this walk* may add;
+- **absolute** — `stack_low + SBT_STACK_RESERVE` (512 KiB) bounds where the
+  thread's stack actually ends. `stack_low` comes from
+  `pthread_get_stackaddr_np` / `pthread_get_stacksize_np` on macOS and
+  `pthread_getattr_np` / `pthread_attr_getstack` on Linux. Without it the
+  relative rule says nothing about what the *caller* already spent: a caller
+  burning 64 KiB per level around a deep walk returned at 60 levels
+  (~3.9 MiB) and SIGSEGV'd at 64, and a macOS secondary thread (512 KiB by
+  default) never had 4 MiB to give.
+
+`Regex.__init__` asks for the thread's range once and caches it; the floor
+re-asks only when the current stack pointer falls outside the cached range
+(i.e. the `Regex` moved threads). Asking per `_sbt_run` instead measured
+1.388x on `static_nested_quantifier`.
+
+**Residual assumptions.** The reserve has to cover whatever nests between two
+checks, and the check sits in the general-SPLIT branch: one cycle of the call
+graph, measured at ~4.5 KiB, against a 512 KiB reserve. A pattern that nests
+*hundreds* of lookarounds between two cyclic splits would push past that —
+lookaround frames are real and are not check sites. Platforms other than
+macOS and Linux cannot be asked for their stack bounds and keep the relative
+rule alone.
+
+Two cyclic shapes avoid the recursion altogether: a greedy or lazy SPLIT
+whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
 `while` loop (`is_simple_loop` / `is_simple_lazy`), so `a+`, `[a-z]*` and
-`.*?` iterate. `_sbt_needs_depth_guard` keys off exactly that distinction and
-drops depth tracking for patterns where every cyclic split is simple —
-measured 1.25-1.6x on recursion-heavy patterns.
+`.*?` iterate. `sbt_depth_plan` computes whether anything is left that can
+still recurse without bound — a cycle in the *specialized call graph*, which
+models the simple-loop rewrites, so it is exact rather than an
+over-approximation of the NFA — and drops the whole guard (floor included)
+when there is none; measured 1.25-1.6x on recursion-heavy patterns when the
+check was applied unconditionally. The same pass verifies that the
+general-SPLIT states form a feedback vertex set of that graph, which is what
+licenses keeping the check in that one branch instead of on entry to every
+state.
 
 A **counted repetition** over a single byte class gets the same treatment,
 one level up. `nfa.mojo` expands `x{n,m}` into `n` required copies plus
