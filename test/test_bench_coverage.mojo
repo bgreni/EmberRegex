@@ -539,9 +539,7 @@ def test_bench_match_single_byte_run() raises:
     # stays accelerated (a single-byte self-loop is a genuine run).
     comptime S = Regex["a+e|x"]
     assert_true(S._strategy.use_eager_dfa)
-    comptime n_accel = len(S._edfa.accel_states) + len(
-        S._edfa.accel_nib_states
-    )
+    comptime n_accel = len(S._edfa.accel_states) + len(S._edfa.accel_nib_states)
     assert_true(n_accel >= 1)
     var re = S()
     var input = "a" * 20480 + "e"
@@ -628,6 +626,71 @@ def test_bench_memo_ambiguous_plus_miss() raises:
     assert_equal(hit.end, 21)
 
 
+def test_bench_memo_ambiguous_plus_in_span() raises:
+    # bench memo_ambiguous_plus_in_span_1500: the span is the whole input,
+    # the first arm cannot match (no `c`), so group 1 is unset and the
+    # answer comes from `a+b`. Pinned against the Pike VM slot for slot.
+    comptime S = Regex["(a|aa)+c|a+b"]
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = String("a") * 1500 + "b"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 1501)
+    assert_equal(r.slots[0], -1)
+    assert_equal(r.slots[1], -1)
+    var exp = re._pike_search(input)
+    assert_equal(exp.end, 1501)
+    assert_equal(exp.slots[0], -1)
+
+
+def test_bench_capture_search_miss() raises:
+    # bench capture_search_miss_100KB: `.` and `@` are everywhere, `.com`
+    # nowhere — the prescans pass and the search is a genuine miss.
+    comptime S = Regex["(\\w+)@(\\w+)\\.com"]
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = String("user@example.org ") * (100 * 1024 // 17)
+    assert_false(re.search(input).matched)
+    # Positive control: one `.com` token at the end is found with groups.
+    var hit = input + "x@y.com"
+    var r = re.search(hit)
+    assert_true(r.matched)
+    assert_equal(r.group_str(hit, 1), "x")
+    assert_equal(r.group_str(hit, 2), "y")
+
+
+def _capture_sparse_input() -> String:
+    """bench.mojo's `capture_sparse_input`, byte for byte."""
+    var filler = String("lorem ipsum 42 dolor sit amet ") * 43
+    var parts = List[String]()
+    for _ in range(50):
+        parts.append("123-4567")
+    return filler.join(parts) + filler
+
+
+def test_bench_capture_findall_sparse() raises:
+    # bench capture_findall_sparse_64KB: exactly 50 matches, each
+    # reporting group 1 (findall's Python-flavored group-1 text), and the
+    # filler's `42` runs never produce one.
+    comptime S = Regex["(\\d+)-(\\d+)"]
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = _capture_sparse_input()
+    assert_true(input.byte_length() > 60 * 1024)
+    var all = re.findall(input)
+    assert_equal(len(all), 50)
+    assert_equal(all[0], "123")
+    assert_equal(all[49], "123")
+    var spans = re.finditer(input)
+    assert_equal(len(spans), 50)
+    assert_equal(spans[7].group_str(input, 2), "4567")
+    assert_equal(
+        len(re.findall(String("lorem ipsum 42 dolor sit amet ") * 3)), 0
+    )
+
+
 def _bench_counted_haystack(n: Int) -> String:
     """Mirror of `make_counted_haystack` in bench/bench.mojo."""
     var parts = List[String]()
@@ -640,12 +703,16 @@ def _bench_counted_haystack(n: Int) -> String:
 
 
 def test_bench_counted_repeat_search_2KB() raises:
-    # bench counted_repeat_search_2KB: the capture keeps it on the
-    # backtracker (a capture-free `[a-z]{3,7}\d` goes to a DFA lane and the
-    # row would time the wrong engine), the haystack is ~2 KB, and the
-    # first match is far enough in that the row really walks it.
-    comptime S = Regex["([a-z]{3,7})\\d"]
+    # bench counted_repeat_search_2KB: the leading lookahead keeps it on
+    # the backtracker for EVERY verb (`_use_lf_lane` governs search /
+    # findall; `_strategy.use_dfa` only match() — a capture alone rides
+    # the DFA-bounded capture lane and the row would time the wrong
+    # engine), the haystack is ~2 KB, and the first match is far enough
+    # in that the row really walks it.
+    comptime S = Regex["(?=[a-z])([a-z]{3,7})\\d"]
     assert_false(S._strategy.use_dfa)
+    assert_false(S._use_lf_lane)
+    assert_false(S._use_dfa_span)
     var re = S()
     var input = _bench_counted_haystack(90)
     assert_true(input.byte_length() > 1800)
@@ -677,8 +744,10 @@ def test_bench_counted_repeat_giveback_2KB() raises:
     # back. Pin that the row is on the backtracker, that the giveback mode
     # really is SBT_GIVEBACK_ALL, and that the match is the SHORTER count
     # (6, not 7) — which is exactly what a hand-back produces.
-    comptime S = Regex["([a-z]{3,7})[a-z]x"]
+    comptime S = Regex["(?=[a-z])([a-z]{3,7})[a-z]x"]
     assert_false(S._strategy.use_dfa)
+    assert_false(S._use_lf_lane)
+    assert_false(S._use_dfa_span)
     var re = S()
     var input = _bench_giveback_haystack(90)
     assert_true(input.byte_length() > 600)

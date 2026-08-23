@@ -131,6 +131,7 @@ struct PikeVM[num_slots: Int](Copyable):
         max_pos: Int = -1,
         full: Bool = False,
         unanchored: Bool = False,
+        end_at: Int = -1,
     ) -> MatchResult[Self.num_slots]:
         """Core NFA simulation using pre-allocated buffers.
 
@@ -140,10 +141,25 @@ struct PikeVM[num_slots: Int](Copyable):
         If unanchored is True, a fresh start-state thread is injected at
         every position (at lowest priority) until a match is recorded, so
         one pass finds the leftmost match anywhere >= start_pos.
+
+        If end_at >= 0, MATCH accepts only at exactly that position (the
+        first thread in priority order there wins, as in fullmatch) and
+        the simulation stops there — but anchors and word boundaries
+        still see the REAL input: `max_pos` would truncate `input_len`,
+        so `$` would hold at the pin and `\b` would see no byte after
+        it, which is wrong for the DFA-span capture lane (engine.mojo
+        `_span_fill_slots`), whose span ends mid-input.
         """
         var input_len = len(input)
         if max_pos >= 0 and max_pos < input_len:
             input_len = max_pos
+        # Where the simulation stops and fullmatch-style acceptance
+        # applies: the end pin, else the (possibly truncated) input end.
+        var stop = input_len
+        var pinned = full
+        if end_at >= 0 and end_at <= input_len:
+            stop = end_at
+            pinned = True
         var num_states = bufs.num_states
         if num_states == 0:
             return MatchResult[Self.num_slots].no_match()
@@ -174,10 +190,10 @@ struct PikeVM[num_slots: Int](Copyable):
         var pos = start_pos
         while True:
             # Check for match states
-            if full:
-                # Fullmatch: MATCH only accepts at end of input; the first
-                # (highest-priority) thread that reached it wins.
-                if pos >= input_len:
+            if pinned:
+                # Fullmatch / end pin: MATCH only accepts at `stop`; the
+                # first (highest-priority) thread that reached it wins.
+                if pos >= stop:
                     for i in range(len(bufs.current_states)):
                         if (
                             self.nfa.states.unsafe_get(
@@ -221,7 +237,7 @@ struct PikeVM[num_slots: Int](Copyable):
                         bufs.current_slot_data.resize(i * Self._stride, 0)
                         break
 
-            if pos >= input_len:
+            if pos >= stop:
                 break
 
             var ch = UInt32(ptr.unsafe_offset(pos).unsafe_load())
