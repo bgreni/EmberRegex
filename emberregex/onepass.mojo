@@ -226,7 +226,7 @@ def onepass_shape(nfa: NFA) -> Bool:
     backtracker): the walk costs ~1.8 ns per byte whatever the pattern;
     the backtracker pays that per arm it tries. On an alternation loop
     the walk wins at every length and loses the SBT_BUDGET /
-    SBT_MAX_DEPTH cliff — `(?:(x)|y)+` 71 vs 326 at 40 bytes, 2.0 vs
+    SBT_STACK_BUDGET cliff — `(?:(x)|y)+` 71 vs 326 at 40 bytes, 2.0 vs
     7.8 us at 1 KB (backtracker exhausts the budget → Pike VM past
     8 KB); `(?:(x)|(y)|z)+` 72 vs 612; `(a|b)*(c)` 72 vs 90 and 1.6 vs
     6.4 us; `(?:(ab)|(cd))+` 70 vs 76 and 1.9 vs 5.3 us. Without a body

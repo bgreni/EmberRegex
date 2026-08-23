@@ -96,7 +96,7 @@ def test_onepass_selection() raises:
     # (`onepass_shape`): a general loop the backtracker runs by
     # recursion whose body carries an ALTERNATION — where it re-tries
     # an arm per iteration — and no simple loop anywhere. 4-9x faster at
-    # every length, and no SBT_BUDGET / SBT_MAX_DEPTH cliff.
+    # every length, and no SBT_BUDGET / SBT_STACK_BUDGET cliff.
     assert_true(Regex["(?:(x)|y)+"]._use_onepass)
     assert_true(Regex["(?:(x)|(y)|z)+"]._use_onepass)
     assert_true(Regex["(a|b)*(c)"]._use_onepass)
@@ -367,7 +367,7 @@ def test_match_no_backtracker_budget() raises:
     # A one-pass pattern's match() is one table walk: the pathological
     # shape `(a*)*b` is not one-pass, but a long run through a one-pass
     # loop nest must not hit any budget. (`(?:(x)|y)+` over 200 KB would
-    # recurse past SBT_MAX_DEPTH on the backtracker.)
+    # exceed SBT_STACK_BUDGET on the backtracker.)
     var re = Regex["(?:(x)|y)+"]()
     var input = String("xy") * 100_000
     var r = re.match(input)
