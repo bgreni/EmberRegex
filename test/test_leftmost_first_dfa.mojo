@@ -13,17 +13,20 @@ newlines and bytes >= 0x80.
 
 from emberregex import Regex
 from emberregex.static_dfa import (
+    EDFA_TABLE_MIN_BYTES,
     EagerDFA,
     edfa_flags_arr,
     edfa_id_dtype,
     edfa_table_arr,
 )
+from emberregex.static_rdfa import rdfa_find_start
 from emberregex.static_lfdfa import (
     LF_LIST_CAP,
     build_lf_dfa,
     lfdfa_find_end,
     lfdfa_match_at,
 )
+from std.benchmark import keep
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 from std.time import perf_counter_ns
 
@@ -262,6 +265,165 @@ def test_lazy_scan_does_not_walk_the_line() raises:
         t_big = min(t_big, t1 - t0)
         t_small = min(t_small, t2 - t1)
     assert_true(t_big < 50 * t_small + 200_000)
+
+
+def test_tiny_tables_materialize_as_shared_data() raises:
+    # A comptime table below EDFA_TABLE_MIN_BYTES lowers to a per-call
+    # stack copy inside the walker (~11 ns per call for a 3-state table,
+    # which was 60% of the per-match cost of `<.*?>` findall). The
+    # materialized arrays are padded to that size, so the constant is a
+    # shared global and a short walk costs per-byte work only.
+    comptime S = Regex["<.*?>"]
+    comptime assert S._lfdfa.d.num_states * 256 < EDFA_TABLE_MIN_BYTES
+    comptime assert S._LFDFA_TN >= EDFA_TABLE_MIN_BYTES
+    comptime assert S._RDFA_TN >= EDFA_TABLE_MIN_BYTES
+    comptime assert S._EDFA_TN >= EDFA_TABLE_MIN_BYTES
+    var s = "<abcdefg> " * 64
+    var b = s.as_bytes()
+    # A 1-byte reverse walk against a 9-byte scalar one: with the copy
+    # the fixed cost dominates both (measured 11.5 vs 12.8 ns per call),
+    # without it the walk is per-byte work (1.0 vs 8.9 ns). Min of
+    # several timings; inputs alternate so the call cannot be hoisted.
+    var t_one = 1 << 62
+    var t_nine = 1 << 62
+    for _ in range(7):
+        var t0 = perf_counter_ns()
+        var acc = 0
+        for k in range(20000):
+            var e = 9 + (k & 1) * 10
+            acc += rdfa_find_start[
+                d=S._rdfa, table=S._RDFA_TABLE, flags=S._RDFA_FLAGS
+            ](b, e, e - 1)
+        var t1 = perf_counter_ns()
+        for k in range(20000):
+            var e = 9 + (k & 1) * 10
+            acc += rdfa_find_start[
+                d=S._rdfa, table=S._RDFA_TABLE, flags=S._RDFA_FLAGS
+            ](b, e, e - 9)
+        var t2 = perf_counter_ns()
+        keep(acc)
+        t_one = min(t_one, t1 - t0)
+        t_nine = min(t_nine, t2 - t1)
+    assert_true(3 * t_one < t_nine)
+
+
+def test_anchored_first_attempt_on_classic_table() raises:
+    # One greedy loop, branch-free suffix: the classic table's longest
+    # end is the leftmost-first end, so the first candidate is tried
+    # anchored there and a success skips the reverse walk entirely.
+    comptime S = Regex["[a-z]+x[0-9]"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._lf_anchored_classic)
+    var re = S()
+    # Success at the first candidate: start is the candidate itself.
+    var r = re.search("  abcx7 zzx")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 7)
+    # The attempt at 0 walks "aaax" and dies on ' ': nothing starts
+    # there, and the unanchored scan + reverse walk find the later one.
+    var r2 = re.search("aaax aax1")
+    assert_equal(r2.start, 5)
+    assert_equal(r2.end, 9)
+    # Failed attempt whose walk ends exactly at end of input.
+    assert_false(re.search("aaaax").matched)
+    assert_false(re.search("x").matched)
+    assert_false(re.search("").matched)
+    var all = re.findall("ax1 bx ax2 x3 cx")
+    assert_equal(len(all), 2)
+    assert_equal(all[0], "ax1")
+    assert_equal(all[1], "ax2")
+    # Shapes with two loops or an alternation keep the pure lane.
+    comptime T = Regex["[a-z]+@[a-z]+"]
+    assert_true(T._use_lf_dfa)
+    assert_false(T._lf_anchored_classic)
+    comptime U = Regex["<.*?>"]
+    assert_false(U._lf_anchored_classic)
+    # The bench shapes ride it.
+    assert_true(Regex["[a-z]+x"]._lf_anchored_classic)
+    assert_true(Regex[".*x"]._lf_anchored_classic)
+
+
+def test_anchored_first_attempt_on_backtracker() raises:
+    # Lazy pattern, every loop simple: the first candidate is tried
+    # anchored on the backtracker (a byte compare + one class scan); a
+    # success needs no reverse walk. This is what puts `<.*?>` findall
+    # at the backtracker's per-match cost on short tags while keeping
+    # the lane's linear scan for the misses.
+    comptime S = Regex["<.*?>"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._lf_anchored_sbt)
+    assert_false(S._lf_anchored_classic)
+    var re = S()
+    var r = re.search("xx<ab>cd<e>")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 6)
+    # The attempt at the first `<` dies on '\n'; the unanchored scan and
+    # the reverse walk recover the later match.
+    var r2 = re.search("<ab\n<cd>")
+    assert_equal(r2.start, 4)
+    assert_equal(r2.end, 8)
+    assert_false(re.search("<abc").matched)
+    assert_false(re.search("<").matched)
+    var all = re.findall("<a>\n<b\n<c><d>")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "<a>")
+    assert_equal(all[1], "<c>")
+    assert_equal(all[2], "<d>")
+    # A budget-exhausted attempt decides nothing and the scan takes
+    # over from the same candidate: 20 lazy loops over 19 `x`s explore
+    # ~2^19 exits — well past SBT_BUDGET — and the answer is the same
+    # as the Pike VM's.
+    comptime T = Regex["(?:.*?x){20}"]
+    assert_true(T._use_lf_dfa)
+    assert_true(T._lf_anchored_sbt)
+    var ret = T()
+    var miss = "x" * 19 + "y"
+    assert_equal(ret._sbt_match_at(miss.as_bytes(), 0), -2)
+    assert_false(ret.search(miss).matched)
+    assert_false(ret._pike_search(miss).matched)
+    # The attempt is speculative: LF_SBT_ATTEMPT_BUDGET steps, once per
+    # walk (the lane stops speculating after the first -2). Lines of 39
+    # `x`s exhaust it at every candidate; under the full SBT_BUDGET this
+    # walk cost ~197 us per match (440x the lane), now it is one
+    # bounded attempt plus the scan — within a loose factor of the same
+    # shape with the attempt off (`(?:ab)*` in front makes the loop
+    # recursive and clears `_lf_anchored_sbt`).
+    comptime V = Regex["(?:ab)*(?:.*?x){20}"]
+    assert_true(V._use_lf_dfa)
+    assert_false(V._lf_anchored_sbt)
+    var rv = V()
+    var lines = ("x" * 39 + "\n") * 20
+    var got = ret.findall(lines)
+    var want = rv.findall(lines)
+    assert_equal(len(got), 20)
+    assert_equal(len(got), len(want))
+    for i in range(len(got)):
+        assert_equal(got[i], want[i])
+    var t_on = 1 << 62
+    var t_off = 1 << 62
+    for _ in range(5):
+        var t0 = perf_counter_ns()
+        for _ in range(20):
+            keep(len(ret.findall(lines)))
+        var t1 = perf_counter_ns()
+        for _ in range(20):
+            keep(len(rv.findall(lines)))
+        var t2 = perf_counter_ns()
+        t_on = min(t_on, t1 - t0)
+        t_off = min(t_off, t2 - t1)
+    assert_true(t_on < 5 * t_off + 200_000)
+    var hit = "ax" * 19 + "bx" + "x"
+    var rh = ret.search(hit)
+    var rp = ret._pike_search(hit)
+    assert_true(rh.matched)
+    assert_equal(rh.start, rp.start)
+    assert_equal(rh.end, rp.end)
+    # A lazy pattern with a recursive (non-simple) loop keeps the pure
+    # lane: the backtracker's attempt could be deep there.
+    comptime U = Regex["(?:ab)+.*?x"]
+    assert_true(U._use_lf_dfa)
+    assert_false(U._lf_anchored_sbt)
+    assert_true(Regex["x*?y"]._lf_anchored_sbt)
 
 
 def test_eol_in_priority_order() raises:
