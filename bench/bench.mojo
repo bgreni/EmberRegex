@@ -775,6 +775,58 @@ def bench_lf_dfa_lazy_findall_64KB(mut b: Bench) raises:
     b.bench_function[go](BenchId("lf_dfa_lazy_findall_64KB"))
 
 
+def lcg_prose(n: Int) -> String:
+    """`n` bytes of prose-like text off an LCG's high bits: lower-case
+    letters, spaces, some capitals, digits, punctuation, newlines and
+    underscores — word runs of a few bytes separated by non-word bytes.
+    Mirrored by test_bench_coverage.mojo (the word count is pinned)."""
+    var out = List[Byte]()
+    var x: UInt64 = 12345
+    while len(out) < n:
+        x = x * 6364136223846793005 + 1442695040888963407
+        var r = Int((x >> 33) % 40)
+        if r < 26:
+            out.append(Byte(97 + r))
+        elif r < 30:
+            out.append(Byte(32))
+        elif r < 33:
+            out.append(Byte(65 + r - 30))
+        elif r < 36:
+            out.append(Byte(48 + r - 33))
+        elif r == 36:
+            out.append(Byte(44))
+        elif r == 37:
+            out.append(Byte(46))
+        elif r == 38:
+            out.append(Byte(10))
+        else:
+            out.append(Byte(95))
+    return String(unsafe_from_utf8=Span(out))
+
+
+def bench_word_boundary_findall_64KB(mut b: Bench) raises:
+    # Every word of 64 KB of prose-like text: the word anchors ride the
+    # engine selection picks for `\b\w+\b` (the backtracker — the DFA
+    # lanes model the anchor too, but the shape heuristic keeps a single
+    # class run there). ~8300 matches per call.
+    var re = Regex["\\b\\w+\\b"]()
+    var input = lcg_prose(64 * 1024)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.findall(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("word_boundary_findall_64KB"))
+
+
 def bench_match_single_byte_run_20KB(mut b: Bench) raises:
     # match() on the classic table over a 20 KB run of ONE byte: the
     # `a+` state self-loops on a single byte and must keep its SIMD
@@ -2123,6 +2175,7 @@ def main() raises:
     bench_lf_dfa_lazy_findall_64KB(b)
     bench_lf_dfa_class_run_search_20KB(b)
     bench_match_single_byte_run_20KB(b)
+    bench_word_boundary_findall_64KB(b)
 
     # Real-world (static_ prefix IDs)
     bench_static_email(b)

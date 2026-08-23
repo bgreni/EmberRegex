@@ -57,6 +57,7 @@ from .static_dfa import (
     _byte_classes,
     _flat_closure,
     _flatten_nfa,
+    WB_DROP,
 )
 
 # Determinization cap. The plan's open call starts this high: getting
@@ -358,10 +359,10 @@ def build_multi_dfa(nfa: NFA, enabled: Bool) -> MultiDFA:
 
     # --- The folded unanchored restart, precomputed per context. ---
     var start_o = _flat_closure(
-        kinds, out1s, out2s, anchors, nfa.start, False, False
+        kinds, out1s, out2s, anchors, nfa.start, False, False, WB_DROP
     )
     var start_n = _flat_closure(
-        kinds, out1s, out2s, anchors, nfa.start, False, True
+        kinds, out1s, out2s, anchors, nfa.start, False, True, WB_DROP
     )
 
     # --- Continuation closures, memoized by target state. ---
@@ -377,7 +378,7 @@ def build_multi_dfa(nfa: NFA, enabled: Bool) -> MultiDFA:
 
     # Entry state: position 0 (both BOL kinds hold).
     var entry = _flat_closure(
-        kinds, out1s, out2s, anchors, nfa.start, True, True
+        kinds, out1s, out2s, anchors, nfa.start, True, True, WB_DROP
     )
     var s0 = _bs_find_or_add(entry, sets_bits, hashes, index)
 
@@ -405,12 +406,12 @@ def build_multi_dfa(nfa: NFA, enabled: Bool) -> MultiDFA:
                     slot = tslot.unsafe_get(t)
                     if slot < 0:
                         var c_o = _flat_closure(
-                            kinds, out1s, out2s, anchors, t, False, False
+                            kinds, out1s, out2s, anchors, t, False, False, WB_DROP
                         )
                         var c_n = c_o
                         if has_bol_ml:
                             c_n = _flat_closure(
-                                kinds, out1s, out2s, anchors, t, False, True
+                                kinds, out1s, out2s, anchors, t, False, True, WB_DROP
                             )
                         gval_o.append(c_o)
                         gval_n.append(c_n)

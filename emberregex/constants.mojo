@@ -68,3 +68,15 @@ comptime CHAR_FF = __to_byte["\x0c"]()
 comptime CHAR_n = __to_byte["n"]()
 comptime CHAR_r = __to_byte["r"]()
 comptime CHAR_t = __to_byte["t"]()
+
+
+@always_inline
+def is_word_byte(ch: Byte) -> Bool:
+    """ASCII word byte `[A-Za-z0-9_]` — the `\\b` / `\\w` alphabet every
+    engine shares (bytes >= 0x80 are non-word, UTF-8 mode included)."""
+    return (
+        (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
+        or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
+        or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
+        or ch == CHAR_UNDERSCORE
+    )
