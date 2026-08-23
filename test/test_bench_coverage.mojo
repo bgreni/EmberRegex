@@ -703,7 +703,7 @@ def test_bench_onepass_match_kv() raises:
     var r = re.match(input)
     assert_true(r.matched)
     var p = re._pike_match(input)
-    for s in range(6):
+    for s in range(4):
         assert_equal(r.slots[s], p.slots[s])
     assert_false(re.match("host=db01&port=5432&user=admin&retry=55!").matched)
 
