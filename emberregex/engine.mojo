@@ -29,6 +29,7 @@ from .flags import RegexFlags
 from .optimize import (
     extract_alt_prefix,
     extract_filter_prefix,
+    extract_inner_literal,
     extract_literal_alternation,
     extract_literal_prefix,
     extract_literal_suffix,
@@ -36,8 +37,11 @@ from .optimize import (
     extract_required_byte,
     extract_match_sandwich,
     is_pure_literal,
+    lit_bytes_arr,
+    lit_flags_arr,
     select_probe_offsets,
     FilterPrefix,
+    InnerLiteral,
     LiteralAlt,
 )
 from .teddy import (
@@ -52,6 +56,7 @@ from .simd_scan import (
     lane_bits,
     simd_find_byte,
     simd_find_literal,
+    simd_find_literal_rare,
 )
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
@@ -536,26 +541,10 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
 
 
-@always_inline
-def _probe_eq[
-    W: Int, //, caseless: Bool, target: UInt8
-](v: SIMD[DType.uint8, W]) -> SIMD[DType.bool, W]:
-    """Chunk compare for one filter-prefix position. Caseless positions
-    fold via |0x20 — valid because their targets are lowercase ASCII
-    letters, whose only |0x20 preimages are the two cases."""
-    comptime if caseless:
-        return (v | 0x20).eq(target)
-    else:
-        return v.eq(target)
-
-
-@always_inline
-def _probe_eq1[caseless: Bool, target: UInt8](b: Byte) -> Bool:
-    """Scalar companion of _probe_eq."""
-    comptime if caseless:
-        return (b | 0x20) == target
-    else:
-        return b == target
+# The probe compares (_probe_eq/_probe_eq1) live in simd_scan.mojo as
+# probe_eq/probe_eq1, next to simd_find_literal_rare — the lifted Mula
+# memmem both the filter-prefix scanner and the inner-literal strategy
+# call.
 
 
 def _nfa_has_backref(nfa: NFA) -> Bool:
@@ -1038,6 +1027,43 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _use_scan_filter = (
         Self._strategy.fprefix_len > 0 or Self._strategy.use_teddy_prefix
     )
+    # The filter prefix as kernel comptime parameters, for
+    # _find_prefix_candidate's delegation to simd_find_literal_rare
+    # (List-bearing values must not ride as comptime parameters).
+    # Referenced only when fprefix_len >= 2.
+    comptime _FPRE_LIT = lit_bytes_arr[Self._strategy.fprefix_len](
+        Self._fpre.bytes
+    )
+    comptime _FPRE_CL = lit_flags_arr[Self._strategy.fprefix_len](
+        Self._fpre.caseless
+    )
+    # Reverse-suffix / reverse-inner required literal (Rust regex's
+    # ReverseSuffix/ReverseInner, effects (a)+(b) — see _lf_next_match's
+    # docstring). Only used when no candidate scanner exists: the filter
+    # prefix and the Teddy alternation prefix are start-anchored, so
+    # their candidate scan already bounds the work per position, and a
+    # second memmem was not worth its extra pass in the shapes measured
+    # (a 1-byte prefix CAN be less selective than the literal — running
+    # both is the unmeasured alternative, not a soundness question). The
+    # pivot prefilter may coexist — the literal test runs first, and the
+    # pivot then scans a region the literal has vouched for. The `and`
+    # chain elaborates the extraction only for LF-lane patterns without
+    # a scanner.
+    comptime _inner_lit = extract_inner_literal(Self.nfa)
+    comptime _use_rev_literal = (
+        Self._use_lf_lane
+        and not Self._use_scan_filter
+        and Self._inner_lit.valid
+    )
+    # The inner literal as kernel comptime parameters; referenced only
+    # where _use_rev_literal holds, so the invalid case (length 0) never
+    # elaborates.
+    comptime _IL_N = len(Self._inner_lit.bytes)
+    comptime _IL_LIT = lit_bytes_arr[Self._IL_N](Self._inner_lit.bytes)
+    comptime _IL_CL = lit_flags_arr[Self._IL_N](Self._inner_lit.caseless)
+    comptime _IL_PROBES = select_probe_offsets(
+        Self._inner_lit.bytes, Self._inner_lit.caseless
+    )
     # Field, not a per-method call: the check runs a cycle-flags pass over
     # the NFA, and comptime memoization covers field declarations only.
     # Consulted by the Teddy and LazyDFA search lanes (_lf_end_at) and
@@ -1424,6 +1450,13 @@ struct Regex[pattern: String](Copyable, Movable):
         lane stays linear where the old per-candidate loop was
         quadratic. One attempt per call, never one per candidate.
 
+        Ahead of everything, `_use_rev_literal` patterns run the
+        required-literal prefilter: no occurrence of the inner literal at
+        or after `pos + min_offset` answers the call outright with
+        (-1, -1) — no candidates, no scan — and with a comptime-bounded
+        pre-literal gap the whole candidate pipeline starts at
+        `lit_pos - max_offset` (see the block below).
+
         The backtracker attempt is speculative: it gets
         LF_SBT_ATTEMPT_BUDGET steps, and running out decides nothing —
         the scan starts from the same candidate, and `speculate` is
@@ -1445,7 +1478,34 @@ struct Regex[pattern: String](Copyable, Movable):
             return (0, end)
         else:
             var input_len = len(input)
-            var s0 = self._lf_candidate(input, input_len, pos)
+            var p = pos
+            comptime if Self._use_rev_literal:
+                # Required-literal prefilter (Rust regex's ReverseSuffix
+                # / ReverseInner): every match at or after `p` contains
+                # the inner literal, at or after `p + min_offset`.
+                # (a) No occurrence there means no match — answered by
+                # one memmem, no scan. (b) When the pattern consumes a
+                # bounded number of bytes before the literal, no match
+                # starts before `lit_pos - max_offset`, so the candidate
+                # sources and the scan start there. With an unbounded
+                # gap the scan still starts at `p` — a match may begin
+                # anywhere in the run before the literal, and recovering
+                # its start by walking leftward is the quadratic trap
+                # REV_INNER_MAX_BACKSCAN guards against in Rust; this
+                # design has no leftward walk at all.
+                var lit_pos = simd_find_literal_rare[
+                    lit=Self._IL_LIT,
+                    cl=Self._IL_CL,
+                    off_a = Self._IL_PROBES[0],
+                    off_b = Self._IL_PROBES[1],
+                ](input, p + Self._inner_lit.min_offset)
+                if lit_pos < 0:
+                    return (-1, -1)
+                comptime if Self._inner_lit.max_offset >= 0:
+                    var lb = lit_pos - Self._inner_lit.max_offset
+                    if lb > p:
+                        p = lb
+            var s0 = self._lf_candidate(input, input_len, p)
             if s0 < 0:
                 return (-1, -1)
             comptime if Self._lf_anchored_classic:
@@ -3108,167 +3168,21 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos += 1
                 return -1
         else:
-            comptime W = simd_width_of[DType.uint8]()
+            # Delegates to the lifted Mula memmem (simd_scan.mojo): the
+            # kernel probes the two rarest filter positions
+            # (background-frequency heuristic, memchr-style; caseless
+            # positions rank as the sum of both cases) with a
+            # 4x-unrolled two-byte SIMD filter and verifies survivors
+            # across the whole filter.
             comptime probes = select_probe_offsets(
                 Self._fpre.bytes, Self._fpre.caseless
             )
-            comptime off_a = probes[0]
-            comptime off_b = probes[1]
-            comptime byte_a = Self._fpre.bytes[off_a]
-            comptime byte_b = Self._fpre.bytes[off_b]
-            comptime ca = Self._fpre.caseless[off_a]
-            comptime cb = Self._fpre.caseless[off_b]
-            # Loop guards use the full filter extent, not off_b: a candidate
-            # in the last lane is verified across all fprefix_len bytes.
-            comptime last_off = fpn - 1
-            var ptr = Pointer(input.unsafe_ptr())
-            var pos = start
-
-            # 4x-unrolled SIMD body: 4*W bytes per iter
-            while pos + 4 * W + last_off <= input_len:
-                var b0 = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
-                var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[
-                    width=W
-                ]()
-                var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[
-                    width=W
-                ]()
-                var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[
-                    width=W
-                ]()
-                var e0 = _probe_eq[caseless=ca, target=byte_a](b0)
-                var e1 = _probe_eq[caseless=ca, target=byte_a](b1)
-                var e2 = _probe_eq[caseless=ca, target=byte_a](b2)
-                var e3 = _probe_eq[caseless=ca, target=byte_a](b3)
-                if (e0 | e1 | e2 | e3).reduce_or():
-                    var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var m0 = e0 & _probe_eq[caseless=cb, target=byte_b](l0)
-                    var m1 = e1 & _probe_eq[caseless=cb, target=byte_b](l1)
-                    var m2 = e2 & _probe_eq[caseless=cb, target=byte_b](l2)
-                    var m3 = e3 & _probe_eq[caseless=cb, target=byte_b](l3)
-                    if (m0 | m1 | m2 | m3).reduce_or():
-                        var r = self._first_verified_lane(input, pos, m0)
-                        if r >= 0:
-                            return r
-                        r = self._first_verified_lane(input, pos + W, m1)
-                        if r >= 0:
-                            return r
-                        r = self._first_verified_lane(input, pos + 2 * W, m2)
-                        if r >= 0:
-                            return r
-                        r = self._first_verified_lane(input, pos + 3 * W, m3)
-                        if r >= 0:
-                            return r
-                pos += 4 * W
-
-            # Single-chunk SIMD body for the bytes between the unrolled body
-            # and the tail
-            while pos + W + last_off <= input_len:
-                var block_a = ptr.unsafe_offset(pos + off_a).unsafe_load[
-                    width=W
-                ]()
-                var mask_a = _probe_eq[caseless=ca, target=byte_a](block_a)
-                if mask_a.reduce_or():
-                    var block_b = ptr.unsafe_offset(pos + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var mask = mask_a & _probe_eq[caseless=cb, target=byte_b](
-                        block_b
-                    )
-                    if mask.reduce_or():
-                        var r = self._first_verified_lane(input, pos, mask)
-                        if r >= 0:
-                            return r
-                pos += W
-
-            # Tail (< W + last_off remaining positions). With an exact
-            # first byte, hop between its occurrences via simd_find_byte
-            # (a scalar per-position verify measured 1.9x slower on
-            # 100B-input searches, where the tail dominates); a caseless
-            # first byte falls back to the per-position verify.
-            comptime c0 = Self._fpre.caseless[0]
-            comptime if not c0:
-                comptime fb = Self._fpre.bytes[0]
-                while True:
-                    var candidate = simd_find_byte(input, fb, pos)
-                    if candidate < 0:
-                        return -1
-                    pos = candidate
-                    if pos + fpn > input_len:
-                        return -1
-                    var ok = True
-                    comptime for j in range(1, fpn):
-                        comptime cj = Self._fpre.caseless[j]
-                        comptime bj = Self._fpre.bytes[j]
-                        if ok:
-                            ok = _probe_eq1[caseless=cj, target=bj](
-                                input.unsafe_get(pos + j)
-                            )
-                    if ok:
-                        return pos
-                    pos += 1
-            else:
-                while pos + fpn <= input_len:
-                    var ok = True
-                    comptime for j in range(fpn):
-                        comptime cj = Self._fpre.caseless[j]
-                        comptime bj = Self._fpre.bytes[j]
-                        if ok:
-                            ok = _probe_eq1[caseless=cj, target=bj](
-                                input.unsafe_get(pos + j)
-                            )
-                    if ok:
-                        return pos
-                    pos += 1
-                return -1
-
-    @always_inline
-    def _verify_prefix_middle[
-        origin: Origin, //
-    ](self, input: Span[Byte, origin], pos: Int) -> Bool:
-        """Verify the filter-prefix bytes the probe masks didn't check
-        (every offset except the two probe offsets)."""
-        comptime probes = select_probe_offsets(
-            Self._fpre.bytes, Self._fpre.caseless
-        )
-        var ptr = Pointer(input.unsafe_ptr())
-        var ok = True
-        comptime for k in range(Self._strategy.fprefix_len):
-            comptime if k != probes[0] and k != probes[1]:
-                comptime pb = Self._fpre.bytes[k]
-                comptime pc = Self._fpre.caseless[k]
-                if ok:
-                    ok = _probe_eq1[caseless=pc, target=pb](
-                        ptr[unsafe_offset=pos + k]
-                    )
-        return ok
-
-    @always_inline
-    def _first_verified_lane[
-        W: Int, origin: Origin, //
-    ](
-        self, input: Span[Byte, origin], base: Int, m: SIMD[DType.bool, W]
-    ) -> Int:
-        """First lane of the candidate mask that passes full prefix
-        verification, as an absolute input position, or -1."""
-        var bits = lane_bits(m)
-        while bits != 0:
-            var j = first_lane_index(bits)
-            if self._verify_prefix_middle(input, base + j):
-                return base + j
-            bits = clear_first_lane(bits)
-        return -1
+            return simd_find_literal_rare[
+                lit=Self._FPRE_LIT,
+                cl=Self._FPRE_CL,
+                off_a = probes[0],
+                off_b = probes[1],
+            ](input, start)
 
     @always_inline
     def _first_byte_hit(self, b: Byte) -> Bool:

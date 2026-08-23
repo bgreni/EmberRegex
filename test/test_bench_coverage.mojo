@@ -646,13 +646,17 @@ def test_bench_memo_ambiguous_plus_in_span() raises:
 
 
 def test_bench_capture_search_miss() raises:
-    # bench capture_search_miss_100KB: `.` and `@` are everywhere, `.com`
-    # nowhere — the prescans pass and the search is a genuine miss.
+    # bench capture_search_miss_100KB: `.`, `@` AND `.com` are all
+    # present (`x.com` tokens without a preceding `@\w+` run), so the
+    # required-byte prescan and the reverse-literal memmem both pass and
+    # the search is a genuine miss the DFA scan has to earn.
     comptime S = Regex["(\\w+)@(\\w+)\\.com"]
     assert_true(S._use_dfa_span)
+    assert_true(S._use_rev_literal)
     var re = S()
-    var input = String("user@example.org ") * (100 * 1024 // 17)
+    var input = String("user@example.org x.com ") * (100 * 1024 // 23)
     assert_false(re.search(input).matched)
+    assert_false(re._pike_search(input).matched)
     # Positive control: one `.com` token at the end is found with groups.
     var hit = input + "x@y.com"
     var r = re.search(hit)
@@ -799,6 +803,65 @@ def test_bench_counted_repeat_giveback_2KB() raises:
     assert_equal(len(re.findall(input)), 3)
     # A 7-letter run with no `x` is refuted at every count from 7 to 3.
     assert_false(re.search("abcdefg qrstuvw").matched)
+
+
+def _reverse_suffix_miss_input() -> String:
+    """bench.mojo's `reverse_suffix_miss_input`, byte for byte."""
+    var filler = "log.tx err.txx data.ttx x.t wo.rd "
+    var input = String("")
+    for _ in range(64 * 1024 // 34):
+        input += filler
+    return input
+
+
+def test_bench_reverse_suffix_search() raises:
+    # bench reverse_suffix_search_64KB: '.' (the required byte) and the
+    # ".tx" probe-pair near-miss are everywhere, ".txt" nowhere — the
+    # required-literal memmem answers the search and it is a genuine
+    # miss.
+    comptime S = Regex["\\w+\\.txt"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._use_rev_literal)
+    var re = S()
+    var input = _reverse_suffix_miss_input()
+    assert_true(input.byte_length() > 60 * 1024)
+    assert_false(re.search(input).matched)
+    assert_false(re._pike_search(input).matched)
+    # Positive control: one real token at the end is found exactly.
+    var hit = input + "file.txt"
+    var r = re.search(hit)
+    assert_true(r.matched)
+    assert_equal(r.start, input.byte_length())
+    assert_equal(r.end, hit.byte_length())
+
+
+def _reverse_inner_miss_input() -> String:
+    """bench.mojo's `reverse_inner_miss_input`, byte for byte."""
+    var filler = "svc: api / level: info /x msg: ok :/ trace: nine "
+    var input = String("")
+    for _ in range(64 * 1024 // 49):  # filler is 49 bytes
+        input += filler
+    return input
+
+
+def test_bench_reverse_inner_search() raises:
+    # bench reverse_inner_search_64KB: ':' and '/' (and the ":/" probe
+    # pair) are everywhere, "://" nowhere — a genuine miss the memmem
+    # answers.
+    comptime S = Regex["[a-z]+://[^ ]+"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._use_rev_literal)
+    var re = S()
+    var input = _reverse_inner_miss_input()
+    assert_true(input.byte_length() > 60 * 1024)
+    assert_false(re.search(input).matched)
+    assert_false(re._pike_search(input).matched)
+    # Positive control, with the reverse walk recovering the run start.
+    var hit = input + "see http://example.com now"
+    var r = re.search(hit)
+    assert_true(r.matched)
+    assert_equal(r.start, input.byte_length() + 4)
+    assert_equal(r.end, hit.byte_length() - 4)
 
 
 def main() raises:
