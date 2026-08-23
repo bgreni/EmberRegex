@@ -52,6 +52,36 @@ comptime EDFA_STATE_CAP = 128
 # EDFA_STATE_CAP anyway, so the pattern falls to the LazyDFA unchanged.
 comptime EDFA_NFA_CAP = 4096
 
+# --- Runtime transition-table element type ---------------------------------
+#
+# The comptime table stays `List[Int]` with -1 for dead cells; only the
+# materialized copy narrows, to the smallest SIGNED type that holds every
+# state id. Two things are hot in the walk: how much of the table stays in
+# cache (EDFA_STATE_CAP * 256 cells is 32KB as Int32, 8KB as Int8) and the
+# per-byte instruction count.
+#
+# Signed, keeping -1, is what makes both affordable. The walk's dead test
+# is `next < 0` — one test-and-branch on the value just loaded. Retiring
+# -1 for a positive sentinel (an unsigned type, premultiplied or not)
+# costs a compare against a constant in that same loop, and measured
+# +14% to +32% on a 128-state walk — more than narrowing wins back. See
+# the task A2 report for the five-way comparison.
+comptime EDFA_DEAD = -1
+
+
+def edfa_id_dtype(num_states: Int) -> DType:
+    """Comptime: narrowest signed element type holding every state id.
+
+    Signed because the dead marker is -1; Int8 covers ids 0..127, which
+    is every id an EDFA_STATE_CAP-state DFA has.
+    """
+    if num_states <= 128:
+        return DType.int8
+    elif num_states <= 32768:
+        return DType.int16
+    return DType.int32
+
+
 # NFA state sets as SIMD bitsets. The comptime interpreter models SIMD
 # natively (whole-vector ops and lane accesses cost about as much as scalar
 # arithmetic, ~1us), while every List element access costs ~40us and every
@@ -758,11 +788,17 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
     return result^
 
 
-def edfa_table_arr[n: Int](d: EagerDFA) -> InlineArray[Int32, n]:
-    """Comptime conversion of the flat table to a materializable array."""
-    var arr = InlineArray[Int32, n](fill=-1)
+def edfa_table_arr[
+    n: Int, dt: DType
+](d: EagerDFA) -> InlineArray[Scalar[dt], n]:
+    """Comptime conversion of the flat table to a materializable array.
+
+    `dt` comes from `edfa_id_dtype`; EDFA_DEAD (-1) survives the
+    narrowing, so the walkers keep their sign-bit dead test.
+    """
+    var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
     for i in range(n):
-        arr[i] = Int32(d.table[i])
+        arr[i] = Scalar[dt](d.table[i])
     return arr^
 
 
@@ -1035,11 +1071,12 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
 @always_inline
 def _edfa_full_match_impl[
     origin: Origin,
+    dt: DType,
     tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Int32, tn],
+    table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
@@ -1073,11 +1110,12 @@ def _edfa_full_match_impl[
 @always_inline
 def edfa_full_match[
     origin: Origin,
+    dt: DType,
     tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Int32, tn],
+    table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """Anchored full match (mirrors LazyDFA.full_match).
@@ -1100,11 +1138,12 @@ def edfa_full_match[
 @always_inline
 def _edfa_match_at_impl[
     origin: Origin,
+    dt: DType,
     tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Int32, tn],
+    table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin], start: Int) -> Int:
@@ -1154,11 +1193,12 @@ def _edfa_match_at_impl[
 @always_inline
 def edfa_match_at[
     origin: Origin,
+    dt: DType,
     tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Int32, tn],
+    table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Anchored match at `start`; returns leftmost-longest end or -1
@@ -1182,11 +1222,12 @@ def edfa_match_at[
 @always_inline
 def edfa_search_forward[
     origin: Origin,
+    dt: DType,
     tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Int32, tn],
+    table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
     first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH],
     bitmap_useful: Bool,

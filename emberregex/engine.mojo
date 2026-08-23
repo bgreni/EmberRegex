@@ -65,6 +65,7 @@ from .static_dfa import (
     build_eager_dfa,
     edfa_table_arr,
     edfa_flags_arr,
+    edfa_id_dtype,
     edfa_full_match,
     edfa_match_at,
     edfa_search_forward,
@@ -512,7 +513,12 @@ struct Regex[pattern: String](Copyable, Movable):
         and not Self._strategy.use_teddy
     )
     comptime _EDFA_TN = Self._edfa.num_states * 256
-    comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN](Self._edfa)
+    # The table is the walk's hot data, so it materializes in the
+    # narrowest element type the ids fit (see edfa_id_dtype).
+    comptime _EDFA_DT = edfa_id_dtype(Self._edfa.num_states)
+    comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN, Self._EDFA_DT](
+        Self._edfa
+    )
     comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
     comptime _SHENG_MASKS = sheng_masks_arr(
         Self._edfa, Self._strategy.use_sheng
