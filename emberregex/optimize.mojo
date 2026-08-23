@@ -823,11 +823,9 @@ def first_byte_bitmap_of(nfa: NFA, state_idx: Int) -> FirstByteSet:
     var visited = List[Bool](fill=False, length=len(nfa.states))
     var stack = List[Int]()
     stack.append(state_idx)
-    var stack_top = len(stack)
 
-    while stack_top > 0:
-        stack_top -= 1
-        var s = stack[stack_top]
+    while len(stack) > 0:
+        var s = stack.pop()
         if s < 0 or s >= len(nfa.states):
             # Dangling out-edge: nothing can be proven about this state.
             return _unknown_first_bytes()
@@ -841,10 +839,8 @@ def first_byte_bitmap_of(nfa: NFA, state_idx: Int) -> FirstByteSet:
             # out2 == -1 marks a no-op SPLIT (single live arm).
             if nfa.states[s].out2 >= 0:
                 stack.append(nfa.states[s].out2)
-            stack_top = len(stack)
         elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
             stack.append(nfa.states[s].out1)
-            stack_top = len(stack)
         elif kind == NFAStateKind.CHAR:
             var ch = Int(nfa.states[s].char_value)
             if ch >= 256:

@@ -356,8 +356,14 @@ def test_anchored_match_paths_unchanged() raises:
 
 
 def _lcg_bytes(seed: Int, n: Int, alphabet: List[Byte]) -> String:
+    """LCG stream seeded from BOTH `seed` and `n`.
+
+    Seeding from `seed` alone would make the ten lengths of one seed prefixes
+    of a single stream — 46 distinct bytes across the sweep instead of 50
+    independent inputs.
+    """
     var out = List[Byte]()
-    var x = seed
+    var x = (seed * 1000003 + n * 104729 + 12345) & 0x7FFFFFFF
     for _ in range(n):
         x = (x * 1103515245 + 12345) & 0x7FFFFFFF
         out.append(alphabet[x % len(alphabet)])
@@ -365,6 +371,14 @@ def _lcg_bytes(seed: Int, n: Int, alphabet: List[Byte]) -> String:
 
 
 def _assert_pike_agrees[pattern: String](data: String, label: String) raises:
+    """Differential against the Pike VM, which shares the backtracker's
+    leftmost-first semantics but none of its optimizations.
+
+    Only valid for patterns WITHOUT backreferences: the Pike VM has no BACKREF
+    case (executor.mojo drops it into the consuming bucket, where it can never
+    match), so it would be a wrong oracle. Backref patterns are pinned against
+    hand-computed expectations in `test_backref_crafted_oracle` instead.
+    """
     var re = Regex[pattern]()
     var got = re.search(data)
     var want = re._pike_search(data)
@@ -384,13 +398,20 @@ def _assert_pike_agrees[pattern: String](data: String, label: String) raises:
         assert_equal(gm.end, wm.end, label + " match end")
 
 
-def _sweep[pattern: String](alphabet: List[Byte], label: String) raises:
+def _sweep[
+    pattern: String
+](alphabet: List[Byte], label: String, crafted: List[String]) raises:
+    """50 LCG inputs plus the crafted ones — the crafted list carries the
+    shapes where a giveback actually SUCCEEDS, which random text over a
+    13-byte alphabet hits only by luck."""
     for seed in [1, 7, 42, 99, 20260822]:
         for n in [0, 1, 2, 3, 5, 8, 13, 21, 34, 55]:
             var data = _lcg_bytes(seed, n, alphabet)
             _assert_pike_agrees[pattern](
                 data, label + " seed=" + String(seed) + " n=" + String(n)
             )
+    for c in crafted:
+        _assert_pike_agrees[pattern](c, label + " crafted=" + c)
 
 
 def test_possessify_against_pike() raises:
@@ -411,20 +432,79 @@ def test_possessify_against_pike() raises:
         32,
         10,
     ]
-    # 50 inputs per pattern; greedy + lazy, disjoint / overlapping /
-    # empty-capable exits.
-    _sweep["(\\d+)x"](alpha, "disjoint-digits")
-    _sweep["([a-z]+)ab"](alpha, "overlap-letters")
-    _sweep["(a+)(?:b|$)"](alpha, "empty-capable")
-    _sweep["([a-z]+[0-9]+)+x"](alpha, "nested")
-    _sweep["<(\\w+)[^>]*>"](alpha, "exit-covers-body")
-    _sweep["(\\w+)=(\\S+)"](alpha, "key-value")
-    _sweep["(<.*?>)"](alpha, "lazy-any")
-    _sweep["(a.*?\\d)"](alpha, "lazy-digit-exit")
-    _sweep["x([a-z]*?)(\\d|$)"](alpha, "lazy-empty-capable")
-    _sweep["<([a-z]+)>[^<]*</\\1>"](alpha, "backref-html")
-    _sweep["(a+)+b"](alpha, "pathological")
-    _sweep["([a-z]+)\\s*=\\s*(\\d+)"](alpha, "assign")
+    # 50 LCG inputs + crafted givebacks per pattern; greedy and lazy,
+    # disjoint / overlapping / empty-capable exits.
+    _sweep["(\\d+)x"](alpha, "disjoint-digits", ["1x2x", "aaa123x", "123", "x"])
+    _sweep["([a-z]+)ab"](
+        alpha, "overlap-letters", ["zzzab", "xxabab", "ab", "aab", "zzzb"]
+    )
+    _sweep["(a+)(?:b|$)"](alpha, "empty-capable", ["aaa", "aaab", "b", "aa"])
+    _sweep["([a-z]+[0-9]+)+x"](alpha, "nested", ["abc123x", "a1ax", "a1", "x"])
+    _sweep["<(\\w+)[^>]*>"](
+        alpha, "exit-covers-body", ["<div class=q>", "<a>", "<", "<>"]
+    )
+    _sweep["(\\w+)=(\\S+)"](
+        alpha, "key-value", ["host=localhost port=5432", "=x", "a="]
+    )
+    _sweep["(<.*?>)"](
+        alpha, "lazy-any", ["xx<abc>yy<d>", "<>", "<a><b>", "no tags"]
+    )
+    _sweep["(a.*?\\d)"](
+        alpha, "lazy-digit-exit", ["a\nb1", "axb1", "a1", "aa22"]
+    )
+    _sweep["x([a-z]*?)(\\d|$)"](
+        alpha, "lazy-empty-capable", ["xabc1", "x", "xzz", "xa9b"]
+    )
+    _sweep["(a+)+b"](alpha, "pathological", ["aaab", "aaa", "b"])
+    _sweep["([a-z]+)\\s*=\\s*(\\d+)"](
+        alpha, "assign", ["foo = 42", "foo=42", "foo = x", "a=1"]
+    )
+
+
+def test_backref_crafted_oracle() raises:
+    """`<([a-z]+)>[^<]*</\\1>` cannot be checked against the Pike VM — it has
+    no BACKREF case, so it reports no-match for every input (verified: it
+    says False on "<b>x</b>", which really matches). These expectations are
+    hand-computed and cross-checked against Python's `re`.
+
+    Both loops in this pattern are POSSESSIVE (`[a-z]+` before `>`, `[^<]*`
+    before `<`), so it is exactly the shape where a wrong possessification
+    would show up as a lost match or a wrong span.
+    """
+    var re = Regex["<([a-z]+)>[^<]*</\\1>"]()
+
+    var a = re.search("<b>x</b>")
+    assert_true(a.matched)
+    assert_equal(a.start, 0)
+    assert_equal(a.end, 8)
+    assert_equal(a.group_str("<b>x</b>", 1), "b")
+
+    # First candidate start fails on the backref; the second one matches.
+    var b = re.search("<i>..</b><i>y</i>")
+    assert_true(b.matched)
+    assert_equal(b.start, 9)
+    assert_equal(b.end, 17)
+    assert_equal(b.group_str("<i>..</b><i>y</i>", 1), "i")
+
+    var c = re.search("<ab>zz</ab>")
+    assert_true(c.matched)
+    assert_equal(c.start, 0)
+    assert_equal(c.end, 11)
+    assert_equal(c.group_str("<ab>zz</ab>", 1), "ab")
+
+    var d = re.search("<div>content</div>")
+    assert_true(d.matched)
+    assert_equal(d.start, 0)
+    assert_equal(d.end, 18)
+    assert_equal(d.group_str("<div>content</div>", 1), "div")
+
+    # Misses: the closing name differs, is a prefix of the opening name, or
+    # would need the possessive `[a-z]+` to hand a byte back (it must not,
+    # and must not match either way).
+    assert_false(re.search("<div>content</span>").matched)
+    assert_false(re.search("<b>x</bb>").matched)
+    assert_false(re.search("<ab>x</a>").matched)
+    assert_false(re.search("<b>x<y</b>").matched)  # [^<]* cannot cross '<'
 
 
 def main() raises:
