@@ -517,5 +517,34 @@ def test_bench_teddy_prefix_search() raises:
     assert_equal(r.end, input.byte_length())
 
 
+def test_bench_lf_dfa_lazy_findall() raises:
+    # bench lf_dfa_lazy_findall_64KB: every tag is a match, none spans
+    # past its own `>`.
+    comptime S = Regex["<.*?>"]
+    assert_true(S._strategy.use_lf_dfa)
+    var re = S()
+    var parts = List[String]()
+    var n = 64 * 1024 // 14
+    for _ in range(n):
+        parts.append("<tag>")
+    var input = String(" text ").join(parts)
+    var all = re.findall(input)
+    assert_equal(len(all), n)
+    assert_equal(all[0], "<tag>")
+    assert_equal(all[n - 1], "<tag>")
+
+
+def test_bench_lf_dfa_class_run_search() raises:
+    # bench lf_dfa_class_run_search_20KB: the whole run plus the x.
+    comptime S = Regex["[a-z]+x"]
+    assert_true(S._strategy.use_lf_dfa)
+    var re = S()
+    var input = "a" * (20 * 1024) + "x"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 20 * 1024 + 1)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
