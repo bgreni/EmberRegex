@@ -563,6 +563,58 @@ def test_bench_lf_dfa_class_run_search() raises:
     assert_equal(r.end, 20 * 1024 + 1)
 
 
+def _lcg_prose(n: Int) -> String:
+    """bench.mojo's `lcg_prose`, byte for byte."""
+    var out = List[Byte]()
+    var x: UInt64 = 12345
+    while len(out) < n:
+        x = x * 6364136223846793005 + 1442695040888963407
+        var r = Int((x >> 33) % 40)
+        if r < 26:
+            out.append(Byte(97 + r))
+        elif r < 30:
+            out.append(Byte(32))
+        elif r < 33:
+            out.append(Byte(65 + r - 30))
+        elif r < 36:
+            out.append(Byte(48 + r - 33))
+        elif r == 36:
+            out.append(Byte(44))
+        elif r == 37:
+            out.append(Byte(46))
+        elif r == 38:
+            out.append(Byte(10))
+        else:
+            out.append(Byte(95))
+    return String(unsafe_from_utf8=Span(out))
+
+
+def test_bench_word_boundary_findall() raises:
+    # bench word_boundary_findall_64KB: thousands of words, every one
+    # agreeing with the Pike VM, and the count pinned so a silent
+    # no-match run cannot hide.
+    comptime S = Regex["\\b\\w+\\b"]
+    var re = S()
+    var input = _lcg_prose(64 * 1024)
+    var all = re.findall(input)
+    var exp = re._pike_findall(input)
+    assert_equal(len(all), len(exp))
+    assert_true(len(all) > 5000)
+    for i in range(len(all)):
+        assert_equal(all[i], exp[i])
+
+
+def test_bench_anchor_word_boundary() raises:
+    # bench anchor_word_boundary / anchor_word_boundary_miss.
+    var re = Regex["\\bworld\\b"]()
+    var r = re.search("say hello world today")
+    assert_true(r.matched)
+    assert_equal(r.start, 10)
+    assert_equal(r.end, 15)
+    var miss = Regex["\\borld\\b"]()
+    assert_false(miss.search("say hello world today").matched)
+
+
 def test_bench_memo_ambiguous_plus_miss() raises:
     # bench memo_ambiguous_plus_miss_1500: 1500 `a`s then `c`, so there is
     # no `b` anywhere and every candidate position fails — that is the

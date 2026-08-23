@@ -19,6 +19,7 @@ from .constants import (
     CHAR_ZERO,
     CHAR_Z_LOWER,
     CHAR_Z_UPPER,
+    is_word_byte,
 )
 from .nfa import NFA, NFAState, NFAStateKind
 from .charset import CharSet
@@ -502,12 +503,7 @@ struct PikeVM[num_slots: Int](Copyable):
     @staticmethod
     def _is_word_char(ch: Byte) -> Bool:
         """Check if a character is a word character [a-zA-Z0-9_]."""
-        return (
-            (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
-            or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
-            or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
-            or ch == CHAR_UNDERSCORE
-        )
+        return is_word_byte(ch)
 
 
 def _bt_try_match[
@@ -700,12 +696,7 @@ def _bt_check_anchor[
 
 
 def _bt_is_word_char(ch: Byte) -> Bool:
-    return (
-        (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
-        or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
-        or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
-        or ch == CHAR_UNDERSCORE
-    )
+    return is_word_byte(ch)
 
 
 def _bt_to_lower(ch: Byte) -> Byte:

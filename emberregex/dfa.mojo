@@ -515,7 +515,9 @@ def _epsilon_closure(
             ):
                 # EOL anchors: keep in state set for runtime resolution
                 out.append(s)
-            # WORD_BOUNDARY etc. — not handled in DFA
+            # WORD_BOUNDARY etc. — not modelled by the LazyDFA; engine
+            # selection keeps word-anchor patterns off it (they need the
+            # eager tables, which carry the look-behind class per state).
         elif kind == NFAStateKind.MATCH:
             has_match = True
             out.append(s)

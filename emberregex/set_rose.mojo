@@ -1119,6 +1119,7 @@ def build_rose(
         # plan's phase-7 lift; until then those stay resident.
         if (
             not nfa.can_use_dfa
+            or nfa.has_word_boundary
             or _eol_ml_continuation_consumes(nfa)
             or _eol_continuation_crosses_anchor(nfa)
         ):
