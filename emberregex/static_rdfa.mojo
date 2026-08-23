@@ -21,17 +21,37 @@ deferred to per-state flag bits the walker checks against `p == 0` and
 `input[p - 1] == '\\n'`.
 
 The walk is bounded by `end - floor` and by the automaton dying, so for
-`findall` it never passes the previous match end.
+`findall` it never passes the previous match end. It is also accelerated
+the way the forward walk is: a reverse state that self-loops on all but
+<= 2 bytes (the `.*` of `.*x`, walking back over everything but '\n')
+SIMD-scans backward to the previous exit byte — the whole run is one
+state with one flag byte, so its leftmost position is the only one that
+matters. States carrying a BOL flag are excluded (a '\n' inside the run
+would be an accept point the skip cannot see).
 """
 
 from std.bit import count_trailing_zeros
 from std.collections import InlineArray
+from std.sys import simd_width_of
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind
 from .set_reverse import _reverse_edges, _rev_flat_closure
+from .simd_kernels import (
+    ACCEL_SHUFTI,
+    ACCEL_TRUFFLE,
+    HAS_FAST_BYTE_SHUFFLE,
+    _class_contains,
+    build_shufti_masks,
+    build_truffle_masks,
+    nibble_table_from,
+    rfind_in_class,
+    shufti_encodable,
+)
+from .simd_scan import lane_bits, last_lane_index
 from .static_dfa import (
+    ACCEL_MIN_LOOP_BYTES,
     EDFA_DEAD,
     EDFA_NFA_CAP,
     _MIN_CAP,
@@ -69,6 +89,16 @@ struct RDFA(Copyable, Movable):
     var seed_other: Int  # end < len and input[end] != '\n'
     var any_bol0: Bool
     var any_bolnl: Bool
+    # Accelerated states (no BOL flag): self-loop on all but <= 2 bytes,
+    # or on a nibble-encodable set of >= ACCEL_MIN_LOOP_BYTES bytes — the
+    # same two flavours as EagerDFA, scanning backward.
+    var accel_states: List[Int]
+    var accel_exit1: List[Int]
+    var accel_exit2: List[Int]  # or -1
+    var accel_nib_states: List[Int]
+    var accel_nib_kind: List[Int]
+    var accel_nib_t0: List[Int]
+    var accel_nib_t1: List[Int]
 
     def __init__(out self):
         self.valid = False
@@ -80,34 +110,13 @@ struct RDFA(Copyable, Movable):
         self.seed_other = 0
         self.any_bol0 = False
         self.any_bolnl = False
-
-
-struct RDFAView(Copyable, Movable):
-    """POD scalars for the walker; tables arrive as InlineArrays (the
-    symbol-length rule, see ReverseView in set_reverse.mojo)."""
-
-    var seed_at_end: Int
-    var seed_at_nl: Int
-    var seed_other: Int
-    var any_bol0: Bool
-    var any_bolnl: Bool
-
-    def __init__(out self):
-        self.seed_at_end = 0
-        self.seed_at_nl = 0
-        self.seed_other = 0
-        self.any_bol0 = False
-        self.any_bolnl = False
-
-
-def rdfa_view(d: RDFA) -> RDFAView:
-    var v = RDFAView()
-    v.seed_at_end = d.seed_at_end
-    v.seed_at_nl = d.seed_at_nl
-    v.seed_other = d.seed_other
-    v.any_bol0 = d.any_bol0
-    v.any_bolnl = d.any_bolnl
-    return v^
+        self.accel_states = List[Int]()
+        self.accel_exit1 = List[Int]()
+        self.accel_exit2 = List[Int]()
+        self.accel_nib_states = List[Int]()
+        self.accel_nib_kind = List[Int]()
+        self.accel_nib_t0 = List[Int]()
+        self.accel_nib_t1 = List[Int]()
 
 
 def _rev_bol_reaches_start(
@@ -396,6 +405,33 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             result.any_bol0 = True
         if f & Int(RDFA_BOLNL) != 0:
             result.any_bolnl = True
+    # Acceleration (see the module docstring; same rules as _edfa_finish).
+    for si in range(nfinal):
+        if flags[si] & (Int(RDFA_BOL0) | Int(RDFA_BOLNL)) != 0:
+            continue
+        var row = rows.unsafe_get(si)
+        var exits = List[Int]()
+        for byte in range(256):
+            if Int(row[byte]) != si:
+                exits.append(byte)
+        if len(exits) == 0 or len(exits) == 256:
+            continue
+        if len(exits) <= 2:
+            result.accel_states.append(si)
+            result.accel_exit1.append(exits[0])
+            result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
+        elif HAS_FAST_BYTE_SHUFFLE and 256 - len(exits) >= ACCEL_MIN_LOOP_BYTES:
+            var t0 = List[Int]()
+            var t1 = List[Int]()
+            if shufti_encodable(exits):
+                build_shufti_masks(exits, t0, t1)
+                result.accel_nib_kind.append(ACCEL_SHUFTI)
+            else:
+                build_truffle_masks(exits, t0, t1)
+                result.accel_nib_kind.append(ACCEL_TRUFFLE)
+            result.accel_nib_states.append(si)
+            result.accel_nib_t0.extend(t0^)
+            result.accel_nib_t1.extend(t1^)
     result.valid = True
     result.num_states = nfinal
     result.table = table^
@@ -425,13 +461,96 @@ def rdfa_flags_arr[n: Int](d: RDFA) -> InlineArray[UInt8, n]:
 
 
 @always_inline
+def _rfind_exit2[
+    origin: Origin, //, e1: UInt8, e2: UInt8
+](input: Span[Byte, origin], pos: Int, floor: Int) -> Int:
+    """Smallest p in [floor, pos] such that no byte of input[p:pos] is
+    e1 or e2 — the backward twin of `_find_exit2`."""
+    comptime W = simd_width_of[DType.uint8]()
+    var ptr = Pointer(input.unsafe_ptr())
+    var p = pos
+    while p - W >= floor:
+        var block = ptr.unsafe_offset(p - W).unsafe_load[width=W]()
+        var bits = lane_bits(block.eq(e1) | block.eq(e2))
+        if bits != 0:
+            return p - W + last_lane_index(bits) + 1
+        p -= W
+    while p > floor:
+        var b = input.unsafe_get(p - 1)
+        if b == e1 or b == e2:
+            return p
+        p -= 1
+    return floor
+
+
+def _rdfa_accel_mask_word(d: RDFA, word: Int) -> UInt64:
+    var m = UInt64(0)
+    for s in d.accel_states:
+        if s >> 6 == word:
+            m |= UInt64(1) << UInt64(s & 63)
+    for s in d.accel_nib_states:
+        if s >> 6 == word:
+            m |= UInt64(1) << UInt64(s & 63)
+    return m
+
+
+def _rdfa_has_accel(d: RDFA) -> Bool:
+    return len(d.accel_states) > 0 or len(d.accel_nib_states) > 0
+
+
+@always_inline
+def _rdfa_accel_skip[
+    origin: Origin, //, d: RDFA
+](input: Span[Byte, origin], cur: Int, pos: Int, floor: Int) -> Int:
+    """If `cur` is an accelerated reverse state, SIMD-scan backward to
+    just after its previous exit byte (never below `floor`). Returns the
+    new position (== pos when nothing was skipped)."""
+    comptime W = simd_width_of[DType.uint8]()
+    if pos - floor < W:
+        return pos
+    comptime m0 = _rdfa_accel_mask_word(d, 0)
+    comptime m1 = _rdfa_accel_mask_word(d, 1)
+    comptime if d.num_states <= 64:
+        if (m0 >> UInt64(cur)) & 1 == 0:
+            return pos
+    else:
+        var m = m0 if cur < 64 else m1
+        if (m >> UInt64(cur & 63)) & 1 == 0:
+            return pos
+    var p = pos
+    comptime for ai in range(len(d.accel_states)):
+        comptime a_state = d.accel_states[ai]
+        comptime a_e1 = UInt8(d.accel_exit1[ai])
+        comptime a_e2 = UInt8(
+            d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
+        )
+        if cur == a_state:
+            p = _rfind_exit2[e1=a_e1, e2=a_e2](input, p, floor)
+    comptime for ai in range(len(d.accel_nib_states)):
+        comptime a_state = d.accel_nib_states[ai]
+        comptime a_kind = d.accel_nib_kind[ai]
+        comptime a_t0 = nibble_table_from(d.accel_nib_t0, ai)
+        comptime a_t1 = nibble_table_from(d.accel_nib_t1, ai)
+        if cur == a_state:
+            # Scalar peek at the byte about to be consumed: only
+            # vectorize when it actually self-loops.
+            if not _class_contains[kind=a_kind, t0=a_t0, t1=a_t1](
+                input.unsafe_get(p - 1)
+            ):
+                p = rfind_in_class[kind=a_kind, t0=a_t0, t1=a_t1](
+                    input, p - 1, floor
+                )
+    return p
+
+
+@always_inline
 def rdfa_find_start[
     origin: Origin,
     dt: DType,
     tn: Int,
     ns: Int,
     //,
-    d: RDFAView,
+    d: RDFA,
     table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], end: Int, floor: Int) -> Int:
@@ -440,7 +559,8 @@ def rdfa_find_start[
 
     Positions come in decreasing order, so every accepting position
     overwrites the last; the walk stops at `floor`, at position 0, or
-    when the reverse automaton dies.
+    when the reverse automaton dies. An accelerated state skips its run
+    first and records its flags at the run's leftmost position.
     """
     var tbl = materialize[table]()
     var flg = materialize[flags]()
@@ -456,6 +576,8 @@ def rdfa_find_start[
     var best = -1
     while True:
         var f = flg.unsafe_get(cur)
+        comptime if _rdfa_has_accel(d):
+            pos = _rdfa_accel_skip[d=d](input, cur, pos, floor)
         if (f & RDFA_NORM) != 0:
             best = pos
         if pos == 0:

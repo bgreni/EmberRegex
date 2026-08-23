@@ -52,6 +52,17 @@ comptime EDFA_STATE_CAP = 128
 # EDFA_STATE_CAP anyway, so the pattern falls to the LazyDFA unchanged.
 comptime EDFA_NFA_CAP = 4096
 
+# Smallest self-loop set a state needs for nibble acceleration. A state
+# looping on one to three bytes is never worth a vector scan — its runs
+# are rare — but it is common: in the leftmost-first unanchored table
+# every "partial literal + restart" state loops on the byte that kills
+# the partial match and starts it over (`[c-thread, restart]` on `c`),
+# and a 32-arm alternation had 17 such states, each paying the per-byte
+# accelerated-state dispatch chain for nothing (measured 1.5x on
+# sheng64_alt_32_search_2KB). The <= 2-exit path is unaffected: those
+# states loop on >= 254 bytes.
+comptime ACCEL_MIN_LOOP_BYTES = 4
+
 # --- Runtime transition-table element type ---------------------------------
 #
 # The comptime table stays `List[Int]` with -1 for dead cells; only the
@@ -1117,9 +1128,10 @@ def _edfa_finish(
     # <= 2 exit bytes (e.g. the `.*` state of `.*x`) use direct compares;
     # larger sets (e.g. the `\w+` self-loop) are nibble-encoded as shufti
     # masks when exact, truffle otherwise — only on targets with a native
-    # byte shuffle. EOL_AT_NEWLINE-flagged states are excluded: skipping
-    # bytes would skip their per-'\n' last_match updates when '\n'
-    # self-loops.
+    # byte shuffle, and only when the self-loop set is big enough to
+    # occur in runs (ACCEL_MIN_LOOP_BYTES). EOL_AT_NEWLINE-flagged states
+    # are excluded: skipping bytes would skip their per-'\n' last_match
+    # updates when '\n' self-loops.
     for s in range(nsets):
         if new_flags[s] & Int(EDFA_EOL_AT_NEWLINE) != 0:
             continue
@@ -1138,7 +1150,7 @@ def _edfa_finish(
             result.accel_states.append(s)
             result.accel_exit1.append(exits[0])
             result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
+        elif HAS_FAST_BYTE_SHUFFLE and 256 - len(exits) >= ACCEL_MIN_LOOP_BYTES:
             var t0 = List[Int]()
             var t1 = List[Int]()
             if shufti_encodable(exits):

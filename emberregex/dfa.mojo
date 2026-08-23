@@ -256,7 +256,10 @@ struct LazyDFA(Copyable, Movable):
         """Try to match at start position. Returns end position or -1.
 
         The returned end is leftmost-longest; callers that need Python's
-        leftmost-first end must re-resolve it (see Regex._lf_end_at).
+        leftmost-first end must re-resolve it (see Regex._lf_end_at). The
+        eager search lane avoids that by determinizing in priority order
+        (static_lfdfa.mojo); this engine only backs patterns whose
+        comptime tables overflowed.
         """
         self._ensure_init(nfa)
         var input_len = len(input)

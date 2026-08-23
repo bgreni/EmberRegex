@@ -81,7 +81,6 @@ from .static_rdfa import (
     rdfa_find_start,
     rdfa_flags_arr,
     rdfa_table_arr,
-    rdfa_view,
 )
 from .sheng import (
     sheng_cap_for,
@@ -604,7 +603,6 @@ struct Regex[pattern: String](Copyable, Movable):
         Self._rdfa
     )
     comptime _RDFA_FLAGS = rdfa_flags_arr[Self._rdfa.num_states](Self._rdfa)
-    comptime _RDFA_VIEW = rdfa_view(Self._rdfa)
     # Pivot-anchored prefilter shape (the `[class]+ P …` family), read off
     # the classic table; the leftmost-first scan starts at its candidate.
     comptime _lf_pivot = _pivot_prefilter(Self._edfa)
@@ -765,7 +763,7 @@ struct Regex[pattern: String](Copyable, Movable):
             if end < 0:
                 return (-1, -1)
             var start = rdfa_find_start[
-                d=Self._RDFA_VIEW,
+                d=Self._rdfa,
                 table=Self._RDFA_TABLE,
                 flags=Self._RDFA_FLAGS,
             ](input, end, s0)
@@ -1748,10 +1746,11 @@ struct Regex[pattern: String](Copyable, Movable):
     def _replace_dfa(
         mut self, input: String, replacement: String
     ) raises -> String:
-        """replace() implementation for the DFA lane (Teddy/Sheng/eager/
-        lazy), mirroring the split() DFA loop: literal-prefix candidate scan
-        when the pattern has one, search_forward otherwise. Anchored
-        patterns resolve through the DFA's start-state contexts."""
+        """replace() implementation for the Teddy / LazyDFA lane (the
+        leftmost-first lane has _replace_lf), mirroring the split() DFA
+        loop: literal-prefix candidate scan when the pattern has one,
+        search_forward otherwise. Anchored patterns resolve through the
+        DFA's start-state contexts."""
         var output = String()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()

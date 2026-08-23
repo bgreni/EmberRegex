@@ -264,6 +264,60 @@ def test_reverse_walk_never_passes_previous_end() raises:
     assert_equal(len(exp), 1000)
 
 
+def _assert_finditer_pike[p: StaticString](input: String) raises:
+    var re = Regex[p]()
+    var got = re.finditer(input)
+    var exp = re._pike_finditer(input)
+    assert_equal(len(got), len(exp), String(p, " finditer len"))
+    for i in range(len(got)):
+        assert_equal(got[i].start, exp[i].start, String(p, " start ", i))
+        assert_equal(got[i].end, exp[i].end, String(p, " end ", i))
+
+
+def test_reverse_acceleration_bounds() raises:
+    # The reverse walk SIMD-skips a self-looping state's run. The skip
+    # must stop at the floor (the previous match end: `b` matched first
+    # at 0, so the `.*x` / `[a-z]+x` match starts at 1, not 0) and at an
+    # exit byte ('\n' for `.`, the non-letter for `[a-z]`). Runs are
+    # longer than a SIMD chunk so the vector path is the one exercised.
+    comptime S = Regex["b|.*x"]
+    assert_true(S._strategy.use_lf_dfa)
+    comptime any_rev_accel = len(S._rdfa.accel_states) > 0
+    assert_true(any_rev_accel)
+    var re = S()
+    var run = "b" + "a" * 40 + "x"
+    var got = re.finditer(run)
+    assert_equal(len(got), 2)
+    assert_equal(got[0].start, 0)
+    assert_equal(got[0].end, 1)
+    assert_equal(got[1].start, 1)
+    assert_equal(got[1].end, 42)
+    _assert_finditer_pike["b|.*x"](run)
+    var lines = "aaa\n" + "a" * 40 + "x"
+    var r = re.search(lines)
+    assert_equal(r.start, 4)
+    assert_equal(r.end, 45)
+    _assert_finditer_pike["b|.*x"](lines)
+    _assert_finditer_pike["b|.*x"]("x" + "a" * 33 + "x\n" + "a" * 17 + "x")
+
+    comptime T = Regex["b|[a-z]+x"]
+    assert_true(T._strategy.use_lf_dfa)
+    var re2 = T()
+    var got2 = re2.finditer(run)
+    assert_equal(len(got2), 2)
+    assert_equal(got2[1].start, 1)
+    assert_equal(got2[1].end, 42)
+    var mixed = "b" + "a" * 20 + "1" + "a" * 40 + "x"
+    var r2 = re2.search(mixed)
+    assert_equal(r2.start, 0)
+    assert_equal(r2.end, 1)
+    var all2 = re2.finditer(mixed)
+    assert_equal(len(all2), 2)
+    assert_equal(all2[1].start, 22)
+    assert_equal(all2[1].end, 63)
+    _assert_finditer_pike["b|[a-z]+x"](mixed)
+
+
 def test_findall_alternation_prefix_order() raises:
     var re = Regex["foo|foobar"]()
     var all = re.findall("foobarfoo")
