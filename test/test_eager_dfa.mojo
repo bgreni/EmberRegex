@@ -6,7 +6,33 @@ regression can't hide behind the identical-semantics lazy path.
 """
 
 from emberregex import Regex
+from emberregex.static_dfa import (
+    EDFA_DEAD,
+    EDFA_STATE_CAP,
+    EagerDFA,
+    edfa_id_dtype,
+)
+from std.collections import InlineArray
+from std.sys import size_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
+
+
+def _table_roundtrips[
+    n: Int, dt: DType, //
+](d: EagerDFA, arr: InlineArray[Scalar[dt], n]) -> Bool:
+    """Comptime: every materialized cell reads back as the comptime cell.
+
+    Both directions matter: a live id must not wrap in the narrowed type,
+    and a dead cell must still read back as EDFA_DEAD so the walkers'
+    `next < 0` test keeps working.
+    """
+    for i in range(n):
+        var want = d.table[i]
+        if Int(arr[i]) != want:
+            return False
+        if want < 0 and want != EDFA_DEAD:
+            return False
+    return True
 
 
 def test_eager_selected_for_alternation() raises:
@@ -22,6 +48,61 @@ def test_eager_selected_for_quantifier_with_suffix() raises:
     comptime S = Regex[".*x"]
     assert_true(S._strategy.use_dfa)
     assert_true(S._strategy.use_eager_dfa)
+
+
+def test_table_element_type_is_narrow() raises:
+    # The per-byte table load is the eager walker's hot instruction and
+    # the table its hot data: the element type must be narrower than the
+    # Int32 the table started as, and stay signed so the dead test is a
+    # sign test rather than a compare against a sentinel.
+    comptime S = Regex["[a-z]{5,10}[0-9]{3,5}"]
+    assert_true(S._strategy.use_eager_dfa)
+    comptime dt = edfa_id_dtype(S._edfa.num_states)
+    assert_false(dt.is_unsigned())
+    assert_true(size_of[Scalar[dt]]() < 4)
+    assert_equal(dt, S._EDFA_DT)
+
+
+def test_table_dead_sentinel_roundtrip() raises:
+    # Narrowing must not disturb either kind of cell: live ids can't wrap
+    # and dead cells stay EDFA_DEAD.
+    comptime S = Regex["[a-z]{5,10}[0-9]{3,5}"]
+    assert_true(S._strategy.use_eager_dfa)
+    comptime ok = _table_roundtrips(S._edfa, S._EDFA_TABLE)
+    assert_true(ok)
+    # And through the walkers: a dead transition mid-input must still end
+    # the walk at the last match rather than run on.
+    var re = Regex["[a-z]{5,10}[0-9]{3,5}"]()
+    assert_true(re.match("abcdefg1234").matched)
+    assert_false(re.match("abcd1234").matched)  # dies in the [a-z] run
+    var r = re.search("!!abcdefg1234!!")
+    assert_true(r.matched)
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 13)
+
+
+def test_eager_at_state_cap_boundary() raises:
+    # Exactly EDFA_STATE_CAP states: id 127 is the largest the narrowed
+    # element type must hold — one more state and the pattern leaves the
+    # eager lane instead.
+    comptime S = Regex["(?:a|b){127}"]
+    assert_true(S._strategy.use_eager_dfa)
+    assert_equal(S._edfa.num_states, EDFA_STATE_CAP)
+    # The narrowed element type has to reach the cap's largest id — raise
+    # EDFA_STATE_CAP past 128 and edfa_id_dtype must widen with it.
+    comptime dt = edfa_id_dtype(S._edfa.num_states)
+    comptime id_max = (1 << (8 * size_of[Scalar[dt]]() - 1)) - 1
+    assert_true(EDFA_STATE_CAP - 1 <= id_max)
+    var re = Regex["(?:a|b){127}"]()
+    assert_true(re.match("ab" * 63 + "a").matched)
+    assert_false(re.match("ab" * 63).matched)  # 126 bytes: one short
+    assert_false(re.match("ab" * 63 + "c").matched)  # dead on the last byte
+    # One state past the cap still falls back to the LazyDFA.
+    comptime T = Regex["(?:a|b){128}"]
+    assert_true(T._strategy.use_dfa)
+    assert_false(T._strategy.use_eager_dfa)
+    var re2 = Regex["(?:a|b){128}"]()
+    assert_true(re2.match("ab" * 64).matched)
 
 
 def test_state_blowup_falls_back_to_lazy() raises:
