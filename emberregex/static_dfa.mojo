@@ -40,6 +40,13 @@ from .simd_kernels import (
 comptime EDFA_MATCH: UInt8 = 1
 comptime EDFA_EOL_AT_END: UInt8 = 2
 comptime EDFA_EOL_AT_NEWLINE: UInt8 = 4
+# Build-time only: a producer's veto on accelerating a state (the
+# leftmost-first determinizer sets it on states whose self-loops exist
+# only because the unanchored restart re-created a thread the byte had
+# just killed — a SIMD scan there never skips anything). Honoured and
+# then stripped by _edfa_finish, so materialized flag bytes never carry
+# it and _minimize keeps such states apart from accelerable ones.
+comptime EDFA_NO_ACCEL: UInt8 = 8
 
 # Determinization cap. Chosen well below the LazyDFA's runtime cap: the
 # comptime interpreter pays for every state x 256 byte columns, and any
@@ -51,6 +58,7 @@ comptime EDFA_STATE_CAP = 128
 # past this cannot fit a subset bitset; in practice such NFAs overflow
 # EDFA_STATE_CAP anyway, so the pattern falls to the LazyDFA unchanged.
 comptime EDFA_NFA_CAP = 4096
+
 
 # --- Runtime transition-table element type ---------------------------------
 #
@@ -1051,6 +1059,32 @@ def build_eager_dfa(
         if len(sets_bits) > EDFA_STATE_CAP:
             return result^  # state blowup: stay invalid, use LazyDFA
 
+    _ = _edfa_finish(
+        result, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize
+    )
+    return result^
+
+
+def _edfa_finish(
+    mut result: EagerDFA,
+    mut rows: List[SIMD[DType.int32, 256]],
+    mut flags: List[Int],
+    mut starts: List[Int],
+    rep_lo: SIMD[DType.int32, 256],
+    rep_hi: SIMD[DType.int32, 256],
+    nclasses: Int,
+    minimize: Bool,
+) -> List[Int]:
+    """Comptime: the determinizer-independent tail — minimization, the
+    match-state permutation, the acceleration scan and the flat table —
+    over a DFA in the row form both subset constructions produce.
+
+    `starts` holds any number of start ids in the caller's order, the
+    first three being (other, after-'\\n', at-0) for the `start_*`
+    fields; the permuted ids come back in the same order so a producer
+    with extra start contexts (the leftmost-first DFA's anchored starts)
+    can record them. Marks `result` valid.
+    """
     # Merge states no input can tell apart. Before the permutation and
     # the acceleration scan on purpose: both key off final state ids, and
     # acceleration can only see a self-loop once the duplicate states
@@ -1093,9 +1127,9 @@ def build_eager_dfa(
     # masks when exact, truffle otherwise — only on targets with a native
     # byte shuffle. EOL_AT_NEWLINE-flagged states are excluded: skipping
     # bytes would skip their per-'\n' last_match updates when '\n'
-    # self-loops.
+    # self-loops. So are states the producer vetoed (EDFA_NO_ACCEL).
     for s in range(nsets):
-        if new_flags[s] & Int(EDFA_EOL_AT_NEWLINE) != 0:
+        if new_flags[s] & (Int(EDFA_EOL_AT_NEWLINE) | Int(EDFA_NO_ACCEL)) != 0:
             continue
         var row = new_rows.unsafe_get(s)
         var exit_count = 0
@@ -1124,6 +1158,9 @@ def build_eager_dfa(
             result.accel_nib_states.append(s)
             result.accel_nib_t0.extend(t0^)
             result.accel_nib_t1.extend(t1^)
+    # The veto has done its job; the walkers' flag bytes never carry it.
+    for s in range(nsets):
+        new_flags[s] &= ~Int(EDFA_NO_ACCEL)
 
     var new_table = List[Int]()
     for s in range(nsets):
@@ -1134,9 +1171,12 @@ def build_eager_dfa(
     result.valid = True
     result.num_states = nsets
     result.num_match_states = num_match
-    result.start_at_0 = Int(perm[starts[2]])
-    result.start_after_nl = Int(perm[starts[1]])
-    result.start_other = Int(perm[starts[0]])
+    var pstarts = List[Int]()
+    for i in range(len(starts)):
+        pstarts.append(Int(perm[starts[i]]))
+    result.start_other = pstarts[0]
+    result.start_after_nl = pstarts[1]
+    result.start_at_0 = pstarts[2]
     for f in new_flags:
         if f & Int(EDFA_EOL_AT_NEWLINE) != 0:
             result.any_eol_nl = True
@@ -1144,7 +1184,7 @@ def build_eager_dfa(
             result.any_eol_end = True
     result.table = new_table^
     result.flags = new_flags^
-    return result^
+    return pstarts^
 
 
 def edfa_table_arr[
@@ -1495,7 +1535,7 @@ def edfa_full_match[
 
 
 @always_inline
-def _edfa_match_at_impl[
+def _edfa_walk_impl[
     origin: Origin,
     dt: DType,
     tn: Int,
@@ -1505,16 +1545,19 @@ def _edfa_match_at_impl[
     table: InlineArray[Scalar[dt], tn],
     flags: InlineArray[UInt8, ns],
     accel: Bool,
+    s_at0: Int,
+    s_nl: Int,
+    s_other: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
     var tbl = materialize[table]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
-        cur = d.start_at_0
+        cur = s_at0
     elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
-        cur = d.start_after_nl
+        cur = s_nl
     else:
-        cur = d.start_other
+        cur = s_other
 
     var last_match = -1
     if cur < d.num_match_states:
@@ -1550,6 +1593,57 @@ def _edfa_match_at_impl[
 
 
 @always_inline
+def edfa_walk_from[
+    origin: Origin,
+    dt: DType,
+    tn: Int,
+    ns: Int,
+    //,
+    d: EagerDFA,
+    table: InlineArray[Scalar[dt], tn],
+    flags: InlineArray[UInt8, ns],
+    s_at0: Int,
+    s_nl: Int,
+    s_other: Int,
+](input: Span[Byte, origin], start: Int) -> Int:
+    """Table walk from `start` in one of three explicit start states
+    (position 0 / after '\n' / mid-line), returning the last position
+    where a match state (or a resolving EOL flag) was observed, or -1.
+
+    What that position MEANS depends on the table: over the classic
+    subset construction it is the leftmost-longest end of a match
+    anchored at `start`; over a leftmost-first table (static_lfdfa.mojo)
+    it is Python's leftmost-first end, anchored or unanchored according
+    to which start ids the caller hands over.
+
+    Dispatches once per walk between an accelerated and a plain loop:
+    walks that can never reach a full vector chunk take the plain loop
+    and pay no per-byte acceleration checks at all.
+    """
+    comptime if _edfa_has_accel(d):
+        comptime W = simd_width_of[DType.uint8]()
+        if len(input) - start >= W:
+            return _edfa_walk_impl[
+                d=d,
+                table=table,
+                flags=flags,
+                accel=True,
+                s_at0=s_at0,
+                s_nl=s_nl,
+                s_other=s_other,
+            ](input, start)
+    return _edfa_walk_impl[
+        d=d,
+        table=table,
+        flags=flags,
+        accel=False,
+        s_at0=s_at0,
+        s_nl=s_nl,
+        s_other=s_other,
+    ](input, start)
+
+
+@always_inline
 def edfa_match_at[
     origin: Origin,
     dt: DType,
@@ -1561,122 +1655,64 @@ def edfa_match_at[
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Anchored match at `start`; returns leftmost-longest end or -1
-    (mirrors LazyDFA.match_at).
-
-    Dispatches once per walk between an accelerated and a plain loop:
-    walks that can never reach a full vector chunk take the plain loop
-    and pay no per-byte acceleration checks at all.
-    """
-    comptime if _edfa_has_accel(d):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _edfa_match_at_impl[
-                d=d, table=table, flags=flags, accel=True
-            ](input, start)
-    return _edfa_match_at_impl[d=d, table=table, flags=flags, accel=False](
-        input, start
-    )
+    (mirrors LazyDFA.match_at). `edfa_walk_from` in the DFA's own start
+    states."""
+    return edfa_walk_from[
+        d=d,
+        table=table,
+        flags=flags,
+        s_at0=d.start_at_0,
+        s_nl=d.start_after_nl,
+        s_other=d.start_other,
+    ](input, start)
 
 
 @always_inline
-def edfa_search_forward[
-    origin: Origin,
-    dt: DType,
-    tn: Int,
-    ns: Int,
-    //,
-    d: EagerDFA,
-    table: InlineArray[Scalar[dt], tn],
-    flags: InlineArray[UInt8, ns],
-    first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH],
-    bitmap_useful: Bool,
-](input: Span[Byte, origin], start: Int) -> Tuple[Int, Int]:
-    """Search for the first match from `start`; returns (start, end) or
-    (-1, -1) (mirrors LazyDFA.search_forward)."""
-    var input_len = len(input)
-    # Pivot-anchored prefilter (the `[class]+ P …` shape): hop between P
-    # occurrences, extend backward over the class run, one attempt each.
+def pivot_first_candidate[
+    origin: Origin, //, d: EagerDFA
+](input: Span[Byte, origin], start: Int) -> Int:
+    """First plausible match start >= `start` under the pivot-anchored
+    prefilter (the `[class]+ P …` shape, see _pivot_prefilter), or -1
+    when no pivot occurrence survives.
+
+    Hops between occurrences of the pivot byte with simd_find_byte,
+    rejects those whose forced chain does not follow, and extends the
+    survivor backward over S1's self-loop set to the start of the class
+    run. Every match from `start` onward begins at such a run start
+    (the run-skip argument in _start_run_skip_idx), so an unanchored
+    leftmost-first scan from the returned position finds the same match
+    a scan from `start` would — minus the prefix the prefilter skipped.
+    Only meaningful when `_pivot_prefilter(d)[0] >= 0`.
+    """
     comptime pv = _pivot_prefilter(d)
-    comptime if pv[0] >= 0:
-        comptime pk = d.accel_nib_kind[pv[0]]
-        comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
-        comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
-        comptime pivot_byte = UInt8(pv[1])
-        comptime fchain = _pivot_forced_chain(d, pv)
-        var ppos = start
-        while True:
-            var p = simd_find_byte(input, pivot_byte, ppos)
-            if p < 0:
-                return (-1, -1)
-            # Forced-chain rejection: bytes required right after the pivot
-            # kill false candidates before the extension + attempt.
-            comptime fclen = len(fchain)
-            comptime if fclen > 0:
-                var fok = p + 1 + fclen <= input_len
-                comptime for j in range(len(fchain)):
-                    comptime fb = Byte(fchain[j])
-                    if fok:
-                        fok = input.unsafe_get(p + 1 + j) == fb
-                if not fok:
-                    ppos = p + 1
-                    continue
-            # The accel tables encode S1's EXIT set; loop set = complement.
-            var s = p
-            while s > start and not _class_contains[kind=pk, t0=pt0, t1=pt1](
-                input.unsafe_get(s - 1)
-            ):
-                s -= 1
-            var end = edfa_match_at[d=d, table=table, flags=flags](input, s)
-            if end >= 0:
-                return (s, end)
-            ppos = p + 1
-    var pos = start
-    while pos <= input_len:
-        comptime if bitmap_useful and HAS_FAST_BYTE_SHUFFLE:
-            # Vectorized candidate skip: scan W bytes at a time for the
-            # next byte in the pattern's first-byte set (shufti/truffle
-            # encoding of the bitmap), instead of a scalar bitmap test
-            # per byte. Scalar peek first: on dense-candidate text (most
-            # bytes qualify) the current byte already satisfies the class
-            # almost every call, and a peek resolves that in ~3
-            # instructions versus the vector kernel's fixed
-            # load+shuffle+reduce cost.
-            comptime km = build_class_masks(
-                stops_from_bitmap(first_byte_bitmap)
-            )
-            if pos < input_len and not _class_contains[
-                kind=km[0], t0=km[1], t1=km[2]
-            ](input.unsafe_get(pos)):
-                pos = find_in_class[kind=km[0], t0=km[1], t1=km[2]](
-                    input, pos + 1
-                )
-        elif bitmap_useful:
-            while pos < input_len:
-                var b = input.unsafe_get(pos)
-                var byte_idx = Int(b >> 3)
-                var bit_idx = UInt8(b & 7)
-                if (first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) != 0:
-                    break
-                pos += 1
-        var end = edfa_match_at[d=d, table=table, flags=flags](input, pos)
-        if end >= 0:
-            return (pos, end)
-        # The DFA is anchored per start position: a dead run at pos says
-        # nothing about later starts (see LazyDFA.search_forward).
-        comptime rs = _start_run_skip_idx(d)
-        comptime if rs >= 0:
-            # start_other self-loops here: the failed attempt consumed a
-            # maximal run and every later start within it fails the same
-            # way, so skip to the run's end instead of retrying byte by
-            # byte. Only for the start_other context (mid-line, not
-            # post-newline); other contexts fall through to pos += 1.
-            comptime rk = d.accel_nib_kind[rs]
-            comptime rt0 = nibble_table_from(d.accel_nib_t0, rs)
-            comptime rt1 = nibble_table_from(d.accel_nib_t1, rs)
-            if pos > 0 and input.unsafe_get(pos - 1) != CHAR_NEWLINE:
-                var run_end = find_in_class[kind=rk, t0=rt0, t1=rt1](input, pos)
-                if run_end > pos:
-                    pos = run_end
-                    continue
-        pos += 1
-    return (-1, -1)
+    comptime assert pv[0] >= 0
+    comptime pk = d.accel_nib_kind[pv[0]]
+    comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
+    comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
+    comptime pivot_byte = UInt8(pv[1])
+    comptime fchain = _pivot_forced_chain(d, pv)
+    var input_len = len(input)
+    var ppos = start
+    while True:
+        var p = simd_find_byte(input, pivot_byte, ppos)
+        if p < 0:
+            return -1
+        # Forced-chain rejection: bytes required right after the pivot
+        # kill false candidates before the extension.
+        comptime fclen = len(fchain)
+        comptime if fclen > 0:
+            var fok = p + 1 + fclen <= input_len
+            comptime for j in range(len(fchain)):
+                comptime fb = Byte(fchain[j])
+                if fok:
+                    fok = input.unsafe_get(p + 1 + j) == fb
+            if not fok:
+                ppos = p + 1
+                continue
+        # The accel tables encode S1's EXIT set; loop set = complement.
+        var s = p
+        while s > start and not _class_contains[kind=pk, t0=pt0, t1=pt1](
+            input.unsafe_get(s - 1)
+        ):
+            s -= 1
+        return s

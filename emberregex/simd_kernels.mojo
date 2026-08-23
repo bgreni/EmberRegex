@@ -29,7 +29,7 @@ from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 
 from .charset import BITMAP_WIDTH
-from .simd_scan import first_lane_index, lane_bits
+from .simd_scan import first_lane_index, lane_bits, last_lane_index
 
 # A nibble has 16 values — this is the lookup-table entry count for
 # shufti/truffle/Teddy masks, NOT a vector width. Scan loops process
@@ -267,3 +267,25 @@ def find_in_class[
             return pos
         pos += 1
     return input_len
+
+
+def rfind_in_class[
+    origin: Origin, //, kind: Int, t0: _NibbleTable, t1: _NibbleTable
+](input: Span[Byte, origin], pos: Int, floor: Int) -> Int:
+    """Backward twin of find_in_class: the smallest p in [floor, pos]
+    such that no byte of input[p:pos] is in the encoded stop set — i.e.
+    one past the last stop byte before `pos`, or `floor`."""
+    comptime W = simd_width_of[DType.uint8]()
+    var ptr = Pointer(input.unsafe_ptr())
+    var p = pos
+    while p - W >= floor:
+        var v = ptr.unsafe_offset(p - W).unsafe_load[width=W]()
+        var bits = lane_bits(_class_hit[kind=kind, t0=t0, t1=t1](v))
+        if bits != 0:
+            return p - W + last_lane_index(bits) + 1
+        p -= W
+    while p > floor:
+        if _class_contains[kind, t0, t1](input.unsafe_get(p - 1)):
+            return p
+        p -= 1
+    return floor

@@ -162,15 +162,23 @@ def test_eager_bol_multiline_search() raises:
 
 
 def test_lf_end_skip_guard() raises:
-    # `.*x` (single greedy loop, branch-free suffix): the comptime
-    # _lf_end_at skip fires and the DFA end must equal Python's.
-    var re1 = Regex[".*x"]()
+    # The eager search lane reports Python's leftmost-first end straight
+    # from its table (static_lfdfa.mojo) — no backtracker re-run and no
+    # shape-based skip of one. `.*x`: single greedy loop, branch-free
+    # suffix, the longest end is also the leftmost-first one.
+    comptime S1 = Regex[".*x"]
+    assert_true(S1._strategy.use_eager_dfa)
+    assert_true(S1._use_lf_dfa)
+    var re1 = S1()
     var r1 = re1.search("axbxc")
     assert_equal(r1.start, 0)
     assert_equal(r1.end, 4)
-    # `a*(?:ab)*` (two loops): leftmost-first end (2) differs from the
-    # longest end (3) on "aab" — the skip must NOT fire here.
-    var re2 = Regex["a*(?:ab)*"]()
+    # `a*(?:ab)*` (two loops): leftmost-first end 2 differs from the
+    # longest end 3 on "aab" — the table must encode the priority.
+    comptime S2 = Regex["a*(?:ab)*"]
+    assert_true(S2._strategy.use_eager_dfa)
+    assert_true(S2._use_lf_dfa)
+    var re2 = S2()
     var r2 = re2.search("aab")
     assert_equal(r2.start, 0)
     assert_equal(r2.end, 2)
@@ -198,8 +206,9 @@ def test_eager_multiline_anchors() raises:
 
 
 def test_eager_leftmost_first_end_resolution() raises:
-    # The DFA lane reports leftmost-longest ends; _lf_end_at must still
-    # re-resolve to Python's leftmost-first semantics (Teddy included).
+    # Python's leftmost-first end on every DFA-family lane: Teddy (which
+    # claims this pure literal alternation on shuffle targets) still
+    # re-resolves through _lf_end_at; the eager table yields it directly.
     var re = Regex["a|ab"]()
     assert_true(re._strategy.use_teddy or re._strategy.use_eager_dfa)
     var r = re.search("ab")

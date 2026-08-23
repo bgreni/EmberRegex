@@ -753,6 +753,72 @@ def bench_static_nested_quantifier(mut b: Bench) raises:
     b.bench_function[go](BenchId("static_nested_quantifier"))
 
 
+def bench_lf_dfa_lazy_findall_64KB(mut b: Bench) raises:
+    # Lazy quantifier on the leftmost-first DFA lane: each `<.*?>` stops
+    # at its own `>` instead of walking to end of line and re-running
+    # the backtracker for the short end. 64 KB of tags, ~4700 matches.
+    var re = Regex["<.*?>"]()
+    var input = repeat_with_sep("<tag>", " text ", 64 * 1024 // 14)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.findall(input)
+                keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("lf_dfa_lazy_findall_64KB"))
+
+
+def bench_match_single_byte_run_20KB(mut b: Bench) raises:
+    # match() on the classic table over a 20 KB run of ONE byte: the
+    # `a+` state self-loops on a single byte and must keep its SIMD
+    # scan (runs of `0`, ` `, `-`, `=` are everyday input).
+    var re = Regex["a+e|x"]()
+    var input = "a" * 20480 + "e"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.match(input)
+                keep(r.end)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("match_single_byte_run_20KB"))
+
+
+def bench_lf_dfa_class_run_search_20KB(mut b: Bench) raises:
+    # `[class]+ suffix` on a long class run: one unanchored forward scan
+    # plus one reverse walk, where per-position anchored attempts were
+    # quadratic in the run length.
+    var re = Regex["[a-z]+x"]()
+    var input = "a" * (20 * 1024) + "x"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.end)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("lf_dfa_class_run_search_20KB"))
+
+
 # ---------------------------------------------------------------------------
 # 9. Real-world patterns (static_ prefix)
 # ---------------------------------------------------------------------------
@@ -2054,6 +2120,9 @@ def main() raises:
     bench_static_url_search(b)
     bench_static_teddy_prefix_search(b)
     bench_static_nested_quantifier(b)
+    bench_lf_dfa_lazy_findall_64KB(b)
+    bench_lf_dfa_class_run_search_20KB(b)
+    bench_match_single_byte_run_20KB(b)
 
     # Real-world (static_ prefix IDs)
     bench_static_email(b)

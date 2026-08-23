@@ -103,7 +103,8 @@ Selected fastest-first at compile time:
 | `prefix + .* + suffix` | sandwich (startswith/endswith) | `optimize.mojo` |
 | alternation of literals | Teddy nibble shuffles | `teddy.mojo` |
 | ≤ 16 DFA states, shuffle target | Sheng | `sheng.mojo` |
-| `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA | `static_dfa.mojo` |
+| `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
+| same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
 | `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
 | backrefs / lookaround / captures | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
@@ -122,6 +123,27 @@ an integer compare; and states that self-loop on all but a few bytes are
 stepping the table. Minimization comes first because the other two key off
 final state ids, and because a self-loop is often only visible once the
 duplicate states splitting it are merged.
+
+That table answers `match()` — Python's `fullmatch`, a language-membership
+question — and nothing else. Its states are *sets*, so a walk over it ends
+leftmost-longest, and Python's `search` is leftmost-**first**: `a|ab` on
+"ab" is `a`, `<.*?>` stops at the first `>`. The search-family verbs run a
+second table, regex-automata's construction: a state is a priority-ORDERED
+list of NFA states (DFS of the epsilon closure, a SPLIT's `out1` before its
+`out2`), a transition whose closure reaches MATCH drops every lower-priority
+thread, and a `restart` bit re-adds the start closure as the lowest-priority
+threads after every byte — the unanchored scan, folded in the way the set
+lane folds its restart, and cleared by truncation so the walk terminates at
+the leftmost-first end. The walker is the same table walk in different
+start states; the same minimization, permutation, acceleration and Sheng
+masks apply, and the restart-only state self-loops on everything outside
+the first-byte set, so the acceleration scan is the candidate prefilter.
+Where the match *starts* is then recovered by a **reverse DFA** — the
+single-pattern form of the set lane's start-of-match automaton — walking
+leftward from the end, never below the previous match end. Two walks per
+match, both linear; the old lane's per-position anchored attempts were
+quadratic on `[a-z]+x` over a long class run, and its backtracker re-run
+for the leftmost-first end is gone from this lane.
 
 The **specialized backtracker** is comptime-specialized per NFA state: each
 `_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind

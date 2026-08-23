@@ -19,7 +19,7 @@ vector->scalar transfer per chunk. Per target:
 bitmask into a lane index.
 """
 
-from std.bit import count_trailing_zeros
+from std.bit import count_leading_zeros, count_trailing_zeros
 from std.memory import bitcast, pack_bits
 from std.sys import simd_width_of
 from std.sys.info import CompilationTarget
@@ -60,6 +60,13 @@ def lane_bits[W: Int, //](mask: SIMD[DType.bool, W]) -> UInt64:
 def first_lane_index(bits: UInt64) -> Int:
     """Lane index of the lowest set bit. Precondition: bits != 0."""
     return Int(count_trailing_zeros(bits)) >> LANE_BIT_SHIFT
+
+
+@always_inline
+def last_lane_index(bits: UInt64) -> Int:
+    """Lane index of the highest set bit (for backward scans).
+    Precondition: bits != 0."""
+    return (63 - Int(count_leading_zeros(bits))) >> LANE_BIT_SHIFT
 
 
 @always_inline

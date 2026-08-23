@@ -27,36 +27,28 @@ HAS_FAST_BYTE_SHUFFLE, and other targets keep the eager table walk.
 
 The walkers mirror the eager DFA walkers exactly (start contexts, EOL
 flags, acceleration, per-walk accel dispatch) — only the transition
-mechanism differs.
+mechanism differs. Search-family verbs no longer walk per candidate
+position: the leftmost-first DFA (static_lfdfa.mojo) runs one
+unanchored `sheng_walk_from` pass, so there is no shuffle-engine
+search_forward here any more.
 """
 
 from std.collections import InlineArray
 from std.sys import simd_width_of
 
 from .constants import CHAR_NEWLINE
-from .charset import BITMAP_WIDTH
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
     EagerDFA,
     _edfa_accel_skip,
     _edfa_has_accel,
-    _pivot_forced_chain,
-    _pivot_prefilter,
-    _start_run_skip_idx,
-    nibble_table_from,
 )
-from .simd_scan import simd_find_byte
 from .simd_kernels import (
-    HAS_FAST_BYTE_SHUFFLE,
     NIBBLE_TABLE_SIZE,
     SHUFFLE_INDEX_LANES,
     WIDE_TABLE_CAP,
-    _class_contains,
-    build_class_masks,
-    find_in_class,
     nibble_lookup,
-    stops_from_bitmap,
     table_lookup_32,
     table_lookup_64,
 )
@@ -241,7 +233,7 @@ def sheng_full_match[
 
 
 @always_inline
-def _sheng_match_at_impl[
+def _sheng_walk_impl[
     origin: Origin,
     ns: Int,
     ml: Int,
@@ -250,17 +242,20 @@ def _sheng_match_at_impl[
     masks: InlineArray[UInt8, ml],
     flags: InlineArray[UInt8, ns],
     accel: Bool,
+    s_at0: Int,
+    s_nl: Int,
+    s_other: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
     comptime dead = d.num_states
     var msk = materialize[masks]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
-        cur = d.start_at_0
+        cur = s_at0
     elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
-        cur = d.start_after_nl
+        cur = s_nl
     else:
-        cur = d.start_other
+        cur = s_other
     var cur_vec = _ShengState(UInt8(cur))
 
     var last_match = -1
@@ -297,6 +292,44 @@ def _sheng_match_at_impl[
 
 
 @always_inline
+def sheng_walk_from[
+    origin: Origin,
+    ns: Int,
+    ml: Int,
+    //,
+    d: EagerDFA,
+    masks: InlineArray[UInt8, ml],
+    flags: InlineArray[UInt8, ns],
+    s_at0: Int,
+    s_nl: Int,
+    s_other: Int,
+](input: Span[Byte, origin], start: Int) -> Int:
+    """Shuffle walk from `start` in explicit start states (mirrors
+    edfa_walk_from), with the same per-walk accelerated/plain dispatch."""
+    comptime if _edfa_has_accel(d):
+        comptime W = simd_width_of[DType.uint8]()
+        if len(input) - start >= W:
+            return _sheng_walk_impl[
+                d=d,
+                masks=masks,
+                flags=flags,
+                accel=True,
+                s_at0=s_at0,
+                s_nl=s_nl,
+                s_other=s_other,
+            ](input, start)
+    return _sheng_walk_impl[
+        d=d,
+        masks=masks,
+        flags=flags,
+        accel=False,
+        s_at0=s_at0,
+        s_nl=s_nl,
+        s_other=s_other,
+    ](input, start)
+
+
+@always_inline
 def sheng_match_at[
     origin: Origin,
     ns: Int,
@@ -306,109 +339,13 @@ def sheng_match_at[
     masks: InlineArray[UInt8, ml],
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
-    """Anchored match at `start` (mirrors edfa_match_at), with the same
-    per-walk accelerated/plain dispatch."""
-    comptime if _edfa_has_accel(d):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _sheng_match_at_impl[
-                d=d, masks=masks, flags=flags, accel=True
-            ](input, start)
-    return _sheng_match_at_impl[d=d, masks=masks, flags=flags, accel=False](
-        input, start
-    )
-
-
-@always_inline
-def sheng_search_forward[
-    origin: Origin,
-    ns: Int,
-    ml: Int,
-    //,
-    d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
-    flags: InlineArray[UInt8, ns],
-    first_byte_bitmap: SIMD[DType.uint8, BITMAP_WIDTH],
-    bitmap_useful: Bool,
-](input: Span[Byte, origin], start: Int) -> Tuple[Int, Int]:
-    """Search for the first match from `start` (mirrors
-    edfa_search_forward)."""
-    var input_len = len(input)
-    # Pivot-anchored prefilter (see edfa_search_forward / _pivot_prefilter).
-    comptime pv = _pivot_prefilter(d)
-    comptime if pv[0] >= 0:
-        comptime pk = d.accel_nib_kind[pv[0]]
-        comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
-        comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
-        comptime pivot_byte = UInt8(pv[1])
-        comptime fchain = _pivot_forced_chain(d, pv)
-        var ppos = start
-        while True:
-            var p = simd_find_byte(input, pivot_byte, ppos)
-            if p < 0:
-                return (-1, -1)
-            # Forced-chain rejection (see edfa_search_forward).
-            comptime fclen = len(fchain)
-            comptime if fclen > 0:
-                var fok = p + 1 + fclen <= input_len
-                comptime for j in range(len(fchain)):
-                    comptime fb = Byte(fchain[j])
-                    if fok:
-                        fok = input.unsafe_get(p + 1 + j) == fb
-                if not fok:
-                    ppos = p + 1
-                    continue
-            var s = p
-            while s > start and not _class_contains[kind=pk, t0=pt0, t1=pt1](
-                input.unsafe_get(s - 1)
-            ):
-                s -= 1
-            var end = sheng_match_at[d=d, masks=masks, flags=flags](input, s)
-            if end >= 0:
-                return (s, end)
-            ppos = p + 1
-    var pos = start
-    while pos <= input_len:
-        comptime if bitmap_useful and HAS_FAST_BYTE_SHUFFLE:
-            # Vectorized candidate skip (see edfa_search_forward). Scalar
-            # peek first: on dense-candidate text (most bytes qualify)
-            # the current byte already satisfies the class almost every
-            # call, and a peek resolves that in ~3 instructions versus
-            # the vector kernel's fixed load+shuffle+reduce cost.
-            comptime km = build_class_masks(
-                stops_from_bitmap(first_byte_bitmap)
-            )
-            if pos < input_len and not _class_contains[
-                kind=km[0], t0=km[1], t1=km[2]
-            ](input.unsafe_get(pos)):
-                pos = find_in_class[kind=km[0], t0=km[1], t1=km[2]](
-                    input, pos + 1
-                )
-        elif bitmap_useful:
-            while pos < input_len:
-                var b = input.unsafe_get(pos)
-                var byte_idx = Int(b >> 3)
-                var bit_idx = UInt8(b & 7)
-                if (first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) != 0:
-                    break
-                pos += 1
-        var end = sheng_match_at[d=d, masks=masks, flags=flags](input, pos)
-        if end >= 0:
-            return (pos, end)
-        # The DFA is anchored per start position: a dead run at pos says
-        # nothing about later starts (see edfa_search_forward).
-        comptime rs = _start_run_skip_idx(d)
-        comptime if rs >= 0:
-            # start_other self-loops here: the failed attempt consumed a
-            # maximal run and every later start within it fails the same
-            # way, so skip to the run's end (see edfa_search_forward).
-            comptime rk = d.accel_nib_kind[rs]
-            comptime rt0 = nibble_table_from(d.accel_nib_t0, rs)
-            comptime rt1 = nibble_table_from(d.accel_nib_t1, rs)
-            if pos > 0 and input.unsafe_get(pos - 1) != CHAR_NEWLINE:
-                var run_end = find_in_class[kind=rk, t0=rt0, t1=rt1](input, pos)
-                if run_end > pos:
-                    pos = run_end
-                    continue
-        pos += 1
-    return (-1, -1)
+    """Anchored match at `start` (mirrors edfa_match_at): `sheng_walk_from`
+    in the DFA's own start states."""
+    return sheng_walk_from[
+        d=d,
+        masks=masks,
+        flags=flags,
+        s_at0=d.start_at_0,
+        s_nl=d.start_after_nl,
+        s_other=d.start_other,
+    ](input, start)
