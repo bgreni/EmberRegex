@@ -245,6 +245,9 @@ def bench_onepass_match_kv(mut b: Bench) raises:
     # character. match() is one forward table walk writing the slots as
     # it goes; the backtracker recurses and re-scans per arm. 40-byte
     # key/value token run; the groups report the last letter/digit token.
+    # (Not the design note's `(?P<k>[^=]+)=(?P<v>[^;]*)`: that shape's
+    # loops are simple, so the gate keeps it on the backtracker, which
+    # measured 1.7x faster than the walk there — see `onepass_shape`.)
     var re = Regex["(?:([a-z])|(\\d)|[=;&])+"]()
     var input = "host=db01&port=5432&user=admin&retry=55&"
 

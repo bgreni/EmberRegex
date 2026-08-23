@@ -22,8 +22,21 @@ those slot writes. The pattern is NOT one-pass when a second member wants
 a class an earlier member already claimed with a different target or a
 different slot set: the capture assignment would then depend on bytes not
 yet seen. Within one closure the first visit of an NFA state wins (the
-backtracker's order); a later visit is skipped because its future is the
-same state at the same position, so it could only ever lose.
+backtracker's order), but ONLY among paths carrying the same pending
+anchor conditions (the `need` mask): two such paths lead to the same
+state at the same position under the same conditions, so the later one
+fails wherever the first does and can only ever lose. A duplicate visit
+under DIFFERENT conditions is another matter — the first path's pending
+`$` / `(?m)$` / `\b` restricts which byte classes (or which match ends)
+it contributes, and skipping the later, differently-conditioned path
+would leave the automaton stricter than the pattern (`(?:(a)|b)+(?:\\B|)`
+must match "ab" through the unconditional empty arm even though the
+`\\B`-conditioned arm to MATCH outranks it and fails at end of input).
+Handling it exactly would take per-class merging of both contributions
+and a disjunction of match conditions; regex-automata instead rejects
+EVERY duplicate closure entry — this builder rejects exactly the unsound
+subset: a duplicate whose `need` mask differs from the first visit's
+makes the pattern NOT one-pass, and such patterns keep the backtracker.
 
 Two things differ from regex-automata by design:
 
@@ -408,6 +421,16 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     var stk_s = List[Int]()
     var stk_sl = List[UInt64]()
     var stk_need = List[Int]()
+    # The `need` mask each NFA state was FIRST visited with, per closure
+    # (only read for states whose `seen` bit is set in the CURRENT
+    # closure, so it never needs clearing between states). A duplicate
+    # visit with a different mask makes the pattern NOT one-pass: the
+    # first path's pending anchors restrict what it contributes, and
+    # dropping the differently-conditioned later path would leave the
+    # automaton stricter than the pattern (`(?:(a)|b)+(?:\B|)` silently
+    # failed match("ab") — the unconditional empty arm to MATCH was
+    # shadowed by the `\B`-conditioned one).
+    var seen_need = List[Int](fill=-1, length=n)
     var d = 0
     while d < len(st_nfa):
         # Rows are appended as states are created below; make sure this
@@ -434,8 +457,18 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
             if s < 0 or s >= n:
                 continue
             if (seen[s >> 6] >> UInt64(s & 63)) & 1 != 0:
+                # First visit wins ONLY among paths carrying the same
+                # pending conditions (see the module docstring). A
+                # duplicate under different conditions would need
+                # per-class merging of the two contributions and a
+                # disjunction of match conditions; regex-automata
+                # rejects every duplicate — we reject exactly the
+                # unsound subset.
+                if seen_need[s] != need:
+                    return result^
                 continue
             _bs_set(seen, s)
+            seen_need[s] = need
             var kind = kinds[s]
             if kind == NFAStateKind.SPLIT:
                 stk_s.append(out2s[s])
@@ -997,6 +1030,11 @@ def onepass_find_end[
     recorded match only higher-priority threads survive (one-pass: one
     thread), so a later match overrides and a dead walk returns the
     recorded one.
+
+    No engine code path calls this today: the capture lane's anchored
+    attempt measured faster on the budgeted backtracker (the per-match
+    slot snapshots here cost on short dense inputs), so this walker is
+    provided and tested for a future caller.
     """
     comptime if _edfa_has_accel(op.accel):
         comptime W = simd_width_of[DType.uint8]()

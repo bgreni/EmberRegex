@@ -85,6 +85,22 @@ def test_onepass_invalid_patterns() raises:
     # Both arms consume `a`; which one wins depends on the byte after.
     assert_false(_valid["(a)\\b|(a)"]())
     assert_false(_valid["(a)$|(a)"]())
+    # A duplicate closure visit under DIFFERENT pending-anchor
+    # conditions: the conditioned higher-priority path would shadow the
+    # unconditional one (`(?:\\B|)`: the empty arm must still match at
+    # end of input), so the builder refuses — the review's soundness
+    # hole, pinned. All four have the selected SHAPE; only the
+    # invalidation keeps them off the engine.
+    assert_false(_valid["(?:(a)|b)+(?:\\B|)"]())
+    assert_true(Regex["(?:(a)|b)+(?:\\B|)"]._onepass_shape)
+    assert_false(Regex["(?:(a)|b)+(?:\\B|)"]._use_onepass)
+    assert_false(_valid["(?:(a)|b)+(?:$|c?)"]())
+    assert_true(Regex["(?:(a)|b)+(?:$|c?)"]._onepass_shape)
+    assert_false(Regex["(?:(a)|b)+(?:$|c?)"]._use_onepass)
+    assert_false(_valid["(?:(a)|b)+(?:$|)c"]())
+    assert_false(Regex["(?:(a)|b)+(?:$|)c"]._use_onepass)
+    assert_false(_valid["(?:(a)|b)+(?:\\b|)c"]())
+    assert_false(Regex["(?:(a)|b)+(?:\\b|)c"]._use_onepass)
     # Constructs no table models.
     assert_false(_valid["(\\d+)\\1"]())
     assert_false(_valid["(?=a)(b)"]())
@@ -423,6 +439,44 @@ def test_failed_attempt_leaves_slots_clean() raises:
     assert_equal(r.slots[0], -1)
     assert_equal(r.slots[1], -1)
     _assert_groups(r, re._pike_search("xab bbb"), "clean slots")
+
+
+def test_conditional_path_shadowing_rejected() raises:
+    # The review's probes: a pending-anchor path to MATCH (or to a
+    # consuming state) outranking an unconditional path to the same NFA
+    # state. First-visit-wins on the state id alone dropped the
+    # unconditional arm — `match("ab")` returned no-match while the
+    # Pike VM matched, and the span confirm tripped its debug_assert.
+    # Now such patterns are NOT one-pass (pinned above) and the
+    # backtracker/Pike ladder serves them; every verb must agree with
+    # the Pike VM.
+    var r1 = Regex["(?:(a)|b)+(?:\\B|)"]()
+    _assert_groups(r1.match("ab"), r1._pike_match("ab"), "\\B| ab")
+    _assert_groups(r1.match("ab1"), r1._pike_match("ab1"), "\\B| word")
+    _assert_groups(r1.search("xab"), r1._pike_search("xab"), "\\B| search")
+    var r2 = Regex["(?:(a)|b)+(?:$|c?)"]()
+    var input = String("ab") * 3000 + " c"
+    var got = r2.finditer(input)
+    var exp = r2._pike_finditer(input)
+    assert_equal(len(got), len(exp), "$|c? finditer len")
+    for i in range(len(got)):
+        _assert_groups(got[i], exp[i], String("$|c?[", i, "]"))
+    _assert_groups(r2.match("abc"), r2._pike_match("abc"), "$|c? abc")
+    _assert_groups(r2.match("ab"), r2._pike_match("ab"), "$|c? ab")
+    # Consuming-state variant: the `$`-restricted first visit of `c`
+    # marked it seen with no live classes.
+    var r3 = Regex["(?:(a)|b)+(?:$|)c"]()
+    _assert_groups(r3.match("abc"), r3._pike_match("abc"), "$| c abc")
+    _assert_groups(r3.search("ab c"), r3._pike_search("ab c"), "$| c sp")
+    # \b variant: the boundary-restricted first visit of `c`.
+    var r4 = Regex["(?:(a)|b)+(?:\\b|)c"]()
+    for inp in ["abc", "ab c", "ab", "babc"]:
+        _assert_groups(
+            r4.search(inp), r4._pike_search(inp), String("\\b| c ", inp)
+        )
+        _assert_groups(
+            r4.match(inp), r4._pike_match(inp), String("\\b| c m ", inp)
+        )
 
 
 def test_utf8_mode() raises:

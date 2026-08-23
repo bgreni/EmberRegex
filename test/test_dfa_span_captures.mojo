@@ -51,6 +51,7 @@ def test_span_lane_selection() raises:
     assert_true(Regex["(?:(a)|b)+"]._use_onepass)
     assert_true(Regex["(?:(a)|b)+"]._use_dfa_span)
     assert_false(Regex["((a)(b))+"]._use_onepass)  # no body alternation
+    assert_false(Regex["((a)(b))+"]._use_dfa_span)  # C1's lone-loop rule
     assert_true(Regex["((a)(b))+|q"]._use_dfa_span)
     assert_false(Regex["(?m)^(\\w+)$"]._use_dfa_span)
     assert_true(Regex["(?m)^(\\w+)$|q"]._use_dfa_span)
