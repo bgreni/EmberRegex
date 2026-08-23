@@ -70,13 +70,38 @@ struct LiteralSet(Copyable, Movable):
 
 def extract_literal_set(nfa: NFA, num_patterns: Int) -> LiteralSet:
     """Comptime: detect a union NFA whose every branch is a plain
+    literal chain, then assign Teddy buckets.
+
+    Teddy verification is comptime-unrolled per literal, so this lane
+    keeps the tight LITSET_MAX caps; the Aho-Corasick lane (set_ac.mojo)
+    reuses the same extraction with wider ones.
+    """
+    var result = extract_literal_chains(
+        nfa, num_patterns, LITSET_MAX, LITSET_MAX
+    )
+    if not result.valid:
+        return result^
+    result.buckets = _assign_buckets(
+        result.lits, result.caseless, result.min_len
+    )
+    return result^
+
+
+def extract_literal_chains(
+    nfa: NFA, num_patterns: Int, pat_cap: Int, entry_cap: Int
+) -> LiteralSet:
+    """Comptime: detect a union NFA whose every branch is a plain
     literal chain (CHAR or single-member/case-pair CHARSET states ending
     at a tagged MATCH). In-pattern literal alternations contribute one
     entry per arm, all tagged with the pattern's id. Any other construct
     invalidates the whole set — it then runs on the automata lanes.
+
+    Returns the entries WITHOUT Teddy buckets: callers that need them
+    (extract_literal_set) assign them afterwards, and the AC lane, which
+    has no buckets, skips that quadratic-in-entries pass entirely.
     """
     var result = LiteralSet()
-    if num_patterns < 1 or num_patterns > LITSET_MAX:
+    if num_patterns < 1 or num_patterns > pat_cap:
         return result^
     var num_states = len(nfa.states)
 
@@ -84,7 +109,7 @@ def extract_literal_set(nfa: NFA, num_patterns: Int) -> LiteralSet:
     # quantifier cycles (which revisit SPLITs indefinitely).
     var heads = List[Int]()
     var stack: List[Int] = [nfa.start]
-    var budget = 4 * LITSET_MAX
+    var budget = 4 * entry_cap
     while len(stack) > 0:
         budget -= 1
         if budget < 0:
@@ -110,7 +135,7 @@ def extract_literal_set(nfa: NFA, num_patterns: Int) -> LiteralSet:
             heads.append(s)
         else:
             return result^
-    if len(heads) < 1 or len(heads) > LITSET_MAX:
+    if len(heads) < 1 or len(heads) > entry_cap:
         return result^
 
     # Walk each head's chain to its tagged MATCH; the tag is the entry's
@@ -159,7 +184,6 @@ def extract_literal_set(nfa: NFA, num_patterns: Int) -> LiteralSet:
         result.ids.append(id)
 
     result.min_len = min_len
-    result.buckets = _assign_buckets(result.lits, result.caseless, min_len)
     result.valid = True
     return result^
 

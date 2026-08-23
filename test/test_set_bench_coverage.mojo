@@ -80,6 +80,41 @@ def make_teddy64_pats() -> List[String]:
 comptime TEDDY64_PATS = make_teddy64_pats()
 
 
+def make_ac256_pats() -> List[String]:
+    var pats = List[String]()
+    for i in range(256):
+        pats.append(
+            "k"
+            + String(i // 100)
+            + String((i // 10) % 10)
+            + String(i % 10)
+            + "z"
+        )
+    return pats^
+
+
+comptime AC256_PATS = make_ac256_pats()
+
+
+def make_ac_sparse_haystack(length: Int = HAYSTACK_LEN) -> String:
+    var s = String("")
+    var filler = "the quick brown fox jumps over hazy rivers and empty plains "
+    while s.byte_length() < length - 200:
+        s += filler
+    s += " k000z k017z k128z k255z "
+    while s.byte_length() < length:
+        s += "z"
+    return s^
+
+
+def make_ac_dense_haystack(length: Int = HAYSTACK_LEN) -> String:
+    var s = String("")
+    var unit = "k000z k017z k042z k099z k128z k255z filler words here\n"
+    while s.byte_length() < length:
+        s += unit
+    return s^
+
+
 def make_sparse_haystack(length: Int = HAYSTACK_LEN) -> String:
     var s = String("")
     var filler = "the quick brown fox jumps over hazy rivers and empty plains "
@@ -111,6 +146,74 @@ def mdfa_direct_scan[
     comptime P = mdfa_pool_arr[len(MD.pool)](MD)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
+
+
+def _brute_literal_reports(
+    pats: List[String], input: String
+) -> List[SetMatch]:
+    """O(n*k) reference for an ALL-LITERAL set: every (id, end) where a
+    literal occurs, ordered by (end, id).
+
+    The tagged Pike reference is the oracle everywhere else, but it seeds
+    all 256 start branches at every position, which on a 64KB haystack is
+    minutes. For a literal set this brute-force scan is just as exact.
+    """
+    var data = input.as_bytes()
+    var n = len(data)
+    var flat = List[Byte]()
+    var off = List[Int]()
+    var lens = List[Int]()
+    for p in pats:
+        off.append(len(flat))
+        lens.append(p.byte_length())
+        for b in p.as_bytes():
+            flat.append(b)
+    # Bucket by first byte, or a 64KB haystack times 256 literals is a
+    # minute of bounds-checked comparisons per call.
+    var by_first = List[List[Int]]()
+    for _ in range(256):
+        by_first.append(List[Int]())
+    for i in range(len(pats)):
+        by_first[Int(flat[off[i]])].append(i)
+    var out = List[SetMatch]()
+    for pos in range(n):
+        ref bucket = by_first[Int(data[pos])]
+        for i in bucket:
+            var length = lens[i]
+            if pos + length > n:
+                continue
+            var o = off[i]
+            var ok = True
+            for j in range(1, length):
+                if flat[o + j] != data[pos + j]:
+                    ok = False
+                    break
+            if ok:
+                out.append(SetMatch(i, pos + length))
+    # Emitted by ascending start; reorder to (end, id) per the contract.
+    for i in range(1, len(out)):
+        var key = out[i]
+        var j = i - 1
+        while j >= 0 and (
+            out[j].end > key.end
+            or (out[j].end == key.end and out[j].id > key.id)
+        ):
+            out[j + 1] = out[j]
+            j -= 1
+        out[j + 1] = key
+    return out^
+
+
+def _check_against_brute[
+    patterns: List[String]
+](input: String, label: String) raises -> List[SetMatch]:
+    var db = RegexSet[patterns]()
+    var got = db.scan(input)
+    var expected = _brute_literal_reports(materialize[patterns](), input)
+    assert_equal(len(got), len(expected), label + ": count vs reference")
+    for i in range(len(got)):
+        assert_true(got[i] == expected[i], label + ": order vs reference")
+    return got^
 
 
 def _has_id(reports: List[SetMatch], id: Int) -> Bool:
@@ -166,6 +269,31 @@ def test_bench_teddy64_dense() raises:
     assert_true(_has_id(got, 3))
     assert_true(_has_id(got, 59))
     assert_true(len(got) > 400)
+
+
+def test_bench_ac_256_sparse_64k() raises:
+    comptime S = RegexSet[AC256_PATS]
+    comptime uses_ac = S._use_ac
+    assert_true(uses_ac)
+    var got = _check_against_brute[AC256_PATS](
+        make_ac_sparse_haystack(HAYSTACK_LEN_64K), "ac256 sparse 64k"
+    )
+    # The four planted literals, nothing else.
+    assert_equal(len(got), 4)
+    assert_true(_has_id(got, 0))
+    assert_true(_has_id(got, 17))
+    assert_true(_has_id(got, 128))
+    assert_true(_has_id(got, 255))
+
+
+def test_bench_ac_256_dense() raises:
+    var got = _check_against_brute[AC256_PATS](
+        make_ac_dense_haystack(), "ac256 dense"
+    )
+    # Six hits per 53-byte line over 16KB.
+    assert_true(len(got) > 1800)
+    assert_true(_has_id(got, 42))
+    assert_true(_has_id(got, 99))
 
 
 def test_bench_rose_log_sparse() raises:

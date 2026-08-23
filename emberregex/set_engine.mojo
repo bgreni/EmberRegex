@@ -25,10 +25,13 @@ mostly start with a character class.
 
 Engine ladder (MULTIPATTERN_PLAN.md), fastest first:
 
-  litset -> rose -> mdfa -> bitnfa -> pike
+  litset -> ac -> rose -> mdfa -> bitnfa -> pike
 
 - **litset** (phase 1): the whole set is plain literals — bucketed Teddy,
   no automaton at all.
+- **ac**: still all literals, but more than LITSET_MAX of them — one
+  Aho-Corasick automaton (set_ac.mojo), built linearly in the total
+  literal length instead of determinized.
 - **rose** (phase 4): every pattern (or most) has a required literal
   factor at a fixed offset — one Teddy front end over all factors plus a
   small per-pattern anchored DFA run only at candidates. Patterns with no
@@ -46,6 +49,15 @@ from std.math import max
 from std.os import abort
 
 from .nfa import NFA
+from .set_ac import (
+    ac_cls_arr,
+    ac_pool_arr,
+    ac_rep_arr,
+    ac_scan,
+    ac_table_arr,
+    ac_view,
+    build_ac,
+)
 from .set_bitnfa import (
     bitnfa_ex_idx_arr,
     bitnfa_i32_arr,
@@ -226,10 +238,30 @@ struct RegexSet[
     comptime _litset = extract_literal_set(Self.nfa, Self.num_patterns)
     comptime _use_litset = Self._litset.valid and HAS_FAST_BYTE_SHUFFLE
 
+    # --- Aho-Corasick lane: literal sets past LITSET_MAX --------------------
+    # Teddy unrolls verification per literal, so it stops at 64 patterns;
+    # one AC automaton carries the rest with a linear build instead of a
+    # subset construction. Extraction bails on the first non-literal
+    # state, so non-literal sets pay almost nothing to ask.
+    comptime _ac = build_ac(
+        Self.nfa, Self.num_patterns, not Self._use_litset
+    )
+    comptime _use_ac = Self._ac.valid
+    comptime _ac_v = ac_view(Self._ac)
+    comptime _AC_TABLE = ac_table_arr[
+        Self._ac.num_states * Self._ac.num_classes
+    ](Self._ac)
+    comptime _AC_CLS = ac_cls_arr(Self._ac)
+    comptime _AC_REP = ac_rep_arr[2 * Self._ac.num_states](Self._ac)
+    comptime _AC_POOL = ac_pool_arr[len(Self._ac.pool)](Self._ac)
+
     # --- Rose lane: literal decomposition (phase 4) -------------------------
     # Extraction is linear, so this decides before anything determinizes.
     comptime _rose = build_rose(
-        Self.patterns, Self.num_patterns, not Self._use_litset, Self.ext
+        Self.patterns,
+        Self.num_patterns,
+        not Self._use_litset and not Self._use_ac,
+        Self.ext,
     )
     comptime _use_rose = Self._rose.valid
     comptime _ROSE_TABLE = rose_table_arr[Self._rose.num_conf_states * 256](
@@ -300,7 +332,10 @@ struct RegexSet[
     # cost); word-boundary sets can't determinize (can_use_dfa is False).
     comptime _mdfa = build_multi_dfa(
         Self.nfa,
-        Self.nfa.can_use_dfa and not Self._use_litset and not Self._use_rose,
+        Self.nfa.can_use_dfa
+        and not Self._use_litset
+        and not Self._use_ac
+        and not Self._use_rose,
     )
     comptime _use_mdfa = Self._mdfa.valid
     comptime _MDFA_TABLE = mdfa_table_arr[Self._mdfa.num_states * 256](
@@ -329,6 +364,7 @@ struct RegexSet[
     # already orders its guards this way.)
     comptime _use_bitnfa = (
         not Self._use_litset
+        and not Self._use_ac
         and not Self._use_rose
         and not Self._use_mdfa
         and Self._bitnfa.valid
@@ -358,6 +394,7 @@ struct RegexSet[
 
     comptime _use_pike = (
         not Self._use_litset
+        and not Self._use_ac
         and not Self._use_rose
         and not Self._use_mdfa
         and not Self._use_bitnfa
@@ -638,6 +675,14 @@ struct RegexSet[
         """The engine ladder itself, before any semantic filtering."""
         comptime if Self._use_litset:
             return litset_scan[ls=Self._litset](input)
+        elif Self._use_ac:
+            return ac_scan[
+                v=Self._ac_v,
+                table=Self._AC_TABLE,
+                cls=Self._AC_CLS,
+                rep=Self._AC_REP,
+                pool=Self._AC_POOL,
+            ](input)
         elif Self._use_rose:
             var reports = rose_scan[
                 r=Self._rose_v,

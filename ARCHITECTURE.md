@@ -175,12 +175,13 @@ see "Exact backrefs and lookaround" below.
 ### The engine ladder
 
 ```
-litset ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
+litset ──▶ ac ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
 ```
 
 | Lane | When | File |
 | --- | --- | --- |
 | **litset** | every pattern is a plain literal | `set_literal.mojo` |
+| **ac** | all literals, but more than `LITSET_MAX` of them | `set_ac.mojo` |
 | **rose** | patterns carry required literal factors | `set_rose.mojo` |
 | **mdfa** | general, determinizes within `MDFA_STATE_CAP` | `set_dfa.mojo` |
 | **bitnfa** | determinization blew up, or EOL-consuming continuations | `set_bitnfa.mojo` |
@@ -189,6 +190,17 @@ litset ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
 **litset** — bucketed Teddy. The candidate mask stays `UInt8` but a bucket
 holds a *list* of literal ids, which is Hyperscan's trick for k > 8. No
 automaton at all, just shuffles.
+
+**ac** — Aho-Corasick. Teddy unrolls verification per literal, so it
+stops at 64 patterns; past that a comptime trie over byte classes, with
+failure links resolved and output links folded into each state's report
+slice, walks the input one table lookup per byte and reports every
+literal ending at each position with no failure-link chasing. Build cost
+is linear in the total literal length — no determinization — and the
+root state is SIMD-accelerated to the next possible first byte. Caseless
+literals collapse their case pairs into single byte classes when nothing
+in the set needs the two bytes distinguished; otherwise the position
+expands into alternative trie paths, capped.
 
 **rose** — literal decomposition, Hyperscan's real performance move. Each
 pattern is walked at comptime for a literal run that every match must
