@@ -27,52 +27,87 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 # --- Validity pins -----------------------------------------------------------
 
 
+def _valid[p: StaticString]() -> Bool:
+    """Comptime: is `p` one-pass by the builder's verdict (independent of
+    engine selection)?"""
+    comptime op = build_onepass(_build_static_nfa(p), True)
+    return op.valid
+
+
 def test_onepass_valid_patterns() raises:
-    assert_true(Regex["(\\d+)-(\\d+)"]._use_onepass)
-    assert_true(Regex["(\\w+)@(\\w+)\\.com"]._use_onepass)
-    assert_true(Regex["(?P<k>[^=]+)=(?P<v>[^;]*)"]._use_onepass)
-    assert_true(Regex["((a)(b))"]._use_onepass)
-    assert_true(Regex["(a)?b"]._use_onepass)
-    assert_true(Regex["(x)|(y)"]._use_onepass)
-    assert_true(Regex["([a-c]+)([d-f]+)"]._use_onepass)
-    assert_true(Regex["()"]._use_onepass)
-    assert_true(Regex["(a*)"]._use_onepass)
-    assert_true(Regex["(a*?)"]._use_onepass)
+    assert_true(_valid["(\\d+)-(\\d+)"]())
+    assert_true(_valid["(\\w+)@(\\w+)\\.com"]())
+    assert_true(_valid["(?P<k>[^=]+)=(?P<v>[^;]*)"]())
+    assert_true(_valid["((a)(b))"]())
+    assert_true(_valid["(a)?b"]())
+    assert_true(_valid["(x)|(y)"]())
+    assert_true(_valid["([a-c]+)([d-f]+)"]())
+    assert_true(_valid["()"]())
+    assert_true(_valid["(a*)"]())
+    assert_true(_valid["(a*?)"]())
     # After `x` the loop re-enters the alternation; `(x)` and `y` consume
     # different bytes, so this IS one-pass.
-    assert_true(Regex["(?:(x)|y)+"]._use_onepass)
+    assert_true(_valid["(?:(x)|y)+"]())
+    assert_true(_valid["((a)(b))+"]())
+    assert_true(_valid["(?:(\\w+)=(\\w+);)+"]())
+    assert_true(_valid["(a|b)*c"]())
     # Anchors resolve at build time (BOL kinds against the context, the
     # end conditions as per-state match flags).
-    assert_true(Regex["^(\\w+)$"]._use_onepass)
-    assert_true(Regex["(?m)^(\\w+)$"]._use_onepass)
-    assert_true(Regex["\\b(\\w+)\\b"]._use_onepass)
-    assert_true(Regex["(a)\\b"]._use_onepass)
-    # The bench rows.
-    assert_true(Regex["(\\w+)@(\\w+)\\.(\\w+)"]._use_onepass)
-    assert_true(Regex["(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"]._use_onepass)
-    assert_true(Regex["(https?|ftp)://([^/\\s]+)(/[^\\s]*)?"]._use_onepass)
-    assert_true(Regex["(\\w+)=(\\S+)"]._use_onepass)
+    assert_true(_valid["^(\\w+)$"]())
+    assert_true(_valid["(?m)^(\\w+)$"]())
+    assert_true(_valid["\\b(\\w+)\\b"]())
+    assert_true(_valid["(a)\\b"]())
+    assert_true(_valid["(\\w+)@(\\w+)\\.(\\w+)"]())
+    assert_true(_valid["(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})"]())
+    assert_true(_valid["(https?|ftp)://([^/\\s]+)(/[^\\s]*)?"]())
+    assert_true(_valid["(\\w+)=(\\S+)"]())
 
 
 def test_onepass_invalid_patterns() raises:
     # Two threads can consume the same byte: the capture assignment
     # depends on bytes not yet seen.
-    assert_false(Regex["(a|ab)(c|bcd)(d*)"]._use_onepass)
-    assert_false(Regex["(a*)(a*)"]._use_onepass)
-    assert_false(Regex["(a+)(a+)"]._use_onepass)
-    assert_false(Regex["(.*)(.*)"]._use_onepass)
-    assert_false(Regex["(a?)(a?)b"]._use_onepass)
-    assert_false(Regex["(a|aa)+b"]._use_onepass)
+    assert_false(_valid["(a|ab)(c|bcd)(d*)"]())
+    assert_false(_valid["(a*)(a*)"]())
+    assert_false(_valid["(a+)(a+)"]())
+    assert_false(_valid["(.*)(.*)"]())
+    assert_false(_valid["(a?)(a?)b"]())
+    assert_false(_valid["(a|aa)+b"]())
+    assert_false(_valid["((\\w+)\\s)+\\w+"]())
     # Both arms consume `a`; which one wins depends on the byte after.
-    assert_false(Regex["(a)\\b|(a)"]._use_onepass)
-    assert_false(Regex["(a)$|(a)"]._use_onepass)
+    assert_false(_valid["(a)\\b|(a)"]())
+    assert_false(_valid["(a)$|(a)"]())
     # Constructs no table models.
-    assert_false(Regex["(\\d+)\\1"]._use_onepass)
-    assert_false(Regex["(?=a)(b)"]._use_onepass)
-    assert_false(Regex["(a)(?<=a)"]._use_onepass)
+    assert_false(_valid["(\\d+)\\1"]())
+    assert_false(_valid["(?=a)(b)"]())
+    assert_false(_valid["(a)(?<=a)"]())
+
+
+def test_onepass_selection() raises:
+    # Selected exactly where the backtracker recurses per iteration (a
+    # cyclic SPLIT whose body is not a single state) and the pattern is
+    # one-pass: those shapes are 4-5x faster on the table walk and lose
+    # the SBT_BUDGET / SBT_MAX_DEPTH cliff. Simple-loop shapes keep the
+    # straight-line backtracker, which is 2-3x faster on short inputs.
+    assert_true(Regex["(?:(x)|y)+"]._use_onepass)
+    assert_true(Regex["((a)(b))+"]._use_onepass)
+    assert_true(Regex["((a)(b))+|q"]._use_onepass)
+    assert_true(Regex["(?:(\\w+)=(\\w+);)+"]._use_onepass)
+    assert_true(Regex["(a|b)*(c)"]._use_onepass)
+    assert_true(Regex["(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\w+(?:\\.\\w+)*))?"]._use_onepass)
+    assert_true(Regex["(?:(x)|y)+"]._sbt_general_loop)
+    # One-pass but all loops simple: backtracker.
+    assert_false(Regex["(\\d+)-(\\d+)"]._use_onepass)
+    assert_false(Regex["(\\d+)-(\\d+)"]._sbt_general_loop)
+    assert_false(Regex["(\\w+)@(\\w+)\\.com"]._use_onepass)
+    assert_false(Regex["(?P<k>[^=]+)=(?P<v>[^;]*)"]._use_onepass)
+    assert_false(Regex["(a)?b"]._use_onepass)
+    # General loop but not one-pass: backtracker (Pike when it gives up).
+    assert_false(Regex["(a|aa)+b"]._use_onepass)
+    assert_true(Regex["(a|aa)+b"]._sbt_general_loop)
+    assert_false(Regex["((\\w+)\\s)+\\w+"]._use_onepass)
     # Capture-free patterns never take this engine (the DFA lanes and
     # the classic table serve them).
-    assert_false(Regex["\\d+-\\d+"]._use_onepass)
+    assert_false(Regex["(?:x|y)+"]._use_onepass)
     assert_false(Regex["a|ab"]._use_onepass)
 
 
@@ -240,6 +275,22 @@ def test_match_anchors() raises:
     _assert_groups(ra.match("a"), ra._pike_match("a"), "a wb")
 
 
+def test_match_general_loop_shapes() raises:
+    var re = Regex["(?:(\\w+)=(\\w+);)+"]()
+    assert_true(re._use_onepass)
+    var input = "host=db01;port=5432;user=admin;retry=55;"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "retry")
+    assert_equal(r.group_str(input, 2), "55")
+    _assert_groups(re.match(input), re._pike_match(input), "kv loop")
+    assert_false(re.match("host=db01;port=5432;user=admin;retry=55").matched)
+    var ra = Regex["(a|b)*(c)"]()
+    _assert_groups(ra.match("ababc"), ra._pike_match("ababc"), "altstar")
+    _assert_groups(ra.match("c"), ra._pike_match("c"), "altstar empty")
+    assert_false(ra.match("abab").matched)
+
+
 def test_match_no_backtracker_budget() raises:
     # A one-pass pattern's match() is one table walk: the pathological
     # shape `(a*)*b` is not one-pass, but a long run through a one-pass
@@ -255,22 +306,51 @@ def test_match_no_backtracker_budget() raises:
 
 
 def test_search_uses_span_confirm() raises:
-    # The capture lane's span confirm runs the one-pass walk on the exact
-    # span; `$` and `\b` at the span end see the real neighbour.
-    var re = Regex["(a)$|(a)"]()
+    # The capture lane's anchored attempt and span confirm run the
+    # one-pass walkers for selected patterns; `$` and `\b` at the span
+    # end see the real neighbour, and every slot is the Pike VM's.
+    var re = Regex["(?:(a)|b)+$"]()
+    assert_true(re._use_onepass)
     assert_true(re._use_dfa_span)
-    _assert_groups(re.search("ab"), re._pike_search("ab"), "a$ ab")
-    _assert_groups(re.search("ba"), re._pike_search("ba"), "a$ ba")
-    var rb = Regex["(a)\\b|(a)"]()
-    _assert_groups(rb.search("ab"), rb._pike_search("ab"), "a\\b ab")
-    _assert_groups(rb.search("a b"), rb._pike_search("a b"), "a\\b a b")
-    var rs = Regex["(\\d+)-(\\d+)"]()
-    var input = String("lorem 42 ipsum ") * 300 + "123-4567" + String(" x 7 ") * 200
+    _assert_groups(re.search("xab"), re._pike_search("xab"), "ab$")
+    _assert_groups(re.search("xabx"), re._pike_search("xabx"), "ab$ miss")
+    var rb = Regex["(?:(a)|b)+\\b"]()
+    assert_true(rb._use_onepass)
+    _assert_groups(rb.search("xab c"), rb._pike_search("xab c"), "ab\\b")
+    _assert_groups(rb.search("xabc"), rb._pike_search("xabc"), "abc\\b")
+    var rs = Regex["(?:(\\w+)=(\\w+);)+"]()
+    assert_true(rs._use_onepass)
+    assert_true(rs._use_dfa_span)
+    var input = String("lorem 42 ipsum ") * 300 + "a=1;bb=22;" + String(" x=7 ") * 200 + "c=3;"
     var got = rs.finditer(input)
     var exp = rs._pike_finditer(input)
     assert_equal(len(got), len(exp))
     for i in range(len(got)):
         _assert_groups(got[i], exp[i], String("sparse[", i, "]"))
+    # A match longer than the backtracker attempt's budget: the one-pass
+    # attempt is exact and has none.
+    var long = String("k=v;") * 3000 + " tail"
+    var gl = rs.finditer(long)
+    var el = rs._pike_finditer(long)
+    assert_equal(len(gl), 1)
+    _assert_groups(gl[0], el[0], "long")
+
+
+def test_failed_attempt_leaves_slots_clean() raises:
+    # The lane's anchored attempt at the `a` of "ab " walks two bytes,
+    # dies on the space and returns -1; the match is the final "bbb",
+    # whose path never writes group 1 — so the attempt must hand the
+    # slots back untouched (found by the LCG differential: slot 0 = 61
+    # where the Pike VM had -1).
+    var re = Regex["(?:(a)|b)+$"]()
+    assert_true(re._use_onepass)
+    var r = re.search("xab bbb")
+    assert_true(r.matched)
+    assert_equal(r.start, 4)
+    assert_equal(r.end, 7)
+    assert_equal(r.slots[0], -1)
+    assert_equal(r.slots[1], -1)
+    _assert_groups(r, re._pike_search("xab bbb"), "clean slots")
 
 
 def test_utf8_mode() raises:
@@ -451,13 +531,30 @@ def test_differential_class_runs() raises:
     )
 
 
+def _alpha_kvloop() -> List[String]:
+    return ["a", "b", "=", ";", "k=v;", "ab=1;", "=;", " ", "\n", "é", "€"]
+
+
 def test_differential_loops() raises:
     _differential["(?:(x)|y)+"](_alpha_xy(), "(?:(x)|y)+")
     _differential["((a)(b))+|q"](_alpha_ab(), "((a)(b))+|q")
+    _differential["((a)(b))+"](_alpha_ab(), "((a)(b))+")
+    _differential["(?:(\\w+)=(\\w+);)+"](_alpha_kvloop(), "kv loop")
+    _differential["(a|b)*(c)"](_alpha_abcdef(), "(a|b)*(c)")
+    _differential["(?:(a)|b)+$"](_alpha_ab(), "(?:(a)|b)+$")
+    _differential["(?:(a)|b)+\\b"](_alpha_ab(), "(?:(a)|b)+\\b")
+    _differential["(?m)(?:(a)|b)+$"](_alpha_ab(), "(?m)(?:(a)|b)+$")
+    _differential["(?:(x)|y)+?z"](_alpha_xy(), "(?:(x)|y)+?z")
     _differential["(a*)"](_alpha_ab(), "(a*)")
     _differential["(a*?)b"](_alpha_ab(), "(a*?)b")
     _fullmatch_differential["(?:(x)|y)+"](
         ["x", "y", "xy", "yx", "xyx", "xyy", "yyx", "xx", ""], "loop full"
+    )
+    _fullmatch_differential["(?:(\\w+)=(\\w+);)+"](
+        ["a=1;", "a=1;b=2;", "a=1;b=2", "=1;", "a=;", ""], "kv loop full"
+    )
+    _fullmatch_differential["(?:(x)|y)+?z"](
+        ["xz", "yz", "xyxz", "z", "xy"], "lazy loop full"
     )
     _fullmatch_differential["(a*?)b"](["b", "ab", "aab", "a", ""], "lazy full")
 

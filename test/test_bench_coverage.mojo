@@ -691,6 +691,50 @@ def test_bench_capture_findall_sparse() raises:
     )
 
 
+def test_bench_onepass_match_kv() raises:
+    # bench onepass_match_kv: the pattern is one-pass AND selected (a
+    # general loop), the 40-byte input fullmatches, the groups report the
+    # last pair, and the slots are the Pike VM's.
+    comptime S = Regex["(?:(\\w+)=(\\w+);)+"]
+    assert_true(S._use_onepass)
+    var re = S()
+    var input = "host=db01;port=5432;user=admin;retry=55;"
+    assert_equal(input.byte_length(), 40)
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.group_str(input, 1), "retry")
+    assert_equal(r.group_str(input, 2), "55")
+    var p = re._pike_match(input)
+    for s in range(4):
+        assert_equal(r.slots[s], p.slots[s])
+    assert_false(re.match("host=db01;port=5432;user=admin;retry=55").matched)
+
+
+def test_bench_onepass_findall_2KB() raises:
+    # bench onepass_findall_2KB: 62 matches on the one-pass capture lane,
+    # group 1 text per match (the last pair's key), same spans and slots
+    # as the Pike VM.
+    comptime S = Regex["(?:(\\w+)=(\\w+);)+"]
+    assert_true(S._use_onepass)
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = String("host=db01;port=5432;user=admin; ") * 62
+    assert_true(input.byte_length() > 1900)
+    var all = re.findall(input)
+    assert_equal(len(all), 62)
+    assert_equal(all[0], "user")
+    assert_equal(all[61], "user")
+    var got = re.finditer(input)
+    var exp = re._pike_finditer(input)
+    assert_equal(len(got), 62)
+    for i in range(62):
+        assert_equal(got[i].start, exp[i].start)
+        assert_equal(got[i].end, exp[i].end)
+        for s in range(4):
+            assert_equal(got[i].slots[s], exp[i].slots[s])
+    assert_equal(got[5].group_str(input, 2), "admin")
+
+
 def _bench_counted_haystack(n: Int) -> String:
     """Mirror of `make_counted_haystack` in bench/bench.mojo."""
     var parts = List[String]()

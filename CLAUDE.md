@@ -49,7 +49,8 @@ Engine selection happens at compile time via `comptime if` branches:
 | --- | --- |
 | `_is_pure_literal` | SIMD literal scan |
 | `use_dfa` | Eager comptime DFA (`static_dfa.mojo`) for `match()`; the leftmost-first DFA + reverse DFA (`static_lfdfa.mojo`, `static_rdfa.mojo`, `Regex._use_lf_dfa`) for the search-family verbs; lazy DFA (`dfa.mojo`) when a determinization exceeds `EDFA_STATE_CAP` states |
-| `Regex._use_dfa_span` (captures, same shape, no backrefs/lookaround) | search-family verbs: leftmost-first DFA + reverse DFA for the span, then the backtracker anchored at the start and pinned to the end (`_span_fill_slots`) for the slots; Pike VM on that span if it gives up. `match()` stays on the backtracker |
+| `Regex._use_onepass` (captures, one-pass NFA: at most one thread consumes each byte) | One-pass DFA (`onepass.mojo`): `match()` is one forward table walk writing the slots; the capture lane below uses it for the span confirm instead of the backtracker |
+| `Regex._use_dfa_span` (captures, same shape, no backrefs/lookaround) | search-family verbs: leftmost-first DFA + reverse DFA for the span, then the one-pass DFA (or, when not one-pass, the backtracker anchored at the start and pinned to the end) in `_span_fill_slots` for the slots; Pike VM on that span if the backtracker gives up. `match()` stays on the backtracker when not one-pass |
 | otherwise | Specialized backtracker (`backtrack.mojo`), with Pike VM fallback |
 
 `extract_literal_prefix` (`optimize.mojo`) walks the NFA at compile time to find any guaranteed literal byte sequence at the start. If found, `search` / `findall` / `replace` use `simd_find_prefix` (`simd_scan.mojo`) to skip non-candidate positions before invoking the engine.

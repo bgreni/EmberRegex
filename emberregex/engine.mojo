@@ -113,6 +113,7 @@ from .onepass import (
     onepass_class_arr,
     onepass_eps_arr,
     onepass_eps_len,
+    onepass_find_end,
     onepass_match,
     onepass_state_arr,
     onepass_state_len,
@@ -1022,8 +1023,13 @@ struct Regex[pattern: String](Copyable, Movable):
     # findall rows, `<(\w+)[^>]*>` over 110 bytes). A failure is bounded
     # as before: `-1` by the scan's walk over the same bytes, `-2` by
     # LF_SBT_ATTEMPT_BUDGET once per walk (the `speculate` latch).
+    # A cyclic SPLIT the backtracker runs by general recursion (a loop
+    # whose body is not one ANY/CHAR/CHARSET state): its depth then
+    # tracks the input, and so does its cost. Field, not a call: the
+    # check walks the NFA, and two fields read it.
+    comptime _sbt_general_loop = _sbt_needs_depth_guard(Self.nfa)
     comptime _lf_anchored_sbt = Self._use_dfa_span or (
-        Self.nfa.has_lazy and not _sbt_needs_depth_guard(Self.nfa)
+        Self.nfa.has_lazy and not Self._sbt_general_loop
     )
     # Backtracker (state, pos) memoization is only sound when a subtree's
     # outcome is a function of (state, pos) — see sbt_memo_ok.
@@ -1037,8 +1043,27 @@ struct Regex[pattern: String](Copyable, Movable):
     # pattern, and this build is only worth paying for where a capture
     # verb runs. Capture-free patterns have the classic table and the
     # leftmost-first lane; they never build it.
-    comptime _onepass = build_onepass(Self.nfa, Self._group_count > 0)
-    comptime _use_onepass = Self._group_count > 0 and Self._onepass.valid
+    #
+    # Selection is by shape, not by validity alone: the one-pass walk
+    # costs ~1.5 ns per byte (a table load on the critical path), and on
+    # shapes whose loops are all simple the specialized backtracker is
+    # straight-line code with SIMD class scans — measured 2-3x faster on
+    # the 10-40-byte `match()` rows (`(\w+)@(\w+)\.(\w+)` on 16 bytes:
+    # 8 ns vs 25 ns) and only ~1.3x slower past ~60 bytes. Where the
+    # backtracker recurses per iteration (`_sbt_general_loop`: a loop
+    # whose body is an alternation, a group, or another loop) the walk
+    # is 4-5x faster at every length and has no SBT_BUDGET /
+    # SBT_MAX_DEPTH cliff (`(?:(x)|y)+` over 8 KB exhausts the budget and
+    # falls to the Pike VM on the backtracker). The build is gated on the
+    # same predicate so the simple shapes pay no comptime for it.
+    comptime _onepass = build_onepass(
+        Self.nfa, Self._group_count > 0 and Self._sbt_general_loop
+    )
+    comptime _use_onepass = (
+        Self._group_count > 0
+        and Self._sbt_general_loop
+        and Self._onepass.valid
+    )
     comptime _OP_TN = onepass_table_len(Self._onepass)
     comptime _OP_TABLE = onepass_table_arr[Self._OP_TN](Self._onepass)
     comptime _OP_CLASSES = onepass_class_arr(Self._onepass)
@@ -1387,7 +1412,16 @@ struct Regex[pattern: String](Copyable, Movable):
                     var spent = 0
                     while True:
                         var budget = LF_SBT_ATTEMPT_BUDGET
-                        var aend = self._sbt_match_at(input, s0, slots, budget)
+                        var aend: Int
+                        comptime if Self._use_onepass:
+                            # Exact and budget-free: one table walk from
+                            # s0 is the leftmost-first match there, or
+                            # proof that none starts there.
+                            aend = self._onepass_match_at(
+                                input, s0, slots, budget
+                            )
+                        else:
+                            aend = self._sbt_match_at(input, s0, slots, budget)
                         if aend >= 0:
                             return (s0, aend)
                         if aend == -2:
@@ -1513,6 +1547,35 @@ struct Regex[pattern: String](Copyable, Movable):
         # Slots may hold a partial walk's writes: the Pike result
         # replaces every one of them.
         self._pike_span(input, start, end, slots, pike)
+
+    @always_inline
+    def _onepass_match_at[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+        mut budget: Int,
+    ) -> Int:
+        """The capture lane's anchored attempt on the one-pass DFA (see
+        `onepass_find_end`): Python's leftmost-first end of the match
+        starting at `start` with its slots, or -1 — exact, so never -2.
+        `budget` is charged one step per byte walked, the same allowance
+        `_sbt_match_at` spends, so the lane's per-call accounting of
+        failed attempts is unchanged. Only meaningful when
+        `_use_onepass`."""
+        var steps = 0
+        var end = onepass_find_end[
+            op=Self._onepass,
+            table=Self._OP_TABLE,
+            classes=Self._OP_CLASSES,
+            eps=Self._OP_EPS,
+            states=Self._OP_STATES,
+            num_slots=Self._num_slots,
+        ](input, start, slots, steps)
+        budget -= steps
+        return end
 
     @always_inline
     def _onepass_walk[

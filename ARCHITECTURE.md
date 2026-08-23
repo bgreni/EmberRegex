@@ -106,8 +106,9 @@ Selected fastest-first at compile time:
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
 | `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
+| captures, one-pass NFA | one-pass DFA: `match()`, and the slots of the lane below (`_use_onepass`) | `onepass.mojo` |
 | captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
-| backrefs / lookaround / captures (`match()`) | specialized backtracker | `backtrack.mojo` |
+| backrefs / lookaround / captures (`match()`, not one-pass) | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
 
 **The eager DFA is the interesting one.** Subset construction runs in the
@@ -191,7 +192,35 @@ the same end pin, never on the whole input — and the walk latches: every
 later span of the same call goes straight to that VM, built once per
 walk, so a pattern whose confirm always gives up (`(a*)*b`) pays one
 budget per call, not one per match. `match()` with captures stays on the
-backtracker.
+backtracker unless the pattern is one-pass (next paragraph).
+
+**One-pass DFA** (`onepass.mojo`, `Regex._use_onepass`, regex-automata's
+`onepass`): when at most one NFA thread can consume each byte, the path
+through the NFA for any input is unique, and the capture slots can be
+written during a single forward table walk with no backtracking. A DFA
+state is one NFA state (a transition target) plus a position context
+(start / after `\n` / mid-line, split by the look-behind word class for
+`\b` patterns); expanding it walks the epsilon closure in priority order
+carrying the SAVE slots passed, and every consuming member contributes
+transitions tagged with those slot writes. The pattern is NOT one-pass
+when a later member wants a byte class an earlier one already claimed
+with a different target or slot set (`(a|ab)(c|bcd)`, `(a*)(a*)`,
+`(a)\b|(a)`), or when it carries a backreference or lookaround, or when
+the automaton exceeds `ONEPASS_STATE_CAP` / 64 slots; such patterns keep
+the engines above. Unlike regex-automata the closure does not stop at
+MATCH: `match()` is `fullmatch` (language membership: `(a*?)` must
+fullmatch "aaa") and the capture lane's span confirm already knows its
+end, so both walkers run exactly `[start, end_pin)` and require a match
+state there — its slot writes are then the only possible assignment.
+BOL kinds resolve against the context at build time, `$` / `(?m)$` /
+`\b` before a consuming state restrict its byte classes, and only the
+conditions on the byte after the end remain as per-state match flags
+checked once at `end_pin` against the whole input. States that self-loop
+on all but a few bytes with no slot writes take the eager DFA's SIMD
+acceleration, so `(\w+)@(\w+)\.com` is two class scans and a few table
+steps. The build is its own comptime field, read only by `match()` and
+`_span_fill_slots`, so a capture pattern that only runs search verbs on
+the backtracker lane never pays for it.
 
 **Word boundaries ride all three tables.** `\b` needs the byte on both
 sides, and a closure only knows the one behind it, so — regex-automata's
