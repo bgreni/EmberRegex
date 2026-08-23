@@ -187,8 +187,11 @@ confirm (without the attempt the short-input findall rows measured
 failing those, a SIMD first-byte class scan. `split` and a `replace`
 without backreferences skip the fill. When the backtracker gives
 up on a span (budget or depth) the Pike VM runs on exactly that span with
-the same end pin, never on the whole input. `match()` with captures stays
-on the backtracker.
+the same end pin, never on the whole input — and the walk latches: every
+later span of the same call goes straight to that VM, built once per
+walk, so a pattern whose confirm always gives up (`(a*)*b`) pays one
+budget per call, not one per match. `match()` with captures stays on the
+backtracker.
 
 **Word boundaries ride all three tables.** `\b` needs the byte on both
 sides, and a closure only knows the one behind it, so — regex-automata's
