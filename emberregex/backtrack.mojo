@@ -693,11 +693,23 @@ comptime SBT_BUDGET = 200_000
 comptime SBT_STACK_BUDGET = 4 * 1024 * 1024
 
 
-@always_inline
+@no_inline
 def sbt_stack_here() -> Int:
-    """Address of a fresh local in the CALLER's frame (this is
-    `@always_inline`), i.e. a monotonically decreasing witness of how
-    deep the walk has nested. Public so tests can build their own floor.
+    """Address of a local in THIS function's frame — a monotonically
+    decreasing witness of how deep the caller has nested, since a
+    callee's frame sits directly below its caller's. Public so tests can
+    build their own floor.
+
+    `@no_inline` is load-bearing twice over. It keeps the returned
+    address a fixed offset below the caller's stack pointer whatever the
+    caller looks like, and — the reason it is spelled out rather than
+    left to the optimizer — it keeps the address-of to ONE function in
+    the whole binary. Inlined into the walker it becomes one escaping
+    alloca per instantiation, and at ~800 general SPLITs over the ~2100
+    states of `(?u)\\p{L}+` that SIGSEGVs the Mojo compiler outright
+    (verified: with the address-of inlined, a file with five `\\p{...}`
+    patterns crashes `mojo` in 2m31s; with it here, the same file
+    compiles).
     """
     var slot: Int = 0
     return Int(Pointer(to=slot))
@@ -720,116 +732,6 @@ def sbt_stack_floor[guarded: Bool]() -> Int:
         return 0
 
 
-def _sbt_is_general_split(nfa: NFA, i: Int) -> Bool:
-    """Comptime: True when state `i` is a SPLIT the walker runs through
-    the general (recursive) branch rather than one of the iterative
-    simple-loop rewrites. These are the states that carry the guard."""
-    if i < 0 or i >= len(nfa.states):
-        return False
-    ref s = nfa.states[i]
-    if s.kind != NFAStateKind.SPLIT:
-        return False
-    if s.greedy and _sbt_is_simple_body(nfa, i, s.out1):
-        return False
-    if (not s.greedy) and _sbt_is_simple_body(nfa, i, s.out2):
-        return False
-    return True
-
-
-def _sbt_call_target(nfa: NFA, v: Int, k: Int) -> Int:
-    """Comptime: the `k`-th state `_sbt_try_match[v]` can recursively
-    call, or -2 once `v` has no more. Mirrors the walker's own dispatch,
-    which is what makes the cycle analysis below exact rather than an
-    over-approximation of the NFA graph:
-
-    - a simple greedy loop consumes its body ITERATIVELY and only ever
-      calls its exit (`out2`); a simple lazy loop likewise (`out1`);
-    - MATCH calls nothing;
-    - lookaround calls its sub-NFA and then its continuation;
-    - everything else calls `out1`.
-
-    The counted-repeat rewrite (`_sbt_counted_shape`) is deliberately
-    NOT modelled: it only ever replaces a chain of states by a direct
-    edge to the chain's exit, so ignoring it can add edges but never
-    remove reachability — the conservative direction — and it is gated
-    on this analysis reporting no cycle in the first place.
-    """
-    var n = len(nfa.states)
-    if v < 0 or v >= n:
-        return -2
-    ref s = nfa.states[v]
-    var kind = s.kind
-    if kind == NFAStateKind.MATCH:
-        return -2
-    if kind == NFAStateKind.SPLIT:
-        if s.greedy and _sbt_is_simple_body(nfa, v, s.out1):
-            return s.out2 if k == 0 else -2
-        if (not s.greedy) and _sbt_is_simple_body(nfa, v, s.out2):
-            return s.out1 if k == 0 else -2
-        if k == 0:
-            return s.out1
-        if k == 1:
-            return s.out2
-        return -2
-    if kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND:
-        if k == 0:
-            return s.sub_start
-        if k == 1:
-            return s.out1
-        return -2
-    if k == 0:
-        return s.out1
-    return -2
-
-
-def _sbt_call_graph_has_cycle(nfa: NFA, cut_general_splits: Bool) -> Bool:
-    """Comptime: does the specialized call graph contain a directed
-    cycle? With `cut_general_splits`, the general-SPLIT states are
-    deleted first — so a False answer proves those states form a
-    feedback vertex set, i.e. that every cycle passes through one and a
-    guard placed there alone is enough.
-
-    Iterative three-colour DFS from every state, so entry points other
-    than `nfa.start` (a lookaround's sub-NFA, a caller that starts
-    mid-graph) are covered too. A grey child is a back edge, which is a
-    cycle.
-    """
-    var n = len(nfa.states)
-    var color = List[Int](fill=0, length=n)  # 0 white, 1 grey, 2 black
-    var fs = List[Int]()  # DFS frame: state
-    var fc = List[Int]()  # DFS frame: next child cursor
-    for root in range(n):
-        if color[root] != 0:
-            continue
-        if cut_general_splits and _sbt_is_general_split(nfa, root):
-            color[root] = 2
-            continue
-        color[root] = 1
-        fs.append(root)
-        fc.append(0)
-        while len(fs) > 0:
-            var top = len(fs) - 1
-            var v = fs[top]
-            var child = _sbt_call_target(nfa, v, fc[top])
-            if child == -2:
-                color[v] = 2
-                _ = fs.pop()
-                _ = fc.pop()
-                continue
-            fc[top] = fc[top] + 1
-            if child < 0 or child >= n:
-                continue
-            if cut_general_splits and _sbt_is_general_split(nfa, child):
-                continue
-            if color[child] == 1:
-                return True
-            if color[child] == 0:
-                color[child] = 1
-                fs.append(child)
-                fc.append(0)
-    return False
-
-
 struct SbtDepthPlan(Copyable, Movable):
     """Where the walker has to watch the stack, decided at compile time."""
 
@@ -849,32 +751,139 @@ struct SbtDepthPlan(Copyable, Movable):
 
 
 def sbt_depth_plan(nfa: NFA) -> SbtDepthPlan:
-    """Comptime: the stack guard's placement for `nfa`.
+    """Comptime: whether the backtracker can recurse without bound on
+    `nfa`, and if so where the stack check has to go.
 
-    `needs_guard` keeps the old predicate as a floor (a cyclic SPLIT the
-    walker runs recursively) OR'd with the computed call-graph answer,
-    so nothing that used to be guarded — or gated off the memo lane and
-    the counted-repeat rewrite, which both key off this — can silently
-    stop being.
+    The graph walked here is the **specialized call graph** — the edges
+    `_sbt_try_match[v]` can actually recurse along, not the NFA's — so
+    the answer is exact rather than an over-approximation:
 
-    Cost: one memoized pass per NFA, reached through the single call the
-    walker already made per instantiation. Both DFS walks are O(states).
+    - a simple greedy loop consumes its body ITERATIVELY and only ever
+      calls its exit (`out2`); a simple lazy loop likewise (`out1`).
+      That is why `a+`, `[a-z]*` and `.*?` are cycles in the NFA and not
+      in this graph, and why they pay nothing;
+    - MATCH calls nothing; lookaround calls its sub-NFA then its
+      continuation; everything else calls `out1`.
+
+    The counted-repeat rewrite (`_sbt_counted_shape`) is deliberately
+    NOT modelled: it replaces a chain of states with a direct edge to
+    that chain's exit, so ignoring it can only leave edges in, never
+    take reachability out — the conservative direction — and it is
+    gated on this very analysis reporting no cycle.
+
+    `needs_guard` keeps the older predicate (a cyclic SPLIT the walker
+    runs recursively) as a floor, OR'd with the call-graph answer, so
+    nothing that used to be guarded — or gated off the memo lane and the
+    counted-repeat rewrite, which both key off this — can silently stop
+    being.
+
+    `splits_are_fvs` re-runs the same walk with the general-SPLIT states
+    deleted. False there means those states are NOT a feedback vertex
+    set and a check confined to them would miss a cycle, so the walker
+    checks on entry to every state instead.
+
+    **Cost.** Everything is one flat pass over lists. A comptime call
+    that takes the NFA copies it (~0.7 ms per 100 states), so calling
+    `_sbt_is_simple_body` from inside these walks would make the pass
+    quadratic in the NFA — on the ~2100-state `(?u)\\p{L}+` that crashed
+    the compiler outright. The body test is therefore written out here,
+    once per state, and must stay in step with `_sbt_is_simple_body`.
     """
+    var n = len(nfa.states)
+    # c0/c1: the (at most two) states `_sbt_try_match[i]` can call.
+    var c0 = List[Int](fill=-1, length=n)
+    var c1 = List[Int](fill=-1, length=n)
+    var gsplit = List[Bool](fill=False, length=n)
+    for i in range(n):
+        ref s = nfa.states[i]
+        var kind = s.kind
+        if kind == NFAStateKind.MATCH:
+            continue
+        if kind == NFAStateKind.SPLIT:
+            # Greedy loops carry the body in out1, lazy ones in out2.
+            var b = s.out1 if s.greedy else s.out2
+            var simple = False
+            if b >= 0 and b < n and nfa.states[b].out1 == i:
+                var bk = nfa.states[b].kind
+                simple = (
+                    bk == NFAStateKind.ANY
+                    or bk == NFAStateKind.CHAR
+                    or bk == NFAStateKind.CHARSET
+                )
+            if simple:
+                # Iterative: the body is never called, only the exit.
+                c0[i] = s.out2 if s.greedy else s.out1
+            else:
+                gsplit[i] = True
+                c0[i] = s.out1
+                c1[i] = s.out2
+            continue
+        if kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND:
+            c0[i] = s.sub_start
+            c1[i] = s.out1
+            continue
+        c0[i] = s.out1
+
+    # The older predicate: a cyclic SPLIT the walker runs recursively.
     var cyclic = split_cycle_flags(nfa)
     var old = False
-    for i in range(len(nfa.states)):
-        ref s = nfa.states[i]
-        if s.kind != NFAStateKind.SPLIT or s.out2 == -1:
-            continue
-        if not cyclic[i]:
-            continue
-        var body = s.out1 if s.greedy else s.out2
-        if not _sbt_is_simple_body(nfa, i, body):
+    for i in range(n):
+        if gsplit[i] and cyclic[i] and nfa.states[i].out2 != -1:
             old = True
             break
-    if not old and not _sbt_call_graph_has_cycle(nfa, False):
+
+    # Two iterative three-colour DFS passes over the call graph, rooted
+    # at every state so entry points other than `nfa.start` (a
+    # lookaround's sub-NFA, a caller starting mid-graph) are covered. A
+    # grey child is a back edge, which is a cycle. Pass 1 deletes the
+    # general-SPLIT states first.
+    var found = List[Bool](fill=False, length=2)
+    for p in range(2):
+        var cut = p == 1
+        if cut and not old and not found[0]:
+            break
+        var color = List[Int](fill=0, length=n)  # 0 white, 1 grey, 2 black
+        var fs = List[Int]()  # DFS frame: state
+        var fc = List[Int]()  # DFS frame: next child cursor
+        var hit = False
+        for root in range(n):
+            if hit:
+                break
+            if color[root] != 0:
+                continue
+            if cut and gsplit[root]:
+                color[root] = 2
+                continue
+            color[root] = 1
+            fs.append(root)
+            fc.append(0)
+            while len(fs) > 0:
+                var top = len(fs) - 1
+                var v = fs[top]
+                var k = fc[top]
+                if k > 1:
+                    color[v] = 2
+                    _ = fs.pop()
+                    _ = fc.pop()
+                    continue
+                fc[top] = k + 1
+                var child = c0[v] if k == 0 else c1[v]
+                if child < 0 or child >= n:
+                    continue
+                if cut and gsplit[child]:
+                    continue
+                if color[child] == 1:
+                    hit = True
+                    break
+                if color[child] == 0:
+                    color[child] = 1
+                    fs.append(child)
+                    fc.append(0)
+        found[p] = hit
+
+    if not old and not found[0]:
         return SbtDepthPlan(False, True)
-    return SbtDepthPlan(True, not _sbt_call_graph_has_cycle(nfa, True))
+    return SbtDepthPlan(True, not found[1])
 
 
 def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
