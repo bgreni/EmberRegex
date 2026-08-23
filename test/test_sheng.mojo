@@ -16,7 +16,11 @@ from emberregex.simd_kernels import (
     HAS_WIDE_BYTE_SHUFFLE,
     NIBBLE_TABLE_SIZE,
 )
-from emberregex.sheng import SHENG_STATE_CAP, sheng_viable
+from emberregex.sheng import (
+    SHENG_STATE_CAP,
+    sheng_short_input,
+    sheng_viable,
+)
 from emberregex.static_dfa import build_eager_dfa
 from std.sys import simd_width_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
@@ -293,6 +297,170 @@ def test_sheng_differential_anchored_lcg() raises:
             _assert_pike_agreement[ALT32_EOL](
                 data, String("anchored seed=", seed, " n=", n)
             )
+
+
+# --- Short-input scalar lane ------------------------------------------------
+#
+# An anchored full match on an input too short to amortize the shuffle's
+# fixed costs (start broadcast, lane-0 extract, and — at the wide tiers —
+# 32 or 64 bytes of mask loaded per step) walks the same mask table one
+# scalar load per byte instead. That is a second walker over the same
+# table, reached by a length test, so it needs both a pin on where the
+# boundary sits and a differential that steps across it.
+#
+# Looped forms of the alternations above, so an anchored full match can
+# actually succeed at every length instead of only at three bytes:
+# 19 states (tbl2 tier, bound 10) and 34 states (tbl4 tier, bound 16).
+comptime ALT16_PLUS = (
+    "(?:cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg)+"
+)
+comptime ALT32_PLUS = (
+    "(?:cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+    "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap)+"
+)
+# Same DFA, but every accept now hangs off the EOL-at-end flag.
+comptime ALT32_PLUS_EOL = "(?m)(?:" + ALT32_PLUS + ")$"
+
+
+def test_sheng_short_input_bound_is_per_tier() raises:
+    # The 16-lane shuffle is one load and one `tbl`; it beats the scalar
+    # walk even at three bytes, so that tier gets no scalar lane at all
+    # (0 makes the branch comptime-dead — nothing is emitted).
+    assert_equal(sheng_short_input(NIBBLE_TABLE_SIZE), 0)
+    # tbl2 loads 32 bytes per step and crosses over around ten.
+    assert_equal(sheng_short_input(32), 10)
+    # tbl4 loads 64 and is still behind at fifteen.
+    assert_equal(sheng_short_input(64), 16)
+
+
+def _lcg_words(seed: Int, n: Int, words: List[String]) -> String:
+    """`n` bytes of concatenated whole alternation arms, truncated to
+    length. Multiples of the arm width are full matches, everything else
+    is a miss that still walks to the end — random *letters* would be a
+    miss at almost every length, which is the same answer a broken lane
+    that always says "no" gives."""
+    var out = String("")
+    var x = seed
+    while out.byte_length() < n:
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        out += words[x % len(words)]
+    return String(unsafe_from_utf8=out.as_bytes()[:n])
+
+
+def _arm_words() -> List[String]:
+    var w = List[String]()
+    w.append(String("cat"))
+    w.append(String("cow"))
+    w.append(String("dog"))
+    w.append(String("doe"))
+    w.append(String("bat"))
+    w.append(String("bit"))
+    w.append(String("fig"))
+    w.append(String("fin"))
+    w.append(String("gum"))
+    w.append(String("gas"))
+    w.append(String("hen"))
+    w.append(String("hex"))
+    w.append(String("jam"))
+    w.append(String("jab"))
+    w.append(String("kit"))
+    w.append(String("keg"))
+    return w^
+
+
+def test_sheng_short_input_differential_by_length() raises:
+    # Every length from empty to well past both bounds, on all three
+    # tiers: the scalar lane must answer exactly what the shuffle would.
+    # 0..40 straddles 10 (tbl2) and 16 (tbl4) and keeps going far enough
+    # that the accelerated shuffle lane is exercised on the same pattern.
+    var words = _arm_words()
+    var dogs = List[String]()
+    dogs.append(String("cat"))
+    dogs.append(String("dog"))
+    dogs.append(String("dug"))
+    for seed in [11, 2024]:
+        for n in range(41):
+            _assert_pike_agreement[ALT32_PLUS](
+                _lcg_words(seed, n, words),
+                String("tbl4 short seed=", seed, " n=", n),
+            )
+            _assert_pike_agreement[ALT16_PLUS](
+                _lcg_words(seed, n, words),
+                String("tbl2 short seed=", seed, " n=", n),
+            )
+            _assert_pike_agreement["(?:cat|d[ou]g)+"](
+                _lcg_words(seed, n, dogs),
+                String("tbl1 short seed=", seed, " n=", n),
+            )
+
+
+def test_sheng_short_input_differential_random_bytes() raises:
+    # The same sweep over random bytes rather than whole arms: these
+    # rarely full-match, so they are the negative half — a lane that said
+    # "yes" too often would show up here, and the arm-aligned sweep above
+    # catches one that says "no" too often.
+    comptime ALT32_ALPHA = "catdogbfignhexjmkpsurw0123456789 ."
+    comptime SMALL_ALPHA = "catdogu "
+    comptime IP_ALPHA = "0123456789.abc"
+    for seed in [11, 2024]:
+        for n in range(41):
+            _assert_pike_agreement[ALT32](
+                _lcg_text(seed, n, ALT32_ALPHA),
+                String("alt32 short seed=", seed, " n=", n),
+            )
+            _assert_pike_agreement["cat|d[ou]g"](
+                _lcg_text(seed, n, SMALL_ALPHA),
+                String("small short seed=", seed, " n=", n),
+            )
+            _assert_pike_agreement["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"](
+                _lcg_text(seed, n, IP_ALPHA),
+                String("ip short seed=", seed, " n=", n),
+            )
+
+
+def test_sheng_short_input_eol_flags_agree() raises:
+    # The scalar lane ends with the same EOL-at-end flag test the shuffle
+    # lane does. Under `(?m)...$` the walk's last state is not a match
+    # state on its own — it accepts only because the flag says end of
+    # input counts — so dropping that test turns every one of these into
+    # a miss. Arm-aligned inputs (which DO match) are what makes that
+    # visible; random letters agree with a lane that always says "no".
+    var words = _arm_words()
+    for seed in [13, 808]:
+        for n in range(25):
+            _assert_pike_agreement[ALT32_PLUS_EOL](
+                _lcg_words(seed, n, words),
+                String("eol arms seed=", seed, " n=", n),
+            )
+    comptime ALPHA = "catdogbfignhexjmkpsurw0123456789 .\n"
+    for seed in [13, 808]:
+        for n in range(25):
+            _assert_pike_agreement[ALT32_EOL](
+                _lcg_text(seed, n, ALPHA),
+                String("anchored short seed=", seed, " n=", n),
+            )
+
+
+def test_sheng_short_input_exact_matches_at_each_length() raises:
+    # LCG text rarely produces a full anchored match, so pin the positive
+    # side explicitly: an input that IS a match, at lengths on both sides
+    # of every bound (3, 6, ... 33 bytes crosses 10 and 16).
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        assert_equal(Regex[ALT16_PLUS]._SHENG_CAP, 32)
+        assert_equal(Regex[ALT32_PLUS]._SHENG_CAP, 64)
+    var re32 = Regex[ALT16_PLUS]()
+    var re64 = Regex[ALT32_PLUS]()
+    var word = String("cat")
+    for k in range(1, 12):
+        var text = word * k
+        assert_true(re32.match(text).matched, String("tbl2 cat x ", k))
+        assert_equal(re32.match(text).end, re32._pike_match(text).end)
+        assert_true(re64.match(text).matched, String("tbl4 cat x ", k))
+        assert_equal(re64.match(text).end, re64._pike_match(text).end)
+        # And a near-match that dies on its last byte at each length.
+        var near = text + "z"
+        assert_equal(re32.match(near).matched, re32._pike_match(near).matched)
+        assert_equal(re64.match(near).matched, re64._pike_match(near).matched)
 
 
 # --- What minimization buys the shuffle engine -----------------------------
