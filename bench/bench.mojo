@@ -1643,6 +1643,34 @@ def bench_pathological_nested_quantifier_miss(mut b: Bench) raises:
     b.bench_function[go](BenchId("pathological_nested_quantifier_miss"))
 
 
+def bench_memo_ambiguous_plus_miss(mut b: Bench) raises:
+    # `(a|aa)+` splits a run of `a`s into Fibonacci-many paths, and there is
+    # no `b` to stop the search: the unmemoized backtracker burns
+    # SBT_BUDGET at the first position and the whole search falls to the
+    # Pike VM. With the (state, pos) memo it stays in the backtracker and
+    # the bits carry across candidate positions (see _sbt_run_memo).
+    #
+    # 1500 `a`s, not 2000: past ~1900 the recursion trips SBT_MAX_DEPTH
+    # instead, which hands the pattern to the Pike VM again and would make
+    # this row bimodal. The group is what keeps it off the DFA lane.
+    var re = Regex["(a|aa)+b"]()
+    var input = String("a") * 1500 + "c"
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("memo_ambiguous_plus_miss_1500"))
+
+
 # ---------------------------------------------------------------------------
 # 20. More real-world patterns
 # ---------------------------------------------------------------------------
@@ -2092,6 +2120,7 @@ def main() raises:
     bench_pathological_dotstar_miss(b)
     bench_pathological_backref_repeated(b)
     bench_pathological_nested_quantifier_miss(b)
+    bench_memo_ambiguous_plus_miss(b)
 
     # Real-world
     bench_url_parse(b)
