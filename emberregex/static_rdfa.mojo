@@ -18,7 +18,20 @@ the set lane's `set_reverse.mojo` (whose closure this reuses): walking
 leftward the byte just consumed IS `input[p]`, so EOL resolves during
 the closure, while BOL depends on the byte about to be consumed and is
 deferred to per-state flag bits the walker checks against `p == 0` and
-`input[p - 1] == '\\n'`.
+`input[p - 1] == '\\n'`. A pending BOL kind is never stepped past on
+the transition that does not resolve it: only BOL_MULTILINE on the
+'\\n' byte walks through (`(?:x^y|y)` on "xy" starts at 1, not 0).
+
+Word boundaries follow the same mirror. Walking leftward the byte just
+consumed is the anchor's look-AHEAD side and the byte about to be
+consumed its look-behind, so a reverse state records the word class of
+the byte it was entered on (the `right` class, set only while a word
+anchor is pending — `\\b`-free states intern exactly as before), keeps
+word anchors as pending members, and resolves them against the byte it
+is about to consume: on the transition (expanding the anchor's reverse
+continuation before taking the predecessors) and in the accept flags
+(`RDFA_WB_LEFT_WORD` / `RDFA_WB_LEFT_NONWORD`: the entry becomes live
+iff `input[p - 1]` has that class, out of input counting as non-word).
 
 The walk is bounded by `end - floor` and by the automaton dying, so for
 `findall` it never passes the previous match end. It is also accelerated
@@ -55,19 +68,29 @@ from .static_dfa import (
     EDFA_NFA_CAP,
     _MIN_CAP,
     _StateBits,
+    _WB_PREV_SALT,
     _bs_any,
     _bs_eq,
     _bs_hash,
     _bs_set,
     _byte_classes,
     _flatten_nfa,
+    _is_word_byte,
     _minimize,
+    _nfa_has_word_anchor,
+    _wb_holds,
+    _word_anchor_bits,
+    edfa_is_word,
 )
 
 # Per-state accept bits.
 comptime RDFA_NORM: UInt8 = 1  # the entry state is live here
 comptime RDFA_BOL0: UInt8 = 2  # ...after resolving BOL kinds at p == 0
 comptime RDFA_BOLNL: UInt8 = 4  # ...after resolving BOL_MULTILINE after '\n'
+# ...after resolving a pending word anchor against input[p - 1] being a
+# word byte / a non-word byte (or p == 0). Both together are RDFA_NORM.
+comptime RDFA_WB_LEFT_WORD: UInt8 = 8
+comptime RDFA_WB_LEFT_NONWORD: UInt8 = 16
 
 # Same cap as the forward table: the reverse automaton of a pattern that
 # fits EDFA_STATE_CAP forward states normally fits comfortably, and
@@ -85,9 +108,11 @@ struct RDFA(Copyable, Movable):
     var flags: List[Int]  # RDFA_* bits per state
     var seed_at_end: Int  # end == len(input)
     var seed_at_nl: Int  # end < len and input[end] == '\n'
-    var seed_other: Int  # end < len and input[end] != '\n'
+    var seed_other: Int  # end < len and input[end] a non-word byte
+    var seed_other_word: Int  # end < len and input[end] a word byte
     var any_bol0: Bool
     var any_bolnl: Bool
+    var any_wb: Bool  # some state carries an RDFA_WB_* bit
     # Accelerated states (no BOL flag): self-loop on all but <= 2 bytes,
     # or on a nibble-encodable set — the same two flavours as EagerDFA,
     # scanning backward. Every reverse self-loop is a genuine one (there
@@ -108,8 +133,10 @@ struct RDFA(Copyable, Movable):
         self.seed_at_end = 0
         self.seed_at_nl = 0
         self.seed_other = 0
+        self.seed_other_word = 0
         self.any_bol0 = False
         self.any_bolnl = False
+        self.any_wb = False
         self.accel_states = List[Int]()
         self.accel_exit1 = List[Int]()
         self.accel_exit2 = List[Int]()
@@ -178,6 +205,62 @@ def _rev_bol_reaches_start(
                 if h2:
                     stack.append(p)
     return False
+
+
+def _rev_wb_resolve(
+    kinds: List[Int],
+    anchors: List[Int],
+    pred_data: List[Int],
+    pred_off: List[Int],
+    pred_len: List[Int],
+    wb_bits: _StateBits,
+    bits: _StateBits,
+    left_word: Bool,
+    right_word: Bool,
+    entry: Int,
+    mut entry_hit: Bool,
+    mut resolved: _StateBits,
+) -> _StateBits:
+    """Comptime: `bits` with every pending word anchor that holds between
+    `left_word` (the byte about to be consumed) and `right_word` (the
+    byte just consumed) walked past: its backward epsilon closure joins
+    the set (nested anchors resolved the same way, BOL kinds kept
+    pending) and the anchor itself goes into `resolved`, so the step can
+    follow its consuming predecessors like any plain member's. Sets
+    `entry_hit` when a resolved anchor IS the pattern's entry (`\\bfoo`:
+    the entry is live exactly then)."""
+    var out = bits
+    var pend = bits & wb_bits
+    for l in range(64):
+        var w = pend[l]
+        while w != 0:
+            var a = 64 * l + Int(count_trailing_zeros(w))
+            w &= w - 1
+            if not _wb_holds(anchors.unsafe_get(a), left_word, right_word):
+                continue
+            if a == entry:
+                entry_hit = True
+            var seeds = List[Int](fill=a, length=1)
+            var c = _rev_flat_closure(
+                kinds,
+                anchors,
+                pred_data,
+                pred_off,
+                pred_len,
+                seeds,
+                False,
+                False,
+                True,
+                left_word,
+                right_word,
+            )
+            # Anchors still in the closure are the ones that held (a
+            # nested one that did not is dropped by the closure).
+            resolved = resolved | (c & wb_bits)
+            if (c & wb_bits)[entry >> 6] >> UInt64(entry & 63) & 1 != 0:
+                entry_hit = True
+            out = out | c
+    return out
 
 
 def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
@@ -269,12 +352,35 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     if len(match_states) == 0:
         return result^
 
+    # Pending anchors are members that are never stepped past on a
+    # transition that does not resolve them: BOL kinds (resolved by the
+    # walker's flag checks at p == 0 / after '\n', and BOL_MULTILINE also
+    # on the '\n' transition itself) and word anchors (resolved per
+    # transition against the byte about to be consumed).
+    var bol_bits = _StateBits(0)
+    var bol_ml_bits = _StateBits(0)
+    for s in range(n):
+        if kinds.unsafe_get(s) != NFAStateKind.ANCHOR:
+            continue
+        var at = anchors.unsafe_get(s)
+        if at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE:
+            _bs_set(bol_bits, s)
+        if at == AnchorKind.BOL_MULTILINE:
+            _bs_set(bol_ml_bits, s)
+    var has_wb = _nfa_has_word_anchor(nfa)
+    var wb_bits = _word_anchor_bits(kinds, anchors)
+    var st = nfa.start
+
     var sets_bits = List[_StateBits]()
+    var rightv = SIMD[DType.int8, 256](0)  # word class of the byte just consumed
     var hashv = SIMD[DType.uint64, 256](0)
 
-    # Seeds: MATCH closed in each end context.
-    var starts = List[Int]()  # (other, at-nl, at-end) — _minimize order
-    for ctx in range(3):
+    # Seeds: MATCH closed in each end context (plus the mid-input context
+    # after a word byte when a word anchor exists).
+    var starts = List[Int]()  # (other, at-nl, at-end[, other-word]) — _minimize order
+    var nseed = 4 if has_wb else 3
+    for k in range(nseed):
+        var ctx = k if k < 3 else 0
         var closed = _rev_flat_closure(
             kinds,
             anchors,
@@ -285,15 +391,23 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             ctx == 2,
             ctx >= 1,
         )
+        var right = k == 3 and _bs_any(closed & wb_bits)
         var h = _bs_hash(closed)
+        if right:
+            h ^= _WB_PREV_SALT
         var found = -1
-        for k in range(len(sets_bits)):
-            if hashv[k] == h and _bs_eq(sets_bits.unsafe_get(k), closed):
-                found = k
+        for j in range(len(sets_bits)):
+            if (
+                hashv[j] == h
+                and Int(rightv[j]) == Int(right)
+                and _bs_eq(sets_bits.unsafe_get(j), closed)
+            ):
+                found = j
                 break
         if found < 0:
             found = len(sets_bits)
             hashv[found] = h
+            rightv[found] = Int8(1) if right else Int8(0)
             sets_bits.append(closed)
         starts.append(found)
 
@@ -302,6 +416,10 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var gval_n = List[_StateBits]()
     var one_seed = List[Int](fill=0, length=1)
     var need_nl_variant = has_bol_ml or _bs_any(eol_bits)
+    var word_cls = SIMD[DType.uint64, 4](0)
+    for ci in range(nclasses):
+        if _is_word_byte(Int(rep_lo[ci])):
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
 
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0
@@ -309,20 +427,92 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
         if len(sets_bits) > RDFA_STATE_CAP:
             return result^
         var cur_bits = sets_bits.unsafe_get(cur)
-        var pu = _StateBits(0)
+        var cur_right = Int(rightv[cur]) != 0
+        var cur_wb = has_wb and _bs_any(cur_bits & wb_bits)
+        # Predecessors of the members that may be stepped past: the
+        # pending anchors are excluded here and re-admitted per class
+        # below (BOL_MULTILINE on '\n', word anchors that hold).
+        var step_bits = cur_bits & ~bol_bits & ~wb_bits
+        var pu0 = _StateBits(0)
         for l in range(64):
-            var w = cur_bits[l]
+            var w = step_bits[l]
             while w != 0:
                 var t = 64 * l + Int(count_trailing_zeros(w))
                 w &= w - 1
-                pu = pu | pred_bits.unsafe_get(t)
+                pu0 = pu0 | pred_bits.unsafe_get(t)
+        var pu_nl = pu0
+        if has_bol_ml and _bs_any(cur_bits & bol_ml_bits):
+            var bm = cur_bits & bol_ml_bits
+            for l in range(64):
+                var w = bm[l]
+                while w != 0:
+                    var t = 64 * l + Int(count_trailing_zeros(w))
+                    w &= w - 1
+                    pu_nl = pu_nl | pred_bits.unsafe_get(t)
+        # Word anchors resolve against the class of the byte about to be
+        # consumed: one resolved predecessor set per class.
+        var pu_w = pu0
+        var pu_n = pu0
+        var pu_n_nl = pu_nl
+        if cur_wb:
+            for li in range(2):
+                var left = li == 0
+                var hit = False
+                var resolved = _StateBits(0)
+                var r = _rev_wb_resolve(
+                    kinds,
+                    anchors,
+                    pred_data,
+                    pred_off,
+                    pred_len,
+                    wb_bits,
+                    cur_bits,
+                    left,
+                    cur_right,
+                    st,
+                    hit,
+                    resolved,
+                )
+                # The closure's new plain members, plus the anchors that
+                # resolved (their predecessors are stepped past now).
+                var extra = ((r & ~cur_bits) & ~bol_bits & ~wb_bits) | resolved
+                var pe = _StateBits(0)
+                for l in range(64):
+                    var w = extra[l]
+                    while w != 0:
+                        var t = 64 * l + Int(count_trailing_zeros(w))
+                        w &= w - 1
+                        pe = pe | pred_bits.unsafe_get(t)
+                if left:
+                    pu_w = pu0 | pe
+                else:
+                    pu_n = pu0 | pe
+                    # A BOL_MULTILINE the continuation reached is walked
+                    # past on the '\n' transition like a pending one.
+                    var extra_ml = (r & ~cur_bits) & bol_ml_bits
+                    var pe_ml = _StateBits(0)
+                    for l in range(64):
+                        var w = extra_ml[l]
+                        while w != 0:
+                            var t = 64 * l + Int(count_trailing_zeros(w))
+                            w &= w - 1
+                            pe_ml = pe_ml | pred_bits.unsafe_get(t)
+                    pu_n_nl = pu_nl | pe | pe_ml
 
         var row = SIMD[DType.int32, 256](-1)
         for ci in range(nclasses):
+            var is_nl = ci == nl_class
+            var cw = (word_cls[ci >> 6] >> UInt64(ci & 63)) & 1 != 0
+            var pu: _StateBits
+            if is_nl:
+                pu = pu_n_nl
+            elif cw:
+                pu = pu_w
+            else:
+                pu = pu_n
             var raw = pu & acc.unsafe_get(ci)
             if not _bs_any(raw):
                 continue
-            var is_nl = ci == nl_class
             var closed = _StateBits(0)
             for l in range(64):
                 var w = raw[l]
@@ -362,10 +552,17 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
                         closed = closed | gval_n.unsafe_get(slot)
                     else:
                         closed = closed | gval_o.unsafe_get(slot)
+            var right = cw and has_wb and _bs_any(closed & wb_bits)
             var h = _bs_hash(closed)
+            if right:
+                h ^= _WB_PREV_SALT
             var tid = -1
             for k in range(len(sets_bits)):
-                if hashv[k] == h and _bs_eq(sets_bits.unsafe_get(k), closed):
+                if (
+                    hashv[k] == h
+                    and Int(rightv[k]) == Int(right)
+                    and _bs_eq(sets_bits.unsafe_get(k), closed)
+                ):
                     tid = k
                     break
             if tid < 0:
@@ -373,6 +570,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
                     return result^
                 tid = len(sets_bits)
                 hashv[tid] = h
+                rightv[tid] = Int8(1) if right else Int8(0)
                 sets_bits.append(closed)
             for b in range(Int(rep_lo[ci]), Int(rep_hi[ci]) + 1):
                 row[b] = Int32(tid)
@@ -384,35 +582,61 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     # Accept flags per state from the member lists.
     var n_sets = len(sets_bits)
     var flags = List[Int]()
-    var st = nfa.start
     var st_kind = nfa.states[st].kind
     var st_at = nfa.states[st].anchor_type
     var st_is_bol = st_kind == NFAStateKind.ANCHOR and (
         st_at == AnchorKind.BOL or st_at == AnchorKind.BOL_MULTILINE
     )
-    # BOL anchors are the only members the resolution walk starts from;
-    # a set without one (most, in most patterns) needs no walk at all.
-    var bol_bits = _StateBits(0)
-    for s in range(n):
-        if kinds.unsafe_get(s) != NFAStateKind.ANCHOR:
-            continue
-        var at = anchors.unsafe_get(s)
-        if at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE:
-            _bs_set(bol_bits, s)
+    var st_is_wb = st_kind == NFAStateKind.ANCHOR and (
+        st_at == AnchorKind.WORD_BOUNDARY
+        or st_at == AnchorKind.NOT_WORD_BOUNDARY
+    )
+    # Pending anchors are the only members a resolution walk starts
+    # from; a set without one (most, in most patterns) needs no walk.
     for si in range(n_sets):
         var bits = sets_bits.unsafe_get(si)
         var f = 0
+        # A pending word anchor makes the entry's liveness depend on the
+        # byte about to be consumed: resolve for both classes.
+        var r_w = bits
+        var r_n = bits
+        var hit_w = False
+        var hit_n = False
+        if has_wb and _bs_any(bits & wb_bits):
+            var unused_w = _StateBits(0)
+            var unused_n = _StateBits(0)
+            r_w = _rev_wb_resolve(
+                kinds, anchors, pred_data, pred_off, pred_len, wb_bits,
+                bits, True, Int(rightv[si]) != 0, st, hit_w, unused_w,
+            )
+            r_n = _rev_wb_resolve(
+                kinds, anchors, pred_data, pred_off, pred_len, wb_bits,
+                bits, False, Int(rightv[si]) != 0, st, hit_n, unused_n,
+            )
         # The entry is "entered" here only if it is not itself an
-        # unresolved BOL anchor (kept in the set, not walked past).
-        if not st_is_bol and (bits[st >> 6] >> UInt64(st & 63)) & 1 != 0:
+        # unresolved anchor (kept in the set, not walked past).
+        var st_plain = not st_is_bol and not st_is_wb
+        var live_w = hit_w or (
+            st_plain and (r_w[st >> 6] >> UInt64(st & 63)) & 1 != 0
+        )
+        var live_n = hit_n or (
+            st_plain and (r_n[st >> 6] >> UInt64(st & 63)) & 1 != 0
+        )
+        if live_w and live_n:
             f |= Int(RDFA_NORM)
-        if _bs_any(bits & bol_bits):
+        elif live_w:
+            f |= Int(RDFA_WB_LEFT_WORD)
+        elif live_n:
+            f |= Int(RDFA_WB_LEFT_NONWORD)
+        # BOL kinds hold only where the byte before is '\n' or absent —
+        # a non-word left side — so they resolve over `r_n`.
+        if _bs_any(r_n & bol_bits):
             if _rev_bol_reaches_start(
-                kinds, anchors, pred_data, pred_off, pred_len, st, bits, True
+                kinds, anchors, pred_data, pred_off, pred_len, st, r_n, True
             ):
                 f |= Int(RDFA_BOL0)
             if _rev_bol_reaches_start(
-                kinds, anchors, pred_data, pred_off, pred_len, st, bits, False
+                kinds, anchors, pred_data, pred_off, pred_len, st, r_n, False
             ):
                 f |= Int(RDFA_BOLNL)
         flags.append(f)
@@ -430,9 +654,23 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             result.any_bol0 = True
         if f & Int(RDFA_BOLNL) != 0:
             result.any_bolnl = True
+        if f & (Int(RDFA_WB_LEFT_WORD) | Int(RDFA_WB_LEFT_NONWORD)) != 0:
+            result.any_wb = True
     # Acceleration (see the module docstring; same rules as _edfa_finish).
+    # States whose acceptance depends on the byte about to be consumed
+    # (BOL flags, word-anchor flags) are excluded: a skip would pass
+    # their per-byte checks.
     for si in range(nfinal):
-        if flags[si] & (Int(RDFA_BOL0) | Int(RDFA_BOLNL)) != 0:
+        if (
+            flags[si]
+            & (
+                Int(RDFA_BOL0)
+                | Int(RDFA_BOLNL)
+                | Int(RDFA_WB_LEFT_WORD)
+                | Int(RDFA_WB_LEFT_NONWORD)
+            )
+            != 0
+        ):
             continue
         var row = rows.unsafe_get(si)
         var exit_count = 0
@@ -468,6 +706,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     result.seed_other = starts[0]
     result.seed_at_nl = starts[1]
     result.seed_at_end = starts[2]
+    result.seed_other_word = starts[3] if has_wb else starts[0]
     return result^
 
 
@@ -600,7 +839,12 @@ def rdfa_find_start[
     elif input.unsafe_get(end) == CHAR_NEWLINE:
         cur = d.seed_at_nl
     else:
-        cur = d.seed_other
+        comptime if d.seed_other_word != d.seed_other:
+            cur = d.seed_other_word if edfa_is_word(
+                input.unsafe_get(end)
+            ) else d.seed_other
+        else:
+            cur = d.seed_other
     var pos = end
     var best = -1
     while True:
@@ -613,15 +857,21 @@ def rdfa_find_start[
             comptime if d.any_bol0:
                 if (f & RDFA_BOL0) != 0:
                     best = 0
+            comptime if d.any_wb:
+                if (f & RDFA_WB_LEFT_NONWORD) != 0:
+                    best = 0  # out of input is non-word
             return best
+        var b = input.unsafe_get(pos - 1)
         comptime if d.any_bolnl:
-            if (f & RDFA_BOLNL) != 0 and input.unsafe_get(
-                pos - 1
-            ) == CHAR_NEWLINE:
+            if (f & RDFA_BOLNL) != 0 and b == CHAR_NEWLINE:
                 best = pos
+        comptime if d.any_wb:
+            if (f & (RDFA_WB_LEFT_WORD | RDFA_WB_LEFT_NONWORD)) != 0:
+                if ((f & RDFA_WB_LEFT_WORD) != 0) == edfa_is_word(b):
+                    best = pos
         if pos <= floor:
             return best
-        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(input.unsafe_get(pos - 1))))
+        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(b)))
         if nxt < 0:
             return best
         cur = nxt

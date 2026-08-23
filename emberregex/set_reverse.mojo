@@ -63,6 +63,7 @@ from .static_dfa import (
     _bs_set,
     _byte_classes,
     _flatten_nfa,
+    _wb_holds,
 )
 
 # Mirrors MDFA_STATE_CAP: the reverse table is the same shape and the same
@@ -315,6 +316,9 @@ def _rev_flat_closure(
     seeds: List[Int],
     at_end: Bool,
     on_newline: Bool,
+    resolve_wb: Bool = False,
+    left_word: Bool = False,
+    right_word: Bool = False,
 ) -> _StateBits:
     """`_rev_closure` over flat views, as a bitset.
 
@@ -323,6 +327,11 @@ def _rev_flat_closure(
     and anchors whose kind holds in this context (EOL at end, EOL_ML at
     end or on a newline, BOL kinds always pushed so the slices can find
     them).
+
+    Word anchors (single-pattern reverse DFA only — sets keep them off
+    the lane) are likewise kept but not walked past, unless `resolve_wb`:
+    then one that holds between `left_word` / `right_word` is walked
+    past and one that does not is dropped.
     """
     var n = len(kinds)
     var bits = _StateBits(0)
@@ -341,6 +350,16 @@ def _rev_flat_closure(
             var sat = anchors.unsafe_get(s)
             if sat == AnchorKind.BOL or sat == AnchorKind.BOL_MULTILINE:
                 continue  # kept, not walked past
+            if (
+                sat == AnchorKind.WORD_BOUNDARY
+                or sat == AnchorKind.NOT_WORD_BOUNDARY
+            ):
+                if not resolve_wb:
+                    continue  # kept, not walked past
+                if not _wb_holds(sat, left_word, right_word):
+                    # Dropped: clear the membership set above.
+                    bits[s >> 6] = bits[s >> 6] & ~(UInt64(1) << UInt64(s & 63))
+                    continue
         var off = pred_off.unsafe_get(s)
         for k in range(pred_len.unsafe_get(s)):
             var p = pred_data.unsafe_get(off + k)

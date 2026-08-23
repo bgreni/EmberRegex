@@ -67,6 +67,7 @@ from .static_dfa import (
     EagerDFA,
     _eol_continuation_crosses_anchor,
     _eol_ml_continuation_consumes,
+    _wb_cont_reaches_bol,
     _pivot_prefilter,
     build_eager_dfa,
     edfa_table_arr,
@@ -507,12 +508,24 @@ def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
     classic tables would walk to the longest end and re-run the
     backtracker — the trap that motivated the old exclusion).
 
+    Word boundaries ride the DFA lanes too (the tables carry the
+    look-behind byte class per state — static_dfa.mojo). They do not
+    change the shape heuristic below: `\\bfoo\\b` stays a SIMD literal
+    scan plus two byte compares on the backtracker, which measured
+    several times faster than a forward + reverse table walk. The one
+    shape kept off outright is a word anchor whose continuation reaches
+    a BOL kind (`\\b^`), which the lanes cannot expand in context; and
+    since the LazyDFA (dfa.mojo) does not model word anchors,
+    `_compute_strategy` requires the eager table to have built.
+
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
     `_use_dfa_candidate` and threads the result — each evaluation walks
     the NFA several times.
     """
     if not nfa.can_use_dfa or group_count != 0:
+        return False
+    if nfa.has_word_boundary and _wb_cont_reaches_bol(nfa):
         return False
     var cyclic = split_cycle_flags(nfa)
     if not (
@@ -601,8 +614,12 @@ def _compute_strategy(
     # LazyDFA, whose longest-end walk is the wrong engine for `.*?`.
     # `lazy_lf_valid` is only meaningful (and only evaluated by the
     # caller) when `nfa.has_lazy`.
-    var use_dfa = dfa_candidate and (
-        not nfa.has_lazy or (eager_dfa_valid and lazy_lf_valid)
+    # A word-anchor pattern rides the DFA lanes only when the eager
+    # table built: the runtime LazyDFA does not model word anchors.
+    var use_dfa = (
+        dfa_candidate
+        and (not nfa.has_lazy or (eager_dfa_valid and lazy_lf_valid))
+        and (not nfa.has_word_boundary or eager_dfa_valid)
     )
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
