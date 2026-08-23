@@ -11,7 +11,7 @@ detected at compile time and fall back to the runtime LazyDFA (dfa.mojo),
 which keeps its own 4096-state cap and Pike VM fallback.
 """
 
-from std.bit import count_trailing_zeros
+from std.bit import count_trailing_zeros, pop_count
 from std.collections import InlineArray
 from std.sys import simd_width_of
 
@@ -503,7 +503,356 @@ def _flatten_nfa(
         cls_mask.append(cm)
 
 
-def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
+# --- Hopcroft minimization -------------------------------------------------
+#
+# Determinization merges NFA state SETS, not languages: two subsets that
+# accept the same continuations stay separate DFA states (the three tails
+# of `foo|foobar|fob` are one language behind three subsets). Merging them
+# pays three ways downstream — a smaller table, a narrower Sheng tier (or
+# Sheng viability at all), and self-loops the acceleration scan can only
+# see once the duplicates splitting them are gone.
+#
+# Shaped for the comptime interpreter like the determinizer above: the
+# partition lives entirely in SIMD lanes (two 64-bit words per block, one
+# lane per state), and the only List the refinement loop touches is the
+# transition column it is currently splitting by — of which there are as
+# many as the DFA has DISTINCT columns, not as many as it has byte
+# classes (see the dedupe in the transpose below).
+
+# States a two-word block bitset holds. A DFA with more states than this
+# is returned unminimized rather than overrunning the lanes.
+comptime _MIN_CAP = 128
+
+# Byte classes transposed per pass over the transition rows. Trades lane
+# writes (cheap) against row reads (a 1 KB copy each) — see _minimize.
+comptime _COL_CHUNK = 8
+
+
+def _mk_bit64() -> SIMD[DType.uint64, 64]:
+    var v = SIMD[DType.uint64, 64](0)
+    for i in range(64):
+        v[i] = UInt64(1) << UInt64(i)
+    return v
+
+
+comptime _BIT64 = _mk_bit64()
+
+
+def _mk_iota256() -> SIMD[DType.int32, 256]:
+    var v = SIMD[DType.int32, 256](0)
+    for i in range(256):
+        v[i] = Int32(i)
+    return v
+
+
+comptime _IOTA256 = _mk_iota256()
+
+
+def _mk_col_salt() -> SIMD[DType.uint64, _MIN_CAP]:
+    """Distinct odd multiplier per state lane, as in _mk_bs_salt."""
+    var v = SIMD[DType.uint64, _MIN_CAP](0)
+    for i in range(_MIN_CAP):
+        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
+    return v
+
+
+comptime _COL_SALT = _mk_col_salt()
+
+
+@always_inline
+def _col_hash(column: SIMD[DType.int32, _MIN_CAP]) -> UInt64:
+    return (column.cast[DType.uint64]() * _COL_SALT).reduce_add()
+
+
+@always_inline
+def _lane_word(m: SIMD[DType.bool, 64]) -> UInt64:
+    """Comptime: 64 boolean lanes packed into a word, lane i in bit i."""
+    return m.select(_BIT64, SIMD[DType.uint64, 64](0)).reduce_or()
+
+
+def _minimize(
+    mut rows: List[SIMD[DType.int32, 256]],
+    mut flags: List[Int],
+    mut starts: List[Int],
+    rep_lo: SIMD[DType.int32, 256],
+    rep_hi: SIMD[DType.int32, 256],
+    nclasses: Int,
+):
+    """Hopcroft partition refinement over the byte classes, in place.
+
+    Must run BEFORE the match-state permutation and the acceleration
+    scan, both of which key off final state ids.
+
+    Takes the DFA's whole observable surface and nothing else — the
+    transition rows, the per-state flag bytes, the three start ids and
+    the byte-class descriptors — so any determinizer producing that shape
+    can reuse it. Preconditions: `len(flags) >= len(rows)`, every entry
+    of `starts` is a valid state id, and each row gives every byte of a
+    class the same target. A row count above `_MIN_CAP` is NOT a
+    precondition — that returns the DFA untouched.
+
+    Rows stay in the caller's byte-indexed SIMD form rather than
+    EagerDFA's flat `List[Int]` table on purpose: at 35-70us per List
+    element access, one round trip through that table would cost more
+    than the whole refinement.
+
+    Soundness. The initial partition separates states by their FULL flag
+    byte, so merged states agree on EDFA_MATCH and on both EOL flags.
+    Refinement then splits any block whose members disagree, on some byte
+    class, about which block they step into; the dead target (-1) is
+    nobody's predecessor, so a state stepping to -1 on a class splits
+    away from one stepping into a live block on it. What survives is a
+    block whose members agree on the flag byte and, class-wise, on the
+    successor block, so by induction the walkers observe the identical
+    (match, EOL-flag) sequence from either member for any input in any
+    start context. Byte classes are a sound refinement alphabet because
+    the determinizer gives every byte of a class the same target.
+    """
+    comptime assert EDFA_STATE_CAP <= _MIN_CAP
+    var n = len(rows)
+    if n <= 1 or n > _MIN_CAP:
+        # Nothing to merge, or more states than the two-word block
+        # bitsets and 128-lane partition arrays hold. `build_eager_dfa`
+        # caps well under _MIN_CAP, but a different producer must get an
+        # unminimized DFA back rather than lanes written out of range.
+        return
+
+    # Class-major transition columns (lane s = where s steps on class c)
+    # plus each class's image, which lets the refinement reject a
+    # (splitter, class) pair without reading the column at all.
+    #
+    # The transpose runs in chunks of _COL_CHUNK classes, so each row is
+    # read once per CHUNK rather than once per class: a `List[SIMD]`
+    # element read copies the whole 1 KB row (~150 us measured in the
+    # comptime interpreter) where a SIMD lane op is ~1.5 us, so the
+    # transpose belongs in lanes. On a 121-state x 130-class DFA that is
+    # 2057 row reads instead of 15730. The width is a measured optimum:
+    # a wider chunk saves reads but every lane write then copies a bigger
+    # buffer, and 32 lost half the win back (task B1 fix report).
+    var col = List[SIMD[DType.int32, _MIN_CAP]]()
+    var colhash = SIMD[DType.uint64, 256](0)
+    var img0 = SIMD[DType.uint64, 256](0)
+    var img1 = SIMD[DType.uint64, 256](0)
+    var c0 = 0
+    while c0 < nclasses:
+        var c1 = c0 + _COL_CHUNK
+        if c1 > nclasses:
+            c1 = nclasses
+        var buf = SIMD[DType.int32, _COL_CHUNK * _MIN_CAP](-1)
+        for s in range(n):
+            ref row = rows[s]
+            for c in range(c0, c1):
+                buf[(c - c0) * _MIN_CAP + s] = row[Int(rep_lo[c])]
+        for c in range(c0, c1):
+            var column = SIMD[DType.int32, _MIN_CAP](-1)
+            var base = (c - c0) * _MIN_CAP
+            var iw0 = UInt64(0)
+            var iw1 = UInt64(0)
+            for s in range(n):
+                var t = Int(buf[base + s])
+                column[s] = Int32(t)
+                if t >= 0:
+                    if t < 64:
+                        iw0 |= UInt64(1) << UInt64(t)
+                    else:
+                        iw1 |= UInt64(1) << UInt64(t - 64)
+            # Keep only DISTINCT columns. `_byte_classes` is deliberately
+            # a refinement of the exact partition (non-adjacent intervals
+            # with identical behaviour stay separate classes), and equal
+            # columns are interchangeable as splitters — refining by one
+            # is refining by the other — so the refinement below should
+            # walk distinct columns, not classes. On the class-heavy
+            # shapes this is the whole cost: a 121-state x 130-class DFA
+            # has 3 distinct columns, i.e. 3 splitter passes per popped
+            # block instead of 130. Hash first (a lane read), confirm
+            # with an exact SIMD compare (the only List read).
+            var h = _col_hash(column)
+            var dup = False
+            for d in range(len(col)):
+                if colhash[d] != h:
+                    continue
+                if (col.unsafe_get(d) ^ column).reduce_or() == 0:
+                    dup = True
+                    break
+            if not dup:
+                var dc = len(col)
+                colhash[dc] = h
+                img0[dc] = iw0
+                img1[dc] = iw1
+                col.append(column)
+        c0 = c1
+
+    # Initial partition: one block per distinct flag byte.
+    var blk0 = SIMD[DType.uint64, _MIN_CAP](0)
+    var blk1 = SIMD[DType.uint64, _MIN_CAP](0)
+    var block_of = SIMD[DType.int32, _MIN_CAP](0)
+    # Only the initial blocks need a flag: refinement splits blocks whose
+    # members already share one, so blk_flag is never read again after
+    # this loop and split-created blocks deliberately leave it stale.
+    var blk_flag = SIMD[DType.int32, _MIN_CAP](-1)
+    var nblocks = 0
+    for s in range(n):
+        var f = flags.unsafe_get(s)
+        var bi = -1
+        for j in range(nblocks):
+            if Int(blk_flag[j]) == f:
+                bi = j
+                break
+        if bi < 0:
+            bi = nblocks
+            blk_flag[bi] = Int32(f)
+            nblocks += 1
+        block_of[s] = Int32(bi)
+        if s < 64:
+            blk0[bi] = blk0[bi] | (UInt64(1) << UInt64(s))
+        else:
+            blk1[bi] = blk1[bi] | (UInt64(1) << UInt64(s - 64))
+    if nblocks == n:
+        return  # already minimal: the flags alone separate every state
+
+    # Worklist of splitter blocks. EVERY initial block goes in: the usual
+    # "all but the largest" shortcut assumes a total transition function,
+    # and this table has dead cells.
+    #
+    # A push only ever targets a block that is NOT already queued (a
+    # brand-new Z, or a Y the `queued` test just cleared), so the
+    # worklist holds no duplicates and its length stays <= nblocks <=
+    # _MIN_CAP. Total pushes over the run can exceed that — a block can
+    # be popped and re-queued by a later split — but the length cannot.
+    var wl = SIMD[DType.int32, 256](0)
+    var wl_n = 0
+    var inwl0 = UInt64(0)
+    var inwl1 = UInt64(0)
+    for b0 in range(nblocks):
+        wl[wl_n] = Int32(b0)
+        wl_n += 1
+        if b0 < 64:
+            inwl0 |= UInt64(1) << UInt64(b0)
+        else:
+            inwl1 |= UInt64(1) << UInt64(b0 - 64)
+
+    var touched = SIMD[DType.int32, _MIN_CAP](0)
+    while wl_n > 0:
+        wl_n -= 1
+        var a = Int(wl[wl_n])
+        if a < 64:
+            inwl0 &= ~(UInt64(1) << UInt64(a))
+        else:
+            inwl1 &= ~(UInt64(1) << UInt64(a - 64))
+        var a0 = blk0[a]
+        var a1 = blk1[a]
+        for c in range(len(col)):
+            if (img0[c] & a0) == 0 and (img1[c] & a1) == 0:
+                continue  # nothing steps into A on this class
+            # X = the states stepping into A on class c, one lane each.
+            var t = col.unsafe_get(c)
+            var live = t.ge(0)
+            var sh = t.cast[DType.uint64]() & 63
+            var m0 = ((SIMD[DType.uint64, _MIN_CAP](a0) >> sh) & 1).ne(0)
+            var m1 = ((SIMD[DType.uint64, _MIN_CAP](a1) >> sh) & 1).ne(0)
+            var inx = live & t.lt(64).select(m0, m1)
+            var x0 = _lane_word(inx.slice[64, offset=0]())
+            var x1 = _lane_word(inx.slice[64, offset=64]())
+            if x0 == 0 and x1 == 0:
+                continue
+
+            # Blocks holding at least one X member.
+            var nt = 0
+            var seen0 = UInt64(0)
+            var seen1 = UInt64(0)
+            for w in range(2):
+                var word = x0 if w == 0 else x1
+                while word != 0:
+                    var s = 64 * w + Int(count_trailing_zeros(word))
+                    word &= word - 1
+                    var yb = Int(block_of[s])
+                    var bit = UInt64(1) << UInt64(yb & 63)
+                    if yb < 64:
+                        if seen0 & bit != 0:
+                            continue
+                        seen0 |= bit
+                    else:
+                        if seen1 & bit != 0:
+                            continue
+                        seen1 |= bit
+                    touched[nt] = Int32(yb)
+                    nt += 1
+
+            for ti in range(nt):
+                var y = Int(touched[ti])
+                var i0 = blk0[y] & x0
+                var i1 = blk1[y] & x1
+                var d0 = blk0[y] & ~x0
+                var d1 = blk1[y] & ~x1
+                if d0 == 0 and d1 == 0:
+                    continue  # Y lies wholly inside X: nothing to split
+                var z = nblocks
+                nblocks += 1
+                blk0[y] = d0
+                blk1[y] = d1
+                blk0[z] = i0
+                blk1[z] = i1
+                for w2 in range(2):
+                    var word2 = i0 if w2 == 0 else i1
+                    while word2 != 0:
+                        var s2 = 64 * w2 + Int(count_trailing_zeros(word2))
+                        word2 &= word2 - 1
+                        block_of[s2] = Int32(z)
+                # Y already queued -> queue Z as well; otherwise queue
+                # the smaller half (Hopcroft's n log n argument).
+                var queued = ((inwl0 >> UInt64(y)) & 1) != 0 if y < 64 else (
+                    ((inwl1 >> UInt64(y - 64)) & 1) != 0
+                )
+                var push = z
+                var d_size = pop_count(d0) + pop_count(d1)
+                var i_size = pop_count(i0) + pop_count(i1)
+                if not queued and d_size < i_size:
+                    push = y
+                wl[wl_n] = Int32(push)
+                wl_n += 1
+                if push < 64:
+                    inwl0 |= UInt64(1) << UInt64(push)
+                else:
+                    inwl1 |= UInt64(1) << UInt64(push - 64)
+
+    # Rebuild. New ids follow first encounter walking the old ids, so the
+    # result does not depend on the order blocks happened to split in.
+    var newid = SIMD[DType.int32, _MIN_CAP](-1)
+    var repof = SIMD[DType.int32, _MIN_CAP](-1)
+    var nnew = 0
+    for s in range(n):
+        var ob = Int(block_of[s])
+        if Int(newid[ob]) < 0:
+            newid[ob] = Int32(nnew)
+            repof[nnew] = Int32(s)
+            nnew += 1
+    var remap = SIMD[DType.int32, _MIN_CAP](-1)
+    for s in range(n):
+        remap[s] = newid[Int(block_of[s])]
+
+    var new_rows = List[SIMD[DType.int32, 256]]()
+    var new_flags = List[Int]()
+    for nb in range(nnew):
+        var r = Int(repof[nb])
+        var row = rows.unsafe_get(r)
+        var row2 = SIMD[DType.int32, 256](-1)
+        for c in range(nclasses):
+            var t = Int(row[Int(rep_lo[c])])
+            if t < 0:
+                continue  # dead: this class's lanes stay -1
+            var span = _IOTA256.ge(rep_lo[c]) & _IOTA256.le(rep_hi[c])
+            row2 = span.select(SIMD[DType.int32, 256](remap[t]), row2)
+        new_rows.append(row2)
+        new_flags.append(flags.unsafe_get(r))
+    for i in range(len(starts)):
+        starts[i] = Int(remap[starts[i]])
+    rows = new_rows^
+    flags = new_flags^
+
+
+def build_eager_dfa(
+    nfa: NFA, enabled: Bool, minimize: Bool = True
+) -> EagerDFA:
     """Full subset construction — runs at compile time.
 
     Returns an invalid placeholder when `enabled` is False (pattern doesn't
@@ -516,6 +865,9 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
     loops touch only bitsets, SIMD lanes, and flat Lists. The naive form
     (per-(state, byte) `_accepts` calls, List[Int] state sets) cost tens of
     seconds to minutes per big Unicode class pattern.
+
+    `minimize` is a test hook: it defaults on, and turning it off yields
+    the raw subset construction so a test can pin what the merge saved.
     """
     var result = EagerDFA()
     if not enabled:
@@ -699,9 +1051,16 @@ def build_eager_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
         if len(sets_bits) > EDFA_STATE_CAP:
             return result^  # state blowup: stay invalid, use LazyDFA
 
+    # Merge states no input can tell apart. Before the permutation and
+    # the acceleration scan on purpose: both key off final state ids, and
+    # acceleration can only see a self-loop once the duplicate states
+    # splitting it are gone.
+    if minimize:
+        _minimize(rows, flags, starts, rep_lo, rep_hi, nclasses)
+
     # Permute states so match states occupy ids [0, num_match): the hot
     # per-byte match test becomes `cur < num_match` (no flags load).
-    var nsets = len(sets_bits)
+    var nsets = len(rows)
     var perm = SIMD[DType.int32, 256](-1)
     var next_id = 0
     for s in range(nsets):

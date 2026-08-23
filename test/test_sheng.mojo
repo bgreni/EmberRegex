@@ -16,7 +16,8 @@ from emberregex.simd_kernels import (
     HAS_WIDE_BYTE_SHUFFLE,
     NIBBLE_TABLE_SIZE,
 )
-from emberregex.sheng import SHENG_STATE_CAP
+from emberregex.sheng import SHENG_STATE_CAP, sheng_viable
+from emberregex.static_dfa import build_eager_dfa
 from std.sys import simd_width_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -292,6 +293,77 @@ def test_sheng_differential_anchored_lcg() raises:
             _assert_pike_agreement[ALT32_EOL](
                 data, String("anchored seed=", seed, " n=", n)
             )
+
+
+# --- What minimization buys the shuffle engine -----------------------------
+#
+# Sheng's tiers are state-count cliffs, so merging equivalent states is
+# not just a smaller table: it decides which tbl a pattern gets, and
+# whether it gets one at all.
+
+
+# 25 four-letter arms plus a digit run. Subset construction leaves 65
+# states — one past the widest tbl tier — so the raw DFA cannot ride the
+# shuffle engine at all; merging the shared tails leaves 53 and it can.
+comptime ALT25 = (
+    "crab|crow|deer|dove|fawn|frog|goat|gull|hare|hawk|ibis|jays|kite"
+    "|lamb|lark|lion|lynx|mole|moth|mule|newt|owls|puma|rook|seal|[0-9]{3}"
+)
+
+# 24 three-letter arms plus a digit run: 34 raw states need the 64-lane
+# tbl4, the 29 that survive minimization fit the 32-lane tbl2.
+comptime ALT24 = (
+    "cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+    "|lap|lab|mop|mob|net|nap|owl|oak|[0-9]{3}"
+)
+
+
+def test_minimization_brings_pattern_onto_sheng() raises:
+    comptime S = Regex[ALT25]
+    comptime raw = build_eager_dfa(S.nfa, True, minimize=False)
+    comptime raw_viable = sheng_viable(raw)
+    assert_true(raw.valid)
+    assert_true(raw.num_states > 64)
+    assert_true(S._edfa.num_states < 64)
+    assert_true(S._edfa.num_states < raw.num_states)
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        # SHENG_STATE_CAP is 64 here, so the raw DFA misses the engine by
+        # a state and the minimized one clears it.
+        assert_false(raw_viable)
+        assert_true(S._strategy.use_sheng)
+        assert_equal(S._SHENG_CAP, 64)
+    else:
+        assert_false(S._strategy.use_sheng)
+    var re = S()
+    assert_true(re.match("puma").matched)
+    assert_true(re.match("lynx").matched)
+    assert_true(re.match("407").matched)
+    assert_false(re.match("zebu").matched)
+    var r = re.search("a wild newt appears")
+    assert_true(r.matched)
+    assert_equal(r.start, 7)
+    assert_equal(r.end, 11)
+
+
+def test_minimization_narrows_sheng_tier() raises:
+    comptime S = Regex[ALT24]
+    comptime raw = build_eager_dfa(S.nfa, True, minimize=False)
+    assert_true(raw.num_states > 32)
+    assert_true(S._edfa.num_states < 32)
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        # The raw count would have forced the 64-lane tbl4.
+        assert_equal(S._SHENG_CAP, 32)
+        assert_true(S._strategy.use_sheng)
+    var re = S()
+    assert_true(re.match("hex").matched)
+    assert_true(re.match("oak").matched)
+    assert_true(re.match("512").matched)
+    assert_false(re.match("elk").matched)
+    var all = re.findall("a cow, a fig, 731")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "cow")
+    assert_equal(all[1], "fig")
+    assert_equal(all[2], "731")
 
 
 def main() raises:

@@ -112,11 +112,16 @@ Selected fastest-first at compile time:
 comptime interpreter over the comptime NFA; byte equivalence classes bound
 the per-state work; the transition table and per-state flag bytes
 materialize as constant data. The runtime engine is a pure table walk with
-no lazy construction and no fallible path. Two structural optimizations:
-match states are permuted to ids `[0, num_match_states)` so the per-byte
-match test is an integer compare, and states that self-loop on all but a
-few bytes are **accelerated** — the walker SIMD-scans to the next exit byte
-instead of stepping the table.
+no lazy construction and no fallible path. Three structural passes run over
+the result, in this order: **Hopcroft minimization** merges states no input
+can tell apart (subset construction separates state *sets*, not languages,
+so `cat|cot|cut|cit` keeps four tails where one suffices); match states are
+then permuted to ids `[0, num_match_states)` so the per-byte match test is
+an integer compare; and states that self-loop on all but a few bytes are
+**accelerated** — the walker SIMD-scans to the next exit byte instead of
+stepping the table. Minimization comes first because the other two key off
+final state ids, and because a self-loop is often only visible once the
+duplicate states splitting it are merged.
 
 The **specialized backtracker** is comptime-specialized per NFA state: each
 `_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind
