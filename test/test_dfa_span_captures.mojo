@@ -262,6 +262,39 @@ def test_pike_on_span_fallback() raises:
     assert_equal(all[1].slots[0], 4002 + 3999)
 
 
+def test_confirm_giveup_latches_per_walk() raises:
+    # `(a*)*b`: the backtracker exhausts SBT_BUDGET on every span confirm
+    # (the empty outer iteration). After the first give-up in a walk the
+    # lane must send the remaining spans straight to a Pike VM built once
+    # for the walk — paying the budget per span measured 64x the
+    # whole-input Pike on this input; with the latch the lane is within a
+    # small factor of it (measured ~1.3x).
+    var re = Regex["(a*)*b"]()
+    assert_true(Regex["(a*)*b"]._use_dfa_span)
+    var input = String("xaab ab aaab x ") * 60
+    var got = re.findall(input)
+    var exp = re._pike_findall(input)
+    assert_equal(len(got), len(exp))
+    assert_equal(len(got), 180)
+    for i in range(len(got)):
+        assert_equal(got[i], exp[i])
+    var t_lane = 1 << 62
+    var t_pike = 1 << 62
+    for _ in range(5):
+        var t0 = perf_counter_ns()
+        var a = re.finditer(input)
+        var t1 = perf_counter_ns()
+        var b = re._pike_finditer(input)
+        var t2 = perf_counter_ns()
+        assert_equal(len(a), len(b))
+        t_lane = min(t_lane, t1 - t0)
+        t_pike = min(t_pike, t2 - t1)
+    assert_true(
+        t_lane <= 8 * t_pike,
+        String("lane ", t_lane, " ns vs whole-input Pike ", t_pike, " ns"),
+    )
+
+
 def test_miss_is_dfa_fast() raises:
     # 100 KB with `@` in every token but no `.com`: the backtracker lane
     # re-runs `(\w+)@(\w+)\.com` from every word byte, the span lane is
