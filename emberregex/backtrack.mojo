@@ -831,7 +831,11 @@ def _sbt_try_match[
                         # Explored before, to completion, and failed.
                         # Without backrefs nothing feeding this subtree has
                         # changed, and a cache hit is not work — hand the
-                        # budget unit back.
+                        # budget unit back. That does mean SBT_BUDGET stops
+                        # being a hard bound on the number of CALLS: hits
+                        # are free. It still bounds the work, because every
+                        # hit is reached from a frame that did pay, and a
+                        # frame makes at most two calls.
                         budget += 1
                         return -1
                     var memo_r = _sbt_try_match[

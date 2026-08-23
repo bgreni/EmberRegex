@@ -204,6 +204,14 @@ def _sbt_run_memo[
     Restarting is safe: the walkers only ever WRITE capture slots, and
     every SAVE restores its slot when its subtree fails, so the -1 this is
     called on leaves `slots` as the first attempt found them.
+
+    Invariant the whole scheme rests on: **bits are only ever consulted
+    after an attempt that returned normally.** A bit means "this subtree
+    was explored to completion and failed", but an attempt that runs out
+    of budget or depth marks every general SPLIT it unwinds through, and
+    those subtrees were cut off rather than refuted. `_sbt_run_memoized`
+    therefore throws the buffer away before raising, so no later attempt —
+    in this walk or a future one — can read an aborted attempt's bits.
     """
     comptime memo_rows = sbt_memo_rows(nfa)
     if memo_rows * (len(input) + 1) > SBT_MEMO_BITS:
@@ -257,6 +265,13 @@ def _sbt_run_memoized[
         end_at=end_at,
     )
     if budget < 0:
+        # An aborted attempt leaves POISONED bits: every general SPLIT on
+        # the unwind marks itself, but those subtrees were cut off, not
+        # refuted. Drop the whole buffer rather than let a later attempt
+        # read them as failures — the caller is going to the Pike VM
+        # anyway, and a future caller that retried in-place would silently
+        # miss matches.
+        memo.clear()
         raise Error("SBT_BUDGET_EXHAUSTED")
     return result
 
@@ -794,8 +809,6 @@ struct Regex[pattern: String](Copyable, Movable):
         and usually fails within a few bytes, so an O(n) scan of the whole
         input for a required byte only adds work.
         """
-        # One (state, pos) memo for this whole walk — see _sbt_run.
-        var sbt_memo = List[UInt64]()
         # Suffix fast-fail: match() must consume the entire input, so when
         # the pattern has a guaranteed literal suffix the input must end
         # with it — an O(suffix) check that short-circuits misses that
@@ -865,6 +878,10 @@ struct Regex[pattern: String](Copyable, Movable):
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_match(input)
         try:
+            # Declared here, not at the top of the method: the sandwich,
+            # SIMD-literal and DFA lanes above all return without ever
+            # reaching the backtracker.
+            var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             # anchored_end: MATCH only accepts at end of input, so
             # alternatives that prefer a shorter match (e.g. `(a|ab)` on
@@ -1003,13 +1020,14 @@ struct Regex[pattern: String](Copyable, Movable):
     def _search_impl(
         mut self, input: String
     ) raises -> MatchResult[Self._num_slots]:
-        # One (state, pos) memo for this whole walk — see _sbt_run.
-        var sbt_memo = List[UInt64]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
 
         # BOL anchor: only try position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            # One attempt, so the buffer lives in this branch alone; the
+            # other two branches own theirs.
+            var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
@@ -2233,12 +2251,14 @@ struct Regex[pattern: String](Copyable, Movable):
         _dfa_end_is_leftmost_first), the re-run is skipped at compile time
         and the DFA's end is returned directly.
         """
-        # One (state, pos) memo for this whole walk — see _sbt_run.
-        var sbt_memo = List[UInt64]()
         comptime if Self._lf_end_is_dfa_end:
             return dfa_end
         else:
             try:
+                # Below the early return: this runs per reported match on
+                # the DFA lanes, and an empty List still costs a few stores
+                # and a destructor edge on a path that never uses it.
+                var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                 var end = _sbt_run[
                     nfa=Self.nfa,

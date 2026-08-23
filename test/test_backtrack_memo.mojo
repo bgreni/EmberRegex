@@ -34,6 +34,9 @@ def test_ambiguous_alternation_plus_stays_in_backtracker() raises:
     # no `b` to find, an unmemoized walk explores all of them and burns
     # SBT_BUDGET. Before the memo this call raised — that raise IS the
     # Pike fallback, so a plain -1 is the thing being asserted.
+    # 2000 sits just under SBT_MAX_DEPTH for this shape (~3 frames per
+    # byte); past ~2100 the walk trips the depth cap instead and goes to
+    # the Pike VM either way, so this size is deliberate.
     comptime P = "(?:a|aa)+b"
     var text = String("a") * 2000 + "c"
     assert_equal(_sbt_end[P](text), -1)
@@ -185,6 +188,44 @@ def test_replace_and_split_carry_the_memo() raises:
     assert_equal(len(parts), 2)
     assert_equal(parts[0], String("a") * 300 + "c")
     assert_equal(parts[1], String("a") * 300 + "c")
+
+
+def test_aborted_attempt_leaves_no_poisoned_bits() raises:
+    # A memoized attempt that runs out of budget or depth marks every
+    # general SPLIT it unwinds through, and those subtrees were cut off,
+    # not refuted. The buffer has to be discarded rather than handed to the
+    # next attempt, which would read them as refutations. Both inputs are
+    # the same length on purpose, so the stale-size check in `_sbt_run`
+    # cannot be what saves the second one — without the discard this
+    # returns -1 on an input that plainly matches.
+    comptime P = "(a|aa)+b"
+    comptime R = Regex[P]
+    var memo = List[UInt64]()
+    var aborts = String("a") * 2200 + "c"
+    var matches = String("aab") + String("a") * 2198
+    assert_equal(aborts.byte_length(), matches.byte_length())
+    var slots = InlineArray[Int, R._num_slots](fill=-1)
+    var raised = False
+    try:
+        _ = _sbt_run[nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots](
+            aborts.as_bytes(), 0, slots, memo
+        )
+    except:
+        raised = True
+    assert_true(raised, "2200 a's must exhaust the backtracker")
+    assert_equal(len(memo), 0, "an aborted attempt's bits are discarded")
+    var slots2 = InlineArray[Int, R._num_slots](fill=-1)
+    var end = _sbt_run[nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots](
+        matches.as_bytes(), 0, slots2, memo
+    )
+    assert_equal(end, 3)
+    # And through the public verb, which is what would silently miss.
+    var re = Regex[P]()
+    var got = re.search(matches)
+    var want = re._pike_search(matches)
+    assert_true(got.matched)
+    assert_equal(got.start, want.start)
+    assert_equal(got.end, want.end)
 
 
 def main() raises:
