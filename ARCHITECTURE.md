@@ -169,6 +169,25 @@ SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
 drops depth tracking for patterns where every cyclic split is simple —
 measured 1.25-1.6x on recursion-heavy patterns.
 
+A **counted repetition** over a single byte class gets the same treatment,
+one level up. `nfa.mojo` expands `x{n,m}` into `n` required copies plus
+either a star loop or `m-n` optional copies wrapped in `?` SPLITs — right
+for the DFA lanes (one byte class determinizes to `m+1` states, linear),
+ruinous for the backtracker, which pays a function instantiation and a
+stack frame per copy: `a{1,2000}` took ~12 minutes to compile.
+`_sbt_counted_shape` reads that chain back at compile time and the walker
+runs it as one bounded loop — consume up to `hi`, hand back down to `lo`
+with the same auto-possessification the simple loop uses, or extend up
+from `lo` when lazy. It is exact rather than merely equivalent because a
+single-class body with no capture inside makes every k-byte path through
+the chain the same path, which collapses the recursion's binary-order
+enumeration of the optional copies into a plain count order. Two whole
+populations are excluded: chains with `hi == lo` (already a run of tail
+calls, so there is no frame to save) and any NFA with a general cyclic
+SPLIT (its exit call is not in tail position, so collapsing free frames
+into real ones there deepens a walk that already recurses per byte —
+`(?:a|a{2,3})+b` on 2000 `a`s went from completing to overflowing).
+
 Search gets its own prefilters: literal prefixes drive `simd_find_prefix`,
 required-byte and first-byte bitmaps drive shufti/truffle skips, and the
 `[class]+ P …` shape gets a pivot-anchored search that hops between

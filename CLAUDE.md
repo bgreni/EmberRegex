@@ -68,6 +68,8 @@ The classic table is leftmost-LONGEST (its states are sets), which is exactly wh
 
 It is **not** flattened into a single function, and `_sbt_try_match` itself is deliberately not `@always_inline`. A cyclic SPLIT can reach its own instantiation, so the general-SPLIT branch is real recursion: that is why `SBT_MAX_DEPTH` (10,000) exists as a *stack* bound distinct from `SBT_BUDGET`, and why `(?:ab)+` on 50KB once overflowed the stack (see ROADMAP.md). Two cyclic shapes escape it — a greedy or lazy SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back compiles to iteration (`is_simple_loop` / `is_simple_lazy`), which is what `_sbt_needs_depth_guard` keys off to skip depth tracking entirely.
 
+A counted repetition (`x{n,m}`) whose body is a single ANY/CHAR/CHARSET gets the same treatment one level up: `_sbt_counted_shape` (`backtrack.mojo`) recognises the required-copies + star-loop / `?`-ladder chain `_build_repetition` emits and compiles it to one bounded loop, so `a{1,2000}` costs one instantiation and one frame instead of ~4000 and 2000. The NFA keeps the expansion for the DFA lanes. Two exclusions matter: fixed chains (`hi == lo`) are already tail calls and are left alone, and NFAs where `_sbt_needs_depth_guard` is true are refused outright — the counted loop's exit call is not in tail position, and trading free frames for real ones inside a walk that recurses per input byte overflows the stack.
+
 ### 5. Result (`result.mojo`)
 `MatchResult` stores a flat `slots: List[Int]` — pairs of `[start, end]` byte offsets, one pair per group. Group 0 is the full match. `group_str(input, n)` slices the input using those offsets.
 
