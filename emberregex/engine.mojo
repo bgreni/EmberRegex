@@ -577,11 +577,10 @@ def _dfa_candidate(nfa: NFA, admit_shape: Bool = False) -> Bool:
     `_compute_strategy` requires the eager table to have built.
 
     `admit_shape` skips the shape test (the guards stay): the capture
-    lane passes `Regex._use_onepass` so a one-pass capture pattern
-    whose only loop is a lone general one (`((a)(b))+`,
-    `(?:([a-z])=(\\d);)+`) rides the lane, where its anchored attempt is
-    the exact one-pass walk, instead of the backtracker lane, where the
-    same loop recurses per iteration.
+    lane passes `Regex._use_onepass` so a one-pass capture pattern of
+    the alternation-loop shape (`(?:(x)|y)+`, `(a|b)*(c)`) rides the
+    lane whatever its C1 shape, and its span confirm is the exact
+    one-pass walk instead of the backtracker + Pike ladder.
 
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
@@ -1066,15 +1065,21 @@ struct Regex[pattern: String](Copyable, Movable):
     # leftmost-first lane; they never build it.
     #
     # Selection is by shape, not by validity alone (`onepass_shape`,
-    # with the measurements): the walk costs ~1.4 ns per byte (a table
-    # load on the critical path), the specialized backtracker ~7 ns per
-    # general-loop iteration plus SIMD-speed class runs. So the walk
-    # takes the patterns whose loops are all general and short-bodied
-    # (`(?:(x)|y)+`, `((a)(b))+`: 4-5x faster at every length, and no
-    # SBT_BUDGET / SBT_MAX_DEPTH cliff), and the backtracker keeps every
-    # shape with a simple loop (`(\w+)@(\w+)\.(\w+)`: 8 vs 25 ns on 16
-    # bytes; `(?:(\w+)=(\w+);)+`: 30 vs 59 ns). The build is gated on
-    # the same predicate so the other shapes pay no comptime for it.
+    # with the measurements): the walk costs ~1.8 ns per byte (a table
+    # load on the critical path), the backtracker pays that per arm it
+    # tries. So the walk takes a general loop (one the backtracker runs
+    # by recursion) whose body carries an ALTERNATION, where the
+    # backtracker re-tries an arm per character (`(?:(x)|y)+`,
+    # `(?:(x)|(y)|z)+`, `(a|b)*c`): 4-9x faster at every length, and no
+    # SBT_BUDGET / SBT_MAX_DEPTH cliff. A simple loop, or a general loop
+    # with no body alternation (`((a)(b))+`, `(?:([a-z])(\d))+`), keeps
+    # the backtracker, whose SIMD class runs and cheap short-body
+    # recursion win. The build is gated on the same predicate so the
+    # other shapes pay no comptime for it. Used in exactly two places
+    # (both `_use_onepass`): match() and `_span_fill_slots`; the capture
+    # lane's anchored attempt stays on the backtracker (an
+    # unbounded-end one-pass walk's per-match slot snapshots make it
+    # slower on short dense inputs).
     comptime _onepass_shape = onepass_shape(Self.nfa)
     comptime _onepass = build_onepass(
         Self.nfa, Self._group_count > 0 and Self._onepass_shape
