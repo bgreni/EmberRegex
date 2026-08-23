@@ -185,14 +185,17 @@ def bench_static_nested_groups(mut b: Bench) raises:
 
 def bench_capture_search_miss_100KB(mut b: Bench) raises:
     # DFA-bounded capture lane, miss-heavy input: 100 KB of `@`-bearing
-    # tokens with no `.com`, so the required-byte (`.`) prescan and the
-    # `@` pivot both pass and the engines have to do real work. The
-    # backtracker lane re-runs `(\\w+)@(\\w+)\\.com` from every word byte
-    # (giving `\w+` back a byte at a time); the lane is one unanchored
-    # DFA scan reporting no end. (A token set without `@` would measure
-    # the 3 us required-byte scan on both lanes.)
+    # tokens whose `.com` never follows an `@\w+` run, so the
+    # required-byte (`.`) prescan, the required-literal (`.com`) memmem
+    # and the `@` pivot all pass and the engines have to do real work.
+    # The backtracker lane re-runs `(\\w+)@(\\w+)\\.com` from every word
+    # byte (giving `\w+` back a byte at a time); the lane is one
+    # unanchored DFA scan reporting no end. (A token set without `@`
+    # would measure the 3 us required-byte scan on both lanes; one
+    # without `.com` would measure the reverse-literal memmem —
+    # reverse_suffix_search_64KB's job.)
     var re = Regex["(\\w+)@(\\w+)\\.com"]()
-    var input = String("user@example.org ") * (100 * 1024 // 17)
+    var input = String("user@example.org x.com ") * (100 * 1024 // 23)
 
     @always_inline
     @parameter
@@ -235,6 +238,74 @@ def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("capture_findall_sparse_64KB"))
+
+
+def reverse_suffix_miss_input() -> String:
+    """64 KB rich in '.' (the required byte), 't'/'x' runs and probe-pair
+    near-misses of ".txt" (".tx" hits the '.'/+'x' probe pair), but never
+    the literal itself."""
+    var filler = "log.tx err.txx data.ttx x.t wo.rd "
+    var input = String("")
+    for _ in range(64 * 1024 // 34):
+        input += filler
+    return input
+
+
+def bench_reverse_suffix_search_64KB(mut b: Bench) raises:
+    # Reverse-suffix required-literal strategy (`_use_rev_literal`,
+    # effect (a)): every `\w+\.txt` match must contain ".txt", so one
+    # memmem over the 64 KB answers the search. Without the strategy the
+    # LF lane walks the whole input, bouncing between the `\w+` run
+    # state and the partial-literal states at every '.'.
+    var re = Regex["\\w+\\.txt"]()
+    var input = reverse_suffix_miss_input()
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("reverse_suffix_search_64KB"))
+
+
+def reverse_inner_miss_input() -> String:
+    """64 KB where ':' and '/' are everywhere (":/" hits the ':'+'/'
+    probe pair) but "://" never occurs."""
+    var filler = "svc: api / level: info /x msg: ok :/ trace: nine "
+    var input = String("")
+    for _ in range(64 * 1024 // 50):
+        input += filler
+    return input
+
+
+def bench_reverse_inner_search_64KB(mut b: Bench) raises:
+    # Reverse-inner required literal: "://" sits mid-pattern (after the
+    # unbounded `[a-z]+`), so it is not a prefix any scanner sees — the
+    # memmem is the only prefilter that can answer this miss without the
+    # unanchored scan.
+    var re = Regex["[a-z]+://[^ ]+"]()
+    var input = reverse_inner_miss_input()
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            for _ in range(ITERS_PER_CALL):
+                var r = re.search(input)
+                keep(r.matched)
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("reverse_inner_search_64KB"))
 
 
 def bench_onepass_match_kv(mut b: Bench) raises:
@@ -2379,6 +2450,8 @@ def main() raises:
     bench_static_nested_groups(b)
     bench_capture_search_miss_100KB(b)
     bench_capture_findall_sparse_64KB(b)
+    bench_reverse_suffix_search_64KB(b)
+    bench_reverse_inner_search_64KB(b)
     bench_onepass_match_kv(b)
     bench_onepass_findall_2KB(b)
     bench_static_greedy_vs_lazy(b)

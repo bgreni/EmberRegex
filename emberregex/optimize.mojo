@@ -6,9 +6,10 @@ match must start with.
 """
 
 from .constants import CHAR_A_UPPER, CHAR_NEWLINE, CHAR_Z_UPPER
-from .nfa import NFA, NFAStateKind
+from .nfa import NFA, NFAStateKind, split_cycle_flags
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
+from std.collections import InlineArray
 
 
 def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
@@ -621,6 +622,450 @@ def extract_literal_suffix(nfa: NFA) -> List[UInt8]:
     for i in range(len(rev) - 1, -1, -1):
         suffix.append(rev[i])
     return suffix^
+
+
+# --- Inner (reverse-suffix / reverse-inner) required-literal extraction -----
+
+# extract_inner_literal understands NFAs up to this many states (its
+# bitsets are fixed-width); larger ones report no literal. EDFA_STATE_CAP
+# keeps the consuming lanes far below this.
+comptime INNER_LIT_MAX_STATES = 512
+# Longest literal kept. Any prefix of a required run is itself required,
+# so truncation is sound — the truncated run merely stops being a suffix.
+comptime INNER_LIT_MAX_LEN = 16
+# Alternation nesting the walk resolves before giving up.
+comptime _INNER_MAX_DEPTH = 12
+
+comptime _INNER_BITS = INNER_LIT_MAX_STATES // 8
+
+
+struct InnerLiteral(Copyable, Movable):
+    """A REQUIRED literal byte run: every match contains `bytes`
+    contiguously (caseless positions store the lowercase byte and match
+    both ASCII cases), preceded by at least `min_offset` and at most
+    `max_offset` consumed bytes (`max_offset == -1` = unbounded). Runs at
+    fixed offset 0 are excluded — those belong to the prefix scanners
+    (extract_literal_prefix / extract_filter_prefix / extract_alt_prefix).
+
+    `is_suffix` marks a run that ends every match (no bytes are consumed
+    after it). `valid` requires a run of >= 2 bytes: a single required
+    byte is already covered by extract_required_byte.
+
+    The engine uses this as a prefilter (Rust regex's ReverseSuffix /
+    ReverseInner, effects (a)+(b)): no occurrence of `bytes` at or after
+    `pos + min_offset` proves there is no match starting at or after
+    `pos`; and when `max_offset` is bounded, no match starts before
+    `lit_pos - max_offset`."""
+
+    var valid: Bool
+    var bytes: List[UInt8]
+    var caseless: List[Bool]
+    var min_offset: Int
+    var max_offset: Int
+    var is_suffix: Bool
+
+    def __init__(out self):
+        self.valid = False
+        self.bytes = List[UInt8]()
+        self.caseless = List[Bool]()
+        self.min_offset = 0
+        self.max_offset = 0
+        self.is_suffix = False
+
+
+@always_inline
+def _inner_bit(bits: SIMD[DType.uint8, _INNER_BITS], s: Int) -> Bool:
+    return (bits[s >> 3] & (UInt8(1) << UInt8(s & 7))) != 0
+
+
+@always_inline
+def _inner_set(mut bits: SIMD[DType.uint8, _INNER_BITS], s: Int):
+    bits[s >> 3] = bits[s >> 3] | (UInt8(1) << UInt8(s & 7))
+
+
+def _arm_reaches(nfa: NFA, arm: Int, target: Int) -> Bool:
+    """Comptime: does the subgraph entered at `arm` reach `target`
+    (following out1/out2; MATCH is a dead end)? Distinguishes a
+    quantifier SPLIT's looping arm from its exit arm — seeded per arm,
+    unlike forms_cycle, which seeds both."""
+    var n = len(nfa.states)
+    var visited = SIMD[DType.uint8, _INNER_BITS](0)
+    var stack = List[Int]()
+    stack.append(arm)
+    while len(stack) > 0:
+        var s = stack.pop()
+        if s < 0 or s >= n:
+            continue
+        if s == target:
+            return True
+        if _inner_bit(visited, s):
+            continue
+        _inner_set(visited, s)
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.MATCH:
+            continue
+        stack.append(nfa.states[s].out1)
+        if kind == NFAStateKind.SPLIT:
+            stack.append(nfa.states[s].out2)
+    return False
+
+
+@fieldwise_init
+struct _SegRes(Copyable, Movable):
+    """Result of _seg_walk: the state it stopped at, min/max bytes
+    consumed on the way (`maxb == -1` = unbounded), and the directly
+    stepped states (for alternation join discovery)."""
+
+    var ok: Bool
+    var end: Int
+    var minb: Int
+    var maxb: Int
+    var spine: SIMD[DType.uint8, _INNER_BITS]
+
+
+def _seg_fail() -> _SegRes:
+    return _SegRes(False, -1, 0, 0, SIMD[DType.uint8, _INNER_BITS](0))
+
+
+def _seg_walk(
+    nfa: NFA,
+    s0: Int,
+    stops: SIMD[DType.uint8, _INNER_BITS],
+    oncycle: List[Bool],
+    depth: Int,
+) -> _SegRes:
+    """Comptime: walk the mandatory spine from `s0` until reaching MATCH
+    or a state in `stops` (the walk stops ON a stop state without
+    accounting it), summing min/max consumed bytes. Quantifier SPLITs are
+    skipped via their exit arm (max becomes unbounded); alternation
+    SPLITs are resolved through _alt_join. `ok == False` means the
+    subgraph was not understood — callers must treat the segment as
+    unknown."""
+    var res = _SegRes(True, -1, 0, 0, SIMD[DType.uint8, _INNER_BITS](0))
+    var unbounded = False
+    var n = len(nfa.states)
+    var s = s0
+    var steps = 0
+    while True:
+        steps += 1
+        if steps > 2 * n + 8 or s < 0 or s >= n:
+            return _seg_fail()
+        if _inner_bit(stops, s):
+            res.end = s
+            break
+        if _inner_bit(res.spine, s):
+            return _seg_fail()  # a cycle the SPLIT logic did not explain
+        _inner_set(res.spine, s)
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.MATCH:
+            res.end = s
+            break
+        elif (
+            kind == NFAStateKind.CHAR
+            or kind == NFAStateKind.CHARSET
+            or kind == NFAStateKind.ANY
+        ):
+            res.minb += 1
+            res.maxb += 1
+            s = nfa.states[s].out1
+        elif (
+            kind == NFAStateKind.SAVE
+            or kind == NFAStateKind.ANCHOR
+            or kind == NFAStateKind.LOOKAHEAD
+            or kind == NFAStateKind.LOOKBEHIND
+        ):
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.BACKREF:
+            unbounded = True
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.SPLIT:
+            var o1 = nfa.states[s].out1
+            var o2 = nfa.states[s].out2
+            if o2 < 0:
+                s = o1
+            elif o1 < 0:
+                s = o2
+            else:
+                var l1 = False
+                var l2 = False
+                if oncycle[s]:
+                    l1 = _arm_reaches(nfa, o1, s)
+                    l2 = _arm_reaches(nfa, o2, s)
+                if l1 and l2:
+                    # An alternation inside a loop body: neither arm is
+                    # mandatory and there is no single exit to follow.
+                    return _seg_fail()
+                elif l1:
+                    unbounded = True
+                    s = o2
+                elif l2:
+                    unbounded = True
+                    s = o1
+                else:
+                    var j = _alt_join(nfa, s, stops, oncycle, depth)
+                    if not j.ok:
+                        return _seg_fail()
+                    res.minb += j.minb
+                    if j.maxb < 0:
+                        unbounded = True
+                    else:
+                        res.maxb += j.maxb
+                    s = j.end
+        else:
+            return _seg_fail()
+    if unbounded:
+        res.maxb = -1
+    return res^
+
+
+def _alt_join(
+    nfa: NFA,
+    split_idx: Int,
+    stops: SIMD[DType.uint8, _INNER_BITS],
+    oncycle: List[Bool],
+    depth: Int,
+) -> _SegRes:
+    """Comptime: resolve an alternation SPLIT to (join state, min/max
+    bytes across both arms). Thompson arms are disjoint subgraphs patched
+    to a common continuation, so the first arm-1 spine state that arm 2
+    reaches is the join; arm 1 is then re-walked bounded at it for its
+    own byte counts. `end` is the join; `spine` is left empty."""
+    if depth <= 0:
+        return _seg_fail()
+    var o1 = nfa.states[split_idx].out1
+    var o2 = nfa.states[split_idx].out2
+    var r1 = _seg_walk(nfa, o1, stops, oncycle, depth - 1)
+    if not r1.ok:
+        return _seg_fail()
+    var r2 = _seg_walk(nfa, o2, stops | r1.spine, oncycle, depth - 1)
+    if not r2.ok:
+        return _seg_fail()
+    var join = r2.end
+    var jstops = stops
+    _inner_set(jstops, join)
+    var r1b = _seg_walk(nfa, o1, jstops, oncycle, depth - 1)
+    if not r1b.ok or r1b.end != join:
+        return _seg_fail()
+    var minb = min(r1b.minb, r2.minb)
+    var maxb = -1
+    if r1b.maxb >= 0 and r2.maxb >= 0:
+        maxb = max(r1b.maxb, r2.maxb)
+    return _SegRes(True, join, minb, maxb, SIMD[DType.uint8, _INNER_BITS](0))
+
+
+def extract_inner_literal(nfa: NFA) -> InnerLiteral:
+    """Comptime: the best REQUIRED literal run that does not sit at fixed
+    offset 0 (see InnerLiteral). Walks the NFA's mandatory spine from the
+    start: CHAR and filterable CHARSET states (exact byte or ASCII case
+    pair) extend the open run; SAVE/ANCHOR/no-op SPLITs are zero-width
+    and keep it open (the bytes on both sides stay adjacent in the
+    input); any other consuming or variable-width state closes it and
+    advances the min/max gap; quantifier loops make the gap unbounded;
+    alternations contribute min/max over both arms (_alt_join). The walk
+    stops — keeping the runs already established, which remain sound —
+    at anything it does not understand.
+
+    Among the collected runs, positions at fixed offset 0 are dropped and
+    the rarest run of length >= 2 wins (score = the run's rarest byte by
+    _probe_rank_table, caseless positions counting both cases; ties
+    prefer the longer run)."""
+    var res = InnerLiteral()
+    var n = len(nfa.states)
+    if n == 0 or n > INNER_LIT_MAX_STATES:
+        return res^
+    var oncycle = split_cycle_flags(nfa)
+
+    # Completed runs.
+    var run_bytes = List[List[UInt8]]()
+    var run_cl = List[List[Bool]]()
+    var run_min = List[Int]()
+    var run_max = List[Int]()  # -1 = unbounded
+
+    # Walk state: gap consumed so far, and the open run buffer.
+    var cur_min = 0
+    var cur_max = 0
+    var unbounded = False
+    var buf_b = List[UInt8]()
+    var buf_c = List[Bool]()
+    var buf_min = 0
+    var buf_max = 0
+    var suffix_flag = False  # the LAST closed run abutted MATCH
+
+    var visited = SIMD[DType.uint8, _INNER_BITS](0)
+    var s = nfa.start
+    var steps = 0
+    while True:
+        steps += 1
+        if steps > 2 * n + 8 or s < 0 or s >= n:
+            break  # bail; the runs found so far stay sound
+        if _inner_bit(visited, s):
+            break
+        _inner_set(visited, s)
+        var kind = nfa.states[s].kind
+
+        # Literal-extendable states.
+        var ext_byte = -1
+        var ext_cl = False
+        if kind == NFAStateKind.CHAR and nfa.states[s].char_value < 256:
+            ext_byte = Int(nfa.states[s].char_value)
+        elif kind == NFAStateKind.CHARSET:
+            var fb = _charset_filter_byte(nfa, nfa.states[s].charset_index)
+            ext_byte = fb[0]
+            ext_cl = fb[1]
+        if ext_byte >= 0:
+            if len(buf_b) == 0:
+                buf_min = cur_min
+                buf_max = -1 if unbounded else cur_max
+            buf_b.append(UInt8(ext_byte))
+            buf_c.append(ext_cl)
+            s = nfa.states[s].out1
+            continue
+
+        # Zero-width pass-throughs that keep the run open.
+        if kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
+            s = nfa.states[s].out1
+            continue
+        if kind == NFAStateKind.SPLIT and (
+            nfa.states[s].out1 < 0 or nfa.states[s].out2 < 0
+        ):
+            var o1 = nfa.states[s].out1
+            s = o1 if o1 >= 0 else nfa.states[s].out2
+            continue
+
+        # Everything else closes the open run.
+        if len(buf_b) > 0:
+            cur_min += len(buf_b)
+            if not unbounded:
+                cur_max += len(buf_b)
+            run_min.append(buf_min)
+            run_max.append(buf_max)
+            run_bytes.append(buf_b^)
+            run_cl.append(buf_c^)
+            buf_b = List[UInt8]()
+            buf_c = List[Bool]()
+            suffix_flag = kind == NFAStateKind.MATCH
+
+        if kind == NFAStateKind.MATCH:
+            break
+        elif (
+            kind == NFAStateKind.CHAR
+            or kind == NFAStateKind.CHARSET
+            or kind == NFAStateKind.ANY
+        ):
+            # Consuming but not literal-extendable (multi-member charset,
+            # ANY, CHAR >= 256 — the last can never match a byte, so any
+            # accounting is vacuously sound).
+            cur_min += 1
+            cur_max += 1
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND:
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.BACKREF:
+            unbounded = True
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.SPLIT:
+            var o1 = nfa.states[s].out1
+            var o2 = nfa.states[s].out2
+            var l1 = False
+            var l2 = False
+            if oncycle[s]:
+                l1 = _arm_reaches(nfa, o1, s)
+                l2 = _arm_reaches(nfa, o2, s)
+            if l1 and l2:
+                break  # alternation inside a loop body
+            elif l1:
+                unbounded = True
+                s = o2
+            elif l2:
+                unbounded = True
+                s = o1
+            else:
+                var j = _alt_join(
+                    nfa,
+                    s,
+                    SIMD[DType.uint8, _INNER_BITS](0),
+                    oncycle,
+                    _INNER_MAX_DEPTH,
+                )
+                if not j.ok:
+                    break
+                cur_min += j.minb
+                if j.maxb < 0:
+                    unbounded = True
+                else:
+                    cur_max += j.maxb
+                s = j.end
+        else:
+            break
+
+    # A bailed walk can leave a run open; its bytes were established from
+    # mandatory states, so keep it (suffix unknown -> False).
+    if len(buf_b) > 0:
+        run_min.append(buf_min)
+        run_max.append(buf_max)
+        run_bytes.append(buf_b^)
+        run_cl.append(buf_c^)
+        suffix_flag = False
+
+    # Selection: drop fixed-offset-0 runs, require length >= 2, prefer
+    # the rarest (then the longer) run.
+    var ranks = _probe_rank_table()
+    var best = -1
+    var best_score = 1 << 30
+    for i in range(len(run_bytes)):
+        if run_max[i] == 0:
+            continue
+        if len(run_bytes[i]) < 2:
+            continue
+        var score = 1 << 29
+        for k in range(len(run_bytes[i])):
+            var r = ranks[Int(run_bytes[i][k])]
+            if run_cl[i][k]:
+                r += ranks[Int(run_bytes[i][k]) - 32]
+            if r < score:
+                score = r
+        var better = False
+        if best < 0:
+            better = True
+        elif score < best_score:
+            better = True
+        elif score == best_score and len(run_bytes[i]) > len(run_bytes[best]):
+            better = True
+        if better:
+            best = i
+            best_score = score
+    if best < 0:
+        return res^
+
+    var truncated = len(run_bytes[best]) > INNER_LIT_MAX_LEN
+    var m = min(len(run_bytes[best]), INNER_LIT_MAX_LEN)
+    for k in range(m):
+        res.bytes.append(run_bytes[best][k])
+        res.caseless.append(run_cl[best][k])
+    res.min_offset = run_min[best]
+    res.max_offset = run_max[best]
+    res.is_suffix = (
+        best == len(run_bytes) - 1 and suffix_flag and not truncated
+    )
+    res.valid = True
+    return res^
+
+
+def lit_bytes_arr[n: Int](l: List[UInt8]) -> InlineArray[UInt8, n]:
+    """Comptime: List -> InlineArray so literal bytes can ride as walker
+    comptime parameters (List-bearing values must not)."""
+    var a = InlineArray[UInt8, n](fill=0)
+    for i in range(min(n, len(l))):
+        a[i] = l[i]
+    return a^
+
+
+def lit_flags_arr[n: Int](l: List[Bool]) -> InlineArray[Bool, n]:
+    """Comptime: List -> InlineArray for the parallel caseless flags."""
+    var a = InlineArray[Bool, n](fill=False)
+    for i in range(min(n, len(l))):
+        a[i] = l[i]
+    return a^
 
 
 def _probe_rank_table() -> List[Int]:

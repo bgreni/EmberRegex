@@ -165,6 +165,29 @@ match, never one per candidate. Every materialized table is padded to
 a per-call stack copy inside the walker, which cost more than the walk
 itself on 3-state tables.
 
+A pattern with no start-anchored scanner may still carry a **required
+inner literal** — a byte run every match must contain, sitting after an
+unbounded loop where no prefix scanner can see it (`\w+\.txt` must
+contain ".txt", `[a-z]+://[^ ]+` must contain "://"). `extract_inner_literal`
+(optimize.mojo) walks the NFA's mandatory spine at comptime — literal
+states extend a run, zero-width states keep it open, loops make the
+preceding gap unbounded, alternations contribute min/max over both arms —
+and keeps the rarest run of ≥ 2 bytes that is not at fixed offset 0 (the
+prefix scanners' territory). When the leftmost-first lane has no filter
+prefix and no Teddy prefix (`Regex._use_rev_literal`, Rust regex's
+ReverseSuffix/ReverseInner), `_lf_next_match` memmems the literal
+(`simd_find_literal_rare`, the same two-rarest-probe Muła kernel the
+filter-prefix scanner delegates to) before anything else: no occurrence
+at or after `pos + min_offset` is proof of no match — one SIMD pass
+answers the call (the `reverse_suffix_search_64KB` /
+`reverse_inner_search_64KB` rows measure ~40x on miss-heavy 64 KB) — and
+when the pre-literal gap is comptime-bounded (`(foo|bar)\.txt`: 3 bytes)
+the candidate pipeline starts at `lit_pos - max_offset`. With an
+unbounded gap the scan still starts at `pos`: recovering a start by
+walking leftward from the literal is the quadratic trap Rust bounds with
+REV_INNER_MAX_BACKSCAN, and this design has no leftward walk at all. The
+pivot prefilter may coexist; the literal test simply runs first.
+
 Capture groups do not keep a pattern off these tables — SAVE states are
 epsilon to every determinizer — only backreferences and lookaround do. A
 capture pattern of the admitted shape runs its search-family verbs on the
