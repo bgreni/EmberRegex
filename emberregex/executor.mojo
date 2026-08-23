@@ -311,7 +311,23 @@ struct PikeVM[num_slots: Int](Copyable):
 
             pos += 1
 
-            if len(bufs.current_states) == 0:
+            # An empty thread list only ends the scan when no later start
+            # position could revive it. In unanchored mode a fresh start
+            # thread is injected at every position until a match is
+            # recorded, and that injection dies here whenever a leading
+            # assertion fails — `(?m)^`, `\b`, lookaround — so breaking out
+            # would strand every later line start (e.g. `(?m)^abc$` on
+            # "xx\nabc"). Keep stepping: the per-position seeding above is
+            # all the work that remains, so the pass stays O(n).
+            # A leading non-multiline `^` is the one assertion that cannot be
+            # revived: it dominates every match path (see
+            # `_detect_start_anchor`) and holds only at position 0, so the
+            # fast exit stays available for `^...` patterns.
+            if len(bufs.current_states) == 0 and (
+                matched
+                or not unanchored
+                or self.nfa.start_anchor == AnchorKind.BOL
+            ):
                 break
 
         if matched:
