@@ -1769,9 +1769,6 @@ def _accel_mask_word(d: EagerDFA, word: Int) -> UInt64:
     for s in d.accel_nib_states:
         if s >> 6 == word:
             m |= UInt64(1) << UInt64(s & 63)
-    for s in d.region_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
     return m
 
 
@@ -1786,16 +1783,14 @@ def _region_land_arr(d: EagerDFA) -> InlineArray[Int16, 256]:
 @always_inline
 def _edfa_accel_skip[
     origin: Origin, //, d: EagerDFA
-](
-    input: Span[Byte, origin], mut cur: Int, pos: Int, mut last_match: Int
-) -> Int:
+](input: Span[Byte, origin], cur: Int, pos: Int, mut last_match: Int) -> Int:
     """If `cur` is an accelerated state, SIMD-scan to its next exit byte.
 
     Returns the new position (== pos when cur isn't accelerated). For
     match-flagged accelerated states every skipped position is a match end,
-    so last_match advances to the scan destination. A region skip (see
-    EagerDFA.region_states) may also move `cur` to the member the last
-    skipped byte lands in.
+    so last_match advances to the scan destination. Region members (see
+    EagerDFA.region_states) are not handled here; their skip is
+    `_edfa_region_skip`, which the walkers call right after this one.
 
     This runs once per walked byte, so the common cases must exit within a
     few instructions: too little input left to vectorize (short matches),
@@ -1840,6 +1835,23 @@ def _edfa_accel_skip[
                 p = find_in_class[kind=a_kind, t0=a_t0, t1=a_t1](input, p + 1)
                 comptime if a_state < d.num_match_states:
                     last_match = p
+    return p
+
+
+@always_inline
+def _edfa_region_skip[
+    origin: Origin, //, d: EagerDFA
+](input: Span[Byte, origin], mut cur: Int, pos: Int) -> Int:
+    """If `cur` is a member of the table's region (EagerDFA.region_states),
+    SIMD-scan to the region's next exit byte and land `cur` in the member
+    the last skipped byte selects. Returns the new position (== pos when
+    nothing was skipped). Only instantiated for tables with a region —
+    the walkers guard the call with `_edfa_has_region`.
+    """
+    comptime W = simd_width_of[DType.uint8]()
+    var p = pos
+    if p + W > len(input):
+        return p
     comptime nreg = len(d.region_states)
     comptime if nreg >= 2:
         var in_region = False
@@ -2074,6 +2086,8 @@ def _edfa_full_match_impl[
         comptime if accel:
             var unused = -1
             pos = _edfa_accel_skip[d=d](input, cur, pos, unused)
+            comptime if _edfa_has_region(d):
+                pos = _edfa_region_skip[d=d](input, cur, pos)
             if pos >= input_len:
                 break
         var nxt = Int(tbl.unsafe_get(cur * 256 + Int(input.unsafe_get(pos))))
@@ -2158,6 +2172,8 @@ def _edfa_walk_impl[
     while pos < input_len:
         comptime if accel:
             pos = _edfa_accel_skip[d=d](input, cur, pos, last_match)
+            comptime if _edfa_has_region(d):
+                pos = _edfa_region_skip[d=d](input, cur, pos)
             if pos >= input_len:
                 break
         var b = input.unsafe_get(pos)

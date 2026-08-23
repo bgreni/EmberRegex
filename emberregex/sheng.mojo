@@ -44,6 +44,8 @@ from .static_dfa import (
     EagerDFA,
     _edfa_accel_skip,
     _edfa_has_accel,
+    _edfa_has_region,
+    _edfa_region_skip,
     edfa_is_word,
 )
 from .simd_kernels import (
@@ -182,8 +184,10 @@ def _sheng_full_match_impl[
         while pos < input_len:
             var unused = -1
             var skipped = _edfa_accel_skip[d=d](input, cur, pos, unused)
-            comptime if len(d.region_states) >= 2:
-                if skipped > pos:
+            comptime if _edfa_has_region(d):
+                var before = cur
+                skipped = _edfa_region_skip[d=d](input, cur, skipped)
+                if cur != before:
                     cur_vec = _ShengState(UInt8(cur))
             pos = skipped
             if pos >= input_len:
@@ -278,8 +282,10 @@ def _sheng_walk_impl[
     while pos < input_len:
         comptime if accel:
             var skipped = _edfa_accel_skip[d=d](input, cur, pos, last_match)
-            comptime if len(d.region_states) >= 2:
-                if skipped > pos:
+            comptime if _edfa_has_region(d):
+                var before = cur
+                skipped = _edfa_region_skip[d=d](input, cur, skipped)
+                if cur != before:
                     cur_vec = _ShengState(UInt8(cur))
             pos = skipped
             if pos >= input_len:
