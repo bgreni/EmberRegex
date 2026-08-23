@@ -72,6 +72,8 @@ from .static_dfa import (
     _wb_holds,
     _wb_normalize,
     _word_anchor_bits,
+    WB_PENDING,
+    WB_RESOLVE,
     edfa_walk_from,
 )
 from .sheng import sheng_walk_from
@@ -143,7 +145,7 @@ def _lf_closure(
     at_start: Bool,
     after_newline: Bool,
     mut pool: List[Int],
-    resolve_wb: Bool = False,
+    wb_mode: Int = WB_PENDING,
     prev_word: Bool = False,
     next_word: Bool = False,
 ) -> Int:
@@ -155,9 +157,9 @@ def _lf_closure(
     `_flat_closure`, keeps EOL kinds as pending members, and STOPS at
     MATCH: whatever is still on the stack is lower priority than a
     thread that has already matched. Word anchors are pending members
-    too, unless `resolve_wb` (an anchor's continuation, expanded once
-    both neighbouring classes are known): then they resolve against
-    `prev_word` / `next_word` in place.
+    too (`WB_PENDING`), unless `wb_mode` is `WB_RESOLVE` (an anchor's
+    continuation, expanded once both neighbouring classes are known):
+    then they resolve against `prev_word` / `next_word` in place.
     """
     var n = len(kinds)
     var visited = _StateBits(0)
@@ -191,10 +193,12 @@ def _lf_closure(
                 at == AnchorKind.WORD_BOUNDARY
                 or at == AnchorKind.NOT_WORD_BOUNDARY
             ):
-                if not resolve_wb:
+                if wb_mode == WB_PENDING:
                     pool.append(s)
                     count += 1
-                elif _wb_holds(at, prev_word, next_word):
+                elif wb_mode == WB_RESOLVE and _wb_holds(
+                    at, prev_word, next_word
+                ):
                     stack.append(out1s.unsafe_get(s))
         elif kind == NFAStateKind.MATCH:
             pool.append(s)
@@ -632,7 +636,7 @@ def build_lf_dfa(
                             False,
                             False,
                             pool,
-                            True,
+                            WB_RESOLVE,
                             lprev,
                             variant_word,
                         )

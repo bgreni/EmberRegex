@@ -80,6 +80,8 @@ from .static_dfa import (
     _nfa_has_word_anchor,
     _wb_holds,
     _word_anchor_bits,
+    WB_PENDING,
+    WB_RESOLVE,
     edfa_is_word,
 )
 
@@ -250,7 +252,7 @@ def _rev_wb_resolve(
                 seeds,
                 False,
                 False,
-                True,
+                WB_RESOLVE,
                 left_word,
                 right_word,
             )
@@ -390,6 +392,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             match_states,
             ctx == 2,
             ctx >= 1,
+            WB_PENDING,
         )
         var right = k == 3 and _bs_any(closed & wb_bits)
         var h = _bs_hash(closed)
@@ -531,6 +534,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
                             one_seed,
                             False,
                             False,
+                            WB_PENDING,
                         )
                         var g_n = g_o
                         if need_nl_variant:
@@ -543,6 +547,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
                                 one_seed,
                                 False,
                                 True,
+                                WB_PENDING,
                             )
                         gval_o.append(g_o)
                         gval_n.append(g_n)

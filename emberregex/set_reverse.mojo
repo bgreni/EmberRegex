@@ -66,6 +66,9 @@ from .static_dfa import (
     _byte_classes,
     _flatten_nfa,
     _wb_holds,
+    WB_DROP,
+    WB_PENDING,
+    WB_RESOLVE,
 )
 
 # Mirrors MDFA_STATE_CAP: the reverse table is the same shape and the same
@@ -318,7 +321,7 @@ def _rev_flat_closure(
     seeds: List[Int],
     at_end: Bool,
     on_newline: Bool,
-    resolve_wb: Bool = False,
+    wb_mode: Int = WB_DROP,
     left_word: Bool = False,
     right_word: Bool = False,
 ) -> _StateBits:
@@ -330,10 +333,11 @@ def _rev_flat_closure(
     end or on a newline, BOL kinds always pushed so the slices can find
     them).
 
-    Word anchors (single-pattern reverse DFA only — sets keep them off
-    the lane) are likewise kept but not walked past, unless `resolve_wb`:
-    then one that holds between `left_word` / `right_word` is walked
-    past and one that does not is dropped.
+    Word anchors follow `wb_mode`: walked past by default, like
+    `_rev_closure` (the set lanes never determinize one); kept but not
+    walked past (`WB_PENDING`) for the single-pattern reverse DFA; or
+    resolved (`WB_RESOLVE`): one that holds between `left_word` /
+    `right_word` is walked past and one that does not is dropped.
     """
     var n = len(kinds)
     var bits = _StateBits(0)
@@ -356,9 +360,11 @@ def _rev_flat_closure(
                 sat == AnchorKind.WORD_BOUNDARY
                 or sat == AnchorKind.NOT_WORD_BOUNDARY
             ):
-                if not resolve_wb:
+                if wb_mode == WB_PENDING:
                     continue  # kept, not walked past
-                if not _wb_holds(sat, left_word, right_word):
+                if wb_mode == WB_RESOLVE and not _wb_holds(
+                    sat, left_word, right_word
+                ):
                     # Dropped: clear the membership set above.
                     bits[s >> 6] = bits[s >> 6] & ~(UInt64(1) << UInt64(s & 63))
                     continue

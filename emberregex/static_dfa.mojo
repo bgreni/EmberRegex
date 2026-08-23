@@ -104,6 +104,12 @@ def edfa_id_dtype(num_states: Int) -> DType:
     return DType.int32
 
 
+# How a closure treats a WORD_BOUNDARY / NOT_WORD_BOUNDARY state.
+comptime WB_DROP = 0  # dropped, as `_epsilon_closure` does (the set lanes)
+comptime WB_PENDING = 1  # kept as a pending member (single-pattern lanes)
+comptime WB_RESOLVE = 2  # resolved against (prev_word, next_word)
+
+
 def _is_word_byte(b: Int) -> Bool:
     """Comptime: ASCII word byte `[A-Za-z0-9_]` — the `\\b` alphabet of
     every engine here (bytes >= 0x80 are non-word, UTF-8 mode included)."""
@@ -195,7 +201,7 @@ def _flat_closure(
     seed: Int,
     at_start: Bool,
     after_newline: Bool,
-    resolve_wb: Bool = False,
+    wb_mode: Int = WB_DROP,
     prev_word: Bool = False,
     next_word: Bool = False,
 ) -> _StateBits:
@@ -206,11 +212,13 @@ def _flat_closure(
     for runtime resolution, everything else (consuming, MATCH, and the
     non-DFA state kinds) is kept as-is.
 
-    Word-boundary anchors are kept as PENDING members too — they need the
-    byte on both sides, and a closure only ever knows the one behind it.
-    With `resolve_wb` (the continuation of a pending anchor, expanded
-    once both classes are known) they resolve against `prev_word` /
-    `next_word` instead and are walked past or dropped.
+    Word-boundary anchors follow `wb_mode`: dropped by default (the set
+    lanes, which never determinize one — and whose List-based parity
+    references drop them); kept as PENDING members for the single-pattern
+    lanes (they need the byte on both sides, and a closure only ever
+    knows the one behind it); or, for the continuation of a pending
+    anchor expanded once both classes are known, resolved against
+    `prev_word` / `next_word` and walked past or dropped.
     """
     var bits = _StateBits(0)
     var visited = _StateBits(0)
@@ -243,9 +251,11 @@ def _flat_closure(
                 at == AnchorKind.WORD_BOUNDARY
                 or at == AnchorKind.NOT_WORD_BOUNDARY
             ):
-                if not resolve_wb:
+                if wb_mode == WB_PENDING:
                     _bs_set(bits, s)
-                elif _wb_holds(at, prev_word, next_word):
+                elif wb_mode == WB_RESOLVE and _wb_holds(
+                    at, prev_word, next_word
+                ):
                     stack.append(out1s.unsafe_get(s))
         else:
             # CHAR, CHARSET, ANY, MATCH, and non-DFA kinds
@@ -296,7 +306,7 @@ def _wb_resolve(
                 out1s.unsafe_get(a),
                 False,
                 False,
-                True,
+                WB_RESOLVE,
                 prev_word,
                 next_word,
             )
@@ -334,7 +344,7 @@ def _wb_anchor_flags(
             out1s.unsafe_get(a),
             False,
             False,
-            True,
+            WB_RESOLVE,
             prev_word,
             nw,
         )
@@ -1273,7 +1283,14 @@ def build_eager_dfa(
     for k in range(nstart_ctx):
         var ctx = k % 3
         var closed = _flat_closure(
-            kinds, out1s, out2s, anchors, nfa.start, ctx == 2, ctx >= 1
+            kinds,
+            out1s,
+            out2s,
+            anchors,
+            nfa.start,
+            ctx == 2,
+            ctx >= 1,
+            WB_PENDING,
         )
         var prev = k == 3 and _bs_any(closed & wb_bits)
         var h = _bs_hash(closed)
@@ -1348,12 +1365,26 @@ def build_eager_dfa(
                     slot = tslot.unsafe_get(t)
                     if slot < 0:
                         var c_o = _flat_closure(
-                            kinds, out1s, out2s, anchors, t, False, False
+                            kinds,
+                            out1s,
+                            out2s,
+                            anchors,
+                            t,
+                            False,
+                            False,
+                            WB_PENDING,
                         )
                         var c_n = c_o
                         if has_bol_ml:
                             c_n = _flat_closure(
-                                kinds, out1s, out2s, anchors, t, False, True
+                                kinds,
+                                out1s,
+                                out2s,
+                                anchors,
+                                t,
+                                False,
+                                True,
+                                WB_PENDING,
                             )
                         gval_o.append(c_o)
                         gval_n.append(c_n)
