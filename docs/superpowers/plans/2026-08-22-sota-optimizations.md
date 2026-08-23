@@ -190,6 +190,8 @@ Run: `pixi run mojo -D ASSERT=all -I . test/test_possessify.mojo`, then `pixi ru
 
 ### Task B5: Chunk-parallel Sheng for full_match / is_match (#9)
 
+*Not executed — deliberately dropped during the batch; see the final session summary. The speculative chunk-parallel walker remains future work.*
+
 **Files:**
 - Modify: `emberregex/sheng.mojo` — `_sheng_full_match_impl` non-accel path: when `input_len >= 4 * 256`, split into K=4 equal chunks; chunk 0 runs from the real start state; chunks 1..3 run from the identity permutation `[0,1,…,CAP-1]` (lanes ≥ CAP unused) so the final vector is the chunk's transition function; compose `v = shuffle(f_k, v)` in order. Match detection is only needed at the END for `full_match` (state after all bytes), so no per-byte match mask is required here. Dead detection per stride as today on chunk 0 only.
 - Test: `test/test_sheng.mojo` (extend)

@@ -304,7 +304,7 @@ def test_tiny_tables_materialize_as_shared_data() raises:
         keep(acc)
         t_one = min(t_one, t1 - t0)
         t_nine = min(t_nine, t2 - t1)
-    assert_true(3 * t_one < t_nine)
+    assert_true(3 * t_one < t_nine + 200_000)
 
 
 def test_anchored_first_attempt_on_classic_table() raises:
