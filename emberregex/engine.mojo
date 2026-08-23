@@ -67,15 +67,26 @@ from .static_dfa import (
     edfa_flags_arr,
     edfa_id_dtype,
     edfa_full_match,
-    edfa_match_at,
-    edfa_search_forward,
+    pivot_first_candidate,
+)
+from .static_lfdfa import (
+    LFDFA,
+    build_lf_dfa,
+    lfdfa_find_end,
+    sheng_lfdfa_find_end,
+)
+from .static_rdfa import (
+    RDFA,
+    build_reverse_dfa,
+    rdfa_find_start,
+    rdfa_flags_arr,
+    rdfa_table_arr,
+    rdfa_view,
 )
 from .sheng import (
     sheng_cap_for,
     sheng_full_match,
     sheng_masks_arr,
-    sheng_match_at,
-    sheng_search_forward,
     sheng_viable,
 )
 from .simd_kernels import (
@@ -341,12 +352,20 @@ def _probe_eq1[caseless: Bool, target: UInt8](b: Byte) -> Bool:
 def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
     """True when the pattern should run on a DFA engine (eager or lazy).
 
+    Lazy quantifiers no longer exclude a pattern: the leftmost-first
+    table (static_lfdfa.mojo) stops `<.*?>` at the first `>` by
+    construction, so the search verbs get the lazy end from the DFA
+    itself. `_compute_strategy` still keeps a lazy pattern whose
+    leftmost-first determinization overflows OFF the DFA lanes (the
+    classic tables would walk to the longest end and re-run the
+    backtracker — the trap that motivated the old exclusion).
+
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
     `_use_dfa_candidate` and threads the result — each evaluation walks
     the NFA several times.
     """
-    if not nfa.can_use_dfa or group_count != 0 or nfa.has_lazy:
+    if not nfa.can_use_dfa or group_count != 0:
         return False
     var cyclic = split_cycle_flags(nfa)
     if not (
@@ -369,15 +388,24 @@ struct MatchStrategy:
     skipping) apply.
 
     `use_dfa` means "a DFA engine runs this pattern"; `use_eager_dfa`
-    selects the comptime-determinized table over the runtime LazyDFA;
+    selects the comptime-determinized table over the runtime LazyDFA for
+    `match()` (fullmatch — language membership, the classic table);
     `use_sheng` further selects the shuffle walker over the table walk
     for small eager DFAs on targets with a native byte shuffle.
+
+    `use_lf_dfa` is the search-family lane: the leftmost-first table
+    plus the reverse DFA (one unanchored forward scan for the end, one
+    reverse walk for the start), with `use_lf_sheng` its shuffle
+    variant. When it is off, a `use_dfa` pattern's search verbs run on
+    Teddy or on the LazyDFA with the backtracker end re-run.
     """
 
     var use_simd_literal: Bool
     var use_dfa: Bool
     var use_eager_dfa: Bool
     var use_sheng: Bool
+    var use_lf_dfa: Bool
+    var use_lf_sheng: Bool
     var use_teddy: Bool
     var use_teddy_prefix: Bool
     var use_sandwich_match: Bool
@@ -403,8 +431,17 @@ def _compute_strategy(
     pivot_ok: Bool,
     fprefix_len: Int,
     alt_prefix_valid: Bool,
-    use_dfa: Bool,
+    dfa_candidate: Bool,
+    lf_valid: Bool,
+    lf_sheng_ok: Bool,
 ) -> MatchStrategy:
+    # A lazy pattern rides the DFA lanes only when BOTH tables built:
+    # the classic one for match() and the leftmost-first one for the
+    # search verbs. Otherwise it stays on the backtracker — never the
+    # LazyDFA, whose longest-end walk is the wrong engine for `.*?`.
+    var use_dfa = dfa_candidate and (
+        not nfa.has_lazy or (eager_dfa_valid and lf_valid)
+    )
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
     var pure_literal = is_pure_literal(nfa)
@@ -441,11 +478,14 @@ def _compute_strategy(
         required_byte = -1
     else:
         required_byte = extract_required_byte(nfa)
+    var use_lf_dfa = use_dfa and lf_valid and not use_teddy
     return MatchStrategy(
         use_simd_literal=use_simd_literal,
         use_dfa=use_dfa,
         use_eager_dfa=use_dfa and eager_dfa_valid,
         use_sheng=use_dfa and eager_dfa_valid and sheng_ok and not use_teddy,
+        use_lf_dfa=use_lf_dfa,
+        use_lf_sheng=use_lf_dfa and lf_sheng_ok,
         use_teddy=use_teddy,
         use_teddy_prefix=use_teddy_prefix,
         use_sandwich_match=use_sandwich_match,
@@ -486,10 +526,18 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _use_dfa_candidate = _dfa_candidate(Self.nfa, Self._group_count)
     # Teddy-claimed patterns (pure literal alternations on shuffle targets)
     # never run the DFA engines, so skip their comptime determinization.
-    comptime _edfa = build_eager_dfa(
-        Self.nfa,
-        Self._use_dfa_candidate
-        and not (Self._lit_alt.valid and HAS_FAST_BYTE_SHUFFLE),
+    comptime _build_dfas = Self._use_dfa_candidate and not (
+        Self._lit_alt.valid and HAS_FAST_BYTE_SHUFFLE
+    )
+    # The classic table: match() (fullmatch) and the prefilter shapes.
+    comptime _edfa = build_eager_dfa(Self.nfa, Self._build_dfas)
+    # The leftmost-first table and its reverse companion: the search
+    # verbs. Lazy patterns are only worth a classic table when this one
+    # built too (see _compute_strategy), so the reverse build is gated
+    # on the forward one.
+    comptime _lfdfa = build_lf_dfa(Self.nfa, Self._build_dfas)
+    comptime _rdfa = build_reverse_dfa(
+        Self.nfa, Self._build_dfas and Self._lfdfa.valid
     )
     comptime _strategy = _compute_strategy(
         Self.nfa,
@@ -505,13 +553,21 @@ struct Regex[pattern: String](Copyable, Movable):
         len(Self._fpre.bytes),
         Self._alt_prefix.valid,
         Self._use_dfa_candidate,
+        Self._lfdfa.valid and Self._rdfa.valid,
+        sheng_viable(Self._lfdfa.d) and HAS_FAST_BYTE_SHUFFLE,
     )
-    # LazyDFA only backs DFA patterns whose comptime determinization
-    # overflowed EDFA_STATE_CAP — and that Teddy didn't claim.
+    # The LazyDFA backs a DFA pattern's verbs whenever a comptime table is
+    # missing: match() when the classic determinization overflowed
+    # EDFA_STATE_CAP, the search verbs when the leftmost-first one did.
+    # Never for Teddy-claimed patterns, and never for lazy patterns
+    # (those leave the DFA lanes entirely — see _compute_strategy).
     comptime _use_lazy_dfa = (
         Self._strategy.use_dfa
-        and not Self._strategy.use_eager_dfa
         and not Self._strategy.use_teddy
+        and (
+            not Self._strategy.use_eager_dfa
+            or not Self._strategy.use_lf_dfa
+        )
     )
     comptime _EDFA_TN = Self._edfa.num_states * 256
     # The table is the walk's hot data, so it materializes in the
@@ -527,6 +583,31 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _SHENG_MASKS = sheng_masks_arr[Self._SHENG_CAP](
         Self._edfa, Self._strategy.use_sheng
     )
+    # Leftmost-first lane tables (same materialization rules as above).
+    comptime _LFDFA_TN = Self._lfdfa.d.num_states * 256
+    comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.d.num_states)
+    comptime _LFDFA_TABLE = edfa_table_arr[Self._LFDFA_TN, Self._LFDFA_DT](
+        Self._lfdfa.d
+    )
+    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.d.num_states](
+        Self._lfdfa.d
+    )
+    comptime _LF_SHENG_CAP = sheng_cap_for(
+        Self._lfdfa.d, Self._strategy.use_lf_sheng
+    )
+    comptime _LF_SHENG_MASKS = sheng_masks_arr[Self._LF_SHENG_CAP](
+        Self._lfdfa.d, Self._strategy.use_lf_sheng
+    )
+    comptime _RDFA_TN = Self._rdfa.num_states * 256
+    comptime _RDFA_DT = edfa_id_dtype(Self._rdfa.num_states)
+    comptime _RDFA_TABLE = rdfa_table_arr[Self._RDFA_TN, Self._RDFA_DT](
+        Self._rdfa
+    )
+    comptime _RDFA_FLAGS = rdfa_flags_arr[Self._rdfa.num_states](Self._rdfa)
+    comptime _RDFA_VIEW = rdfa_view(Self._rdfa)
+    # Pivot-anchored prefilter shape (the `[class]+ P …` family), read off
+    # the classic table; the leftmost-first scan starts at its candidate.
+    comptime _lf_pivot = _pivot_prefilter(Self._edfa)
     comptime _match_suffix = _match_suffix_for_fastfail(
         Self.nfa,
         Self._strategy.use_sandwich_match,
@@ -540,6 +621,7 @@ struct Regex[pattern: String](Copyable, Movable):
     )
     # Field, not a per-method call: the check runs a cycle-flags pass over
     # the NFA, and comptime memoization covers field declarations only.
+    # Only the Teddy and LazyDFA search lanes still consult it.
     comptime _lf_end_is_dfa_end = _dfa_end_is_leftmost_first(Self.nfa)
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
@@ -568,7 +650,10 @@ struct Regex[pattern: String](Copyable, Movable):
 
     # --- DFA engine dispatch: comptime table walk or runtime LazyDFA ------
     # Only the lazy branches can raise (DFA_STATE_CAP -> Pike VM fallback);
-    # the eager table is complete by construction.
+    # the eager tables are complete by construction. match() dispatches
+    # over the classic table; the search verbs over the leftmost-first
+    # lane (_lf_next_match) when it built, else Teddy or the LazyDFA
+    # through _dfa_match_at / _dfa_search_forward.
 
     @always_inline
     def _dfa_full_match(mut self, input: String) raises -> Bool:
@@ -597,18 +682,6 @@ struct Regex[pattern: String](Copyable, Movable):
     ](mut self, input: Span[Byte, origin], start: Int) raises -> Int:
         comptime if Self._strategy.use_teddy:
             return teddy_match_at[alt=Self._lit_alt](input, start)
-        elif Self._strategy.use_sheng:
-            return sheng_match_at[
-                d=Self._edfa,
-                masks=Self._SHENG_MASKS,
-                flags=Self._EDFA_FLAGS,
-            ](input, start)
-        elif Self._strategy.use_eager_dfa:
-            return edfa_match_at[
-                d=Self._edfa,
-                table=Self._EDFA_TABLE,
-                flags=Self._EDFA_FLAGS,
-            ](input, start)
         else:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
@@ -622,22 +695,6 @@ struct Regex[pattern: String](Copyable, Movable):
     ]:
         comptime if Self._strategy.use_teddy:
             return teddy_search_forward[alt=Self._lit_alt](input, start)
-        elif Self._strategy.use_sheng:
-            return sheng_search_forward[
-                d=Self._edfa,
-                masks=Self._SHENG_MASKS,
-                flags=Self._EDFA_FLAGS,
-                first_byte_bitmap=Self._first_byte_bitmap,
-                bitmap_useful=Self._strategy.first_byte_useful,
-            ](input, start)
-        elif Self._strategy.use_eager_dfa:
-            return edfa_search_forward[
-                d=Self._edfa,
-                table=Self._EDFA_TABLE,
-                flags=Self._EDFA_FLAGS,
-                first_byte_bitmap=Self._first_byte_bitmap,
-                bitmap_useful=Self._strategy.first_byte_useful,
-            ](input, start)
         else:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
@@ -648,6 +705,72 @@ struct Regex[pattern: String](Copyable, Movable):
                 Self._first_byte_bitmap,
                 Self._strategy.first_byte_useful,
             )
+
+    # --- Leftmost-first lane: unanchored forward scan + reverse start ----
+
+    @always_inline
+    def _lf_find_end[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], pos: Int) -> Int:
+        """Leftmost-first match END at or after `pos`, or -1."""
+        comptime if Self._strategy.use_lf_sheng:
+            return sheng_lfdfa_find_end[
+                lf=Self._lfdfa,
+                masks=Self._LF_SHENG_MASKS,
+                flags=Self._LFDFA_FLAGS,
+            ](input, pos)
+        else:
+            return lfdfa_find_end[
+                lf=Self._lfdfa,
+                table=Self._LFDFA_TABLE,
+                flags=Self._LFDFA_FLAGS,
+            ](input, pos)
+
+    @always_inline
+    def _lf_next_match[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], pos: Int) -> Tuple[Int, Int]:
+        """The leftmost-first match starting at or after `pos` as
+        (start, end), or (-1, -1).
+
+        One unanchored forward scan gives the end; the reverse DFA walks
+        back from it, never below `pos`, for the start. The prefilters
+        only move the scan's starting point: a filter-prefix / Teddy
+        alternation-prefix candidate, or the pivot prefilter's class-run
+        start — positions before which no match can begin, so the scan
+        from there finds the same leftmost match a scan from `pos` would.
+        A `^`-anchored pattern has no restart threads (nothing can begin
+        mid-input), so its scan from 0 is the anchored attempt and its
+        start needs no reverse walk.
+        """
+        comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            if pos > 0:
+                return (-1, -1)
+            var end = self._lf_find_end(input, 0)
+            if end < 0:
+                return (-1, -1)
+            return (0, end)
+        else:
+            var input_len = len(input)
+            var s0 = pos
+            comptime if Self._use_scan_filter:
+                s0 = self._scan_candidate(input, input_len, pos)
+                if s0 < 0:
+                    return (-1, -1)
+            elif Self._lf_pivot[0] >= 0:
+                s0 = pivot_first_candidate[d=Self._edfa](input, pos)
+                if s0 < 0:
+                    return (-1, -1)
+            var end = self._lf_find_end(input, s0)
+            if end < 0:
+                return (-1, -1)
+            var start = rdfa_find_start[
+                d=Self._RDFA_VIEW,
+                table=Self._RDFA_TABLE,
+                flags=Self._RDFA_FLAGS,
+            ](input, end, s0)
+            debug_assert(start >= 0, "reverse DFA lost the match start")
+            return (start, end)
 
     def match(mut self, input: String) -> MatchResult[Self._num_slots]:
         """Match the entire input against the pattern.
@@ -770,6 +893,16 @@ struct Regex[pattern: String](Copyable, Movable):
                 matched=True,
                 start=pos,
                 end=pos + Self._strategy.prefix_len,
+                slots=InlineArray[Int, Self._num_slots](fill=-1),
+            )
+        elif Self._strategy.use_lf_dfa:
+            var rng = self._lf_next_match(input.as_bytes(), 0)
+            if rng[0] < 0:
+                return MatchResult[Self._num_slots].no_match()
+            return MatchResult[Self._num_slots](
+                matched=True,
+                start=rng[0],
+                end=rng[1],
                 slots=InlineArray[Int, Self._num_slots](fill=-1),
             )
         elif Self._strategy.use_dfa:
@@ -1009,6 +1142,22 @@ struct Regex[pattern: String](Copyable, Movable):
                 )
                 pos += Self._strategy.prefix_len
             return results^
+        elif Self._strategy.use_lf_dfa:
+            var results = List[MatchResult[Self._num_slots]]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            while pos <= input_len:
+                var rng = self._lf_next_match(input_bytes, pos)
+                if rng[0] < 0:
+                    break
+                results.append(Self._span_result(rng[0], rng[1]))
+                # Empty match: advance one byte (mirrors every other lane).
+                if rng[1] > rng[0]:
+                    pos = rng[1]
+                else:
+                    pos = rng[0] + 1
+            return results^
         elif Self._strategy.use_dfa:
             var results = List[MatchResult[Self._num_slots]]()
             var input_bytes = input.as_bytes()
@@ -1138,6 +1287,23 @@ struct Regex[pattern: String](Copyable, Movable):
                     )
                 )
                 pos += Self._strategy.prefix_len
+            return results^
+        elif Self._strategy.use_lf_dfa:
+            var results = List[String]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            while pos <= input_len:
+                var rng = self._lf_next_match(input_bytes, pos)
+                if rng[0] < 0:
+                    break
+                results.append(
+                    String(unsafe_from_utf8=input_bytes[rng[0] : rng[1]])
+                )
+                if rng[1] > rng[0]:
+                    pos = rng[1]
+                else:
+                    pos = rng[0] + 1
             return results^
         elif Self._strategy.use_dfa:
             var results = List[String]()
@@ -1523,6 +1689,8 @@ struct Regex[pattern: String](Copyable, Movable):
                     unsafe_from_utf8=input_bytes[prev_end:input_len]
                 )
             return output^
+        elif Self._strategy.use_lf_dfa:
+            return self._replace_lf(input, replacement)
         elif Self._strategy.use_dfa:
             try:
                 return self._replace_dfa(input, replacement)
@@ -1533,6 +1701,49 @@ struct Regex[pattern: String](Copyable, Movable):
                 return self._replace_impl(input, replacement)
             except:
                 return self._pike_replace(input, replacement)
+
+    def _replace_lf(mut self, input: String, replacement: String) -> String:
+        """replace() on the leftmost-first lane: the same loop as
+        _replace_dfa over _lf_next_match spans, and nothing can raise."""
+        var output = String()
+        var input_bytes = input.as_bytes()
+        var input_len = input.byte_length()
+        var literal_replacement = (
+            simd_find_byte(replacement.as_bytes(), CHAR_BACKSLASH, 0) < 0
+        )
+        var prev_end = 0
+        var pos = 0
+        while pos <= input_len:
+            var rng = self._lf_next_match(input_bytes, pos)
+            if rng[0] < 0:
+                break
+            var start = rng[0]
+            var end = rng[1]
+            if start > prev_end:
+                output += String(unsafe_from_utf8=input_bytes[prev_end:start])
+            if literal_replacement:
+                output += replacement
+            else:
+                var match_result = MatchResult[Self._num_slots](
+                    matched=True,
+                    start=start,
+                    end=end,
+                    slots=InlineArray[Int, Self._num_slots](fill=-1),
+                )
+                output += self._expand_replacement(
+                    input_bytes, match_result, replacement
+                )
+            if end > start:
+                prev_end = end
+                pos = end
+            else:
+                # Empty match: keep the byte at start in the next segment
+                # (mirrors _replace_impl).
+                prev_end = start
+                pos = start + 1
+        if prev_end < input_len:
+            output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+        return output^
 
     def _replace_dfa(
         mut self, input: String, replacement: String
@@ -1659,7 +1870,35 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def split(mut self, input: String) -> List[String]:
         """Split input by matches of the pattern."""
-        comptime if Self._strategy.use_dfa:
+        comptime if Self._strategy.use_lf_dfa:
+            var parts = List[String]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            var prev_end = 0
+            while pos <= input_len:
+                var rng = self._lf_next_match(input_bytes, pos)
+                if rng[0] < 0:
+                    break
+                var start = rng[0]
+                var end = rng[1]
+                parts.append(
+                    String(unsafe_from_utf8=input_bytes[prev_end:start])
+                )
+                if end > start:
+                    prev_end = end
+                    pos = end
+                else:
+                    # Empty match: the byte at start still belongs to the
+                    # next segment (Python re.split keeps it).
+                    prev_end = start
+                    pos = start + 1
+            if prev_end <= input_len:
+                parts.append(
+                    String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+                )
+            return parts^
+        elif Self._strategy.use_dfa:
             var parts = List[String]()
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
@@ -2063,12 +2302,14 @@ struct Regex[pattern: String](Copyable, Movable):
     ](self, input: Span[Byte, origin], start: Int, dfa_end: Int) -> Int:
         """Resolve the leftmost-first (Python re) end of the match at `start`.
 
-        The lazy DFA reports leftmost-longest ends — a subset construction
-        cannot track alternative priority, so `a|ab` on "ab" yields end 2
-        where Python yields 1. The DFA is still authoritative for *finding*
-        the leftmost start; this runs the backtracker once, anchored there,
-        to disambiguate the end with the same semantics as every other
-        engine. Costs one anchored run per reported match.
+        The Teddy and LazyDFA lanes report leftmost-longest ends — their
+        state sets carry no thread priority, so `a|ab` on "ab" yields end
+        2 where Python yields 1. Those lanes are still authoritative for
+        *finding* the leftmost start; this runs the backtracker once,
+        anchored there, to disambiguate the end with the same semantics
+        as every other engine. Costs one anchored run per reported match.
+        The eager search lane no longer needs it: its leftmost-first table
+        (static_lfdfa.mojo) yields Python's end directly.
 
         Falls back to the Pike VM if the backtracker budget is exhausted,
         and to the DFA's own end as a last resort (still a valid match,
