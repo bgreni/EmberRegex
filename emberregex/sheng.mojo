@@ -40,7 +40,6 @@ from .constants import CHAR_NEWLINE
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
-    EDFA_MATCH_IF_NONWORD,
     EDFA_MATCH_IF_WORD,
     EagerDFA,
     _edfa_accel_skip,
@@ -183,6 +182,9 @@ def _sheng_full_match_impl[
         while pos < input_len:
             var unused = -1
             var skipped = _edfa_accel_skip[d=d](input, cur, pos, unused)
+            comptime if len(d.region_states) >= 2:
+                if skipped > pos:
+                    cur_vec = _ShengState(UInt8(cur))
             pos = skipped
             if pos >= input_len:
                 break
@@ -275,7 +277,11 @@ def _sheng_walk_impl[
     var input_len = len(input)
     while pos < input_len:
         comptime if accel:
-            pos = _edfa_accel_skip[d=d](input, cur, pos, last_match)
+            var skipped = _edfa_accel_skip[d=d](input, cur, pos, last_match)
+            comptime if len(d.region_states) >= 2:
+                if skipped > pos:
+                    cur_vec = _ShengState(UInt8(cur))
+            pos = skipped
             if pos >= input_len:
                 break
         var b = input.unsafe_get(pos)
@@ -286,8 +292,8 @@ def _sheng_walk_impl[
             ):
                 last_match = pos
         comptime if d.any_wb:
-            var f = flg.unsafe_get(cur)
-            if (f & (EDFA_MATCH_IF_WORD | EDFA_MATCH_IF_NONWORD)) != 0:
+            if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
+                var f = flg.unsafe_get(cur)
                 if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
                     last_match = pos
         cur_vec = _sheng_step(msk, b, cur_vec)

@@ -17,6 +17,7 @@ from emberregex.static_dfa import (
     EDFA_MATCH_IF_NONWORD,
     EDFA_MATCH_IF_WORD,
     EagerDFA,
+    _edfa_has_region,
     build_eager_dfa,
     edfa_flags_arr,
     edfa_full_match,
@@ -41,7 +42,7 @@ def test_word_boundary_rides_the_dfa_lanes() raises:
     # A word anchor no longer clears can_use_dfa; a DFA-shaped pattern
     # carrying one runs match() on the classic table and the search
     # verbs on the leftmost-first + reverse tables.
-    comptime S = Regex["\\b(?:foo|bar)\\b"]
+    comptime S = Regex["\\b(?:[a-z]+|\\d+)ing\\b"]
     assert_true(S.nfa.can_use_dfa)
     assert_true(S.nfa.has_word_boundary)
     assert_true(S._strategy.use_dfa)
@@ -53,6 +54,43 @@ def test_word_boundary_rides_the_dfa_lanes() raises:
     assert_true(T._use_lf_dfa)
     comptime U = Regex["\\b[a-z]+ing\\b"]
     assert_true(U._strategy.use_dfa)
+    assert_true(U._use_lf_dfa)
+
+
+def test_scanner_patterns_without_a_region_keep_the_backtracker() raises:
+    # The leftmost-first lane skips false candidates with the restart
+    # states' acceleration; a pending `\b` splits those by look-behind
+    # class, so they are accelerated as a REGION when the exit set is
+    # sparse (EagerDFA.region_states). With a dense exit set and a
+    # literal candidate scanner available, the search verbs stay on the
+    # backtracker (match() keeps the classic table).
+    comptime S = Regex["(?:alpha|bravo|charlie|delta|echo) \\w+\\b"]
+    assert_true(S._strategy.use_dfa)
+    assert_true(S._strategy.use_eager_dfa)
+    assert_true(S._use_scan_filter)
+    assert_false(comptime(_edfa_has_region(S._lfdfa.d)))
+    assert_false(S._use_lf_dfa)
+    assert_false(S._use_lazy_dfa)
+    var re = S()
+    var input = "alpha one bravo_x charlie two"
+    var got = re.finditer(input)
+    var exp = re._pike_finditer(input)
+    assert_equal(len(got), len(exp))
+    for i in range(len(got)):
+        assert_equal(got[i].start, exp[i].start)
+        assert_equal(got[i].end, exp[i].end)
+    assert_true(re.match("alpha one").matched)
+    assert_false(re.match("alpha one ").matched)
+    # A sparse exit set gets the region skip and rides the lane even
+    # with a scanner: `\bfoo(?:bar|baz)\b` restarts in two states (after
+    # a word byte / after a non-word byte) that agree on every byte but
+    # 'f'.
+    comptime T = Regex["\\bfoo(?:bar|baz)\\b"]
+    assert_true(T._use_scan_filter)
+    assert_true(comptime(_edfa_has_region(T._lfdfa.d)))
+    assert_true(T._use_lf_dfa)
+    comptime U = Regex["\\b(?:foo|bar)\\b"]
+    assert_true(comptime(_edfa_has_region(U._lfdfa.d)))
     assert_true(U._use_lf_dfa)
 
 

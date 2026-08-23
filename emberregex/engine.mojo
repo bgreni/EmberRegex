@@ -65,6 +65,7 @@ from .backtrack import (
 from .dfa import LazyDFA
 from .static_dfa import (
     EagerDFA,
+    _edfa_has_region,
     _eol_continuation_crosses_anchor,
     _eol_ml_continuation_consumes,
     _wb_cont_reaches_bol,
@@ -741,11 +742,27 @@ struct Regex[pattern: String](Copyable, Movable):
     )
     # The search-family lane (see MatchStrategy's docstring for why it is
     # not a strategy field). Referenced by the search verbs only.
+    #
+    # The lane runs ONE unanchored scan from the first candidate, so
+    # after a false candidate it is the table's restart states that must
+    # skip ahead. A pending `\b` splits those by look-behind class, and
+    # the pair alternates every few bytes of prose; the region
+    # acceleration (EagerDFA.region_states) scans the pair as one when
+    # its exit set is sparse. When it is not and the pattern has a
+    # candidate scanner (filter prefix or Teddy alternation prefix), the
+    # search verbs stay on the backtracker, whose scanner jumps straight
+    # to the next literal occurrence (measured 3.6x slower on the lane
+    # before the region skip existed).
     comptime _use_lf_dfa = (
         Self._strategy.use_dfa
         and not Self._strategy.use_teddy
         and Self._lfdfa.valid
         and Self._rdfa.valid
+        and not (
+            Self.nfa.has_word_boundary
+            and Self._use_scan_filter
+            and not _edfa_has_region(Self._lfdfa.d)
+        )
     )
     comptime _use_lf_sheng = (
         Self._use_lf_dfa

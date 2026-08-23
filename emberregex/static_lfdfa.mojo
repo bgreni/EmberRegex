@@ -1045,7 +1045,7 @@ def build_lf_dfa(
             flags[s] |= Int(EDFA_NO_ACCEL)
 
     var pstarts = _edfa_finish(
-        result.d, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize
+        result.d, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize, nctx
     )
     if has_wb:
         result.d.start_other_word = pstarts[3]

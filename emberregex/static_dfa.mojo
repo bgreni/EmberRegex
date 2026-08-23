@@ -63,6 +63,11 @@ comptime EDFA_MATCH_IF_NONWORD: UInt8 = 32
 # discovering only the states the input actually reaches.
 comptime EDFA_STATE_CAP = 128
 
+# Largest exit set a region acceleration (EagerDFA.region_states) is
+# built for: the scan restarts after every candidate, so it only pays
+# when exit bytes are sparse in ordinary text.
+comptime _REGION_MAX_EXITS = 4
+
 # NFA-size capacity of the bitset determinizer: 64 lanes x 64 bits. An NFA
 # past this cannot fit a subset bitset; in practice such NFAs overflow
 # EDFA_STATE_CAP anyway, so the pattern falls to the LazyDFA unchanged.
@@ -403,8 +408,11 @@ struct EagerDFA(Copyable, Movable):
     var num_states: Int
     # States are permuted so match states occupy ids [0, num_match_states):
     # the per-byte "is this a match state" test is an integer compare
-    # instead of a flags load.
+    # instead of a flags load. States with a word-conditional match flag
+    # follow them, in [num_match_states, num_match_states + num_cond_states),
+    # so the per-byte word-anchor check loads a flag byte only there.
     var num_match_states: Int
+    var num_cond_states: Int
     var table: List[Int]  # num_states * 256 entries; -1 = dead
     var flags: List[Int]  # num_states entries; EDFA_* bitmask
     var start_at_0: Int  # initial state at position 0
@@ -428,6 +436,20 @@ struct EagerDFA(Copyable, Movable):
     var accel_nib_kind: List[Int]  # ACCEL_SHUFTI or ACCEL_TRUFFLE
     var accel_nib_t0: List[Int]  # NIBBLE_TABLE_SIZE entries per state
     var accel_nib_t1: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+    # Region acceleration: a small set of flag-free states whose rows
+    # agree on every byte outside an exit set and land inside the set —
+    # the look-behind-split restart states of a word-anchor pattern
+    # (`\b(?:foo|bar)\b` restarts in one state after a word byte and
+    # another after a non-word byte, and neither self-loops on prose).
+    # The walkers SIMD-scan to the next exit byte as for a single state
+    # and land in the member the last skipped byte selects.
+    var region_states: List[Int]
+    var region_exit1: Int  # -1 when the exit set is nibble-encoded
+    var region_exit2: Int  # or -1
+    var region_nib_kind: Int
+    var region_nib_t0: List[Int]
+    var region_nib_t1: List[Int]
+    var region_land: List[Int]  # 256 entries: member landed in per byte
 
     def __init__(out self):
         """Invalid placeholder with one dead state (keeps arrays non-empty
@@ -435,6 +457,7 @@ struct EagerDFA(Copyable, Movable):
         self.valid = False
         self.num_states = 1
         self.num_match_states = 0
+        self.num_cond_states = 0
         self.table = List[Int](fill=-1, length=256)
         self.flags = List[Int](fill=0, length=1)
         self.start_at_0 = 0
@@ -451,6 +474,13 @@ struct EagerDFA(Copyable, Movable):
         self.accel_nib_kind = List[Int]()
         self.accel_nib_t0 = List[Int]()
         self.accel_nib_t1 = List[Int]()
+        self.region_states = List[Int]()
+        self.region_exit1 = -1
+        self.region_exit2 = -1
+        self.region_nib_kind = 0
+        self.region_nib_t0 = List[Int]()
+        self.region_nib_t1 = List[Int]()
+        self.region_land = List[Int]()
 
 
 def _eol_ml_continuation_consumes(nfa: NFA) -> Bool:
@@ -1409,7 +1439,15 @@ def build_eager_dfa(
             return result^  # state blowup: stay invalid, use LazyDFA
 
     var pstarts = _edfa_finish(
-        result, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize
+        result,
+        rows,
+        flags,
+        starts,
+        rep_lo,
+        rep_hi,
+        nclasses,
+        minimize,
+        nstart_ctx,
     )
     if has_wb:
         result.start_other_word = pstarts[3]
@@ -1425,6 +1463,7 @@ def _edfa_finish(
     rep_hi: SIMD[DType.int32, 256],
     nclasses: Int,
     minimize: Bool,
+    nregion: Int = 3,
 ) -> List[Int]:
     """Comptime: the determinizer-independent tail — minimization, the
     match-state permutation, the acceleration scan and the flat table —
@@ -1434,7 +1473,9 @@ def _edfa_finish(
     first three being (other, after-'\\n', at-0) for the `start_*`
     fields; the permuted ids come back in the same order so a producer
     with extra start contexts (the leftmost-first DFA's anchored starts)
-    can record them. Marks `result` valid.
+    can record them. The first `nregion` of them are the candidates for
+    region acceleration (the unanchored start contexts). Marks `result`
+    valid.
     """
     # Merge states no input can tell apart. Before the permutation and
     # the acceleration scan on purpose: both key off final state ids, and
@@ -1454,6 +1495,13 @@ def _edfa_finish(
             next_id += 1
     var num_match = next_id
     for s in range(nsets):
+        if Int(perm[s]) < 0 and flags.unsafe_get(s) & (
+            Int(EDFA_MATCH_IF_WORD) | Int(EDFA_MATCH_IF_NONWORD)
+        ) != 0:
+            perm[s] = Int32(next_id)
+            next_id += 1
+    var num_cond = next_id - num_match
+    for s in range(nsets):
         if Int(perm[s]) < 0:
             perm[s] = Int32(next_id)
             next_id += 1
@@ -1470,6 +1518,68 @@ def _edfa_finish(
                 row2[b] = perm[t]
         new_rows[Int(perm[s])] = row2
         new_flags[Int(perm[s])] = flags.unsafe_get(s)
+
+    # Region acceleration over the unanchored start states (see
+    # EagerDFA.region_states): members must be flag-free and unvetoed,
+    # at least two of them distinct, and their rows must agree on every
+    # non-exit byte with a target inside the set. Exit bytes are the rest
+    # — where the rows differ, leave the set, or die.
+    var members = List[Int]()
+    for i in range(min(nregion, len(starts))):
+        var sid = Int(perm[starts[i]])
+        if new_flags[sid] != 0:
+            continue  # match / EOL / word flags, or the NO_ACCEL veto
+        var dup = False
+        for m in members:
+            if m == sid:
+                dup = True
+        if not dup:
+            members.append(sid)
+    if len(members) >= 2:
+        var land = List[Int](fill=-1, length=256)
+        var exits = List[Int]()
+        for byte in range(256):
+            var t = Int(new_rows[members[0]][byte])
+            var ok = t >= 0
+            if ok:
+                var inside = False
+                for m in members:
+                    if m == t:
+                        inside = True
+                ok = inside
+            if ok:
+                for mi in range(1, len(members)):
+                    if Int(new_rows[members[mi]][byte]) != t:
+                        ok = False
+                        break
+            if ok:
+                land[byte] = t
+            else:
+                exits.append(byte)
+        # Sparse exit sets only: the scan is re-entered after every
+        # candidate, and with a dense set it rarely skips anything.
+        # Measured on `\b(?:words)\b` findall over 64 KB of prose: 2 exit
+        # bytes 80 -> 22 us, 4 exits 80 -> 45 us, 8 exits 79 -> 89 us
+        # (slower), 26 exits (`\b[a-z]+ing\b`) 101 -> 128 us (slower).
+        if len(exits) > 0 and len(exits) <= _REGION_MAX_EXITS:
+            var encodable = len(exits) <= 2 or HAS_FAST_BYTE_SHUFFLE
+            if encodable:
+                result.region_states = members.copy()
+                result.region_land = land^
+                if len(exits) <= 2:
+                    result.region_exit1 = exits[0]
+                    result.region_exit2 = exits[1] if len(exits) == 2 else -1
+                else:
+                    var t0 = List[Int]()
+                    var t1 = List[Int]()
+                    if shufti_encodable(exits):
+                        build_shufti_masks(exits, t0, t1)
+                        result.region_nib_kind = ACCEL_SHUFTI
+                    else:
+                        build_truffle_masks(exits, t0, t1)
+                        result.region_nib_kind = ACCEL_TRUFFLE
+                    result.region_nib_t0 = t0^
+                    result.region_nib_t1 = t1^
 
     # Acceleration: a state that self-loops on all but an exit-byte set gets
     # a SIMD scan to its next exit byte instead of a per-byte table walk.
@@ -1500,6 +1610,17 @@ def _edfa_finish(
                 exit_count += 1
         if exit_count == 0 or exit_count == 256:
             continue  # never exits / never self-loops: nothing to skip
+        # A region member takes the region skip instead: its own loop
+        # set is a byte class (word bytes, say) whose runs are a few
+        # bytes long in prose, while the region's exit set is sparse —
+        # a byte the member loops on but the region does not costs one
+        # table step, not a scan restart per run.
+        var is_member = False
+        for m in result.region_states:
+            if m == s:
+                is_member = True
+        if is_member:
+            continue
         var exits = List[Int]()
         for byte in range(256):
             if Int(row[byte]) != s:
@@ -1533,6 +1654,7 @@ def _edfa_finish(
     result.valid = True
     result.num_states = nsets
     result.num_match_states = num_match
+    result.num_cond_states = num_cond
     var pstarts = List[Int]()
     for i in range(len(starts)):
         pstarts.append(Int(perm[starts[i]]))
@@ -1616,18 +1738,33 @@ def _accel_mask_word(d: EagerDFA, word: Int) -> UInt64:
     for s in d.accel_nib_states:
         if s >> 6 == word:
             m |= UInt64(1) << UInt64(s & 63)
+    for s in d.region_states:
+        if s >> 6 == word:
+            m |= UInt64(1) << UInt64(s & 63)
     return m
+
+
+def _region_land_arr(d: EagerDFA) -> InlineArray[Int16, 256]:
+    """Comptime: `region_land` as a materializable array."""
+    var arr = InlineArray[Int16, 256](fill=-1)
+    for b in range(len(d.region_land)):
+        arr[b] = Int16(d.region_land[b])
+    return arr^
 
 
 @always_inline
 def _edfa_accel_skip[
     origin: Origin, //, d: EagerDFA
-](input: Span[Byte, origin], cur: Int, pos: Int, mut last_match: Int) -> Int:
+](
+    input: Span[Byte, origin], mut cur: Int, pos: Int, mut last_match: Int
+) -> Int:
     """If `cur` is an accelerated state, SIMD-scan to its next exit byte.
 
     Returns the new position (== pos when cur isn't accelerated). For
     match-flagged accelerated states every skipped position is a match end,
-    so last_match advances to the scan destination.
+    so last_match advances to the scan destination. A region skip (see
+    EagerDFA.region_states) may also move `cur` to the member the last
+    skipped byte lands in.
 
     This runs once per walked byte, so the common cases must exit within a
     few instructions: too little input left to vectorize (short matches),
@@ -1672,12 +1809,58 @@ def _edfa_accel_skip[
                 p = find_in_class[kind=a_kind, t0=a_t0, t1=a_t1](input, p + 1)
                 comptime if a_state < d.num_match_states:
                     last_match = p
+    comptime nreg = len(d.region_states)
+    comptime if nreg >= 2:
+        var in_region = False
+        comptime for ri in range(nreg):
+            comptime r_state = d.region_states[ri]
+            if cur == r_state:
+                in_region = True
+        if in_region and p < len(input):
+            var p2 = p
+            comptime if d.region_exit1 >= 0:
+                comptime r_e1 = UInt8(d.region_exit1)
+                comptime r_e2 = UInt8(
+                    d.region_exit2 if d.region_exit2 >= 0 else d.region_exit1
+                )
+                # Scalar peek: a region is re-entered right after landing
+                # on an exit byte (a false candidate), where a vector
+                # compare would only confirm what one byte compare does.
+                var b0 = input.unsafe_get(p)
+                if b0 != r_e1 and b0 != r_e2:
+                    p2 = _find_exit2[e1=r_e1, e2=r_e2](input, p + 1)
+            else:
+                comptime r_kind = d.region_nib_kind
+                comptime r_t0 = nibble_table_from(d.region_nib_t0, 0)
+                comptime r_t1 = nibble_table_from(d.region_nib_t1, 0)
+                if not _class_contains[kind=r_kind, t0=r_t0, t1=r_t1](
+                    input.unsafe_get(p)
+                ):
+                    p2 = find_in_class[kind=r_kind, t0=r_t0, t1=r_t1](
+                        input, p + 1
+                    )
+            if p2 > p:
+                # Every skipped byte's target is the same from any
+                # member: the state is whatever the last one selected.
+                comptime land = _region_land_arr(d)
+                var lnd = materialize[land]()
+                cur = Int(lnd.unsafe_get(Int(input.unsafe_get(p2 - 1))))
+                p = p2
     return p
+
+
+def _edfa_has_region(d: EagerDFA) -> Bool:
+    """Comptime: does the table carry a region acceleration?"""
+    return len(d.region_states) >= 2
 
 
 def _edfa_has_accel(d: EagerDFA) -> Bool:
     """Comptime: does any state carry acceleration data?"""
-    return len(d.accel_states) > 0 or len(d.accel_nib_states) > 0
+    return (
+        len(d.accel_states) > 0
+        or len(d.accel_nib_states) > 0
+        or len(d.region_states) >= 2
+    )
 
 
 def _start_run_skip_idx(d: EagerDFA) -> Int:
@@ -1956,8 +2139,9 @@ def _edfa_walk_impl[
         comptime if d.any_wb:
             # A pending word anchor resolves against this byte: the
             # state is a match end here iff the byte's class agrees.
-            var f = flg.unsafe_get(cur)
-            if (f & (EDFA_MATCH_IF_WORD | EDFA_MATCH_IF_NONWORD)) != 0:
+            # Such states occupy one id range (see num_cond_states).
+            if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
+                var f = flg.unsafe_get(cur)
                 if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
                     last_match = pos
         var nxt = Int(tbl.unsafe_get(cur * 256 + Int(b)))
