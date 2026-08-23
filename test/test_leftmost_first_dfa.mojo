@@ -349,6 +349,30 @@ def test_reverse_walk_never_passes_previous_end() raises:
     assert_equal(len(exp), 1000)
 
 
+def test_reverse_walk_does_not_step_past_a_pending_bol() raises:
+    # The reverse table keeps BOL kinds as pending members; it must not
+    # follow their predecessors on a transition that cannot resolve them
+    # (`x^` never holds mid-input), or the start walks past the true
+    # start. Found while mirroring word anchors into the reverse DFA.
+    comptime S = Regex["(?:x^y|y)"]
+    assert_true(S._use_lf_dfa)
+    var re = S()
+    var r = re.search("xy")
+    assert_equal(r.start, 1)
+    assert_equal(r.end, 2)
+    # BOL_MULTILINE does resolve on the '\n' transition and is stepped
+    # past there.
+    comptime T = Regex["(?m)(?:x\\n^y|y)"]
+    assert_true(T._use_lf_dfa)
+    var t = T()
+    var r2 = t.search("x\ny")
+    assert_equal(r2.start, 0)
+    assert_equal(r2.end, 3)
+    var r3 = t.search("xzy")
+    assert_equal(r3.start, 2)
+    assert_equal(r3.end, 3)
+
+
 def _assert_finditer_pike[p: StaticString](input: String) raises:
     var re = Regex[p]()
     var got = re.finditer(input)

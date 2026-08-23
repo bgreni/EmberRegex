@@ -28,10 +28,12 @@ way the forward lanes defer EOL:
   - `bolnl` — ids reachable by resolving BOL_MULTILINE only
               (p > 0 and input[p-1] == '\\n')
 
-Word boundaries would need both neighbours at once; they already keep a
-set off the DFA lanes (`can_use_dfa`), and such sets take the SOM-carrying
-Pike instead (`set_pike.som_scan`), so the reverse lane never has to model
-them.
+Word boundaries need both neighbours at once; they keep a SET off the DFA
+lanes (`can_use_dfa` is cleared for such unions in set_nfa.mojo), and such
+sets take the SOM-carrying Pike instead (`set_pike.som_scan`), so this
+reverse lane never models them. The single-pattern reverse DFA
+(static_rdfa.mojo) does, with a per-state look-ahead class — the same
+trick would lift the restriction here.
 
 Cost is one leftward walk per distinct reported end, each bounded by the
 reverse automaton dying — i.e. by the longest match that can end there,
