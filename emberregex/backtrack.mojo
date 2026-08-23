@@ -35,6 +35,14 @@ from .constants import (
 from .nfa import split_cycle_flags, NFA, NFAState, NFAStateKind
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
+from .optimize import first_byte_bitmap_of, loop_body_bitmap
+from .simd_kernels import (
+    HAS_FAST_BYTE_SHUFFLE,
+    build_class_masks,
+    find_in_class,
+    stops_from_bitmap,
+    _class_contains,
+)
 
 
 @always_inline
@@ -130,6 +138,168 @@ def _exit_is_eol_then_match(nfa: NFA, out2: Int) -> Bool:
     return nfa.states[nxt].kind == NFAStateKind.MATCH
 
 
+def _sbt_is_simple_body(nfa: NFA, split_idx: Int, body_idx: Int) -> Bool:
+    """Compile-time helper: True when `body_idx` is a single consuming state
+    that loops straight back to the SPLIT at `split_idx`.
+
+    This is the shape the backtracker compiles to iteration instead of
+    recursion (`a*`, `\\d+`, `.*?`), so it is also the shape the depth guard
+    can ignore and the shape auto-possessification applies to.
+    """
+    return (
+        body_idx >= 0
+        and body_idx < len(nfa.states)
+        and nfa.states[body_idx].out1 == split_idx
+        and (
+            nfa.states[body_idx].kind == NFAStateKind.ANY
+            or nfa.states[body_idx].kind == NFAStateKind.CHAR
+            or nfa.states[body_idx].kind == NFAStateKind.CHARSET
+        )
+    )
+
+
+# How much of a simple loop's giveback can be skipped, from comparing the
+# bytes the body eats with the bytes that can START the loop's continuation
+# (PCRE2 calls this auto_possessify).
+comptime SBT_GIVEBACK_ALL = 0
+"""Try the exit at every position — nothing can be proven about it."""
+comptime SBT_GIVEBACK_FILTER = 1
+"""Skip positions whose byte cannot start the exit."""
+comptime SBT_GIVEBACK_POSSESSIVE = 2
+"""The exit's first bytes are disjoint from the body's, so no position the
+body consumed can ever start it: the loop never gives anything back."""
+
+
+struct SbtLoopFilter(Copyable, Movable):
+    """Comptime analysis of one simple loop: how far its giveback can be
+    skipped, and the byte sets the walkers test against."""
+
+    var mode: Int
+    var exit_bits: SIMD[DType.uint8, BITMAP_WIDTH]
+    """Bytes that can start the loop's continuation (greedy giveback test)."""
+    var stop_bits: SIMD[DType.uint8, BITMAP_WIDTH]
+    """`exit_bits | ~body`: bytes at which a lazy loop must stop scanning —
+    either the exit could start there or the body can no longer consume."""
+
+    def __init__(
+        out self,
+        mode: Int,
+        exit_bits: SIMD[DType.uint8, BITMAP_WIDTH],
+        stop_bits: SIMD[DType.uint8, BITMAP_WIDTH],
+    ):
+        self.mode = mode
+        self.exit_bits = exit_bits
+        self.stop_bits = stop_bits
+
+
+def _sbt_loop_filter(nfa: NFA, body_idx: Int, exit_idx: Int) -> SbtLoopFilter:
+    """Compile-time: derive a simple loop's giveback mode and byte sets.
+
+    Every position the loop hands back holds a byte the body consumed. If the
+    continuation cannot even START on such a byte, trying it there is provably
+    wasted work — and if that holds for the whole body class, the loop is
+    possessive and only its last position can match.
+
+    Requires `not can_be_empty` for any filtering: an exit that reaches MATCH
+    (or a lookaround/backref) without consuming may succeed on a byte that is
+    in no first-byte set at all, end of input included.
+    """
+    var off = SbtLoopFilter(
+        SBT_GIVEBACK_ALL,
+        SIMD[DType.uint8, BITMAP_WIDTH](0xFF),
+        SIMD[DType.uint8, BITMAP_WIDTH](0xFF),
+    )
+    var exit_fb = first_byte_bitmap_of(nfa, exit_idx)
+    if exit_fb.can_be_empty:
+        return off^
+    var body = loop_body_bitmap(nfa, body_idx)
+    if (body & ~exit_fb.bitmap).reduce_or() == 0:
+        # Every byte the body eats can also start the exit (and an unknown
+        # body reads as empty here): no position could ever be skipped, so
+        # don't pay for the test.
+        return off^
+    var stop_bits = exit_fb.bitmap | ~body
+    if (body & exit_fb.bitmap).reduce_or() == 0:
+        return SbtLoopFilter(SBT_GIVEBACK_POSSESSIVE, exit_fb.bitmap, stop_bits)
+    return SbtLoopFilter(SBT_GIVEBACK_FILTER, exit_fb.bitmap, stop_bits)
+
+
+def sbt_loop_modes(nfa: NFA) -> List[Int]:
+    """Compile-time introspection: the giveback mode of every simple loop in
+    `nfa`, in state order.
+
+    Only tests read this — the walkers compute the same value inline, per
+    instantiation. It exists so a regression that silently stops
+    possessifying a loop fails a test instead of only a benchmark.
+    """
+    var modes = List[Int]()
+    for i in range(len(nfa.states)):
+        ref s = nfa.states[i]
+        if s.kind != NFAStateKind.SPLIT or s.out2 == -1:
+            continue
+        # Greedy loops carry the body in out1 and the exit in out2; lazy
+        # loops the other way round.
+        var body = s.out1 if s.greedy else s.out2
+        var exit_idx = s.out2 if s.greedy else s.out1
+        if not _sbt_is_simple_body(nfa, i, body):
+            continue
+        modes.append(_sbt_loop_filter(nfa, body, exit_idx).mode)
+    return modes^
+
+
+def _sbt_single_byte(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Int:
+    """Compile-time: the only byte in `bitmap`, or -1 when it holds none or
+    more than one. Most continuations start with one literal byte (`>`, `@`,
+    `x`), and that case compiles to an immediate compare instead of a
+    256-bit constant plus a dynamic lane index."""
+    var found = -1
+    for b in range(256):
+        if (bitmap[b >> 3] & (UInt8(1) << UInt8(b & 7))) != 0:
+            if found >= 0:
+                return -1
+            found = b
+    return found
+
+
+@always_inline
+def _sbt_first_byte_test[
+    bits: SIMD[DType.uint8, BITMAP_WIDTH], single: Int
+](b: Byte) -> Bool:
+    """Membership of `b` in a comptime byte set (`single` = its only byte, or
+    -1 for the general bitmap form)."""
+    comptime if single >= 0:
+        return Int(b) == single
+    else:
+        return _sbt_bitmap_check(bits, False, UInt32(b))
+
+
+@always_inline
+def _sbt_class_skip[
+    origin: Origin, //, stop_bitmap: SIMD[DType.uint8, BITMAP_WIDTH]
+](input: Span[Byte, origin], cur: Int) -> Int:
+    """First position >= `cur` whose byte is in `stop_bitmap`, else
+    len(input). Shufti/truffle where the target has a native byte shuffle,
+    scalar bitmap walk elsewhere."""
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime km = build_class_masks(stops_from_bitmap(stop_bitmap))
+        # Scalar peek first (same rationale as the search prefilters): the
+        # byte under the cursor already stops most lazy spans, and the peek
+        # resolves that in a few instructions versus the kernel's fixed cost.
+        if cur < len(input) and not _class_contains[
+            kind=km[0], t0=km[1], t1=km[2]
+        ](input.unsafe_get(cur)):
+            return find_in_class[kind=km[0], t0=km[1], t1=km[2]](input, cur + 1)
+        return cur
+    else:
+        var input_len = len(input)
+        var p = cur
+        while p < input_len and not _sbt_bitmap_check(
+            stop_bitmap, False, UInt32(input.unsafe_get(p))
+        ):
+            p += 1
+        return p
+
+
 # Budget for backtracking work. Each _sbt_try_match call costs one unit.
 # This bounds total work to O(BUDGET) even for pathological patterns like
 # (a+)+, where a depth counter alone fails because simple loop optimization
@@ -159,17 +329,7 @@ def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
         if not cyclic[i]:
             continue
         var body = s.out1 if s.greedy else s.out2
-        var simple = (
-            body >= 0
-            and body < len(nfa.states)
-            and nfa.states[body].out1 == i
-            and (
-                nfa.states[body].kind == NFAStateKind.ANY
-                or nfa.states[body].kind == NFAStateKind.CHAR
-                or nfa.states[body].kind == NFAStateKind.CHARSET
-            )
-        )
-        if not simple:
+        if not _sbt_is_simple_body(nfa, i, body):
             return True
     return False
 
@@ -280,28 +440,12 @@ def _sbt_try_match[
             # Detect a simple single-state body loop: SPLIT → body → SPLIT
             # This covers a*, a+, \d*, \w+, [a-z]*, etc. Greedy loops carry
             # the body in out1, lazy loops in out2.
-            comptime is_simple_loop = (
-                state.greedy
-                and out1 >= 0
-                and out1 < len(nfa.states)
-                and nfa.states[out1].out1 == state_idx
-                and (
-                    nfa.states[out1].kind == NFAStateKind.ANY
-                    or nfa.states[out1].kind == NFAStateKind.CHAR
-                    or nfa.states[out1].kind == NFAStateKind.CHARSET
-                )
+            comptime is_simple_loop = state.greedy and _sbt_is_simple_body(
+                nfa, state_idx, out1
             )
             comptime is_simple_lazy = (
-                (not state.greedy)
-                and out2 >= 0
-                and out2 < len(nfa.states)
-                and nfa.states[out2].out1 == state_idx
-                and (
-                    nfa.states[out2].kind == NFAStateKind.ANY
-                    or nfa.states[out2].kind == NFAStateKind.CHAR
-                    or nfa.states[out2].kind == NFAStateKind.CHARSET
-                )
-            )
+                not state.greedy
+            ) and _sbt_is_simple_body(nfa, state_idx, out2)
             comptime if is_simple_loop:
                 # Greedy: scan forward consuming as many chars as possible,
                 # then try the exit (out2) from rightmost to leftmost position.
@@ -385,20 +529,58 @@ def _sbt_try_match[
                         p -= 1
                     return -1
                 else:
-                    var p = max_pos
-                    while p >= pos:
-                        if budget < 0:
-                            return -1
-                        var result = _sbt_try_match[
-                            nfa=nfa,
-                            state_idx=out2,
-                            num_slots=num_slots,
-                            anchored_end=anchored_end,
-                        ](input, p, slots, budget, depth + DINC, end_at)
-                        if result >= 0:
-                            return result
-                        p -= 1
-                    return -1
+                    # General exit: hand bytes back one at a time. Every
+                    # position in [pos, max_pos) holds a byte the body ate,
+                    # so an exit that cannot START on such a byte fails
+                    # there without being run (auto-possessification).
+                    comptime lf = _sbt_loop_filter(nfa, out1, out2)
+                    comptime mode = lf.mode
+                    comptime exit_bits = lf.exit_bits
+                    comptime exit_byte = _sbt_single_byte(exit_bits)
+                    comptime if mode == SBT_GIVEBACK_POSSESSIVE:
+                        # Only max_pos can start the exit — and the mode
+                        # also proves the exit consumes a byte, so end of
+                        # input cannot match either. No first-byte test
+                        # here: the exit's own first state runs exactly
+                        # that test, specialized, one call deeper.
+                        if max_pos < input_len:
+                            return _sbt_try_match[
+                                nfa=nfa,
+                                state_idx=out2,
+                                num_slots=num_slots,
+                                anchored_end=anchored_end,
+                            ](
+                                input,
+                                max_pos,
+                                slots,
+                                budget,
+                                depth + DINC,
+                                end_at,
+                            )
+                        return -1
+                    else:
+                        var p = max_pos
+                        while p >= pos:
+                            if budget < 0:
+                                return -1
+                            comptime if mode == SBT_GIVEBACK_FILTER:
+                                # p == input_len is skipped too: the exit
+                                # needs a byte and there is none left.
+                                if p >= input_len or not _sbt_first_byte_test[
+                                    exit_bits, exit_byte
+                                ](input.unsafe_get(p)):
+                                    p -= 1
+                                    continue
+                            var result = _sbt_try_match[
+                                nfa=nfa,
+                                state_idx=out2,
+                                num_slots=num_slots,
+                                anchored_end=anchored_end,
+                            ](input, p, slots, budget, depth + DINC, end_at)
+                            if result >= 0:
+                                return result
+                            p -= 1
+                        return -1
             elif is_simple_lazy:
                 # Lazy: try the exit (out1 — lazy splits prefer it) first,
                 # then consume one body char (out2) and repeat. This is
@@ -407,9 +589,23 @@ def _sbt_try_match[
                 # guard. (An earlier version tested out1 for the loop-back
                 # and so never fired for real lazy quantifiers.)
                 comptime body = nfa.states[out2]
+                # Same analysis as the greedy giveback, run forwards: a
+                # position whose byte the body eats and the exit cannot
+                # start is a guaranteed exit failure, so the walker jumps
+                # straight to the next byte that either starts the exit or
+                # stops the body instead of calling the exit per byte.
+                comptime lf = _sbt_loop_filter(nfa, out2, out1)
+                comptime skip = lf.mode != SBT_GIVEBACK_ALL
+                comptime stop_bits = lf.stop_bits
                 var input_len = len(input)
                 var cur = pos
                 while True:
+                    comptime if skip:
+                        cur = _sbt_class_skip[stop_bitmap=stop_bits](input, cur)
+                        if cur >= input_len:
+                            # No byte can start the exit and the body has
+                            # nothing left to eat.
+                            return -1
                     if budget < 0:
                         return -1
                     var result = _sbt_try_match[
