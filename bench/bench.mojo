@@ -1975,9 +1975,13 @@ def bench_counted_repeat_search_2KB(mut b: Bench) raises:
     # Counted repetition on the backtracker: `{3,7}` over a single charset
     # is compiled to one bounded loop that consumes up to 7 bytes and hands
     # them back down to 3, instead of the 3 required copies + 4 nested `?`
-    # SPLITs the NFA holds. The capture group is what keeps the pattern OFF
-    # the DFA lanes — without it engine selection would route this to the
-    # leftmost-first DFA and the row would measure nothing about this code.
+    # SPLITs the NFA holds. The leading `(?=[a-z])` is what keeps the
+    # pattern OFF the DFA lanes: it changes nothing about the language
+    # (the body starts on `[a-z]` anyway) but clears `can_use_dfa`.
+    # Captures alone no longer do — `([a-z]{3,7})\d` rides the
+    # DFA-bounded capture lane (`Regex._use_dfa_span`), whose forward scan
+    # and reverse walk would sit between this loop's runs and the row
+    # would measure the lane, not the loop.
     #
     # The haystack is ~2 KB of lowercase words that all START a valid
     # `[a-z]{3,7}` run and are all refuted by the digit exit; the first
@@ -1988,7 +1992,7 @@ def bench_counted_repeat_search_2KB(mut b: Bench) raises:
     # single exit call per candidate, NOT the hand-back. That is the
     # common shape, and `counted_repeat_giveback_2KB` below covers the
     # other one.
-    var re = Regex["([a-z]{3,7})\\d"]()
+    var re = Regex["(?=[a-z])([a-z]{3,7})\\d"]()
     var input = make_counted_haystack(90)
 
     @always_inline
@@ -2027,8 +2031,9 @@ def bench_counted_repeat_giveback_2KB(mut b: Bench) raises:
     # `_sbt_loop_filter` proves nothing (SBT_GIVEBACK_ALL) and every
     # position between `hi` and `lo` is really handed to the exit. Against
     # `counted_repeat_search_2KB`, which is possessive, this is the row
-    # that would move if the giveback bound or its ordering regressed.
-    var re = Regex["([a-z]{3,7})[a-z]x"]()
+    # that would move if the giveback bound or its ordering regressed. The
+    # leading lookahead keeps it on the backtracker (see that row).
+    var re = Regex["(?=[a-z])([a-z]{3,7})[a-z]x"]()
     var input = make_giveback_haystack(90)
 
     @always_inline

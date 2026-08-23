@@ -703,12 +703,16 @@ def _bench_counted_haystack(n: Int) -> String:
 
 
 def test_bench_counted_repeat_search_2KB() raises:
-    # bench counted_repeat_search_2KB: the capture keeps it on the
-    # backtracker (a capture-free `[a-z]{3,7}\d` goes to a DFA lane and the
-    # row would time the wrong engine), the haystack is ~2 KB, and the
-    # first match is far enough in that the row really walks it.
-    comptime S = Regex["([a-z]{3,7})\\d"]
+    # bench counted_repeat_search_2KB: the leading lookahead keeps it on
+    # the backtracker for EVERY verb (`_use_lf_lane` governs search /
+    # findall; `_strategy.use_dfa` only match() — a capture alone rides
+    # the DFA-bounded capture lane and the row would time the wrong
+    # engine), the haystack is ~2 KB, and the first match is far enough
+    # in that the row really walks it.
+    comptime S = Regex["(?=[a-z])([a-z]{3,7})\\d"]
     assert_false(S._strategy.use_dfa)
+    assert_false(S._use_lf_lane)
+    assert_false(S._use_dfa_span)
     var re = S()
     var input = _bench_counted_haystack(90)
     assert_true(input.byte_length() > 1800)
@@ -740,8 +744,10 @@ def test_bench_counted_repeat_giveback_2KB() raises:
     # back. Pin that the row is on the backtracker, that the giveback mode
     # really is SBT_GIVEBACK_ALL, and that the match is the SHORTER count
     # (6, not 7) — which is exactly what a hand-back produces.
-    comptime S = Regex["([a-z]{3,7})[a-z]x"]
+    comptime S = Regex["(?=[a-z])([a-z]{3,7})[a-z]x"]
     assert_false(S._strategy.use_dfa)
+    assert_false(S._use_lf_lane)
+    assert_false(S._use_dfa_span)
     var re = S()
     var input = _bench_giveback_haystack(90)
     assert_true(input.byte_length() > 600)

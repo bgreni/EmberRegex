@@ -151,8 +151,22 @@ def test_shape_leaves_simple_loops_alone() raises:
 
 
 def test_all_patterns_stay_off_the_dfa() raises:
-    """If engine selection ever routed these to a DFA lane the differential
-    below would pass without executing a single counted loop."""
+    """`_strategy.use_dfa` governs match(): these pins say match() runs
+    the counted loop on the backtracker for every differential pattern.
+    The search verbs of a capture pattern with a DFA-representable shape
+    ride the DFA-bounded capture lane (`Regex._use_dfa_span`), whose
+    anchored attempts and span confirms are this same backtracker, so the
+    differential below still executes the counted loop in search and
+    findall as well — but through the lane. The two bench rows carry a
+    leading `(?=[a-z])` (same language, `can_use_dfa` off) so they time
+    the loop alone; pin that they stay off every lane."""
+    assert_false(Regex["(?=[a-z])([a-z]{3,7})\\d"]._use_lf_lane)
+    assert_false(Regex["(?=[a-z])([a-z]{3,7})\\d"]._use_dfa_span)
+    assert_false(Regex["(?=[a-z])([a-z]{3,7})[a-z]x"]._use_lf_lane)
+    assert_false(Regex["(?=[a-z])([a-z]{3,7})[a-z]x"]._use_dfa_span)
+    assert_equal(_bounds_str["(?=[a-z])([a-z]{3,7})\\d"](), "3:7")
+    assert_equal(_bounds_str["(?=[a-z])([a-z]{3,7})[a-z]x"](), "3:7")
+    assert_true(Regex["([a-z]{3,7})\\d"]._use_dfa_span)
     assert_false(Regex["([a-z]{3,7})\\d"]._strategy.use_dfa)
     assert_false(Regex["(a{2,})b"]._strategy.use_dfa)
     assert_false(Regex["(.{0,5})x"]._strategy.use_dfa)

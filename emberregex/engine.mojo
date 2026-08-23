@@ -867,10 +867,17 @@ struct Regex[pattern: String](Copyable, Movable):
         len(Self._fpre.bytes),
         Self._alt_prefix.valid,
         Self._use_dfa_candidate,
-        # Comptime `and` short-circuits: a greedy pattern's strategy
-        # never touches the leftmost-first tables, so they elaborate
-        # only when a search verb (or a lazy pattern) asks.
-        Self.nfa.has_lazy and Self._lfdfa.valid and Self._rdfa.valid,
+        # Comptime `and` short-circuits left to right: a greedy pattern's
+        # strategy never touches the leftmost-first tables, and neither
+        # does a CAPTURE pattern's (the value is dead there — `use_dfa`
+        # is off for captures), so they elaborate only when a search
+        # verb asks or a capture-free lazy pattern's strategy needs them.
+        # Without the group guard a match()-only program on `<(.*?)>`
+        # paid three determinizations (measured cold: ~1.5 s).
+        Self._group_count == 0
+        and Self.nfa.has_lazy
+        and Self._lfdfa.valid
+        and Self._rdfa.valid,
     )
     # The search-family lane (see MatchStrategy's docstring for why it is
     # not a strategy field). Referenced by the search verbs only.
@@ -1317,13 +1324,10 @@ struct Regex[pattern: String](Copyable, Movable):
             if s0 < 0:
                 return (-1, -1)
             comptime if Self._lf_anchored_classic:
+                # Capture-free only (`_lf_anchored_classic` is off on
+                # the capture lane), so no slots to fill here.
                 var aend = self._edfa_match_at(input, s0)
                 if aend >= 0:
-                    comptime if Self._use_dfa_span:
-                        if fill:
-                            self._span_fill_slots(
-                                input, s0, aend, slots, walk.pike
-                            )
                     return (s0, aend)
                 if s0 >= input_len:
                     return (-1, -1)
@@ -1439,7 +1443,11 @@ struct Regex[pattern: String](Copyable, Movable):
         runs on exactly this span (`_pike_span`) — never on the whole
         input, which would cost the DFA speed the lane exists for — and
         `pike[].sbt_ok` latches off so the rest of the walk's spans skip
-        the backtracker (see `_SpanPike`).
+        the backtracker (see `_SpanPike`). Should the Pike VM ALSO fail
+        to match the span (a table/VM disagreement, which the
+        debug_assert in `_pike_span` flags under ASSERT), the slots are
+        left all `-1`: the span is still reported, only its groups read
+        as unset — the lane never drops a match the tables found.
         """
         if pike[].sbt_ok:
             try:
@@ -1626,6 +1634,10 @@ struct Regex[pattern: String](Copyable, Movable):
                 slots=InlineArray[Int, Self._num_slots](fill=-1),
             )
         elif Self._use_lf_lane:
+            # The same two-line prologue opens every leftmost-first lane
+            # verb: the walk's state lives in the verb's frame and the
+            # walk carries a pointer to it — see `_LFWalk`'s docstring
+            # for why it is shaped this way.
             var pike = _SpanPike[Self._num_slots, Self._use_dfa_span]()
             var walk = _LFWalk(Pointer(to=pike))
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
