@@ -71,6 +71,7 @@ from .static_dfa import (
     edfa_search_forward,
 )
 from .sheng import (
+    sheng_cap_for,
     sheng_full_match,
     sheng_masks_arr,
     sheng_match_at,
@@ -520,7 +521,10 @@ struct Regex[pattern: String](Copyable, Movable):
         Self._edfa
     )
     comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
-    comptime _SHENG_MASKS = sheng_masks_arr(
+    # Narrowest tbl tier that holds this DFA: a 6-state DFA keeps 16-lane
+    # masks even where 64 lanes are available (see sheng.mojo).
+    comptime _SHENG_CAP = sheng_cap_for(Self._edfa, Self._strategy.use_sheng)
+    comptime _SHENG_MASKS = sheng_masks_arr[Self._SHENG_CAP](
         Self._edfa, Self._strategy.use_sheng
     )
     comptime _match_suffix = _match_suffix_for_fastfail(

@@ -15,10 +15,18 @@ iteration regardless of platform.
 Kernels are only selected when the target has a native byte shuffle
 (HAS_FAST_BYTE_SHUFFLE); elsewhere _dynamic_shuffle would expand to scalar
 code slower than the table walk it replaces.
+
+This module also hosts the *wide* table lookups (32 and 64 entries) that
+back the Sheng shuffle DFA. A single index vector is still 16 lanes; what
+widens is the table. AArch64 `tbl` takes a 1-4 register table operand
+(vtbl1/2/4), so 32- and 64-entry lookups are one instruction there. x86
+`pshufb` has no multi-register form, so wide lookups are NEON-only —
+HAS_WIDE_BYTE_SHUFFLE gates them and other targets stay at 16 entries.
 """
 
 from std.sys import simd_width_of
 from std.sys.info import CompilationTarget
+from std.sys.intrinsics import llvm_intrinsic
 
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits
@@ -36,6 +44,21 @@ comptime ACCEL_TRUFFLE = 1
 comptime HAS_FAST_BYTE_SHUFFLE = (
     CompilationTarget.has_neon() or CompilationTarget.has_sse4()
 )
+
+# Multi-register table lookup (`tbl` with 2 or 4 table registers). NEON
+# only: pshufb reads a single 16-byte register, and emulating 32/64 entries
+# with 2-4 pshufb plus blends puts 3+ dependent ops on a chain that Sheng
+# executes once per input byte.
+comptime HAS_WIDE_BYTE_SHUFFLE = CompilationTarget.has_neon()
+
+# Widest single-instruction table lookup on this target. This is the
+# ceiling on Sheng's state count, not a vector width.
+comptime WIDE_TABLE_CAP = 64 if HAS_WIDE_BYTE_SHUFFLE else NIBBLE_TABLE_SIZE
+
+# One tbl/pshufb produces 16 result bytes, so the index vector is one
+# 128-bit register no matter how wide the table is.
+comptime SHUFFLE_INDEX_LANES = 16
+comptime _ShuffleIndex = SIMD[DType.uint8, SHUFFLE_INDEX_LANES]
 
 # 1 << (hi & 7) via lookup, indexed directly by the hi nibble (0..15).
 comptime _POW2_HI = SIMD[DType.uint8, NIBBLE_TABLE_SIZE](
@@ -57,6 +80,49 @@ def nibble_lookup[
     out-of-range semantics are never exercised.
     """
     return table._dynamic_shuffle(indices)
+
+
+@always_inline
+def table_lookup_32(
+    table: SIMD[DType.uint8, 32], indices: _ShuffleIndex
+) -> _ShuffleIndex:
+    """Per-lane 32-entry lookup: out[i] = table[indices[i]].
+
+    One `tbl` with a 2-register table (vtbl2). Measured at the same
+    throughput as the 16-entry form on Apple silicon, so widening a DFA
+    from 16 to 32 states is free.
+
+    Indices must be < 32; out-of-range lanes read as 0 (NEON tbl), which
+    no caller relies on.
+    """
+    return llvm_intrinsic[
+        "llvm.aarch64.neon.tbl2", _ShuffleIndex, has_side_effect=False
+    ](table.slice[16, offset=0](), table.slice[16, offset=16](), indices)
+
+
+@always_inline
+def table_lookup_64(
+    table: SIMD[DType.uint8, 64], indices: _ShuffleIndex
+) -> _ShuffleIndex:
+    """Per-lane 64-entry lookup: out[i] = table[indices[i]].
+
+    One `tbl` with a 4-register table (vtbl4). Roughly half the throughput
+    of the 16/32-entry forms (measured 1.14 vs 0.53 ns per dependent
+    lookup on M-series), so callers should widen only when they must —
+    it is still well ahead of a computed-address table walk (2.0 ns).
+
+    Indices must be < 64; out-of-range lanes read as 0 (NEON tbl), which
+    no caller relies on.
+    """
+    return llvm_intrinsic[
+        "llvm.aarch64.neon.tbl4", _ShuffleIndex, has_side_effect=False
+    ](
+        table.slice[16, offset=0](),
+        table.slice[16, offset=16](),
+        table.slice[16, offset=32](),
+        table.slice[16, offset=48](),
+        indices,
+    )
 
 
 # --- Comptime mask builders -------------------------------------------------

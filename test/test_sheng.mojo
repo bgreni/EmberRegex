@@ -4,12 +4,18 @@ Pins which patterns select the shuffle walker over the eager table walk
 (small DFAs on targets with a native byte shuffle), and exercises the
 Sheng walkers across verbs, anchors, EOL flags, and acceleration so a
 regression can't hide behind the identical-semantics table-walk path.
-Selection assertions are gated on HAS_FAST_BYTE_SHUFFLE; behavior
+Also pins the per-DFA mask-width tier (16 / 32 / 64 lanes) so a DFA never
+silently pays for a wider `tbl` than it needs. Selection assertions are
+gated on HAS_FAST_BYTE_SHUFFLE / HAS_WIDE_BYTE_SHUFFLE; behavior
 assertions run everywhere.
 """
 
 from emberregex import Regex
-from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
+from emberregex.simd_kernels import (
+    HAS_FAST_BYTE_SHUFFLE,
+    HAS_WIDE_BYTE_SHUFFLE,
+    NIBBLE_TABLE_SIZE,
+)
 from emberregex.sheng import SHENG_STATE_CAP
 from std.sys import simd_width_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
@@ -26,16 +32,72 @@ def test_sheng_selected_for_small_alternation() raises:
         assert_true(S._strategy.use_sheng)
 
 
-def test_sheng_not_selected_at_state_cap() raises:
-    # 16 DFA states: no lane left for the dead state.
+# 32-arm alternation with a class arm (so Teddy doesn't claim it): 44 DFA
+# states, i.e. the 64-lane tbl4 tier. Shared with bench `sheng64_alt_32_search_2KB`.
+comptime ALT32 = (
+    "cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+    "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap|[0-9]{3}"
+)
+# Same DFA size, plus per-state EOL_MULTILINE flags.
+comptime ALT32_EOL = "(?m)(?:" + ALT32 + ")$"
+
+
+def test_sheng_selected_for_16_state_dfa() raises:
+    # 16 DFA states: over the 16-lane table (no lane left for the dead
+    # state) but well inside the 32-lane tbl2 tier.
     comptime S = Regex["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"]
     comptime n_states = S._edfa.num_states
-    assert_true(n_states >= SHENG_STATE_CAP)
-    assert_false(S._strategy.use_sheng)
-    # ...and the table walk still handles it.
+    assert_equal(n_states, 16)
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+        assert_equal(S._SHENG_CAP, 32)
+    else:
+        assert_false(S._strategy.use_sheng)
     var re = S()
     assert_true(re.match("192.168.1.100").matched)
     assert_false(re.match("192.168.1").matched)
+
+
+def test_sheng_selected_for_40ish_state_dfa() raises:
+    # ~40 states: only reachable with the 64-lane tbl4 tier.
+    comptime S = Regex[ALT32]
+    comptime n_states = S._edfa.num_states
+    assert_true(n_states > 32 and n_states < 64)
+    assert_false(S._strategy.use_teddy)
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+        assert_equal(S._SHENG_CAP, 64)
+    else:
+        assert_false(S._strategy.use_sheng)
+    var re = S()
+    assert_true(re.match("hex").matched)
+    assert_true(re.match("407").matched)
+    assert_false(re.match("zebra").matched)
+
+
+def test_sheng_narrowest_tier_for_small_dfa() raises:
+    # A DFA that fits 15 real states must stay on the 16-lane tbl (one
+    # instruction, ~2x the throughput of tbl4) — widening it would be a
+    # silent regression.
+    comptime S = Regex["cat|d[ou]g"]
+    assert_equal(S._SHENG_CAP, NIBBLE_TABLE_SIZE)
+
+
+def test_sheng_not_selected_above_state_cap() raises:
+    # 82 DFA states: past every tbl tier, so the eager table walk keeps it.
+    comptime S = Regex[
+        "crab|crow|deer|dove|fawn|frog|goat|gull|hare|hawk|ibis|jays|kite"
+        "|lamb|lark|lion|lynx|mole|moth|mule|newt|owls|puma|quail|rook|seal"
+        "|swan|toad|vole|wasp|wolf|[0-9]{3}"
+    ]
+    comptime n_states = S._edfa.num_states
+    assert_true(n_states >= SHENG_STATE_CAP)
+    assert_false(S._strategy.use_sheng)
+    assert_true(S._strategy.use_eager_dfa)
+    # ...and the table walk still handles it.
+    var re = S()
+    assert_true(re.match("quail").matched)
+    assert_false(re.match("zebu").matched)
 
 
 def test_sheng_match_and_search() raises:
@@ -143,6 +205,93 @@ def test_sheng_high_bytes() raises:
     assert_true(r.matched)
     assert_equal(r.start, 80)
     assert_equal(r.end, 83)
+
+
+# --- Differential vs the Pike VM reference ---------------------------------
+#
+# The wide tiers change the transition mechanism, not the semantics, so
+# every verb must agree with the capture-exact Pike VM byte for byte.
+
+
+def _lcg_text(seed: Int, n: Int, alphabet: String) -> String:
+    var chars = alphabet.as_bytes()
+    var out = List[Byte]()
+    var x = seed
+    for _ in range(n):
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        out.append(chars[x % len(chars)])
+    return String(unsafe_from_utf8=Span(out))
+
+
+def _assert_pike_agreement[
+    p: StaticString
+](input: String, label: String) raises:
+    var re = Regex[p]()
+    var got_s = re.search(input)
+    var exp_s = re._pike_search(input)
+    assert_equal(got_s.matched, exp_s.matched, String(label, " search.matched"))
+    if exp_s.matched:
+        assert_equal(got_s.start, exp_s.start, String(label, " search.start"))
+        assert_equal(got_s.end, exp_s.end, String(label, " search.end"))
+
+    var got_m = re.match(input)
+    var exp_m = re._pike_match(input)
+    assert_equal(got_m.matched, exp_m.matched, String(label, " match.matched"))
+    if exp_m.matched:
+        assert_equal(got_m.end, exp_m.end, String(label, " match.end"))
+
+    var got_f = re.finditer(input)
+    var exp_f = re._pike_finditer(input)
+    assert_equal(len(got_f), len(exp_f), String(label, " finditer len"))
+    for i in range(len(got_f)):
+        assert_equal(
+            got_f[i].start,
+            exp_f[i].start,
+            String(label, " finditer[", i, "].start"),
+        )
+        assert_equal(
+            got_f[i].end, exp_f[i].end, String(label, " finditer[", i, "].end")
+        )
+
+
+def test_sheng_differential_alt32_lcg() raises:
+    # 44-state DFA (tbl4 tier) over an alphabet that keeps partial matches
+    # alive: every literal's first bytes plus digits and separators.
+    comptime ALPHA = "catdogbfignhexjmkpsurw0123456789 ."
+    for seed in [1, 7, 4242]:
+        for n in [0, 1, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 200, 1000]:
+            var data = _lcg_text(seed, n, ALPHA)
+            _assert_pike_agreement[ALT32](
+                data, String("alt32 seed=", seed, " n=", n)
+            )
+
+
+def test_sheng_differential_ip_lcg() raises:
+    # 16-state DFA (tbl2 tier).
+    comptime ALPHA = "0123456789.abc"
+    for seed in [3, 99]:
+        for n in [0, 1, 15, 16, 17, 33, 64, 65, 257]:
+            var data = _lcg_text(seed, n, ALPHA)
+            _assert_pike_agreement["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"](
+                data, String("ip seed=", seed, " n=", n)
+            )
+
+
+def test_sheng_differential_anchored_lcg() raises:
+    # EOL_MULTILINE flags on the same 44-state (tbl4) DFA: the flag checks
+    # sit on the per-byte path next to the shuffle.
+    #
+    # `(?m)^` is deliberately absent: `_pike_search` only matches a
+    # BOL_MULTILINE anchor at offset 0 (e.g. `(?m)^abc$` on "xx\nabc"
+    # reports no match), so it is not a usable reference for that anchor.
+    # That predates the wide tiers and is unrelated to Sheng.
+    comptime ALPHA = "catdogbfignhexjmkpsurw0123456789 .\n"
+    for seed in [5, 77]:
+        for n in [0, 4, 16, 33, 64, 129, 400]:
+            var data = _lcg_text(seed, n, ALPHA)
+            _assert_pike_agreement[ALT32_EOL](
+                data, String("anchored seed=", seed, " n=", n)
+            )
 
 
 def main() raises:
