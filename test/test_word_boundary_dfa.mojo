@@ -69,7 +69,7 @@ def test_scanner_patterns_without_a_region_keep_the_backtracker() raises:
     assert_true(S._strategy.use_dfa)
     assert_true(S._strategy.use_eager_dfa)
     assert_true(S._use_scan_filter)
-    assert_false(comptime(_edfa_has_region(S._lfdfa.d)))
+    assert_false(comptime (_edfa_has_region(S._lfdfa.d)))
     assert_false(S._use_lf_dfa)
     assert_false(S._use_lazy_dfa)
     var re = S()
@@ -88,10 +88,10 @@ def test_scanner_patterns_without_a_region_keep_the_backtracker() raises:
     # 'f'.
     comptime T = Regex["\\bfoo(?:bar|baz)\\b"]
     assert_true(T._use_scan_filter)
-    assert_true(comptime(_edfa_has_region(T._lfdfa.d)))
+    assert_true(comptime (_edfa_has_region(T._lfdfa.d)))
     assert_true(T._use_lf_dfa)
     comptime U = Regex["\\b(?:foo|bar)\\b"]
-    assert_true(comptime(_edfa_has_region(U._lfdfa.d)))
+    assert_true(comptime (_edfa_has_region(U._lfdfa.d)))
     assert_true(U._use_lf_dfa)
 
 
@@ -228,9 +228,7 @@ def test_lf_prev_states_entered_on_word_bytes_only() raises:
 # --- Direct table harness ---------------------------------------------------
 
 
-def _forced_lane_check[
-    p: StaticString
-](input: String, label: String) raises:
+def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     """The three tables built directly and walked against the Pike VM:
     fullmatch on the classic table, the first leftmost-first match
     (end + recovered start) and the whole match sequence on the

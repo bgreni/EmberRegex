@@ -409,7 +409,12 @@ def test_search_uses_span_confirm() raises:
     var rs = Regex["(?:(x)|(y)|z)+"]()
     assert_true(rs._use_onepass)
     assert_true(rs._use_dfa_span)
-    var input = String("lorem 42 ipsum ") * 300 + "xyzxyz" + String(" q 7 ") * 200 + "zyx"
+    var input = (
+        String("lorem 42 ipsum ") * 300
+        + "xyzxyz"
+        + String(" q 7 ") * 200
+        + "zyx"
+    )
     var got = rs.finditer(input)
     var exp = rs._pike_finditer(input)
     assert_equal(len(got), len(exp))

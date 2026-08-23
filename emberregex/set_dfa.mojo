@@ -406,12 +406,26 @@ def build_multi_dfa(nfa: NFA, enabled: Bool) -> MultiDFA:
                     slot = tslot.unsafe_get(t)
                     if slot < 0:
                         var c_o = _flat_closure(
-                            kinds, out1s, out2s, anchors, t, False, False, WB_DROP
+                            kinds,
+                            out1s,
+                            out2s,
+                            anchors,
+                            t,
+                            False,
+                            False,
+                            WB_DROP,
                         )
                         var c_n = c_o
                         if has_bol_ml:
                             c_n = _flat_closure(
-                                kinds, out1s, out2s, anchors, t, False, True, WB_DROP
+                                kinds,
+                                out1s,
+                                out2s,
+                                anchors,
+                                t,
+                                False,
+                                True,
+                                WB_DROP,
                             )
                         gval_o.append(c_o)
                         gval_n.append(c_n)

@@ -265,7 +265,9 @@ def onepass_shape(nfa: NFA) -> Bool:
     return found
 
 
-def _op_norm_ctx(ctx: Int, has_bol: Bool, has_bol_ml: Bool, has_wb: Bool) -> Int:
+def _op_norm_ctx(
+    ctx: Int, has_bol: Bool, has_bol_ml: Bool, has_wb: Bool
+) -> Int:
     """Fold a context onto the ones the NFA can tell apart, so a pattern
     without `(?m)^` has no after-'\\n' states and one without a word
     anchor no after-word states."""
@@ -384,7 +386,9 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     nl_mask[nl_class >> 6] = UInt64(1) << UInt64(nl_class & 63)
     for c in range(nclasses):
         if _is_word_byte(reps[c]):
-            word_mask[c >> 6] = word_mask[c >> 6] | (UInt64(1) << UInt64(c & 63))
+            word_mask[c >> 6] = word_mask[c >> 6] | (
+                UInt64(1) << UInt64(c & 63)
+            )
     var class_is_word = List[Bool](fill=False, length=nclasses)
     for c in range(nclasses):
         class_is_word[c] = _is_word_byte(reps[c])
@@ -400,19 +404,31 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     var match_flags = List[Int]()
 
     var s_at0 = _op_intern_state(
-        key_to_id, st_nfa, st_ctx, nfa.start,
+        key_to_id,
+        st_nfa,
+        st_ctx,
+        nfa.start,
         _op_norm_ctx(_CTX_AT0, has_bol, has_bol_ml, has_wb),
     )
     var s_nl = _op_intern_state(
-        key_to_id, st_nfa, st_ctx, nfa.start,
+        key_to_id,
+        st_nfa,
+        st_ctx,
+        nfa.start,
         _op_norm_ctx(_CTX_NL, has_bol, has_bol_ml, has_wb),
     )
     var s_other = _op_intern_state(
-        key_to_id, st_nfa, st_ctx, nfa.start,
+        key_to_id,
+        st_nfa,
+        st_ctx,
+        nfa.start,
         _op_norm_ctx(_CTX_OTHER, has_bol, has_bol_ml, has_wb),
     )
     var s_word = _op_intern_state(
-        key_to_id, st_nfa, st_ctx, nfa.start,
+        key_to_id,
+        st_nfa,
+        st_ctx,
+        nfa.start,
         _op_norm_ctx(_CTX_WORD, has_bol, has_bol_ml, has_wb),
     )
 
@@ -734,9 +750,7 @@ def onepass_state_arr[n: Int](op: OnePass) -> InlineArray[Int32, n]:
 
 
 @always_inline
-def _op_apply(
-    mask: UInt64, pos: Int, mut slots: InlineArray[Int, _]
-):
+def _op_apply(mask: UInt64, pos: Int, mut slots: InlineArray[Int, _]):
     """Write `pos` into every slot of `mask` (its `_OP_MW_BIT` ignored)."""
     var m = mask & _OP_SLOT_MASK
     while m != 0:
@@ -833,7 +847,7 @@ def _onepass_match_impl[
     while pos < end_pin:
         comptime if accel:
             var unused = -1
-            pos = _edfa_accel_skip[d = op.accel](sub, sid, pos, unused)
+            pos = _edfa_accel_skip[d=op.accel](sub, sid, pos, unused)
             if pos >= end_pin:
                 break
         var v = Int(
@@ -956,7 +970,7 @@ def _onepass_find_end_impl[
             # `build_onepass` — so the exit position, reached in the same
             # state, records the later (overriding) end below.
             var unused = -1
-            var p2 = _edfa_accel_skip[d = op.accel](input, sid, pos, unused)
+            var p2 = _edfa_accel_skip[d=op.accel](input, sid, pos, unused)
             if p2 > pos:
                 steps += p2 - pos
                 pos = p2

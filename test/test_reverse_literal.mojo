@@ -221,9 +221,9 @@ comptime _AB_CL_A = lit_flags_arr[2]([True, False])  # caseless 'a'
 
 
 def _find_txt(input: String, start: Int) -> Int:
-    return simd_find_literal_rare[
-        lit=_TXT_LIT, cl=_TXT_CL, off_a=0, off_b=2
-    ](input.as_bytes(), start)
+    return simd_find_literal_rare[lit=_TXT_LIT, cl=_TXT_CL, off_a=0, off_b=2](
+        input.as_bytes(), start
+    )
 
 
 def test_memmem_basic() raises:
@@ -430,7 +430,9 @@ def _lcg_text(seed: Int, n: Int, alphabet: List[String]) -> String:
     return String(unsafe_from_utf8=Span(out))
 
 
-def _assert_pike_agreement[p: StaticString](input: String, label: String) raises:
+def _assert_pike_agreement[
+    p: StaticString
+](input: String, label: String) raises:
     var re = Regex[p]()
     var got_s = re.search(input)
     var exp_s = re._pike_search(input)
@@ -484,7 +486,9 @@ def _assert_pike_agreement[p: StaticString](input: String, label: String) raises
         assert_equal(got_p[i], exp_p[i], String(label, " split[", i, "]"))
 
 
-def _differential[p: StaticString](alphabet: List[String], label: String) raises:
+def _differential[
+    p: StaticString
+](alphabet: List[String], label: String) raises:
     """4 seeds x 11 SIMD-boundary lengths = 44 inputs per pattern."""
     for seed in [1, 7, 99, 4242]:
         for n in [15, 16, 17, 31, 32, 33, 63, 64, 65, 120, 600]:
@@ -500,15 +504,38 @@ def _txt_alphabet() -> List[String]:
     # that hit the probe pair (".tx"), newlines, and multi-byte
     # characters so scans cross bytes >= 0x80.
     return [
-        "a", "b", "t", "x", ".", "9", " ", "\n", "é", "€",
-        ".txt", "9.txt", "ab.txt", ".tx", "txt",
+        "a",
+        "b",
+        "t",
+        "x",
+        ".",
+        "9",
+        " ",
+        "\n",
+        "é",
+        "€",
+        ".txt",
+        "9.txt",
+        "ab.txt",
+        ".tx",
+        "txt",
     ]
 
 
 def _url_alphabet() -> List[String]:
     return [
-        "a", "z", ":", "/", " ", "\n", "é", "€",
-        "://", "a://b", ":/", "//",
+        "a",
+        "z",
+        ":",
+        "/",
+        " ",
+        "\n",
+        "é",
+        "€",
+        "://",
+        "a://b",
+        ":/",
+        "//",
     ]
 
 
@@ -534,14 +561,25 @@ def test_differential_bounded_gap() raises:
     # the controls test.)
     assert_true(Regex["[ab]{0,3}foo"]._use_rev_literal)
     _differential["[ab]{0,3}foo"](
-        ["a", "b", "f", "o", " ", "\n", "foo", "afoo", "bbfoo", "fo",
-         "é"],
+        ["a", "b", "f", "o", " ", "\n", "foo", "afoo", "bbfoo", "fo", "é"],
         "[ab]{0,3}foo",
     )
     assert_true(Regex["[0-9]{2,5}xy"]._use_rev_literal)
     _differential["[0-9]{2,5}xy"](
-        ["0", "1", "9", "x", "y", " ", "\n", "xy", "12xy", "999999xy",
-         "axy", "é"],
+        [
+            "0",
+            "1",
+            "9",
+            "x",
+            "y",
+            " ",
+            "\n",
+            "xy",
+            "12xy",
+            "999999xy",
+            "axy",
+            "é",
+        ],
         "[0-9]{2,5}xy",
     )
     assert_true(Regex[".{0,2}foo"]._use_rev_literal)
@@ -554,24 +592,51 @@ def test_differential_bounded_gap() raises:
     )
     assert_true(Regex["[ab]?[cd]?foo"]._use_rev_literal)
     _differential["[ab]?[cd]?foo"](
-        ["a", "b", "c", "d", "f", "o", " ", "\n", "foo", "acfoo",
-         "bfoo", "é"],
+        ["a", "b", "c", "d", "f", "o", " ", "\n", "foo", "acfoo", "bfoo", "é"],
         "[ab]?[cd]?foo",
     )
 
 
 def test_differential_caseless() raises:
     _differential["(?i)\\d+href"](
-        ["1", "9", "h", "r", "e", "f", "H", " ", "\n", "href", "HREF",
-         "9href", "1HrEf", "é"],
+        [
+            "1",
+            "9",
+            "h",
+            "r",
+            "e",
+            "f",
+            "H",
+            " ",
+            "\n",
+            "href",
+            "HREF",
+            "9href",
+            "1HrEf",
+            "é",
+        ],
         "(?i)\\d+href",
     )
 
 
 def test_differential_capture_lane() raises:
     _differential["(\\w+)@(\\w+)\\.com"](
-        ["a", "u", "@", ".", "c", "o", "m", " ", "\n", ".com", "u@v.com",
-         "@x.com", "a.com", "é"],
+        [
+            "a",
+            "u",
+            "@",
+            ".",
+            "c",
+            "o",
+            "m",
+            " ",
+            "\n",
+            ".com",
+            "u@v.com",
+            "@x.com",
+            "a.com",
+            "é",
+        ],
         "(\\w+)@(\\w+)\\.com",
     )
 
@@ -584,15 +649,28 @@ def test_differential_controls_off_strategy() raises:
         "x[ab]*\\.txt",
     )
     _differential["http://[a-z]+"](
-        ["h", "t", "p", ":", "/", "a", " ", "\n", "http://ab", "http:/",
-         "é"],
+        ["h", "t", "p", ":", "/", "a", " ", "\n", "http://ab", "http:/", "é"],
         "http://[a-z]+",
     )
     # Bounded-gap-LOOKING literal alternation: Teddy-owned, off-strategy.
     assert_false(Regex["(?:foo|bar)\\.txt"]._use_rev_literal)
     _differential["(?:foo|bar)\\.txt"](
-        ["f", "o", "b", "a", "r", ".", " ", "\n", "foo", "bar", ".txt",
-         "foo.txt", "bar.txt", "é"],
+        [
+            "f",
+            "o",
+            "b",
+            "a",
+            "r",
+            ".",
+            " ",
+            "\n",
+            "foo",
+            "bar",
+            ".txt",
+            "foo.txt",
+            "bar.txt",
+            "é",
+        ],
         "(?:foo|bar)\\.txt",
     )
 

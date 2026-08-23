@@ -726,9 +726,7 @@ def _best_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
             break
     _flush_run(cur_bytes, cur_cl, cur_off, ranks, result, best_score)
     if result.ok:
-        result.look = _chain_look(
-            nfa, chain, result.offset, len(result.bytes)
-        )
+        result.look = _chain_look(nfa, chain, result.offset, len(result.bytes))
     return result^
 
 
@@ -1540,7 +1538,9 @@ def _rose_verify_at[
                         if (
                             at >= off
                             and _lit_at[lit=lit, cl=cli](input, at)
-                            and _look_ok[look=look, base=kb, n=n_look](input, at)
+                            and _look_ok[look=look, base=kb, n=n_look](
+                                input, at
+                            )
                         ):
                             var cur: Int
                             if at == 0:
@@ -1563,7 +1563,9 @@ def _rose_verify_at[
                         if (
                             at >= off
                             and _lit_at[lit=lit, cl=cli](input, at)
-                            and _look_ok[look=look, base=kb, n=n_look](input, at)
+                            and _look_ok[look=look, base=kb, n=n_look](
+                                input, at
+                            )
                         ):
                             _rose_confirm[
                                 r=r,

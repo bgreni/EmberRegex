@@ -201,7 +201,9 @@ def _rev_bol_reaches_start(
                 var at2 = anchors.unsafe_get(p)
                 var h2: Bool
                 if at_zero:
-                    h2 = at2 == AnchorKind.BOL or at2 == AnchorKind.BOL_MULTILINE
+                    h2 = (
+                        at2 == AnchorKind.BOL or at2 == AnchorKind.BOL_MULTILINE
+                    )
                 else:
                     h2 = at2 == AnchorKind.BOL_MULTILINE
                 if h2:
@@ -374,12 +376,16 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var st = nfa.start
 
     var sets_bits = List[_StateBits]()
-    var rightv = SIMD[DType.int8, 256](0)  # word class of the byte just consumed
+    var rightv = SIMD[DType.int8, 256](
+        0
+    )  # word class of the byte just consumed
     var hashv = SIMD[DType.uint64, 256](0)
 
     # Seeds: MATCH closed in each end context (plus the mid-input context
     # after a word byte when a word anchor exists).
-    var starts = List[Int]()  # (other, at-nl, at-end[, other-word]) — _minimize order
+    var starts = List[
+        Int
+    ]()  # (other, at-nl, at-end[, other-word]) — _minimize order
     var nseed = 4 if has_wb else 3
     for k in range(nseed):
         var ctx = k if k < 3 else 0
@@ -422,7 +428,9 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var word_cls = SIMD[DType.uint64, 4](0)
     for ci in range(nclasses):
         if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (
+                UInt64(1) << UInt64(ci & 63)
+            )
 
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0
@@ -611,12 +619,32 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             var unused_w = _StateBits(0)
             var unused_n = _StateBits(0)
             r_w = _rev_wb_resolve(
-                kinds, anchors, pred_data, pred_off, pred_len, wb_bits,
-                bits, True, Int(rightv[si]) != 0, st, hit_w, unused_w,
+                kinds,
+                anchors,
+                pred_data,
+                pred_off,
+                pred_len,
+                wb_bits,
+                bits,
+                True,
+                Int(rightv[si]) != 0,
+                st,
+                hit_w,
+                unused_w,
             )
             r_n = _rev_wb_resolve(
-                kinds, anchors, pred_data, pred_off, pred_len, wb_bits,
-                bits, False, Int(rightv[si]) != 0, st, hit_n, unused_n,
+                kinds,
+                anchors,
+                pred_data,
+                pred_off,
+                pred_len,
+                wb_bits,
+                bits,
+                False,
+                Int(rightv[si]) != 0,
+                st,
+                hit_n,
+                unused_n,
             )
         # The entry is "entered" here only if it is not itself an
         # unresolved anchor (kept in the set, not walked past).
@@ -715,9 +743,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     return result^
 
 
-def rdfa_table_arr[
-    n: Int, dt: DType
-](d: RDFA) -> InlineArray[Scalar[dt], n]:
+def rdfa_table_arr[n: Int, dt: DType](d: RDFA) -> InlineArray[Scalar[dt], n]:
     """Comptime conversion of the flat table to a materializable array
     (narrow id type from `edfa_id_dtype`, `n` from `edfa_table_len` so a
     tiny table is padded with dead rows to EDFA_TABLE_MIN_BYTES,

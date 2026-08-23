@@ -157,7 +157,7 @@ def _lit_verify_rest[
             comptime pc = cl[k]
             if ok:
                 ok = probe_eq1[caseless=pc, target=pb](
-                    ptr[unsafe_offset = pos + k]
+                    ptr[unsafe_offset=pos + k]
                 )
     return ok
 
