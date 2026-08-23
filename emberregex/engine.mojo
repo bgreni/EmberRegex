@@ -529,10 +529,15 @@ struct Regex[pattern: String](Copyable, Movable):
     # The classic table: match() (fullmatch) and the prefilter shapes.
     comptime _edfa = build_eager_dfa(Self.nfa, Self._build_dfas)
     # The leftmost-first table and its reverse companion: the search
-    # verbs. Lazy patterns are only worth a classic table when this one
-    # built too (see _compute_strategy), so the reverse build is gated
-    # on the forward one.
-    comptime _lfdfa = build_lf_dfa(Self.nfa, Self._build_dfas)
+    # verbs. Gated on the classic table having built: a pattern whose
+    # set-based determinization overflows EDFA_STATE_CAP overflows the
+    # ordered one too in every shape seen, and the leftmost-first build
+    # would otherwise run to the cap before finding out (measured ~4 s
+    # of wasted comptime per such pattern). The reverse build is gated
+    # on the forward one for the same reason.
+    comptime _lfdfa = build_lf_dfa(
+        Self.nfa, Self._build_dfas and Self._edfa.valid
+    )
     comptime _rdfa = build_reverse_dfa(
         Self.nfa, Self._build_dfas and Self._lfdfa.valid
     )
