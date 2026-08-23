@@ -343,6 +343,57 @@ def test_anchored_first_attempt_on_classic_table() raises:
     assert_true(Regex[".*x"]._lf_anchored_classic)
 
 
+def test_anchored_first_attempt_on_backtracker() raises:
+    # Lazy pattern, every loop simple: the first candidate is tried
+    # anchored on the backtracker (a byte compare + one class scan); a
+    # success needs no reverse walk. This is what puts `<.*?>` findall
+    # at the backtracker's per-match cost on short tags while keeping
+    # the lane's linear scan for the misses.
+    comptime S = Regex["<.*?>"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._lf_anchored_sbt)
+    assert_false(S._lf_anchored_classic)
+    var re = S()
+    var r = re.search("xx<ab>cd<e>")
+    assert_equal(r.start, 2)
+    assert_equal(r.end, 6)
+    # The attempt at the first `<` dies on '\n'; the unanchored scan and
+    # the reverse walk recover the later match.
+    var r2 = re.search("<ab\n<cd>")
+    assert_equal(r2.start, 4)
+    assert_equal(r2.end, 8)
+    assert_false(re.search("<abc").matched)
+    assert_false(re.search("<").matched)
+    var all = re.findall("<a>\n<b\n<c><d>")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "<a>")
+    assert_equal(all[1], "<c>")
+    assert_equal(all[2], "<d>")
+    # A budget-exhausted attempt decides nothing and the scan takes
+    # over from the same candidate: 20 lazy loops over 19 `x`s explore
+    # ~2^19 exits — well past SBT_BUDGET — and the answer is the same
+    # as the Pike VM's.
+    comptime T = Regex["(?:.*?x){20}"]
+    assert_true(T._use_lf_dfa)
+    assert_true(T._lf_anchored_sbt)
+    var ret = T()
+    var miss = "x" * 19 + "y"
+    assert_false(ret.search(miss).matched)
+    assert_false(ret._pike_search(miss).matched)
+    var hit = "ax" * 19 + "bx" + "x"
+    var rh = ret.search(hit)
+    var rp = ret._pike_search(hit)
+    assert_true(rh.matched)
+    assert_equal(rh.start, rp.start)
+    assert_equal(rh.end, rp.end)
+    # A lazy pattern with a recursive (non-simple) loop keeps the pure
+    # lane: the backtracker's attempt could be deep there.
+    comptime U = Regex["(?:ab)+.*?x"]
+    assert_true(U._use_lf_dfa)
+    assert_false(U._lf_anchored_sbt)
+    assert_true(Regex["x*?y"]._lf_anchored_sbt)
+
+
 def test_eol_in_priority_order() raises:
     # `ab$|a`: on "ab" the first arm resolves at end of input (2); on
     # "abc" it dies and the second arm's recorded end (1) stands.

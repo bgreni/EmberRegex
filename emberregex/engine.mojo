@@ -56,6 +56,7 @@ from .simd_scan import (
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import (
+    _sbt_needs_depth_guard,
     SBT_BUDGET,
     SBT_MEMO_BITS,
     _sbt_try_match,
@@ -815,6 +816,13 @@ struct Regex[pattern: String](Copyable, Movable):
     # (see _lf_next_match): sound exactly when the classic table's
     # leftmost-longest end IS the leftmost-first end.
     comptime _lf_anchored_classic = Self._lf_end_is_dfa_end
+    # ...and on the backtracker for lazy patterns whose every loop is a
+    # simple (iterative, SIMD-skipping) loop — `<.*?>`, `"[^"]*?"`: the
+    # attempt is a literal check plus one class scan, cheaper than the
+    # scan + reverse walk it replaces on a success.
+    comptime _lf_anchored_sbt = Self.nfa.has_lazy and not (
+        _sbt_needs_depth_guard(Self.nfa)
+    )
     # Backtracker (state, pos) memoization is only sound when a subtree's
     # outcome is a function of (state, pos) — see sbt_memo_ok.
     comptime _sbt_memo_ok = sbt_memo_ok(Self.nfa)
@@ -944,6 +952,24 @@ struct Regex[pattern: String](Copyable, Movable):
             ](input, start)
 
     @always_inline
+    def _sbt_match_at[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], start: Int) -> Int:
+        """Anchored attempt at `start` on the specialized backtracker: the
+        leftmost-first end, -1 when nothing matches there, or -2 when the
+        work budget ran out before that was decided."""
+        try:
+            var sbt_memo = List[UInt64]()
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+            return _sbt_run[
+                nfa=Self.nfa,
+                state_idx=Self._start,
+                num_slots=Self._num_slots,
+            ](input, start, slots, sbt_memo)
+        except:
+            return -2
+
+    @always_inline
     def _lf_candidate[
         origin: Origin, //
     ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
@@ -975,20 +1001,25 @@ struct Regex[pattern: String](Copyable, Movable):
         mid-input), so its scan from 0 is the anchored attempt and its
         start needs no reverse walk.
 
-        Anchored-first attempt: when the pattern's shape makes the
-        classic table's leftmost-longest end the leftmost-first end
-        (`_lf_anchored_classic`, one greedy loop at most — `[a-z]+x`,
-        `.*x`), the first candidate is tried ANCHORED on the classic
-        table before anything else. A success is the match outright:
-        its start is the candidate, so the reverse walk — which would
-        re-walk the whole match, twice the work on a long class run — is
-        skipped. A failure proves nothing starts there, and the
-        unanchored scan takes over from the next candidate; that one
-        wasted walk is bounded by the scan's own walk over the same
-        bytes (the scan keeps every thread of the failed attempt alive,
-        at top priority, until it dies), so the lane stays linear where
-        the old per-candidate loop was quadratic. One attempt per call,
-        never one per candidate.
+        Anchored-first attempt: the first candidate is tried ANCHORED
+        before anything else when a cheap anchored engine exists for the
+        pattern's shape — the classic table when its leftmost-longest end
+        is the leftmost-first end (`_lf_anchored_classic`: one greedy
+        loop at most, `[a-z]+x`, `.*x`), the specialized backtracker for
+        a lazy pattern whose loops are all simple (`_lf_anchored_sbt`:
+        `<.*?>`, where the attempt is a byte compare and one SIMD class
+        scan). A success is the match outright: its start is the
+        candidate, so the reverse walk — which re-walks the whole match,
+        twice the work on a long class run and most of the per-match
+        cost on a short one — is skipped. A failure proves nothing
+        starts there, and the unanchored scan takes over from the next
+        candidate; that one wasted walk is bounded by the scan's own
+        walk over the same bytes (the scan keeps every thread of the
+        failed attempt alive, at top priority, until it dies), so the
+        lane stays linear where the old per-candidate loop was
+        quadratic. One attempt per call, never one per candidate; a
+        backtracker attempt that runs out of budget decides nothing and
+        the scan starts from the same candidate.
         """
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             if pos > 0:
@@ -1011,6 +1042,16 @@ struct Regex[pattern: String](Copyable, Movable):
                 s0 = self._lf_candidate(input, input_len, s0 + 1)
                 if s0 < 0:
                     return (-1, -1)
+            elif Self._lf_anchored_sbt:
+                var aend = self._sbt_match_at(input, s0)
+                if aend >= 0:
+                    return (s0, aend)
+                if aend == -1:
+                    if s0 >= input_len:
+                        return (-1, -1)
+                    s0 = self._lf_candidate(input, input_len, s0 + 1)
+                    if s0 < 0:
+                        return (-1, -1)
             var end = self._lf_find_end(input, s0)
             if end < 0:
                 return (-1, -1)
