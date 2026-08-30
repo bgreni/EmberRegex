@@ -102,21 +102,189 @@ Selected fastest-first at compile time:
 | pattern is a literal string | SIMD literal scan | `simd_scan.mojo` |
 | `prefix + .* + suffix` | sandwich (startswith/endswith) | `optimize.mojo` |
 | alternation of literals | Teddy nibble shuffles | `teddy.mojo` |
-| ≤ 16 DFA states, shuffle target | Sheng | `sheng.mojo` |
-| `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA | `static_dfa.mojo` |
-| `can_use_dfa`, larger | lazy DFA | `dfa.mojo` |
-| backrefs / lookaround / captures | specialized backtracker | `backtrack.mojo` |
+| DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng | `sheng.mojo` |
+| `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
+| same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
+| `can_use_dfa`, CLASSIC table over `EDFA_STATE_CAP` | lazy DFA | `dfa.mojo` |
+| captures, one-pass NFA with an alternation loop | one-pass DFA: `match()`, and the span confirm of the lane below (`_use_onepass`) | `onepass.mojo` |
+| captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
+| backrefs / lookaround / captures (`match()`, not one-pass); also a greedy pattern whose classic table fits but whose leftmost-first table overflowed | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
 
 **The eager DFA is the interesting one.** Subset construction runs in the
 comptime interpreter over the comptime NFA; byte equivalence classes bound
 the per-state work; the transition table and per-state flag bytes
 materialize as constant data. The runtime engine is a pure table walk with
-no lazy construction and no fallible path. Two structural optimizations:
-match states are permuted to ids `[0, num_match_states)` so the per-byte
-match test is an integer compare, and states that self-loop on all but a
-few bytes are **accelerated** — the walker SIMD-scans to the next exit byte
-instead of stepping the table.
+no lazy construction and no fallible path. Three structural passes run over
+the result, in this order: **Hopcroft minimization** merges states no input
+can tell apart (subset construction separates state *sets*, not languages,
+so `cat|cot|cut|cit` keeps four tails where one suffices); match states are
+then permuted to ids `[0, num_match_states)` so the per-byte match test is
+an integer compare; and states that self-loop on all but a few bytes are
+**accelerated** — the walker SIMD-scans to the next exit byte instead of
+stepping the table. Minimization comes first because the other two key off
+final state ids, and because a self-loop is often only visible once the
+duplicate states splitting it are merged.
+
+That table answers `match()` — Python's `fullmatch`, a language-membership
+question — and nothing else. Its states are *sets*, so a walk over it ends
+leftmost-longest, and Python's `search` is leftmost-**first**: `a|ab` on
+"ab" is `a`, `<.*?>` stops at the first `>`. The search-family verbs run a
+second table, regex-automata's construction: a state is a priority-ORDERED
+list of NFA states (DFS of the epsilon closure, a SPLIT's `out1` before its
+`out2`), a transition whose closure reaches MATCH drops every lower-priority
+thread, and a `restart` bit re-adds the start closure as the lowest-priority
+threads after every byte — the unanchored scan, folded in the way the set
+lane folds its restart, and cleared by truncation so the walk terminates at
+the leftmost-first end. The walker is the same table walk in different
+start states; the same minimization, permutation, acceleration and Sheng
+masks apply, and the restart-only state self-loops on everything outside
+the first-byte set, so the acceleration scan is the candidate prefilter.
+Where the match *starts* is then recovered by a **reverse DFA** — the
+single-pattern form of the set lane's start-of-match automaton — walking
+leftward from the end, never below the previous match end. Two walks per
+match, both linear; the old lane's per-position anchored attempts were
+quadratic on `[a-z]+x` over a long class run, and its backtracker re-run
+for the leftmost-first end is gone from this lane.
+
+The reverse walk is a second pass over every match, and on a short match
+it is most of the per-match cost, so the lane tries the first prefilter
+candidate **anchored first** whenever a cheap anchored engine exists for
+the shape: the classic table when its leftmost-longest end is provably
+the leftmost-first end (one greedy loop at most — `[a-z]+x`, `.*x`), the
+specialized backtracker for a lazy pattern whose loops are all simple
+(`<.*?>`: a byte compare and one SIMD class scan). A success is the match
+with its start known — no reverse walk; a failure proves nothing starts
+at that candidate and the unanchored scan takes over from the next one.
+The wasted walk is bounded by the scan's own walk over the same bytes (the
+scan keeps the failed attempt's threads alive, at top priority, until
+they die), so the lane stays linear; `a.*?b` over a 64 KB run with no `b`
+is 3.7 µs here against 2.3 s on the backtracker alone. One attempt per
+match, never one per candidate. Every materialized table holds its state
+ids in the narrowest integer type that fits them (`edfa_id_dtype`:
+`Int8`, `Int16` or `Int32` — the table is the walk's hot data) and is
+padded to `EDFA_TABLE_MIN_BYTES` (1 KB): below that the constant lowers to
+a per-call stack copy inside the walker, which cost more than the walk
+itself on 3-state tables.
+
+A pattern with no start-anchored scanner may still carry a **required
+inner literal** — a byte run every match must contain, sitting after an
+unbounded loop where no prefix scanner can see it (`\w+\.txt` must
+contain ".txt", `[a-z]+://[^ ]+` must contain "://"). `extract_inner_literal`
+(optimize.mojo) walks the NFA's mandatory spine at comptime — literal
+states extend a run, zero-width states keep it open, loops make the
+preceding gap unbounded, alternations contribute min/max over both arms —
+and keeps the rarest run of ≥ 2 bytes that is not at fixed offset 0 (the
+prefix scanners' territory). When the leftmost-first lane has no filter
+prefix and no Teddy prefix (`Regex._use_rev_literal`, Rust regex's
+ReverseSuffix/ReverseInner), `_lf_next_match` memmems the literal
+(`simd_find_literal_rare`, the same two-rarest-probe Muła kernel the
+filter-prefix scanner delegates to) before anything else: no occurrence
+at or after `pos + min_offset` is proof of no match — one SIMD pass
+answers the call (the `reverse_suffix_search_64KB` /
+`reverse_inner_search_64KB` rows measure ~40x on miss-heavy 64 KB) — and
+when the pre-literal gap is comptime-bounded (`[ab]{0,3}foo`: at most 3 bytes)
+the candidate pipeline starts at `lit_pos - max_offset`. With an
+unbounded gap the scan still starts at `pos`: recovering a start by
+walking leftward from the literal is the quadratic trap Rust bounds with
+REV_INNER_MAX_BACKSCAN, and this design has no leftward walk at all. The
+pivot prefilter may coexist; the literal test simply runs first.
+
+Capture groups do not keep a pattern off these tables — SAVE states are
+epsilon to every determinizer — only backreferences and lookaround do. A
+capture pattern of the admitted shape runs its search-family verbs on the
+**DFA-bounded capture lane** (`Regex._use_dfa_span`, regex-automata's
+"Core" strategy): the same forward scan and reverse walk give the span,
+and the specialized backtracker then runs anchored at the start and pinned
+to end at the end (`anchored_end` + `end_at`, over the whole input so `$`
+and `\b` see the real neighbours) to fill the slots. Its first success on
+that span is Python's capture assignment: the span is the leftmost-first
+match, every path before it in NFA priority order fails to reach MATCH at
+all, and the backtracker explores in that order — so the pinned walk costs
+what an unpinned walk from the start costs and never reaches the
+lower-priority assignments with the same span. The lane's miss path is the
+DFA scan alone (the backtracker-per-candidate lane re-ran `(\w+)@(\w+)\.com`
+from every word byte). On this lane the anchored-first attempt on the
+backtracker is made for every shape, not only lazy ones: a success carries
+the slots, so a true first candidate costs one backtracker pass — the old
+lane's cost — and only a false one pays the scan, the reverse walk and the
+confirm (without the attempt the short-input findall rows measured
+1.2-1.7x). The lane's candidate comes from the literal/pivot prefilters or,
+failing those, a SIMD first-byte class scan. `split` and a `replace`
+without backreferences skip the fill. When the backtracker gives
+up on a span (budget or depth) the Pike VM runs on exactly that span with
+the same end pin, never on the whole input — and the walk latches: every
+later span of the same call goes straight to that VM, built once per
+walk, so a pattern whose confirm always gives up (`(a*)*b`) pays one
+budget per call, not one per match. `match()` with captures stays on the
+backtracker unless the pattern is one-pass (next paragraph).
+
+**One-pass DFA** (`onepass.mojo`, `Regex._use_onepass`, regex-automata's
+`onepass`): when at most one NFA thread can consume each byte, the path
+through the NFA for any input is unique, and the capture slots can be
+written during a single forward table walk with no backtracking. A DFA
+state is one NFA state (a transition target) plus a position context
+(start / after `\n` / mid-line, split by the look-behind word class for
+`\b` patterns); expanding it walks the epsilon closure in priority order
+carrying the SAVE slots passed, and every consuming member contributes
+transitions tagged with those slot writes. The pattern is NOT one-pass
+when a later member wants a byte class an earlier one already claimed
+with a different target or slot set (`(a|ab)(c|bcd)`, `(a*)(a*)`,
+`(a)\b|(a)`), or when it carries a backreference or lookaround, or when
+the automaton exceeds `ONEPASS_STATE_CAP` (128) / 63 slots. Unlike
+regex-automata the closure does not stop at MATCH: `match()` is
+`fullmatch` (language membership: `(a*?)` must fullmatch "aaa") and the
+capture lane's span confirm already knows its end, so both walkers
+(`onepass_match`, pinned to a known `[start, end)`) run to the pin and
+require a match state there — the unique path's slot writes are then the
+only assignment. BOL kinds resolve against the context at build time,
+`$` / `(?m)$` / `\b` before a consuming state restrict its byte classes,
+and only the conditions on the byte after the end remain as per-state
+match flags checked once against the whole input.
+
+The one-pass walk replaces the backtracker in exactly two places, both
+gated on `_use_onepass`: `match()` (the whole input), and the capture
+lane's span confirm (`_span_fill_slots`, over a span the forward/reverse
+DFAs already found — exact and O(span), so a one-pass pattern's search
+verbs never fall to the Pike VM on a pathological confirm). Selection is
+by SHAPE, not validity alone (`onepass_shape`): the walk costs ~1.8 ns
+per byte, so it is taken only where the backtracker is much slower — a
+general loop (a cyclic SPLIT the backtracker runs by recursion) whose
+body carries an ALTERNATION, where the backtracker re-tries an arm per
+character (`(?:(x)|y)+`, `(?:(x)|(y)|z)+`, `(a|b)*c`, `(?:(ab)|(cd))+`):
+4-9x faster at every length, and no SBT_BUDGET / SBT_STACK_BUDGET cliff. A
+simple loop anywhere, or a general loop without a body alternation
+(`((a)(b))+`, `(?:([a-z])(\d))+`), keeps the backtracker, whose SIMD
+class runs and cheap short-body recursion win there. The build is its
+own comptime field, read only where `_use_onepass` can hold (a capture
+pattern of the alternation-loop shape), so simple shapes and
+capture-free patterns never pay for it.
+
+**Word boundaries ride all three tables.** `\b` needs the byte on both
+sides, and a closure only knows the one behind it, so — regex-automata's
+approach — a DFA state carries the look-behind: the word class of the
+byte that led to it, recorded only while a word anchor is pending in the
+set (so `\b`-free tables are byte-identical to before). The anchor stays
+a pending member, like an EOL anchor; creating a state resolves it twice,
+for a word and for a non-word next byte, and the two resolved sets feed
+the word and the non-word byte classes of its transitions (the classes
+are cut at the `[A-Za-z0-9_]` edges when an anchor exists). A resolved
+continuation that reaches MATCH becomes a *conditional* match flag
+(`EDFA_MATCH_IF_WORD` / `_NONWORD`) the walker checks against the next
+byte before consuming it, exactly like `EDFA_EOL_AT_NEWLINE`; end of
+input counts as non-word. The mid-line start context splits the same
+way (`start_other` / `start_other_word`), and the reverse DFA mirrors it
+with the roles swapped: the byte just consumed is the look-ahead, the
+byte about to be consumed the look-behind, and the entry's liveness
+becomes `RDFA_WB_LEFT_WORD` / `_NONWORD`. The split restart states of the
+leftmost-first table no longer self-loop on prose (one takes word runs,
+the other non-word runs), so they are accelerated as a **region**: a set
+of flag-free states whose rows agree on every byte outside a sparse exit
+set — the walker scans to the next exit byte and lands in whichever
+member the last skipped byte selects. Engine selection is unchanged
+otherwise; a word anchor whose continuation reaches a BOL kind (`\b^`)
+stays off the lanes, as does the runtime lazy DFA, which does not model
+the anchor. Sets keep word-boundary patterns off their DFA lanes.
 
 The **specialized backtracker** is comptime-specialized per NFA state: each
 `_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind
@@ -132,15 +300,75 @@ What it is *not* is one flat function — `_sbt_try_match` carries no
 `@always_inline`, and could not honour one: a cyclic SPLIT reaches its own
 instantiation, which is unflattenable in principle. So the general-SPLIT
 branch is genuine recursion, and the engine carries **two** independent caps:
-`SBT_BUDGET` bounds total work, while `SBT_MAX_DEPTH` bounds the *stack* —
+`SBT_BUDGET` bounds total work, while `SBT_STACK_BUDGET` bounds the *stack* —
 budget alone does not, since `(?:ab)+` recurses once per byte consumed and has
 overflowed the stack on a 50KB input. Exhausting either falls through to the
-Pike VM. Two cyclic shapes avoid the recursion altogether: a greedy or lazy
-SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
+Pike VM. The stack bound is measured in **bytes**, not calls: the walk reads
+the stack pointer at the checked frames and concedes when it drops below a
+floor taken at `_sbt_run` entry. A call count cannot do the job — the same
+frame measures ~120 B in a release build and 600-1500 B under
+`-D ASSERT=all`, a 12x spread, plus a further 2.4x between pattern shapes, so
+the 10,000-call cap this replaced was 1.2 MB in one build and 14.6 MB in the
+other (which is how `(?:a|a{2,})+b` on 2000 `a`s came to SIGSEGV under the
+test flags).
+
+The floor is the higher of two rules, and both are needed:
+
+- **relative** — `sp - SBT_STACK_BUDGET` (4 MiB, half the 8 MiB main-thread
+  default) bounds what *this walk* may add;
+- **absolute** — `stack_low + SBT_STACK_RESERVE` (512 KiB) bounds where the
+  thread's stack actually ends. `stack_low` comes from
+  `pthread_get_stackaddr_np` / `pthread_get_stacksize_np` on macOS and
+  `pthread_getattr_np` / `pthread_attr_getstack` on Linux. Without it the
+  relative rule says nothing about what the *caller* already spent: a caller
+  burning 64 KiB per level around a deep walk returned at 60 levels
+  (~3.9 MiB) and SIGSEGV'd at 64, and a macOS secondary thread (512 KiB by
+  default) never had 4 MiB to give.
+
+`Regex.__init__` asks for the thread's range once and caches it; the floor
+re-asks only when the current stack pointer falls outside the cached range
+(i.e. the `Regex` moved threads). Asking per `_sbt_run` instead measured
+1.388x on `static_nested_quantifier`.
+
+**Residual assumptions.** The reserve has to cover whatever nests between two
+checks, and the check sits in the general-SPLIT branch: one cycle of the call
+graph, measured at ~4.5 KiB, against a 512 KiB reserve. A pattern that nests
+*hundreds* of lookarounds between two cyclic splits would push past that —
+lookaround frames are real and are not check sites. Platforms other than
+macOS and Linux cannot be asked for their stack bounds and keep the relative
+rule alone.
+
+Two cyclic shapes avoid the recursion altogether: a greedy or lazy SPLIT
+whose body is a single ANY/CHAR/CHARSET looping straight back becomes a
 `while` loop (`is_simple_loop` / `is_simple_lazy`), so `a+`, `[a-z]*` and
-`.*?` iterate. `_sbt_needs_depth_guard` keys off exactly that distinction and
-drops depth tracking for patterns where every cyclic split is simple —
-measured 1.25-1.6x on recursion-heavy patterns.
+`.*?` iterate. `sbt_depth_plan` computes whether anything is left that can
+still recurse without bound — a cycle in the *specialized call graph*, which
+models the simple-loop rewrites, so it is exact rather than an
+over-approximation of the NFA — and drops the whole guard (floor included)
+when there is none; measured 1.25-1.6x on recursion-heavy patterns when the
+check was applied unconditionally. The same pass verifies that the
+general-SPLIT states form a feedback vertex set of that graph, which is what
+licenses keeping the check in that one branch instead of on entry to every
+state.
+
+A **counted repetition** over a single byte class gets the same treatment,
+one level up. `nfa.mojo` expands `x{n,m}` into `n` required copies plus
+either a star loop or `m-n` optional copies wrapped in `?` SPLITs — right
+for the DFA lanes (one byte class determinizes to `m+1` states, linear),
+ruinous for the backtracker, which pays a function instantiation and a
+stack frame per copy: `a{1,2000}` took ~12 minutes to compile.
+`_sbt_counted_shape` reads that chain back at compile time and the walker
+runs it as one bounded loop — consume up to `hi`, hand back down to `lo`
+with the same auto-possessification the simple loop uses, or extend up
+from `lo` when lazy. It is exact rather than merely equivalent because a
+single-class body with no capture inside makes every k-byte path through
+the chain the same path, which collapses the recursion's binary-order
+enumeration of the optional copies into a plain count order. Two whole
+populations are excluded: chains with `hi == lo` (already a run of tail
+calls, so there is no frame to save) and any NFA with a general cyclic
+SPLIT (its exit call is not in tail position, so collapsing free frames
+into real ones there deepens a walk that already recurses per byte —
+`(?:a|a{2,3})+b` on 2000 `a`s went from completing to overflowing).
 
 Search gets its own prefilters: literal prefixes drive `simd_find_prefix`,
 required-byte and first-byte bitmaps drive shufti/truffle skips, and the
@@ -175,12 +403,13 @@ see "Exact backrefs and lookaround" below.
 ### The engine ladder
 
 ```
-litset ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
+litset ──▶ ac ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
 ```
 
 | Lane | When | File |
 | --- | --- | --- |
 | **litset** | every pattern is a plain literal | `set_literal.mojo` |
+| **ac** | all literals, but more than `LITSET_MAX` of them | `set_ac.mojo` |
 | **rose** | patterns carry required literal factors | `set_rose.mojo` |
 | **mdfa** | general, determinizes within `MDFA_STATE_CAP` | `set_dfa.mojo` |
 | **bitnfa** | determinization blew up, or EOL-consuming continuations | `set_bitnfa.mojo` |
@@ -190,6 +419,17 @@ litset ──▶ rose ──▶ mdfa ──▶ bitnfa ──▶ pike
 holds a *list* of literal ids, which is Hyperscan's trick for k > 8. No
 automaton at all, just shuffles.
 
+**ac** — Aho-Corasick. Teddy unrolls verification per literal, so it
+stops at 64 patterns; past that a comptime trie over byte classes, with
+failure links resolved and output links folded into each state's report
+slice, walks the input one table lookup per byte and reports every
+literal ending at each position with no failure-link chasing. Build cost
+is linear in the total literal length — no determinization — and the
+root state is SIMD-accelerated to the next possible first byte. Caseless
+literals collapse their case pairs into single byte classes when nothing
+in the set needs the two bytes distinguished; otherwise the position
+expands into alternative trie paths, capped.
+
 **rose** — literal decomposition, Hyperscan's real performance move. Each
 pattern is walked at comptime for a literal run that every match must
 contain at a *fixed* offset from the match start; all factors pool into one
@@ -197,6 +437,17 @@ Teddy front end, and a per-pattern **anchored** DFA runs only at candidate
 positions. Patterns with no usable factor stay resident on the lane below,
 over their own union NFA, and the two report streams merge. Measured 10.2x
 over the multi-accept DFA on sparse 64KB input.
+
+Between the two sits a **candidate lookaround**: the same comptime walk
+also records the byte classes the pattern's consuming chain requires up to
+`ROSE_LOOK_BYTES` positions on either side of the factor (`conn=\d+` wants
+a digit after it; `\d{2}:\d{2} WARN \w+` wants four fixed classes before
+and a `\w` after), and a Teddy hit whose neighbours disagree — or whose
+required neighbour falls off either end of the input — never reaches the
+confirm DFA. Classes wider than `ROSE_LOOK_MAX_POP` are dropped rather
+than checked, and dropping one does not hide the narrower ones behind it.
+Worth ~10% where the factor occurs without its context, neutral where it
+does not.
 
 **mdfa** — determinizes `.*?(P0|P1|…)` with the unanchored start closure
 folded into every state, so the automaton never dies and never restarts.

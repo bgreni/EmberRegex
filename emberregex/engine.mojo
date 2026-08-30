@@ -29,6 +29,7 @@ from .flags import RegexFlags
 from .optimize import (
     extract_alt_prefix,
     extract_filter_prefix,
+    extract_inner_literal,
     extract_literal_alternation,
     extract_literal_prefix,
     extract_literal_suffix,
@@ -36,8 +37,11 @@ from .optimize import (
     extract_required_byte,
     extract_match_sandwich,
     is_pure_literal,
+    lit_bytes_arr,
+    lit_flags_arr,
     select_probe_offsets,
     FilterPrefix,
+    InnerLiteral,
     LiteralAlt,
 )
 from .teddy import (
@@ -52,28 +56,54 @@ from .simd_scan import (
     lane_bits,
     simd_find_byte,
     simd_find_literal,
+    simd_find_literal_rare,
 )
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
-from .backtrack import _sbt_try_match, SBT_BUDGET
+from .backtrack import (
+    _sbt_needs_depth_guard,
+    sbt_stack_bounds,
+    sbt_stack_floor,
+    SBT_BUDGET,
+    SBT_MEMO_BITS,
+    _sbt_try_match,
+    sbt_memo_budget,
+    sbt_memo_ok,
+    sbt_memo_rows,
+)
 from .dfa import LazyDFA
 from .static_dfa import (
     EagerDFA,
+    _edfa_has_region,
     _eol_continuation_crosses_anchor,
     _eol_ml_continuation_consumes,
+    _wb_cont_reaches_bol,
     _pivot_prefilter,
     build_eager_dfa,
     edfa_table_arr,
+    edfa_table_len,
     edfa_flags_arr,
+    edfa_id_dtype,
     edfa_full_match,
     edfa_match_at,
-    edfa_search_forward,
+    pivot_first_candidate,
+)
+from .static_lfdfa import (
+    build_lf_dfa,
+    lfdfa_find_end,
+    sheng_lfdfa_find_end,
+)
+from .static_rdfa import (
+    build_reverse_dfa,
+    rdfa_find_start,
+    rdfa_flags_arr,
+    rdfa_table_arr,
 )
 from .sheng import (
+    sheng_cap_for,
     sheng_full_match,
     sheng_masks_arr,
     sheng_match_at,
-    sheng_search_forward,
     sheng_viable,
 )
 from .simd_kernels import (
@@ -84,6 +114,19 @@ from .simd_kernels import (
     stops_from_bitmap,
 )
 from .executor import PikeVM, _VMBuffers
+from .onepass import (
+    OnePass,
+    build_onepass,
+    onepass_shape,
+    onepass_class_arr,
+    onepass_eps_arr,
+    onepass_eps_len,
+    onepass_match,
+    onepass_state_arr,
+    onepass_state_len,
+    onepass_table_arr,
+    onepass_table_len,
+)
 from std.collections import InlineArray
 
 
@@ -99,27 +142,197 @@ def _sbt_run[
     input: Span[Byte, origin],
     pos: Int,
     mut slots: InlineArray[Int, num_slots],
+    mut memo: List[UInt64],
     end_at: Int = -1,
+    stack_lo: Int = 0,
+    stack_hi: Int = 0,
 ) raises -> Int:
     """Run backtracker with a fresh budget allocation.
 
-    Raises if the budget is exhausted (work bound) or the recursion depth
-    cap was hit (stack bound — see SBT_MAX_DEPTH), signaling that the
-    result may be a false negative and a fallback engine should be used.
+    Raises if the budget is exhausted (work bound) or the walk ran out
+    of stack (SBT_STACK_BUDGET), signaling that the result may be a
+    false negative and a fallback engine should be used.
 
     Do NOT scale the budget with input length: for non-simple loops the
-    recursion depth tracks consumed bytes, so a larger budget converts
-    the Pike fallback into a stack overflow (measured: `(?:ab)+` on a
-    50KB input crashes under -D ASSERT=all).
+    recursion depth tracks consumed bytes, so a larger budget just means
+    the walk spends longer before the stack guard concedes (before that
+    guard counted bytes, it meant a stack overflow instead — measured:
+    `(?:ab)+` on a 50KB input crashed under -D ASSERT=all).
+
+    `memo` is the caller's (state, pos) bitset — see `_sbt_run_memo`. It
+    starts empty, is filled by the first attempt that would otherwise have
+    been handed to the Pike VM, and is then shared by every later attempt
+    in the same walk: a subtree that failed at some position fails there
+    whatever position the walk started from, so `search` and `findall`
+    pay for the memo once instead of once per candidate.
     """
+    comptime memo_rows = sbt_memo_rows(nfa)
+    comptime if memo_rows > 0:
+        if len(memo) != 0:
+            # An earlier attempt in this walk already paid for the memo,
+            # so stay on the memoized walker. A buffer sized for a
+            # different input is stale, not a cache — drop it.
+            if len(memo) == _sbt_memo_words(memo_rows, len(input)):
+                return _sbt_run_memoized[
+                    nfa=nfa,
+                    state_idx=state_idx,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, memo, end_at, stack_lo, stack_hi)
+            memo.clear()
     var budget = SBT_BUDGET
     var result = _sbt_try_match[
         nfa=nfa,
         state_idx=state_idx,
         num_slots=num_slots,
         anchored_end=anchored_end,
-    ](input, pos, slots, budget, 0, end_at)
+        memo_on=False,
+    ](
+        input,
+        pos,
+        slots,
+        budget,
+        memo_addr=0,
+        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](
+            stack_lo, stack_hi
+        ),
+        end_at=end_at,
+    )
     if budget < 0:
+        comptime if memo_rows > 0:
+            # The shapes that blow the budget are re-exploring (state,
+            # pos) pairs. Build the memo and retry before conceding the
+            # pattern to the Pike VM. A walk that ran out of STACK
+            # instead gets one wasted retry — the memo prunes repeated
+            # subtrees, it cannot make the deepest one shallower — and
+            # that retry is bounded by the same SBT_STACK_BUDGET.
+            if result < 0:
+                return _sbt_run_memo[
+                    nfa=nfa,
+                    state_idx=state_idx,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                ](input, pos, slots, memo, end_at, stack_lo, stack_hi)
+        raise Error("SBT_BUDGET_EXHAUSTED")
+    return result
+
+
+@always_inline
+def _sbt_memo_words(rows: Int, input_len: Int) -> Int:
+    """Words of bitset for `rows` memo rows over an input of `input_len`
+    bytes (positions run 0..input_len inclusive)."""
+    return (rows * (input_len + 1) + 63) >> 6
+
+
+def _sbt_run_memo[
+    origin: Origin,
+    //,
+    nfa: NFA,
+    state_idx: Int,
+    num_slots: Int,
+    anchored_end: Bool = False,
+](
+    input: Span[Byte, origin],
+    pos: Int,
+    mut slots: InlineArray[Int, num_slots],
+    mut memo: List[UInt64],
+    end_at: Int = -1,
+    stack_lo: Int = 0,
+    stack_hi: Int = 0,
+) raises -> Int:
+    """Second attempt at a run that exhausted SBT_BUDGET, this time with a
+    (state, pos) memo (see backtrack.mojo).
+
+    Deliberately not the first attempt. The bitset is
+    `general_splits * (len(input) + 1)` bits that have to be zeroed, and
+    the memoized walker is a whole second instantiation of the
+    backtracker, so runs that fit in the budget — every run of every
+    pattern that is not pathological — keep exactly the code and the cost
+    they had before the memo existed. The buffer is the caller's, so once
+    one attempt has built it, the rest of that walk starts memoized.
+
+    Restarting is safe: the walkers only ever WRITE capture slots, and
+    every SAVE restores its slot when its subtree fails, so the -1 this is
+    called on leaves `slots` as the first attempt found them.
+
+    Invariant the whole scheme rests on: **bits are only ever consulted
+    after an attempt that returned normally.** A bit means "this subtree
+    was explored to completion and failed", but an attempt that runs out
+    of budget or depth marks every general SPLIT it unwinds through, and
+    those subtrees were cut off rather than refuted. `_sbt_run_memoized`
+    therefore throws the buffer away before raising, so no later attempt —
+    in this walk or a future one — can read an aborted attempt's bits.
+    """
+    comptime memo_rows = sbt_memo_rows(nfa)
+    if memo_rows * (len(input) + 1) > SBT_MEMO_BITS:
+        # Wider than the memo cap — hand it to the fallback engine rather
+        # than allocate an unbounded bitset.
+        raise Error("SBT_BUDGET_EXHAUSTED")
+    memo = List[UInt64](fill=0, length=_sbt_memo_words(memo_rows, len(input)))
+    return _sbt_run_memoized[
+        nfa=nfa,
+        state_idx=state_idx,
+        num_slots=num_slots,
+        anchored_end=anchored_end,
+    ](input, pos, slots, memo, end_at, stack_lo, stack_hi)
+
+
+def _sbt_run_memoized[
+    origin: Origin,
+    //,
+    nfa: NFA,
+    state_idx: Int,
+    num_slots: Int,
+    anchored_end: Bool = False,
+](
+    input: Span[Byte, origin],
+    pos: Int,
+    mut slots: InlineArray[Int, num_slots],
+    mut memo: List[UInt64],
+    end_at: Int = -1,
+    stack_lo: Int = 0,
+    stack_hi: Int = 0,
+) raises -> Int:
+    """One attempt on the memoized walker, over a buffer that is already
+    sized and zeroed for this input.
+
+    A separate instantiation from the ordinary walk (`memo_on`), so the
+    memo costs the fast path nothing — not even a branch. Not inlined:
+    this is the pathological lane.
+
+    The budget here is NOT SBT_BUDGET. This attempt is a gamble placed
+    against a fallback (the Pike VM) whose cost is one pass over the same
+    (state, position) table, so it gets a table-proportional allowance and
+    concedes once it is clear memoization is not collapsing the search —
+    see `sbt_memo_budget`.
+    """
+    comptime memo_rows = sbt_memo_rows(nfa)
+    var budget = sbt_memo_budget(memo_rows, len(input))
+    var result = _sbt_try_match[
+        nfa=nfa,
+        state_idx=state_idx,
+        num_slots=num_slots,
+        anchored_end=anchored_end,
+        memo_on=True,
+    ](
+        input,
+        pos,
+        slots,
+        budget,
+        memo_addr=Int(memo.unsafe_ptr()),
+        stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](
+            stack_lo, stack_hi
+        ),
+        end_at=end_at,
+    )
+    if budget < 0:
+        # An aborted attempt leaves POISONED bits: every general SPLIT on
+        # the unwind marks itself, but those subtrees were cut off, not
+        # refuted. Drop the whole buffer rather than let a later attempt
+        # read them as failures — the caller is going to the Pike VM
+        # anyway, and a future caller that retried in-place would silently
+        # miss matches.
+        memo.clear()
         raise Error("SBT_BUDGET_EXHAUSTED")
     return result
 
@@ -220,7 +433,9 @@ def _reaches_consuming_before_match(nfa: NFA, start: Int) -> Bool:
 
 def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
     """Comptime: True when the DFA's leftmost-longest end always equals the
-    backtracker's leftmost-first end, letting _lf_end_at skip its re-run.
+    backtracker's leftmost-first end, letting _lf_end_at skip its re-run
+    and the leftmost-first lane try its first candidate anchored on the
+    classic table (`Regex._lf_anchored_classic`).
 
     Sound shape: every SPLIT is greedy and part of at most ONE quantifier
     cycle (no alternation-like SPLITs), and the cycle's exit path reaches
@@ -278,6 +493,18 @@ def _dfa_end_is_leftmost_first(nfa: NFA) -> Bool:
 # a constant.
 comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
 
+# Steps the leftmost-first lane's speculative backtracker attempt may
+# spend at one candidate (see Regex._sbt_match_at). The shapes it is for
+# (`<.*?>`, `"[^"]*?"`) decide in a handful of steps; past this the
+# unanchored scan is the cheaper judge, so the attempt concedes (-2) and
+# the lane stops speculating for the rest of the walk.
+comptime LF_SBT_ATTEMPT_BUDGET = 2048
+
+# Capture lane: an input this short skips the pivot prefilter hop when
+# the byte at the candidate position can start a match (see
+# Regex._lf_candidate).
+comptime LF_SHORT_INPUT = 16
+
 # Longest tail verified by the match() suffix fast-fail. The check is a
 # necessary condition only, so truncating to the last bytes stays sound.
 comptime MATCH_SUFFIX_CHECK_MAX = 8
@@ -314,37 +541,65 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
 
 
-@always_inline
-def _probe_eq[
-    W: Int, //, caseless: Bool, target: UInt8
-](v: SIMD[DType.uint8, W]) -> SIMD[DType.bool, W]:
-    """Chunk compare for one filter-prefix position. Caseless positions
-    fold via |0x20 — valid because their targets are lowercase ASCII
-    letters, whose only |0x20 preimages are the two cases."""
-    comptime if caseless:
-        return (v | 0x20).eq(target)
-    else:
-        return v.eq(target)
+# The probe compares (_probe_eq/_probe_eq1) live in simd_scan.mojo as
+# probe_eq/probe_eq1, next to simd_find_literal_rare — the lifted Mula
+# memmem both the filter-prefix scanner and the inner-literal strategy
+# call.
 
 
-@always_inline
-def _probe_eq1[caseless: Bool, target: UInt8](b: Byte) -> Bool:
-    """Scalar companion of _probe_eq."""
-    comptime if caseless:
-        return (b | 0x20) == target
-    else:
-        return b == target
+def _nfa_has_backref(nfa: NFA) -> Bool:
+    """Comptime: does the NFA carry a BACKREF state? `can_use_dfa` does
+    not say (the set lanes widen backreferences at the AST level and
+    confirm with the backtracker), and no table can model one."""
+    for i in range(len(nfa.states)):
+        if nfa.states[i].kind == NFAStateKind.BACKREF:
+            return True
+    return False
 
 
-def _dfa_candidate(nfa: NFA, group_count: Int) -> Bool:
-    """True when the pattern should run on a DFA engine (eager or lazy).
+def _dfa_candidate(nfa: NFA) -> Bool:
+    """True when the pattern's SHAPE should run on a DFA engine (eager or
+    lazy): capture-free, this is the classic/leftmost-first lanes
+    (`Regex._use_dfa_candidate`); with captures, the DFA-bounded capture
+    lane (`Regex._use_dfa_span_candidate`), whose search verbs take the
+    span from the same forward/reverse tables and the slots from the
+    backtracker on that span. The shape heuristic is shared: it asks
+    whether the backtracker would do real work per candidate (an
+    alternation arm to try, or a loop with a suffix to give back into),
+    which is what the DFA's single pass saves in either case.
+
+    Lazy quantifiers no longer exclude a pattern: the leftmost-first
+    table (static_lfdfa.mojo) stops `<.*?>` at the first `>` by
+    construction, so the search verbs get the lazy end from the DFA
+    itself. `_compute_strategy` still keeps a lazy pattern whose
+    leftmost-first determinization overflows OFF the DFA lanes (the
+    classic tables would walk to the longest end and re-run the
+    backtracker — the trap that motivated the old exclusion).
+
+    Word boundaries ride the DFA lanes too (the tables carry the
+    look-behind byte class per state — static_dfa.mojo). They do not
+    change the shape heuristic below: `\\bfoo\\b` stays a SIMD literal
+    scan plus two byte compares on the backtracker, which measured
+    several times faster than a forward + reverse table walk. The one
+    shape kept off outright is a word anchor whose continuation reaches
+    a BOL kind (`\\b^`), which the lanes cannot expand in context; and
+    since the LazyDFA (dfa.mojo) does not model word anchors,
+    `_compute_strategy` requires the eager table to have built.
+
+    A one-pass capture pattern the one-pass DFA takes (`_use_onepass`)
+    is always an alternation-loop shape, which this heuristic already
+    admits (the alternation is a real SPLIT), so its search verbs ride
+    the capture lane and their span confirm is the exact one-pass walk
+    — no separate admission is needed.
 
     Comptime memoization applies to `comptime` field declarations, not to
     repeated internal calls, so Regex evaluates this ONCE into
     `_use_dfa_candidate` and threads the result — each evaluation walks
     the NFA several times.
     """
-    if not nfa.can_use_dfa or group_count != 0 or nfa.has_lazy:
+    if not nfa.can_use_dfa or _nfa_has_backref(nfa):
+        return False
+    if nfa.has_word_boundary and _wb_cont_reaches_bol(nfa):
         return False
     var cyclic = split_cycle_flags(nfa)
     if not (
@@ -367,9 +622,32 @@ struct MatchStrategy:
     skipping) apply.
 
     `use_dfa` means "a DFA engine runs this pattern"; `use_eager_dfa`
-    selects the comptime-determinized table over the runtime LazyDFA;
+    selects the comptime-determinized table over the runtime LazyDFA for
+    `match()` (fullmatch — language membership, the classic table);
     `use_sheng` further selects the shuffle walker over the table walk
     for small eager DFAs on targets with a native byte shuffle.
+
+    The search-family lane is deliberately NOT a field here: it is
+    `Regex._use_lf_dfa` / `_use_lf_sheng` (the leftmost-first table plus
+    the reverse DFA — one unanchored forward scan for the end, one
+    reverse walk for the start). Only the search verbs read those, so a
+    program that only calls match() never elaborates either table. This
+    struct reads the leftmost-first table's validity only for a LAZY
+    pattern, whose `use_dfa` genuinely depends on it (a lazy pattern
+    rides the DFA lanes only when both tables built; otherwise it takes
+    the backtracker, never the LazyDFA whose longest-end walk is the
+    wrong engine for `.*?`).
+
+    Where the search verbs of a `use_dfa` pattern go when the
+    leftmost-first lane is off: Teddy if `use_teddy`; the LazyDFA with
+    the backtracker end re-run if the CLASSIC table overflowed
+    (`_use_lazy_dfa`); and otherwise — the classic table fits but the
+    leftmost-first one overflowed, a greedy near-cap shape such as
+    `(?:a|b|\n)*a(?:a|b|\n){6}` — the backtracker. Constructing a
+    runtime LazyDFA for that last case would put an NFA copy into
+    `__init__` (and a raising search path) on a pattern whose match()
+    is a pure table walk, and the old per-position anchored walk over
+    the classic table is gone, so the general engine serves it.
     """
 
     var use_simd_literal: Bool
@@ -401,8 +679,22 @@ def _compute_strategy(
     pivot_ok: Bool,
     fprefix_len: Int,
     alt_prefix_valid: Bool,
-    use_dfa: Bool,
+    dfa_candidate: Bool,
+    lazy_lf_valid: Bool,
 ) -> MatchStrategy:
+    # A lazy pattern rides the DFA lanes only when BOTH tables built:
+    # the classic one for match() and the leftmost-first one for the
+    # search verbs. Otherwise it stays on the backtracker — never the
+    # LazyDFA, whose longest-end walk is the wrong engine for `.*?`.
+    # `lazy_lf_valid` is only meaningful (and only evaluated by the
+    # caller) when `nfa.has_lazy`.
+    # A word-anchor pattern rides the DFA lanes only when the eager
+    # table built: the runtime LazyDFA does not model word anchors.
+    var use_dfa = (
+        dfa_candidate
+        and (not nfa.has_lazy or (eager_dfa_valid and lazy_lf_valid))
+        and (not nfa.has_word_boundary or eager_dfa_valid)
+    )
     var prefix_len = len(prefix)
     var first_byte_useful = _is_bitmap_useful(first_byte_bitmap)
     var pure_literal = is_pure_literal(nfa)
@@ -457,6 +749,79 @@ def _compute_strategy(
     )
 
 
+struct _SpanPike[num_slots: Int, span: Bool](Movable):
+    """The capture lane's per-walk span-confirm state, declared by the
+    verbs and reached through `_LFWalk.pike` — a pointer, never the
+    struct by value (see `_LFWalk`).
+
+    `sbt_ok` — the backtracker has not yet given up on a span confirm in
+    this walk; once it has, every later span of the walk goes straight
+    to the Pike VM (`_span_fill_slots`) in `vm` / `bufs`, built once on
+    that first give-up and reused. Without the latch a pattern whose
+    confirm always exhausts the budget (`(a*)*b`) paid SBT_BUDGET per
+    match (measured 64x the whole-input Pike on a 900-byte findall); with
+    it the loss on a later, non-pathological span is one Pike pass over
+    that span. The capture-free instantiation is a Bool and two
+    `NoneType` fields.
+    """
+
+    var sbt_ok: Bool
+    var vm: List[PikeVM[Self.num_slots]] if Self.span else NoneType
+    var bufs: List[_VMBuffers] if Self.span else NoneType
+
+    @always_inline
+    def __init__(out self):
+        self.sbt_ok = True
+        comptime if Self.span:
+            # Empty Lists: no allocation until the first give-up (an
+            # `Optional` of either type measured 86 ns per verb call in
+            # construction + destruction alone, on calls that never
+            # build anything).
+            self.vm = rebind_var[type_of(self.vm)](
+                List[PikeVM[Self.num_slots]]()
+            )
+            self.bufs = rebind_var[type_of(self.bufs)](List[_VMBuffers]())
+        else:
+            self.vm = rebind_var[type_of(self.vm)](None)
+            self.bufs = rebind_var[type_of(self.bufs)](None)
+
+
+struct _LFWalk[num_slots: Int, span: Bool, origin: MutOrigin](
+    Copyable, Movable
+):
+    """Per-walk state of the leftmost-first lane (one per search / finditer
+    / findall / replace / split call), threaded through `_lf_next_match`.
+
+    `speculate` — the anchored-first attempt is still allowed (cleared
+    once an attempt runs out of LF_SBT_ATTEMPT_BUDGET, see
+    `_lf_next_match`). `pike` — the verb's `_SpanPike` (the capture
+    lane's span-confirm latch and lazily built Pike VM).
+
+    A Bool and a pointer, and the pointer value is what crosses into the
+    out-of-line scan tail — never a struct. What the pointee costs to
+    construct is the whole game: measured on the html findall row, whose
+    every match is an attempt-success that never builds a VM, a pointee
+    with `Optional[PikeVM]` / `Optional[_VMBuffers]` fields cost 86 ns
+    per verb call in construction + destruction — 2x the row — as soon
+    as any use of the walk kept it live; empty `List`s cost ~1 ns (see
+    `_SpanPike`). Same family as C4's `memo_addr` finding in
+    `_sbt_try_match`: whatever lives in a verb's frame or crosses a call
+    must be trivial on the fast path. The pointer carries `origin`, so
+    the verb's `_SpanPike` outlives the walk.
+    """
+
+    var speculate: Bool
+    var pike: Pointer[_SpanPike[Self.num_slots, Self.span], Self.origin]
+
+    @always_inline
+    def __init__(
+        out self,
+        pike: Pointer[_SpanPike[Self.num_slots, Self.span], Self.origin],
+    ):
+        self.speculate = True
+        self.pike = pike
+
+
 struct Regex[pattern: String](Copyable, Movable):
     """A compile-time regex where parsing and NFA construction happen during
     compilation.
@@ -481,14 +846,40 @@ struct Regex[pattern: String](Copyable, Movable):
     # Evaluated once as a field: _dfa_candidate walks the NFA several
     # times, and comptime memoization covers field declarations, not
     # repeated internal calls.
-    comptime _use_dfa_candidate = _dfa_candidate(Self.nfa, Self._group_count)
+    comptime _dfa_shape_ok = _dfa_candidate(Self.nfa)
+    # Capture-free: the classic table serves match(), the leftmost-first
+    # lane the search verbs. With captures: the DFA-bounded capture lane
+    # (`_use_dfa_span`) for the search verbs only — match() keeps the
+    # backtracker, which fills the slots in the same pass.
+    comptime _use_dfa_candidate = Self._dfa_shape_ok and Self._group_count == 0
+    comptime _use_dfa_span_candidate = (
+        Self._dfa_shape_ok and Self._group_count > 0
+    )
     # Teddy-claimed patterns (pure literal alternations on shuffle targets)
     # never run the DFA engines, so skip their comptime determinization.
-    comptime _edfa = build_eager_dfa(
-        Self.nfa,
-        Self._use_dfa_candidate
-        and not (Self._lit_alt.valid and HAS_FAST_BYTE_SHUFFLE),
+    comptime _build_dfas = (
+        Self._use_dfa_candidate or Self._use_dfa_span_candidate
+    ) and not (Self._lit_alt.valid and HAS_FAST_BYTE_SHUFFLE)
+    # The classic table: match() (fullmatch) and the prefilter shapes.
+    comptime _edfa = build_eager_dfa(Self.nfa, Self._build_dfas)
+    # The leftmost-first table and its reverse companion: the search
+    # verbs. Gated on the classic table having built: a pattern whose
+    # set-based determinization overflows EDFA_STATE_CAP overflows the
+    # ordered one too in every shape seen, and the leftmost-first build
+    # would otherwise run to the cap before finding out (measured ~4 s
+    # of wasted comptime per such pattern). The reverse build is gated
+    # on the forward one for the same reason.
+    comptime _lfdfa = build_lf_dfa(
+        Self.nfa, Self._build_dfas and Self._edfa.valid
     )
+    comptime _rdfa = build_reverse_dfa(
+        Self.nfa, Self._build_dfas and Self._lfdfa.valid
+    )
+    # The classic table is referenced through `_group_count == 0 and`
+    # guards: a capture pattern's strategy never reads it (match() is
+    # the backtracker there), so a program that only calls match() on
+    # capture patterns does not determinize — the tables elaborate when
+    # a search verb reads `_use_dfa_span`.
     comptime _strategy = _compute_strategy(
         Self.nfa,
         Self._prefix,
@@ -496,27 +887,135 @@ struct Regex[pattern: String](Copyable, Movable):
         Self._group_count,
         Self._sandwich.valid,
         len(Self._sandwich.suffix),
-        Self._edfa.valid,
-        sheng_viable(Self._edfa) and HAS_FAST_BYTE_SHUFFLE,
+        Self._group_count == 0 and Self._edfa.valid,
+        Self._group_count == 0
+        and sheng_viable(Self._edfa)
+        and HAS_FAST_BYTE_SHUFFLE,
         Self._lit_alt.valid,
-        _pivot_prefilter(Self._edfa)[0] >= 0,
+        Self._group_count == 0 and _pivot_prefilter(Self._edfa)[0] >= 0,
         len(Self._fpre.bytes),
         Self._alt_prefix.valid,
         Self._use_dfa_candidate,
+        # Comptime `and` short-circuits left to right: a greedy pattern's
+        # strategy never touches the leftmost-first tables, and neither
+        # does a CAPTURE pattern's (the value is dead there — `use_dfa`
+        # is off for captures), so they elaborate only when a search
+        # verb asks or a capture-free lazy pattern's strategy needs them.
+        # Without the group guard a match()-only program on `<(.*?)>`
+        # paid three determinizations (measured cold: ~1.5 s).
+        Self._group_count == 0
+        and Self.nfa.has_lazy
+        and Self._lfdfa.valid
+        and Self._rdfa.valid,
     )
-    # LazyDFA only backs DFA patterns whose comptime determinization
-    # overflowed EDFA_STATE_CAP — and that Teddy didn't claim.
+    # The search-family lane (see MatchStrategy's docstring for why it is
+    # not a strategy field). Referenced by the search verbs only.
+    #
+    # The lane runs ONE unanchored scan from the first candidate, so
+    # after a false candidate it is the table's restart states that must
+    # skip ahead. A pending `\b` splits those by look-behind class, and
+    # the pair alternates every few bytes of prose; the region
+    # acceleration (EagerDFA.region_states) scans the pair as one when
+    # its exit set is sparse. When it is not and the pattern has a
+    # candidate scanner (filter prefix or Teddy alternation prefix), the
+    # search verbs stay on the backtracker, whose scanner jumps straight
+    # to the next literal occurrence (measured 3.6x slower on the lane
+    # before the region skip existed).
+    comptime _use_lf_dfa = (
+        Self._strategy.use_dfa
+        and not Self._strategy.use_teddy
+        and Self._lfdfa.valid
+        and Self._rdfa.valid
+        and not (
+            Self.nfa.has_word_boundary
+            and Self._use_scan_filter
+            and not _edfa_has_region(Self._lfdfa.d)
+        )
+    )
+    # The DFA-bounded capture lane (Rust regex's meta "Core" strategy):
+    # the search verbs of a capture pattern take the span from the same
+    # unanchored forward scan + reverse walk as the lane above, then run
+    # the backtracker anchored at the start and pinned to the end to fill
+    # the slots (`_span_fill_slots`). Same `\b` scanner rule as above.
+    # Mutually exclusive with `_use_lf_dfa` (captures vs. none); the
+    # verbs read the two as one lane with a comptime slot-fill switch.
+    comptime _use_dfa_span = (
+        Self._use_dfa_span_candidate
+        and Self._lfdfa.valid
+        and Self._rdfa.valid
+        and not (
+            Self.nfa.has_word_boundary
+            and Self._use_scan_filter
+            and not _edfa_has_region(Self._lfdfa.d)
+        )
+    )
+    comptime _use_lf_lane = Self._use_lf_dfa or Self._use_dfa_span
+    # The `span` type parameter of the lane's per-walk state (`_SpanPike`
+    # / `_LFWalk`): on the lane, "fills slots" is exactly "has captures"
+    # (the two lanes are mutually exclusive on `_group_count`), and this
+    # LEAF expression is what must appear in the type. Mojo mangles a
+    # comptime Bool parameter as its defining EXPRESSION, not its value,
+    # so `_use_dfa_span` there — whose tree repeats `_dfa_shape_ok`, and
+    # through it the one-pass predicates, at every short-circuit — gave
+    # the three `@no_inline` lane methods 2 MB symbol names and a linker
+    # assertion (`ld: name.size() <= maxLength`). Only ever read where
+    # `_use_lf_lane` holds.
+    comptime _span_lane = Self._group_count > 0
+    comptime _use_lf_sheng = (
+        Self._use_lf_lane
+        and sheng_viable(Self._lfdfa.d)
+        and HAS_FAST_BYTE_SHUFFLE
+    )
+    # LazyDFA only backs DFA patterns whose CLASSIC comptime
+    # determinization overflowed EDFA_STATE_CAP — and that Teddy didn't
+    # claim. Lazy patterns never reach it (see _compute_strategy), and a
+    # greedy pattern whose classic table fits but whose leftmost-first
+    # table overflowed runs its search verbs on the backtracker: this
+    # flag types two instance fields, so it must not depend on the
+    # leftmost-first tables or every instantiation would elaborate them.
     comptime _use_lazy_dfa = (
         Self._strategy.use_dfa
         and not Self._strategy.use_eager_dfa
         and not Self._strategy.use_teddy
     )
-    comptime _EDFA_TN = Self._edfa.num_states * 256
-    comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN](Self._edfa)
+    # The table is the walk's hot data, so it materializes in the
+    # narrowest element type the ids fit (see edfa_id_dtype), padded to
+    # EDFA_TABLE_MIN_BYTES so the constant lowers to shared data instead
+    # of a per-call stack copy (see edfa_table_len).
+    comptime _EDFA_TN = edfa_table_len(Self._edfa.num_states)
+    comptime _EDFA_DT = edfa_id_dtype(Self._edfa.num_states)
+    comptime _EDFA_TABLE = edfa_table_arr[Self._EDFA_TN, Self._EDFA_DT](
+        Self._edfa
+    )
     comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
-    comptime _SHENG_MASKS = sheng_masks_arr(
+    # Narrowest tbl tier that holds this DFA: a 6-state DFA keeps 16-lane
+    # masks even where 64 lanes are available (see sheng.mojo).
+    comptime _SHENG_CAP = sheng_cap_for(Self._edfa, Self._strategy.use_sheng)
+    comptime _SHENG_MASKS = sheng_masks_arr[Self._SHENG_CAP](
         Self._edfa, Self._strategy.use_sheng
     )
+    # Leftmost-first lane tables (same materialization rules as above).
+    comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.d.num_states)
+    comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.d.num_states)
+    comptime _LFDFA_TABLE = edfa_table_arr[Self._LFDFA_TN, Self._LFDFA_DT](
+        Self._lfdfa.d
+    )
+    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.d.num_states](
+        Self._lfdfa.d
+    )
+    comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa.d, Self._use_lf_sheng)
+    comptime _LF_SHENG_MASKS = sheng_masks_arr[Self._LF_SHENG_CAP](
+        Self._lfdfa.d, Self._use_lf_sheng
+    )
+    comptime _RDFA_TN = edfa_table_len(Self._rdfa.num_states)
+    comptime _RDFA_DT = edfa_id_dtype(Self._rdfa.num_states)
+    comptime _RDFA_TABLE = rdfa_table_arr[Self._RDFA_TN, Self._RDFA_DT](
+        Self._rdfa
+    )
+    comptime _RDFA_FLAGS = rdfa_flags_arr[Self._rdfa.num_states](Self._rdfa)
+    # Pivot-anchored prefilter shape (the `[class]+ P …` family), read off
+    # the classic table; the leftmost-first scan starts at its candidate.
+    comptime _lf_pivot = _pivot_prefilter(Self._edfa)
     comptime _match_suffix = _match_suffix_for_fastfail(
         Self.nfa,
         Self._strategy.use_sandwich_match,
@@ -528,17 +1027,142 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _use_scan_filter = (
         Self._strategy.fprefix_len > 0 or Self._strategy.use_teddy_prefix
     )
+    # The filter prefix as kernel comptime parameters, for
+    # _find_prefix_candidate's delegation to simd_find_literal_rare
+    # (List-bearing values must not ride as comptime parameters).
+    # Referenced only when fprefix_len >= 2.
+    comptime _FPRE_LIT = lit_bytes_arr[Self._strategy.fprefix_len](
+        Self._fpre.bytes
+    )
+    comptime _FPRE_CL = lit_flags_arr[Self._strategy.fprefix_len](
+        Self._fpre.caseless
+    )
+    # Reverse-suffix / reverse-inner required literal (Rust regex's
+    # ReverseSuffix/ReverseInner, effects (a)+(b) — see _lf_next_match's
+    # docstring). Only used when no candidate scanner exists: the filter
+    # prefix and the Teddy alternation prefix are start-anchored, so
+    # their candidate scan already bounds the work per position, and a
+    # second memmem was not worth its extra pass in the shapes measured
+    # (a 1-byte prefix CAN be less selective than the literal — running
+    # both is the unmeasured alternative, not a soundness question). The
+    # pivot prefilter may coexist — the literal test runs first, and the
+    # pivot then scans a region the literal has vouched for. The `and`
+    # chain elaborates the extraction only for LF-lane patterns without
+    # a scanner.
+    comptime _inner_lit = extract_inner_literal(Self.nfa)
+    comptime _use_rev_literal = (
+        Self._use_lf_lane
+        and not Self._use_scan_filter
+        and Self._inner_lit.valid
+    )
+    # The inner literal as kernel comptime parameters; referenced only
+    # where _use_rev_literal holds, so the invalid case (length 0) never
+    # elaborates.
+    comptime _IL_N = len(Self._inner_lit.bytes)
+    comptime _IL_LIT = lit_bytes_arr[Self._IL_N](Self._inner_lit.bytes)
+    comptime _IL_CL = lit_flags_arr[Self._IL_N](Self._inner_lit.caseless)
+    comptime _IL_PROBES = select_probe_offsets(
+        Self._inner_lit.bytes, Self._inner_lit.caseless
+    )
     # Field, not a per-method call: the check runs a cycle-flags pass over
     # the NFA, and comptime memoization covers field declarations only.
+    # Consulted by the Teddy and LazyDFA search lanes (_lf_end_at) and
+    # by the leftmost-first lane's anchored-first attempt (below).
     comptime _lf_end_is_dfa_end = _dfa_end_is_leftmost_first(Self.nfa)
+    # Leftmost-first lane, anchored-first attempt on the classic table
+    # (see _lf_next_match): sound exactly when the classic table's
+    # leftmost-longest end IS the leftmost-first end.
+    comptime _lf_anchored_classic = (
+        Self._lf_end_is_dfa_end and not Self._use_dfa_span
+    )
+    # ...and on the backtracker for lazy patterns whose every loop is a
+    # simple (iterative, SIMD-skipping) loop — `<.*?>`, `"[^"]*?"`: the
+    # attempt is a literal check plus one class scan, cheaper than the
+    # scan + reverse walk it replaces on a success. On the capture lane
+    # the attempt is made for EVERY shape, and takes precedence over the
+    # classic-table attempt: a success carries the slots, so it replaces
+    # the scan, the reverse walk AND the span confirm — one backtracker
+    # pass, exactly the old lane's cost on a true candidate (measured:
+    # without it the three passes cost 1.2-1.7x on the short-input
+    # findall rows, `<(\w+)[^>]*>` over 110 bytes). A failure is bounded
+    # as before: `-1` by the scan's walk over the same bytes, `-2` by
+    # LF_SBT_ATTEMPT_BUDGET once per walk (the `speculate` latch).
+    # A cyclic SPLIT the backtracker runs by general recursion (a loop
+    # whose body is not one ANY/CHAR/CHARSET state): its depth then
+    # tracks the input, and so does its cost. Field, not a call: the
+    # check walks the NFA, and two fields read it.
+    comptime _sbt_general_loop = _sbt_needs_depth_guard(Self.nfa)
+    comptime _lf_anchored_sbt = Self._use_dfa_span or (
+        Self.nfa.has_lazy and not Self._sbt_general_loop
+    )
+    # Backtracker (state, pos) memoization is only sound when a subtree's
+    # outcome is a function of (state, pos) — see sbt_memo_ok.
+    comptime _sbt_memo_ok = sbt_memo_ok(Self.nfa)
+    # The one-pass DFA (onepass.mojo): capture extraction in a single
+    # forward table walk for patterns where at most one thread can
+    # consume each byte. Serves match() (fullmatch over the whole input)
+    # and the capture lane's span confirm (`_span_fill_slots`, pinned).
+    # Its own field, referenced by `_use_onepass` alone and never by
+    # `_strategy`:
+    # every argument into `_compute_strategy` is elaborated for every
+    # pattern, and this build is only worth paying for where a capture
+    # verb runs. Capture-free patterns have the classic table and the
+    # leftmost-first lane; they never build it.
+    #
+    # Selection is by shape, not by validity alone (`onepass_shape`,
+    # with the measurements): the walk costs ~1.8 ns per byte (a table
+    # load on the critical path), the backtracker pays that per arm it
+    # tries. So the walk takes a general loop (one the backtracker runs
+    # by recursion) whose body carries an ALTERNATION, where the
+    # backtracker re-tries an arm per character (`(?:(x)|y)+`,
+    # `(?:(x)|(y)|z)+`, `(a|b)*c`): 4-9x faster at every length, and no
+    # SBT_BUDGET / SBT_STACK_BUDGET cliff. A simple loop, or a general loop
+    # with no body alternation (`((a)(b))+`, `(?:([a-z])(\d))+`), keeps
+    # the backtracker, whose SIMD class runs and cheap short-body
+    # recursion win. The build is gated on the same predicate so the
+    # other shapes pay no comptime for it. Used in exactly two places
+    # (both `_use_onepass`): match() and `_span_fill_slots`; the capture
+    # lane's anchored attempt stays on the backtracker (an
+    # unbounded-end one-pass walk's per-match slot snapshots make it
+    # slower on short dense inputs).
+    comptime _onepass_shape = onepass_shape(Self.nfa)
+    comptime _onepass = build_onepass(
+        Self.nfa, Self._group_count > 0 and Self._onepass_shape
+    )
+    comptime _use_onepass = (
+        Self._group_count > 0 and Self._onepass_shape and Self._onepass.valid
+    )
+    comptime _OP_TN = onepass_table_len(Self._onepass)
+    comptime _OP_TABLE = onepass_table_arr[Self._OP_TN](Self._onepass)
+    comptime _OP_CLASSES = onepass_class_arr(Self._onepass)
+    comptime _OP_NE = onepass_eps_len(Self._onepass)
+    comptime _OP_EPS = onepass_eps_arr[Self._OP_NE](Self._onepass)
+    comptime _OP_NS = onepass_state_len(Self._onepass)
+    comptime _OP_STATES = onepass_state_arr[Self._OP_NS](Self._onepass)
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
     var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
     var _simd_lit: TypeForPrefixLength[
         Self._strategy.prefix_len
     ] if Self._strategy.use_simd_literal else NoneType
+    # This thread's stack range, asked once here so the backtracker's
+    # stack guard does not pay three libc calls per `_sbt_run` (measured
+    # 1.388x on `static_nested_quantifier`). `sbt_stack_floor` re-asks
+    # whenever the current stack pointer is outside this range, which is
+    # what keeps a `Regex` built on one thread and used on another
+    # correct. Zeroed — and never queried — for patterns whose walk
+    # cannot recurse without bound.
+    var _stack_lo: Int
+    var _stack_hi: Int
 
     def __init__(out self):
+        comptime if _sbt_needs_depth_guard(Self.nfa):
+            var bounds = sbt_stack_bounds()
+            self._stack_lo = bounds.low
+            self._stack_hi = bounds.high
+        else:
+            self._stack_lo = 0
+            self._stack_hi = 0
         comptime if Self._use_lazy_dfa:
             var nfa = _build_static_nfa(Self.pattern)
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
@@ -558,7 +1182,12 @@ struct Regex[pattern: String](Copyable, Movable):
 
     # --- DFA engine dispatch: comptime table walk or runtime LazyDFA ------
     # Only the lazy branches can raise (DFA_STATE_CAP -> Pike VM fallback);
-    # the eager table is complete by construction.
+    # the eager tables are complete by construction. match() dispatches
+    # over the classic table; the search verbs over the leftmost-first
+    # lane (_lf_next_match) when it built, else Teddy or the LazyDFA
+    # through _dfa_match_at / _dfa_search_forward, else (classic table
+    # fits, leftmost-first overflowed) the backtracker — see
+    # MatchStrategy's docstring.
 
     @always_inline
     def _dfa_full_match(mut self, input: String) raises -> Bool:
@@ -587,18 +1216,6 @@ struct Regex[pattern: String](Copyable, Movable):
     ](mut self, input: Span[Byte, origin], start: Int) raises -> Int:
         comptime if Self._strategy.use_teddy:
             return teddy_match_at[alt=Self._lit_alt](input, start)
-        elif Self._strategy.use_sheng:
-            return sheng_match_at[
-                d=Self._edfa,
-                masks=Self._SHENG_MASKS,
-                flags=Self._EDFA_FLAGS,
-            ](input, start)
-        elif Self._strategy.use_eager_dfa:
-            return edfa_match_at[
-                d=Self._edfa,
-                table=Self._EDFA_TABLE,
-                flags=Self._EDFA_FLAGS,
-            ](input, start)
         else:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
@@ -612,22 +1229,6 @@ struct Regex[pattern: String](Copyable, Movable):
     ]:
         comptime if Self._strategy.use_teddy:
             return teddy_search_forward[alt=Self._lit_alt](input, start)
-        elif Self._strategy.use_sheng:
-            return sheng_search_forward[
-                d=Self._edfa,
-                masks=Self._SHENG_MASKS,
-                flags=Self._EDFA_FLAGS,
-                first_byte_bitmap=Self._first_byte_bitmap,
-                bitmap_useful=Self._strategy.first_byte_useful,
-            ](input, start)
-        elif Self._strategy.use_eager_dfa:
-            return edfa_search_forward[
-                d=Self._edfa,
-                table=Self._EDFA_TABLE,
-                flags=Self._EDFA_FLAGS,
-                first_byte_bitmap=Self._first_byte_bitmap,
-                bitmap_useful=Self._strategy.first_byte_useful,
-            ](input, start)
         else:
             ref dfa_nfa = rebind[NFA](self._dfa_nfa)
             ref dfa = rebind[LazyDFA](self._dfa)
@@ -638,6 +1239,501 @@ struct Regex[pattern: String](Copyable, Movable):
                 Self._first_byte_bitmap,
                 Self._strategy.first_byte_useful,
             )
+
+    # --- Leftmost-first lane: unanchored forward scan + reverse start ----
+
+    @always_inline
+    def _lf_find_end[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], pos: Int) -> Int:
+        """Leftmost-first match END at or after `pos`, or -1."""
+        comptime if Self._use_lf_sheng:
+            return sheng_lfdfa_find_end[
+                lf=Self._lfdfa,
+                masks=Self._LF_SHENG_MASKS,
+                flags=Self._LFDFA_FLAGS,
+            ](input, pos)
+        else:
+            return lfdfa_find_end[
+                lf=Self._lfdfa,
+                table=Self._LFDFA_TABLE,
+                flags=Self._LFDFA_FLAGS,
+            ](input, pos)
+
+    @always_inline
+    def _edfa_match_at[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], start: Int) -> Int:
+        """Anchored attempt at `start` on the classic comptime table:
+        the leftmost-longest end, or -1. Only meaningful when
+        use_eager_dfa."""
+        comptime if Self._strategy.use_sheng:
+            return sheng_match_at[
+                d=Self._edfa,
+                masks=Self._SHENG_MASKS,
+                flags=Self._EDFA_FLAGS,
+            ](input, start)
+        else:
+            return edfa_match_at[
+                d=Self._edfa,
+                table=Self._EDFA_TABLE,
+                flags=Self._EDFA_FLAGS,
+            ](input, start)
+
+    @always_inline
+    def _sbt_match_at[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], start: Int) -> Int:
+        """`_sbt_match_at` discarding the capture slots."""
+        var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+        return self._sbt_match_at(input, start, slots)
+
+    @always_inline
+    def _sbt_match_at[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+    ) -> Int:
+        """`_sbt_match_at` with a fresh LF_SBT_ATTEMPT_BUDGET."""
+        var budget = LF_SBT_ATTEMPT_BUDGET
+        return self._sbt_match_at(input, start, slots, budget)
+
+    @always_inline
+    def _sbt_match_at[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+        mut budget: Int,
+    ) -> Int:
+        """Speculative anchored attempt at `start` on the specialized
+        backtracker: the leftmost-first end, -1 when nothing matches
+        there, or -2 when LF_SBT_ATTEMPT_BUDGET steps were spent before
+        that was decided. On success `slots` holds the capture slots of
+        that match — the backtracker's first success from `start`, which
+        is Python's assignment (the DFA-bounded capture lane uses them
+        directly, skipping its span confirm).
+
+        Not `_sbt_run`: that one spends the full SBT_BUDGET (200k steps)
+        and then gambles on a memoized retry before conceding, which is
+        right when the backtracker is the engine of record and wrong
+        here, where the unanchored scan decides the same question in
+        linear time and the attempt is only worth its first few hundred
+        steps (measured: `(?:.*?x){20}` over lines of 39 `x`s burned
+        ~197 us per match under the full budget, 440x the lane).
+
+        `budget` is the attempt's step allowance on entry and what is
+        left of it on return (negative after a -2).
+        """
+        var end = _sbt_try_match[
+            nfa=Self.nfa,
+            state_idx=Self._start,
+            num_slots=Self._num_slots,
+            anchored_end=False,
+            memo_on=False,
+        ](
+            input,
+            start,
+            slots,
+            budget,
+            memo_addr=0,
+            stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(Self.nfa)](
+                self._stack_lo, self._stack_hi
+            ),
+            end_at=-1,
+        )
+        if budget < 0:
+            return -2
+        return end
+
+    @always_inline
+    def _lf_candidate[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
+        """First position >= `pos` where a match can begin according to
+        the comptime-selected prefilter (filter prefix / Teddy
+        alternation prefix / pivot class-run start), `pos` itself when
+        there is none, or -1 when no candidate remains."""
+        comptime if Self._use_scan_filter:
+            return self._scan_candidate(input, input_len, pos)
+        elif Self._lf_pivot[0] >= 0:
+            comptime if Self._use_dfa_span and Self._strategy.first_byte_useful:
+                # Capture lane, short input: `pos` itself is a sound
+                # candidate whenever its byte can start a match, and the
+                # anchored attempt it feeds decides in a few steps — so
+                # skip the pivot hop (a SIMD scan to the pivot byte plus a
+                # scalar walk back over the class run), which on
+                # `(\w+) (\w+)` over "John Doe" cost 9 ns against a 37 ns
+                # replace (1.24x) to land on byte 0. The length gate is
+                # per input, not per candidate: probing at every candidate
+                # (a bitmap bit, but a branch in the loop) measured 1.10x
+                # on the 19- and 55-byte replace/findall rows, where the
+                # hop is already the cheaper choice. A failed attempt here
+                # is bounded like any other and its successor candidate
+                # comes from the hop.
+                if (
+                    input_len <= LF_SHORT_INPUT
+                    and pos < input_len
+                    and self._first_byte_hit(input.unsafe_get(pos))
+                ):
+                    return pos
+            return pivot_first_candidate[d=Self._edfa](input, pos)
+        elif Self._use_dfa_span and Self._strategy.first_byte_useful:
+            # Capture lane only: the candidate feeds a backtracker
+            # attempt whose success skips two DFA passes, so it is worth
+            # a SIMD class scan to land it on a byte the pattern can
+            # start with. (The capture-free lane keeps its scan's own
+            # accelerated restart state as the prefilter.) Returns
+            # input_len, never -1, when no such byte remains — the
+            # attempt/scan at input_len answers empty matches.
+            return self._next_candidate_pos(input, input_len, pos)
+        else:
+            return pos
+
+    @no_inline
+    def _lf_next_match[
+        origin: Origin, wo: MutOrigin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        pos: Int,
+        mut walk: _LFWalk[Self._num_slots, Self._span_lane, wo],
+        mut slots: InlineArray[Int, Self._num_slots],
+        fill: Bool,
+    ) -> Tuple[Int, Int]:
+        """The leftmost-first match starting at or after `pos` as
+        (start, end), or (-1, -1). `walk` is the call's per-walk state:
+        its `speculate` (True at the start of a walk) enables the
+        anchored-first attempt below, and the lane clears it for the
+        rest of the walk once an attempt runs out of budget.
+
+        On the DFA-bounded capture lane (`_use_dfa_span`) and with `fill`
+        set, `slots` (all -1 on entry) receives the match's capture slots
+        — from the anchored backtracker attempt when that is what found
+        the match, else from `_span_fill_slots` on the exact span. A
+        verb that needs no slots (split, replace without backreferences)
+        passes `fill=False` and pays for the span alone. Capture-free
+        patterns have zero slots and `fill` is ignored.
+
+        One unanchored forward scan gives the end; the reverse DFA walks
+        back from it, never below `pos`, for the start. The prefilters
+        only move the scan's starting point: a filter-prefix / Teddy
+        alternation-prefix candidate, or the pivot prefilter's class-run
+        start — positions before which no match can begin, so the scan
+        from there finds the same leftmost match a scan from `pos` would.
+        A `^`-anchored pattern has no restart threads (nothing can begin
+        mid-input), so its scan from 0 is the anchored attempt and its
+        start needs no reverse walk.
+
+        Anchored-first attempt: the first candidate is tried ANCHORED
+        before anything else when a cheap anchored engine exists for the
+        pattern's shape — the classic table when its leftmost-longest end
+        is the leftmost-first end (`_lf_anchored_classic`: one greedy
+        loop at most, `[a-z]+x`, `.*x`), the specialized backtracker for
+        a lazy pattern whose loops are all simple (`_lf_anchored_sbt`:
+        `<.*?>`, where the attempt is a byte compare and one SIMD class
+        scan). A success is the match outright: its start is the
+        candidate, so the reverse walk — which re-walks the whole match,
+        twice the work on a long class run and most of the per-match
+        cost on a short one — is skipped. A failure proves nothing
+        starts there, and the unanchored scan takes over from the next
+        candidate; that one wasted walk is bounded by the scan's own
+        walk over the same bytes (the scan keeps every thread of the
+        failed attempt alive, at top priority, until it dies), so the
+        lane stays linear where the old per-candidate loop was
+        quadratic. One attempt per call, never one per candidate.
+
+        Ahead of everything, `_use_rev_literal` patterns run the
+        required-literal prefilter: no occurrence of the inner literal at
+        or after `pos + min_offset` answers the call outright with
+        (-1, -1) — no candidates, no scan — and with a comptime-bounded
+        pre-literal gap the whole candidate pipeline starts at
+        `lit_pos - max_offset` (see the block below).
+
+        The backtracker attempt is speculative: it gets
+        LF_SBT_ATTEMPT_BUDGET steps, and running out decides nothing —
+        the scan starts from the same candidate, and `speculate` is
+        cleared so no later call in this walk tries again. So the waste
+        of an exhausted attempt is bounded by that budget ONCE per walk,
+        not per match (a pattern like `(?:.*?x){20}` can exhaust it on
+        every line); a failed (-1) attempt is bounded by the scan's walk
+        as above.
+        """
+        comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            if pos > 0:
+                return (-1, -1)
+            var end = self._lf_find_end(input, 0)
+            if end < 0:
+                return (-1, -1)
+            comptime if Self._use_dfa_span:
+                if fill:
+                    self._span_fill_slots(input, 0, end, slots, walk.pike)
+            return (0, end)
+        else:
+            var input_len = len(input)
+            var p = pos
+            comptime if Self._use_rev_literal:
+                # Required-literal prefilter (Rust regex's ReverseSuffix
+                # / ReverseInner): every match at or after `p` contains
+                # the inner literal, at or after `p + min_offset`.
+                # (a) No occurrence there means no match — answered by
+                # one memmem, no scan. (b) When the pattern consumes a
+                # bounded number of bytes before the literal, no match
+                # starts before `lit_pos - max_offset`, so the candidate
+                # sources and the scan start there. With an unbounded
+                # gap the scan still starts at `p` — a match may begin
+                # anywhere in the run before the literal, and recovering
+                # its start by walking leftward is the quadratic trap
+                # REV_INNER_MAX_BACKSCAN guards against in Rust; this
+                # design has no leftward walk at all.
+                var lit_pos = simd_find_literal_rare[
+                    lit=Self._IL_LIT,
+                    cl=Self._IL_CL,
+                    off_a=Self._IL_PROBES[0],
+                    off_b=Self._IL_PROBES[1],
+                ](input, p + Self._inner_lit.min_offset)
+                if lit_pos < 0:
+                    return (-1, -1)
+                comptime if Self._inner_lit.max_offset >= 0:
+                    var lb = lit_pos - Self._inner_lit.max_offset
+                    if lb > p:
+                        p = lb
+            var s0 = self._lf_candidate(input, input_len, p)
+            if s0 < 0:
+                return (-1, -1)
+            comptime if Self._lf_anchored_classic:
+                # Capture-free only (`_lf_anchored_classic` is off on
+                # the capture lane), so no slots to fill here.
+                var aend = self._edfa_match_at(input, s0)
+                if aend >= 0:
+                    return (s0, aend)
+                if s0 >= input_len:
+                    return (-1, -1)
+                s0 = self._lf_candidate(input, input_len, s0 + 1)
+                if s0 < 0:
+                    return (-1, -1)
+            elif Self._lf_anchored_sbt:
+                if walk.speculate:
+                    # The attempt IS the backtracker's first success from
+                    # s0, so its slots are the answer — no confirm.
+                    #
+                    # Capture lane: a -1 moves on to the next candidate
+                    # and tries AGAIN while the call's allowance lasts
+                    # (`spent`, the steps of the failed attempts so far,
+                    # under LF_SBT_ATTEMPT_BUDGET; each attempt keeps its
+                    # own full budget, so a pathological candidate is
+                    # still a -2 that latches `speculate`). Cheap false
+                    # candidates are the common case for a capture
+                    # pattern with a prefilter — `<(\w+)[^>]*>` fails
+                    # at every `</x>` in three steps — and one attempt
+                    # per call sent the match after every such candidate
+                    # through the scan, the reverse walk and the confirm
+                    # (measured 1.24x on the html findall row). The
+                    # allowance keeps the per-call waste bounded by a
+                    # constant, never by the candidate count. The
+                    # capture-free lane keeps D2's one attempt per call.
+                    var spent = 0
+                    while True:
+                        var budget = LF_SBT_ATTEMPT_BUDGET
+                        var aend = self._sbt_match_at(input, s0, slots, budget)
+                        if aend >= 0:
+                            return (s0, aend)
+                        if aend == -2:
+                            walk.speculate = False
+                            break
+                        if s0 >= input_len:
+                            return (-1, -1)
+                        s0 = self._lf_candidate(input, input_len, s0 + 1)
+                        if s0 < 0:
+                            return (-1, -1)
+                        comptime if Self._use_dfa_span:
+                            spent += LF_SBT_ATTEMPT_BUDGET - budget
+                            if spent < LF_SBT_ATTEMPT_BUDGET:
+                                continue
+                        break
+            return self._lf_scan_match(input, s0, walk.pike, slots, fill)
+
+    @no_inline
+    def _lf_scan_match[
+        origin: Origin, wo: MutOrigin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        s0: Int,
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
+        mut slots: InlineArray[Int, Self._num_slots],
+        fill: Bool,
+    ) -> Tuple[Int, Int]:
+        """The unanchored scan from `s0` for the end, the reverse walk for
+        the start, and (capture lane, `fill`) the span confirm — the tail
+        of `_lf_next_match` after its anchored-first attempt. Out of line
+        so the walkers' bodies stay out of the verbs' loops, and handed
+        the `_SpanPike` pointer by value (see `_LFWalk`)."""
+        var end = self._lf_find_end(input, s0)
+        if end < 0:
+            return (-1, -1)
+        var start = rdfa_find_start[
+            d=Self._rdfa,
+            table=Self._RDFA_TABLE,
+            flags=Self._RDFA_FLAGS,
+        ](input, end, s0)
+        debug_assert(start >= 0, "reverse DFA lost the match start")
+        comptime if Self._use_dfa_span:
+            if fill:
+                self._span_fill_slots(input, start, end, slots, pike)
+        return (start, end)
+
+    @no_inline
+    def _span_fill_slots[
+        origin: Origin, wo: MutOrigin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        end: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
+    ):
+        """Capture slots of the leftmost-first match `[start, end)` —
+        step three of the DFA-bounded capture lane: the one-pass DFA
+        walked over exactly that span when the pattern takes it
+        (`_use_onepass`: exact, one table step per byte, no budget),
+        else the specialized backtracker anchored at `start` and pinned
+        to end at `end` (`anchored_end` + `end_at`, the confirm shape
+        set_prefilter.mojo also uses); both over the WHOLE input so `$`
+        and `\b` see the real neighbours of the span.
+
+        Why its first success is Python's capture assignment: the span
+        is the leftmost-first match, i.e. the first path in NFA priority
+        order from `start` that reaches MATCH — and it ends at `end`.
+        Every path before it in that order fails to reach MATCH at all
+        (one that did would be the first success). The backtracker
+        explores in exactly that order (`out1` before `out2`, greedy arm
+        first), so the pinned walk rejects nothing before Python's path
+        and accepts it when it arrives; it never reaches the
+        lower-priority paths that also end at `end` with other slots.
+        The pinned walk therefore costs what the unpinned walk from
+        `start` costs, minus the `end_at` loop shortcuts.
+
+        The memo buffer is per span, not per walk: a memo bit means
+        "this (state, pos) subtree fails" for one fixed `end_at`, and
+        every span of a findall pins a different end.
+
+        When the walk exhausts SBT_BUDGET or SBT_STACK_BUDGET the Pike VM
+        runs on exactly this span (`_pike_span`) — never on the whole
+        input, which would cost the DFA speed the lane exists for — and
+        `pike[].sbt_ok` latches off so the rest of the walk's spans skip
+        the backtracker (see `_SpanPike`). Should the Pike VM ALSO fail
+        to match the span (a table/VM disagreement, which the
+        debug_assert in `_pike_span` flags under ASSERT), the slots are
+        left all `-1`: the span is still reported, only its groups read
+        as unset — the lane never drops a match the tables found.
+        """
+        comptime if Self._use_onepass:
+            # One table walk over the span, exact: a -1 here means the
+            # tables and the one-pass automaton disagree about the span
+            # (never, by construction — flagged under ASSERT), and the
+            # Pike VM below is the same escape hatch as for the
+            # backtracker's disagreement.
+            var got = self._onepass_walk(input, start, end, slots)
+            if got == end:
+                return
+            debug_assert(False, "one-pass DFA rejects the DFA span")
+            for s in range(Self._num_slots):
+                slots[s] = -1
+        else:
+            if pike[].sbt_ok:
+                try:
+                    var memo = List[UInt64]()
+                    var got = _sbt_run[
+                        nfa=Self.nfa,
+                        state_idx=Self._start,
+                        num_slots=Self._num_slots,
+                        anchored_end=True,
+                    ](
+                        input,
+                        start,
+                        slots,
+                        memo,
+                        end_at=end,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
+                    if got == end:
+                        return
+                    debug_assert(
+                        got < 0,
+                        "anchored_end backtracker returned another end",
+                    )
+                except:
+                    pass
+                pike[].sbt_ok = False
+        # Slots may hold a partial walk's writes: the Pike result
+        # replaces every one of them.
+        self._pike_span(input, start, end, slots, pike)
+
+    @always_inline
+    def _onepass_walk[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        end_pin: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+    ) -> Int:
+        """The one-pass DFA over exactly `[start, end_pin)` (see
+        `onepass_match`): `end_pin` with the slots written, else -1.
+        Only meaningful when `_use_onepass`."""
+        return onepass_match[
+            op=Self._onepass,
+            table=Self._OP_TABLE,
+            classes=Self._OP_CLASSES,
+            eps=Self._OP_EPS,
+            states=Self._OP_STATES,
+            num_slots=Self._num_slots,
+        ](input, start, end_pin, slots)
+
+    def _pike_span[
+        origin: Origin, wo: MutOrigin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        start: Int,
+        end: Int,
+        mut slots: InlineArray[Int, Self._num_slots],
+        pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
+    ):
+        """Pike VM on the exact span `[start, end)`: anchored at `start`,
+        MATCH accepted only at `end`, anchors resolved against the whole
+        input (see `PikeVM._execute_with_bufs`'s `end_at`). The same
+        priority-order argument as `_span_fill_slots` applies: the Pike
+        VM's first thread to accept at `end` is Python's assignment. The
+        VM and its buffers are built on the walk's first call and reused
+        by every later span of the same walk."""
+        comptime if Self._use_dfa_span:
+            ref store = pike[]
+            ref vm_slot = rebind[List[PikeVM[Self._num_slots]]](store.vm)
+            ref bufs_slot = rebind[List[_VMBuffers]](store.bufs)
+            if len(vm_slot) == 0:
+                var nfa = _build_static_nfa(Self.pattern)
+                var num_states = len(nfa.states)
+                vm_slot.append(PikeVM[Self._num_slots](nfa^))
+                bufs_slot.append(_VMBuffers(num_states, Self._num_slots))
+            var result = vm_slot[0]._execute_with_bufs(
+                input, start, bufs_slot[0], end_at=end
+            )
+            debug_assert(
+                result.matched and result.end == end,
+                "Pike VM disagrees with the DFA span",
+            )
+            for s in range(Self._num_slots):
+                slots[s] = result.slots[s] if result.matched else -1
 
     def match(mut self, input: String) -> MatchResult[Self._num_slots]:
         """Match the entire input against the pattern.
@@ -714,7 +1810,23 @@ struct Regex[pattern: String](Copyable, Movable):
             except:
                 # DFA state-cache overflow — fall back to the Pike VM
                 return self._pike_match(input)
+        elif Self._use_onepass:
+            # One-pass capture pattern: one forward table walk writes the
+            # slots; a dead walk is a definitive no-match (no budget, no
+            # fallback engine).
+            var bytes = input.as_bytes()
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+            var end = self._onepass_walk(bytes, 0, len(bytes), slots)
+            if end >= 0:
+                return MatchResult[Self._num_slots](
+                    matched=True, start=0, end=end, slots=slots^
+                )
+            return MatchResult[Self._num_slots].no_match()
         try:
+            # Declared here, not at the top of the method: the sandwich,
+            # SIMD-literal and DFA lanes above all return without ever
+            # reaching the backtracker.
+            var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             # anchored_end: MATCH only accepts at end of input, so
             # alternatives that prefer a shorter match (e.g. `(a|ab)` on
@@ -724,7 +1836,14 @@ struct Regex[pattern: String](Copyable, Movable):
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
                 anchored_end=True,
-            ](input.as_bytes(), 0, slots)
+            ](
+                input.as_bytes(),
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -762,7 +1881,23 @@ struct Regex[pattern: String](Copyable, Movable):
                 end=pos + Self._strategy.prefix_len,
                 slots=InlineArray[Int, Self._num_slots](fill=-1),
             )
-        elif Self._strategy.use_dfa:
+        elif Self._use_lf_lane:
+            # The same two-line prologue opens every leftmost-first lane
+            # verb: the walk's state lives in the verb's frame and the
+            # walk carries a pointer to it — see `_LFWalk`'s docstring
+            # for why it is shaped this way.
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
+            var walk = _LFWalk(Pointer(to=pike))
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+            var rng = self._lf_next_match(
+                input.as_bytes(), 0, walk, slots, fill=True
+            )
+            if rng[0] < 0:
+                return MatchResult[Self._num_slots].no_match()
+            return MatchResult[Self._num_slots](
+                matched=True, start=rng[0], end=rng[1], slots=slots^
+            )
+        elif Self._strategy.use_teddy or Self._use_lazy_dfa:
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
             try:
@@ -858,10 +1993,20 @@ struct Regex[pattern: String](Copyable, Movable):
 
         # BOL anchor: only try position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            # One attempt, so the buffer lives in this branch alone; the
+            # other two branches own theirs.
+            var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots)
+            ](
+                input_bytes,
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -884,6 +2029,8 @@ struct Regex[pattern: String](Copyable, Movable):
     ) raises -> MatchResult[Self._num_slots]:
         """General search, accelerated by SIMD prefix scan or first-byte bitmap.
         """
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var pos = 0
         while pos <= input_len:
             comptime if Self._use_scan_filter:
@@ -896,7 +2043,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input, pos, slots)
+            ](
+                input,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -918,6 +2072,8 @@ struct Regex[pattern: String](Copyable, Movable):
         BOL_MULTILINE condition externally and enters the backtracker at the
         post-anchor state, eliminating one NFA state transition per attempt.
         """
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         # Selecting the entry state must happen at compile time so the
         # backtracker is specialized to it.
         comptime entry_state = Self._strategy.post_leading_anchor_start if Self._strategy.post_leading_anchor_start >= 0 else Self._start
@@ -941,7 +2097,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=entry_state, num_slots=Self._num_slots
-            ](input, pos, slots)
+            ](
+                input,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -999,7 +2162,32 @@ struct Regex[pattern: String](Copyable, Movable):
                 )
                 pos += Self._strategy.prefix_len
             return results^
-        elif Self._strategy.use_dfa:
+        elif Self._use_lf_lane:
+            var results = List[MatchResult[Self._num_slots]]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
+            var walk = _LFWalk(Pointer(to=pike))
+            while pos <= input_len:
+                var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+                var rng = self._lf_next_match(
+                    input_bytes, pos, walk, slots, fill=True
+                )
+                if rng[0] < 0:
+                    break
+                results.append(
+                    MatchResult[Self._num_slots](
+                        matched=True, start=rng[0], end=rng[1], slots=slots^
+                    )
+                )
+                # Empty match: advance one byte (mirrors every other lane).
+                if rng[1] > rng[0]:
+                    pos = rng[1]
+                else:
+                    pos = rng[0] + 1
+            return results^
+        elif Self._strategy.use_teddy or Self._use_lazy_dfa:
             var results = List[MatchResult[Self._num_slots]]()
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
@@ -1129,7 +2317,32 @@ struct Regex[pattern: String](Copyable, Movable):
                 )
                 pos += Self._strategy.prefix_len
             return results^
-        elif Self._strategy.use_dfa:
+        elif Self._use_lf_lane:
+            var results = List[String]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
+            var walk = _LFWalk(Pointer(to=pike))
+            while pos <= input_len:
+                var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+                var rng = self._lf_next_match(
+                    input_bytes, pos, walk, slots, fill=True
+                )
+                if rng[0] < 0:
+                    break
+                comptime if Self._use_dfa_span:
+                    self._findall_append(results, input, rng[0], rng[1], slots)
+                else:
+                    results.append(
+                        String(unsafe_from_utf8=input_bytes[rng[0] : rng[1]])
+                    )
+                if rng[1] > rng[0]:
+                    pos = rng[1]
+                else:
+                    pos = rng[0] + 1
+            return results^
+        elif Self._strategy.use_teddy or Self._use_lazy_dfa:
             var results = List[String]()
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
@@ -1233,6 +2446,8 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def _findall_impl(mut self, input: String) raises -> List[String]:
         """findall() implementation for the backtracker path."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var results = List[String]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1242,7 +2457,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots)
+            ](
+                input_bytes,
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 self._findall_append(results, input, 0, end, slots)
             return results^
@@ -1257,7 +2479,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end >= 0:
                         self._findall_append(results, input, pos, end, slots)
                         if end > pos:
@@ -1301,7 +2530,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end < 0:
                         pos += 1
                         continue
@@ -1380,6 +2616,8 @@ struct Regex[pattern: String](Copyable, Movable):
     ) raises -> List[MatchResult[Self._num_slots]]:
         """finditer() implementation for the backtracker path (carries the
         real capture slots per match)."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var results = List[MatchResult[Self._num_slots]]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1389,7 +2627,14 @@ struct Regex[pattern: String](Copyable, Movable):
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
                 nfa=Self.nfa, state_idx=Self._start, num_slots=Self._num_slots
-            ](input_bytes, 0, slots)
+            ](
+                input_bytes,
+                0,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end >= 0:
                 results.append(
                     MatchResult[Self._num_slots](
@@ -1408,7 +2653,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end >= 0:
                         results.append(
                             MatchResult[Self._num_slots](
@@ -1456,7 +2708,14 @@ struct Regex[pattern: String](Copyable, Movable):
                         nfa=Self.nfa,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
-                    ](input_bytes, pos, slots)
+                    ](
+                        input_bytes,
+                        pos,
+                        slots,
+                        sbt_memo,
+                        stack_lo=self._stack_lo,
+                        stack_hi=self._stack_hi,
+                    )
                     if end < 0:
                         pos += 1
                         continue
@@ -1513,7 +2772,9 @@ struct Regex[pattern: String](Copyable, Movable):
                     unsafe_from_utf8=input_bytes[prev_end:input_len]
                 )
             return output^
-        elif Self._strategy.use_dfa:
+        elif Self._use_lf_lane:
+            return self._replace_lf(input, replacement)
+        elif Self._strategy.use_teddy or Self._use_lazy_dfa:
             try:
                 return self._replace_dfa(input, replacement)
             except:
@@ -1524,13 +2785,61 @@ struct Regex[pattern: String](Copyable, Movable):
             except:
                 return self._pike_replace(input, replacement)
 
+    def _replace_lf(mut self, input: String, replacement: String) -> String:
+        """replace() on the leftmost-first lane: the same loop as
+        _replace_dfa over _lf_next_match spans, and nothing can raise.
+        On the capture lane the slots are filled only when the
+        replacement has backreferences to expand."""
+        var output = String()
+        var input_bytes = input.as_bytes()
+        var input_len = input.byte_length()
+        var literal_replacement = (
+            simd_find_byte(replacement.as_bytes(), CHAR_BACKSLASH, 0) < 0
+        )
+        var prev_end = 0
+        var pos = 0
+        var pike = _SpanPike[Self._num_slots, Self._span_lane]()
+        var walk = _LFWalk(Pointer(to=pike))
+        while pos <= input_len:
+            var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+            var rng = self._lf_next_match(
+                input_bytes, pos, walk, slots, fill=not literal_replacement
+            )
+            if rng[0] < 0:
+                break
+            var start = rng[0]
+            var end = rng[1]
+            if start > prev_end:
+                output += String(unsafe_from_utf8=input_bytes[prev_end:start])
+            if literal_replacement:
+                output += replacement
+            else:
+                var match_result = MatchResult[Self._num_slots](
+                    matched=True, start=start, end=end, slots=slots^
+                )
+                output += self._expand_replacement(
+                    input_bytes, match_result, replacement
+                )
+            if end > start:
+                prev_end = end
+                pos = end
+            else:
+                # Empty match: keep the byte at start in the next segment
+                # (mirrors _replace_impl).
+                prev_end = start
+                pos = start + 1
+        if prev_end < input_len:
+            output += String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+        return output^
+
     def _replace_dfa(
         mut self, input: String, replacement: String
     ) raises -> String:
-        """replace() implementation for the DFA lane (Teddy/Sheng/eager/
-        lazy), mirroring the split() DFA loop: literal-prefix candidate scan
-        when the pattern has one, search_forward otherwise. Anchored
-        patterns resolve through the DFA's start-state contexts."""
+        """replace() implementation for the Teddy / LazyDFA lane (the
+        leftmost-first lane has _replace_lf), mirroring the split() DFA
+        loop: literal-prefix candidate scan when the pattern has one,
+        search_forward otherwise. Anchored patterns resolve through the
+        DFA's start-state contexts."""
         var output = String()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1590,6 +2899,8 @@ struct Regex[pattern: String](Copyable, Movable):
         mut self, input: String, replacement: String
     ) raises -> String:
         """replace() implementation for the backtracker path."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var output = String()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1613,7 +2924,14 @@ struct Regex[pattern: String](Copyable, Movable):
                 nfa=Self.nfa,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
-            ](input_bytes, pos, slots)
+            ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end < 0:
                 pos += 1
                 continue
@@ -1649,7 +2967,41 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def split(mut self, input: String) -> List[String]:
         """Split input by matches of the pattern."""
-        comptime if Self._strategy.use_dfa:
+        comptime if Self._use_lf_lane:
+            var parts = List[String]()
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            var prev_end = 0
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
+            var walk = _LFWalk(Pointer(to=pike))
+            while pos <= input_len:
+                # split() never reports groups: the span alone.
+                var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+                var rng = self._lf_next_match(
+                    input_bytes, pos, walk, slots, fill=False
+                )
+                if rng[0] < 0:
+                    break
+                var start = rng[0]
+                var end = rng[1]
+                parts.append(
+                    String(unsafe_from_utf8=input_bytes[prev_end:start])
+                )
+                if end > start:
+                    prev_end = end
+                    pos = end
+                else:
+                    # Empty match: the byte at start still belongs to the
+                    # next segment (Python re.split keeps it).
+                    prev_end = start
+                    pos = start + 1
+            if prev_end <= input_len:
+                parts.append(
+                    String(unsafe_from_utf8=input_bytes[prev_end:input_len])
+                )
+            return parts^
+        elif Self._strategy.use_teddy or Self._use_lazy_dfa:
             var parts = List[String]()
             var input_bytes = input.as_bytes()
             var input_len = input.byte_length()
@@ -1713,6 +3065,8 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def _split_impl(mut self, input: String) raises -> List[String]:
         """split() implementation for the backtracker path."""
+        # One (state, pos) memo for this whole walk — see _sbt_run.
+        var sbt_memo = List[UInt64]()
         var parts = List[String]()
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
@@ -1731,7 +3085,14 @@ struct Regex[pattern: String](Copyable, Movable):
                 nfa=Self.nfa,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
-            ](input_bytes, pos, slots)
+            ](
+                input_bytes,
+                pos,
+                slots,
+                sbt_memo,
+                stack_lo=self._stack_lo,
+                stack_hi=self._stack_hi,
+            )
             if end < 0:
                 pos += 1
                 continue
@@ -1805,167 +3166,30 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos += 1
                 return -1
         else:
-            comptime W = simd_width_of[DType.uint8]()
+            # Delegates to the lifted Mula memmem (simd_scan.mojo): the
+            # kernel probes the two rarest filter positions
+            # (background-frequency heuristic, memchr-style; caseless
+            # positions rank as the sum of both cases) with a
+            # 4x-unrolled two-byte SIMD filter and verifies survivors
+            # across the whole filter.
             comptime probes = select_probe_offsets(
                 Self._fpre.bytes, Self._fpre.caseless
             )
-            comptime off_a = probes[0]
-            comptime off_b = probes[1]
-            comptime byte_a = Self._fpre.bytes[off_a]
-            comptime byte_b = Self._fpre.bytes[off_b]
-            comptime ca = Self._fpre.caseless[off_a]
-            comptime cb = Self._fpre.caseless[off_b]
-            # Loop guards use the full filter extent, not off_b: a candidate
-            # in the last lane is verified across all fprefix_len bytes.
-            comptime last_off = fpn - 1
-            var ptr = Pointer(input.unsafe_ptr())
-            var pos = start
-
-            # 4x-unrolled SIMD body: 4*W bytes per iter
-            while pos + 4 * W + last_off <= input_len:
-                var b0 = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
-                var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[
-                    width=W
-                ]()
-                var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[
-                    width=W
-                ]()
-                var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[
-                    width=W
-                ]()
-                var e0 = _probe_eq[caseless=ca, target=byte_a](b0)
-                var e1 = _probe_eq[caseless=ca, target=byte_a](b1)
-                var e2 = _probe_eq[caseless=ca, target=byte_a](b2)
-                var e3 = _probe_eq[caseless=ca, target=byte_a](b3)
-                if (e0 | e1 | e2 | e3).reduce_or():
-                    var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var m0 = e0 & _probe_eq[caseless=cb, target=byte_b](l0)
-                    var m1 = e1 & _probe_eq[caseless=cb, target=byte_b](l1)
-                    var m2 = e2 & _probe_eq[caseless=cb, target=byte_b](l2)
-                    var m3 = e3 & _probe_eq[caseless=cb, target=byte_b](l3)
-                    if (m0 | m1 | m2 | m3).reduce_or():
-                        var r = self._first_verified_lane(input, pos, m0)
-                        if r >= 0:
-                            return r
-                        r = self._first_verified_lane(input, pos + W, m1)
-                        if r >= 0:
-                            return r
-                        r = self._first_verified_lane(input, pos + 2 * W, m2)
-                        if r >= 0:
-                            return r
-                        r = self._first_verified_lane(input, pos + 3 * W, m3)
-                        if r >= 0:
-                            return r
-                pos += 4 * W
-
-            # Single-chunk SIMD body for the bytes between the unrolled body
-            # and the tail
-            while pos + W + last_off <= input_len:
-                var block_a = ptr.unsafe_offset(pos + off_a).unsafe_load[
-                    width=W
-                ]()
-                var mask_a = _probe_eq[caseless=ca, target=byte_a](block_a)
-                if mask_a.reduce_or():
-                    var block_b = ptr.unsafe_offset(pos + off_b).unsafe_load[
-                        width=W
-                    ]()
-                    var mask = mask_a & _probe_eq[caseless=cb, target=byte_b](
-                        block_b
-                    )
-                    if mask.reduce_or():
-                        var r = self._first_verified_lane(input, pos, mask)
-                        if r >= 0:
-                            return r
-                pos += W
-
-            # Tail (< W + last_off remaining positions). With an exact
-            # first byte, hop between its occurrences via simd_find_byte
-            # (a scalar per-position verify measured 1.9x slower on
-            # 100B-input searches, where the tail dominates); a caseless
-            # first byte falls back to the per-position verify.
-            comptime c0 = Self._fpre.caseless[0]
-            comptime if not c0:
-                comptime fb = Self._fpre.bytes[0]
-                while True:
-                    var candidate = simd_find_byte(input, fb, pos)
-                    if candidate < 0:
-                        return -1
-                    pos = candidate
-                    if pos + fpn > input_len:
-                        return -1
-                    var ok = True
-                    comptime for j in range(1, fpn):
-                        comptime cj = Self._fpre.caseless[j]
-                        comptime bj = Self._fpre.bytes[j]
-                        if ok:
-                            ok = _probe_eq1[caseless=cj, target=bj](
-                                input.unsafe_get(pos + j)
-                            )
-                    if ok:
-                        return pos
-                    pos += 1
-            else:
-                while pos + fpn <= input_len:
-                    var ok = True
-                    comptime for j in range(fpn):
-                        comptime cj = Self._fpre.caseless[j]
-                        comptime bj = Self._fpre.bytes[j]
-                        if ok:
-                            ok = _probe_eq1[caseless=cj, target=bj](
-                                input.unsafe_get(pos + j)
-                            )
-                    if ok:
-                        return pos
-                    pos += 1
-                return -1
+            return simd_find_literal_rare[
+                lit=Self._FPRE_LIT,
+                cl=Self._FPRE_CL,
+                off_a=probes[0],
+                off_b=probes[1],
+            ](input, start)
 
     @always_inline
-    def _verify_prefix_middle[
-        origin: Origin, //
-    ](self, input: Span[Byte, origin], pos: Int) -> Bool:
-        """Verify the filter-prefix bytes the probe masks didn't check
-        (every offset except the two probe offsets)."""
-        comptime probes = select_probe_offsets(
-            Self._fpre.bytes, Self._fpre.caseless
-        )
-        var ptr = Pointer(input.unsafe_ptr())
-        var ok = True
-        comptime for k in range(Self._strategy.fprefix_len):
-            comptime if k != probes[0] and k != probes[1]:
-                comptime pb = Self._fpre.bytes[k]
-                comptime pc = Self._fpre.caseless[k]
-                if ok:
-                    ok = _probe_eq1[caseless=pc, target=pb](
-                        ptr[unsafe_offset=pos + k]
-                    )
-        return ok
-
-    @always_inline
-    def _first_verified_lane[
-        W: Int, origin: Origin, //
-    ](
-        self, input: Span[Byte, origin], base: Int, m: SIMD[DType.bool, W]
-    ) -> Int:
-        """First lane of the candidate mask that passes full prefix
-        verification, as an absolute input position, or -1."""
-        var bits = lane_bits(m)
-        while bits != 0:
-            var j = first_lane_index(bits)
-            if self._verify_prefix_middle(input, base + j):
-                return base + j
-            bits = clear_first_lane(bits)
-        return -1
+    def _first_byte_hit(self, b: Byte) -> Bool:
+        """Is `b` in the pattern's first-byte set? One bit of
+        `_first_byte_bitmap` — cheaper than the shuffle-mask scalar test
+        for a single byte."""
+        var byte_idx = Int(b) >> 3
+        var bit_idx = UInt8(Int(b) & 7)
+        return (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) != 0
 
     @always_inline
     def _next_candidate_pos[
@@ -2053,12 +3277,14 @@ struct Regex[pattern: String](Copyable, Movable):
     ](self, input: Span[Byte, origin], start: Int, dfa_end: Int) -> Int:
         """Resolve the leftmost-first (Python re) end of the match at `start`.
 
-        The lazy DFA reports leftmost-longest ends — a subset construction
-        cannot track alternative priority, so `a|ab` on "ab" yields end 2
-        where Python yields 1. The DFA is still authoritative for *finding*
-        the leftmost start; this runs the backtracker once, anchored there,
-        to disambiguate the end with the same semantics as every other
-        engine. Costs one anchored run per reported match.
+        The Teddy and LazyDFA lanes report leftmost-longest ends — their
+        state sets carry no thread priority, so `a|ab` on "ab" yields end
+        2 where Python yields 1. Those lanes are still authoritative for
+        *finding* the leftmost start; this runs the backtracker once,
+        anchored there, to disambiguate the end with the same semantics
+        as every other engine. Costs one anchored run per reported match.
+        The eager search lane no longer needs it: its leftmost-first table
+        (static_lfdfa.mojo) yields Python's end directly.
 
         Falls back to the Pike VM if the backtracker budget is exhausted,
         and to the DFA's own end as a last resort (still a valid match,
@@ -2073,12 +3299,23 @@ struct Regex[pattern: String](Copyable, Movable):
             return dfa_end
         else:
             try:
+                # Below the early return: this runs per reported match on
+                # the DFA lanes, and an empty List still costs a few stores
+                # and a destructor edge on a path that never uses it.
+                var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                 var end = _sbt_run[
                     nfa=Self.nfa,
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
-                ](input, start, slots)
+                ](
+                    input,
+                    start,
+                    slots,
+                    sbt_memo,
+                    stack_lo=self._stack_lo,
+                    stack_hi=self._stack_hi,
+                )
                 if end >= 0:
                     return end
             except:

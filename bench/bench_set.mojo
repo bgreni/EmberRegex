@@ -2,6 +2,9 @@
 
 Sparse and dense haystacks per lane:
 - set_teddy_*: bucketed multi-literal engine (8 and 64 literals)
+- set_ac_*:    Aho-Corasick, the lane for literal sets past LITSET_MAX
+               (256 literals — too many for Teddy's unrolled verify, too
+               many states for the multi-accept DFA to determinize)
 - set_rose_*:  literal decomposition — Teddy front end + per-pattern
                confirm DFAs, with the residual union on the lane below
 - set_mdfa_*:  multi-accept eager DFA (the phase-2 baseline; called
@@ -109,6 +112,51 @@ def make_teddy64_pats() -> List[String]:
 
 
 comptime TEDDY64_PATS = make_teddy64_pats()
+
+
+def make_ac256_pats() -> List[String]:
+    """256 distinct 5-byte literals: k000z .. k255z (comptime helper).
+
+    Past LITSET_MAX (64), so Teddy declines; the trie is ~800 nodes,
+    which the multi-accept DFA cannot determinize inside
+    MDFA_STATE_CAP. That is exactly the gap the AC lane fills.
+    """
+    var pats = List[String]()
+    for i in range(256):
+        pats.append(
+            "k"
+            + String(i // 100)
+            + String((i // 10) % 10)
+            + String(i % 10)
+            + "z"
+        )
+    return pats^
+
+
+comptime AC256_PATS = make_ac256_pats()
+
+
+def make_ac_sparse_haystack(length: Int = HAYSTACK_LEN) -> String:
+    """Filler with a handful of AC hits near the end. The filler never
+    contains `k` followed by three digits, so only the planted literals
+    report."""
+    var s = String("")
+    var filler = "the quick brown fox jumps over hazy rivers and empty plains "
+    while s.byte_length() < length - 200:
+        s += filler
+    s += " k000z k017z k128z k255z "
+    while s.byte_length() < length:
+        s += "z"
+    return s^
+
+
+def make_ac_dense_haystack(length: Int = HAYSTACK_LEN) -> String:
+    """Six AC hits per line — the confirm-heavy half of the pair."""
+    var s = String("")
+    var unit = "k000z k017z k042z k099z k128z k255z filler words here\n"
+    while s.byte_length() < length:
+        s += unit
+    return s^
 
 
 def make_sparse_haystack(length: Int = HAYSTACK_LEN) -> String:
@@ -227,6 +275,51 @@ def bench_set_teddy64_dense(mut b: Bench) raises:
         bench.iter[call]()
 
     b.bench_function[go](BenchId("set_teddy64_dense_16k"), _throughput(input))
+
+
+# ---------------------------------------------------------------------------
+# Aho-Corasick lane (literal sets past LITSET_MAX)
+# ---------------------------------------------------------------------------
+
+
+def bench_set_ac_256_sparse_64k(mut b: Bench) raises:
+    # Sparse half: the root state is accelerated (all 256 literals start
+    # with the same byte), so this times the SIMD skip plus four walks.
+    var db = RegexSet[AC256_PATS]()
+    var input = make_ac_sparse_haystack(HAYSTACK_LEN_64K)
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            var r = db.scan(input)
+            keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("set_ac_256_sparse_64k"), _throughput(input))
+
+
+def bench_set_ac_256_dense(mut b: Bench) raises:
+    # Dense half: a hit every ~9 bytes, so the table walk dominates and
+    # the root acceleration barely fires.
+    var db = RegexSet[AC256_PATS]()
+    var input = make_ac_dense_haystack()
+
+    @always_inline
+    @parameter
+    def go(mut bench: Bencher) raises:
+        @always_inline
+        @parameter
+        def call() raises:
+            var r = db.scan(input)
+            keep(len(r))
+
+        bench.iter[call]()
+
+    b.bench_function[go](BenchId("set_ac_256_dense_16k"), _throughput(input))
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +650,9 @@ def main() raises:
     bench_set_teddy8_dense(b)
     bench_set_teddy64_sparse(b)
     bench_set_teddy64_dense(b)
+
+    bench_set_ac_256_sparse_64k(b)
+    bench_set_ac_256_dense(b)
 
     bench_set_rose_full_sparse_64k(b)
     bench_set_mdfa_full_sparse_64k(b)

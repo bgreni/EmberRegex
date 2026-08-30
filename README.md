@@ -379,7 +379,9 @@ db.scan("aa ab foobar")   # (0,2) (0,9) (1,9) — "aa", "oo", "foo"; "ab" is not
 
 `Regex` parses the pattern and builds the NFA at compile time. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct function instantiation whose body is a `comptime if` chain over the state kind, so every branch belonging to the other kinds is eliminated and what is left is straight-line code for that one state with its fields baked in. There is no runtime dispatch on state kind, the leaf primitives (charset bitmap tests, anchor checks, case folding) are `@always_inline`, and the acyclic parts of the call graph inline aggressively.
 
-Recursion does not disappear entirely: a cyclic split whose body is not a single-character self-loop — `(?:ab)+`, `(a+)+` — recurses for real, which is why the engine carries both a work budget and a stack-depth cap and falls back to the Pike VM when either is hit. Simple greedy and lazy quantifiers (`a+`, `[a-z]*`, `.*?`) are compiled to iteration instead and never grow the stack.
+Recursion does not disappear entirely: a cyclic split whose body is not a single-character self-loop — `(?:ab)+`, `(a+)+` — recurses for real, which is why the engine carries both a work budget and a stack bound, and falls back to the Pike VM when either is hit. Simple greedy and lazy quantifiers (`a+`, `[a-z]*`, `.*?`) are compiled to iteration instead and never grow the stack.
+
+The stack bound is measured in bytes, not in calls: the walk compares the stack pointer against a floor that is the higher of "4 MiB below where this walk started" and "512 KiB above the end of this thread's stack", the latter read from the platform (`pthread_get_stackaddr_np` on macOS, `pthread_getattr_np` on Linux) once per `Regex` and cached. So a pattern that would otherwise recurse per input byte concedes to the linear-time Pike VM rather than overflowing — including when it is called from a caller that has already consumed most of the stack, or on a thread whose stack was never 8 MiB. On a platform that cannot report its stack bounds only the relative rule applies, which bounds the walk's own growth but not the caller's.
 
 At compile time, EmberRegex selects the fastest engine for the pattern:
 
@@ -388,11 +390,14 @@ At compile time, EmberRegex selects the fastest engine for the pattern:
 | pattern is a literal string | SIMD literal scan |
 | `prefix + .* + suffix` | sandwich (startswith/endswith) |
 | alternation of literals | Teddy nibble shuffles |
-| ≤ 16 DFA states, shuffle-capable target | Sheng |
-| `can_use_dfa`, ≤ `EDFA_STATE_CAP` states | eager comptime DFA |
-| `can_use_dfa`, larger | lazy DFA |
-| backrefs / lookaround / captures | specialized backtracker |
-| backtracker budget exhausted | Pike VM |
+| DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng |
+| `can_use_dfa`, ≤ `EDFA_STATE_CAP` states, `match()` | eager comptime DFA |
+| the same pattern's search-family verbs | leftmost-first DFA for the end + reverse DFA for the start |
+| `can_use_dfa`, classic table larger than the cap | lazy DFA |
+| captures, one-pass NFA with an alternation loop | one-pass DFA |
+| captures, same shape, search-family verbs | DFA-bounded span, then the slots filled on that span |
+| backrefs / lookaround / other capture shapes | specialized backtracker |
+| backtracker budget or stack bound exhausted | Pike VM |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full selection logic and the
 multi-pattern (`RegexSet`) engine ladder.

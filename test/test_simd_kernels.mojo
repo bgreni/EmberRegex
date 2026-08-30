@@ -2,9 +2,11 @@
 
 Kernel-level: both encodings are checked against direct set membership for
 every byte value, at positions covering the vector path and the scalar
-tail. Regex-level: patterns whose self-looping DFA states now carry
-nibble acceleration are pinned (so detection regressions are caught) and
-exercised on inputs with long runs, including bytes >= 0x80.
+tail; the wide (32/64-entry) table lookups backing Sheng are checked
+against a scalar reference on pseudorandom tables. Regex-level: patterns
+whose self-looping DFA states now carry nibble acceleration are pinned (so
+detection regressions are caught) and exercised on inputs with long runs,
+including bytes >= 0x80.
 """
 
 from emberregex import Regex
@@ -12,12 +14,15 @@ from emberregex.simd_kernels import (
     ACCEL_SHUFTI,
     ACCEL_TRUFFLE,
     HAS_FAST_BYTE_SHUFFLE,
+    HAS_WIDE_BYTE_SHUFFLE,
     NIBBLE_TABLE_SIZE,
     build_shufti_masks,
     build_truffle_masks,
     find_in_class,
     nibble_table_from,
     shufti_encodable,
+    table_lookup_32,
+    table_lookup_64,
 )
 from std.sys import simd_width_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
@@ -150,7 +155,11 @@ def test_nibble_accel_long_runs() raises:
     # Runs much longer than W force many accelerated iterations; the match
     # boundaries must still land exactly.
     comptime W = simd_width_of[DType.uint8]()
-    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    comptime S = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime n_nib = len(S._edfa.accel_nib_states)
+        assert_true(n_nib >= 1)
+    var re = S()
     var user = String("u") * (3 * W + 1)
     var host = String("h") * (2 * W + 5)
     var input = "@@ " + user + "@" + host + ".com !"
@@ -179,7 +188,11 @@ def test_shufti_state_pattern() raises:
 def test_nibble_accel_high_bytes() raises:
     # Bytes >= 0x80 (UTF-8 continuation range) in skipped and terminating
     # regions exercise the high-nibble table half.
-    var re = Regex["[^a-z]*[a-z]+"]()
+    comptime S = Regex["[^a-z]*[a-z]+"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime n_nib = len(S._edfa.accel_nib_states)
+        assert_true(n_nib >= 1)
+    var re = S()
     var buf = List[Byte]()
     comptime W = simd_width_of[DType.uint8]()
     for _ in range(2 * W + 3):
@@ -211,12 +224,73 @@ def test_dotstar_suffix_still_accelerated() raises:
 
 def test_nibble_accel_findall_multiline() raises:
     # Accel must not skip past '\n' boundaries that end matches.
-    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    comptime S = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime n_nib = len(S._edfa.accel_nib_states)
+        assert_true(n_nib >= 1)
+    var re = S()
     var text = "a@b.com\nnope\nlong.user@sub.host.org\n"
     var all = re.findall(text)
     assert_equal(len(all), 2)
     assert_equal(all[0], "a@b.com")
     assert_equal(all[1], "long.user@sub.host.org")
+
+
+# --- Wide table lookups (Sheng 32/64-state transition step) ----------------
+
+
+def _lcg_next(x: Int) -> Int:
+    return (x * 1103515245 + 12345) & 0x7FFFFFFF
+
+
+def test_table_lookup_32_vs_scalar() raises:
+    """32-entry lookup == table[idx] for 1000 pseudorandom (table, idx)."""
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        var x = 20260822
+        for _ in range(1000):
+            var table = SIMD[DType.uint8, 32](0)
+            for i in range(32):
+                x = _lcg_next(x)
+                table[i] = UInt8(x & 0xFF)
+            var idx = SIMD[DType.uint8, NIBBLE_TABLE_SIZE](0)
+            for i in range(NIBBLE_TABLE_SIZE):
+                x = _lcg_next(x)
+                idx[i] = UInt8(x % 32)
+            var got = table_lookup_32(table, idx)
+            for i in range(NIBBLE_TABLE_SIZE):
+                assert_equal(got[i], table[Int(idx[i])])
+
+
+def test_table_lookup_64_vs_scalar() raises:
+    """64-entry lookup == table[idx] for 1000 pseudorandom (table, idx)."""
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        var x = 987654321
+        for _ in range(1000):
+            var table = SIMD[DType.uint8, 64](0)
+            for i in range(64):
+                x = _lcg_next(x)
+                table[i] = UInt8(x & 0xFF)
+            var idx = SIMD[DType.uint8, NIBBLE_TABLE_SIZE](0)
+            for i in range(NIBBLE_TABLE_SIZE):
+                x = _lcg_next(x)
+                idx[i] = UInt8(x % 64)
+            var got = table_lookup_64(table, idx)
+            for i in range(NIBBLE_TABLE_SIZE):
+                assert_equal(got[i], table[Int(idx[i])])
+
+
+def test_wide_lookup_broadcast_index() raises:
+    """Sheng broadcasts one state id to all lanes: every lane must agree."""
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        var table = SIMD[DType.uint8, 64](0)
+        for i in range(64):
+            table[i] = UInt8((i * 5 + 7) & 0x3F)
+        for s in range(64):
+            var got = table_lookup_64(
+                table, SIMD[DType.uint8, NIBBLE_TABLE_SIZE](UInt8(s))
+            )
+            for i in range(NIBBLE_TABLE_SIZE):
+                assert_equal(got[i], table[s])
 
 
 def main() raises:

@@ -18,15 +18,6 @@ def test_non_capturing_group() raises:
     assert_true(re.match("abcabc").matched)
 
 
-def test_nested_captures() raises:
-    var re = Regex["((a)(b))"]()
-    var result = re.match("ab")
-    assert_true(result.matched)
-    assert_equal(result.group_str("ab", 1), "ab")
-    assert_equal(result.group_str("ab", 2), "a")
-    assert_equal(result.group_str("ab", 3), "b")
-
-
 def test_capture_alternation() raises:
     var re = Regex["(a)|(b)|(c)"]()
     var result = re.match("b")

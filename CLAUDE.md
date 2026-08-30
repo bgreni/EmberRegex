@@ -9,8 +9,11 @@ pixi run test          # run all tests
 pixi run bench         # single-pattern (`Regex`) benchmark suite
 pixi run bench_all     # run all benchmarks
 
-# Run a single test file
-mojo -D ASSERT=all -I . test/static/test_static.mojo
+# Run a single test file (`mojo` is not on PATH outside pixi)
+pixi run mojo -D ASSERT=all -I . test/test_eager_dfa.mojo
+
+# Run one test file through the runner (substring match on the filename)
+pixi run test --only eager_dfa
 
 # Run benchmarks against Python re for comparison
 python3 bench/bench_compare.py
@@ -38,8 +41,7 @@ Thompson's construction. Builds `NFAFragment` values (start state + list of dang
 
 The NFA records capability flags used for engine selection:
 
-- `can_use_dfa` — true when there are no captures, lookaround, or word-boundary anchors. Simple line anchors (`^`, `$`, and their multiline variants) do NOT disable the DFA.
-- `needs_backtrack` — true when the pattern contains backreferences
+- `can_use_dfa` — true when there is no lookaround (captures are epsilon SAVE states to the determinizers; backreferences are scanned for separately by `_dfa_candidate`). Simple line anchors (`^`, `$`, and their multiline variants) and ASCII word boundaries (`\b`, `\B`) do NOT disable the DFA for a single pattern (`has_word_boundary` marks the latter; the eager tables carry a look-behind byte class per state for them, the runtime lazy DFA never sees them, and the set lanes clear `can_use_dfa` for word-boundary unions themselves).
 - `start_anchor` — leading anchor kind (`BOL`, `BOL_MULTILINE`, or `-1`), used for position-skip optimizations
 
 ### 3. Engine selection (`engine.mojo` — `Regex`)
@@ -49,25 +51,32 @@ Engine selection happens at compile time via `comptime if` branches:
 | Condition | Engine |
 | --- | --- |
 | `_is_pure_literal` | SIMD literal scan |
-| `use_dfa` | Eager comptime DFA (`static_dfa.mojo`); lazy DFA (`dfa.mojo`) when determinization exceeds `EDFA_STATE_CAP` states |
+| `use_dfa` | Eager comptime DFA (`static_dfa.mojo`) for `match()`; the leftmost-first DFA + reverse DFA (`static_lfdfa.mojo`, `static_rdfa.mojo`, `Regex._use_lf_dfa`) for the search-family verbs; lazy DFA (`dfa.mojo`) when the CLASSIC determinization exceeds `EDFA_STATE_CAP` states. A `\b` pattern that also has a candidate scanner keeps its search verbs on the backtracker unless the leftmost-first table's split restart states accelerate as a region |
+| `use_sheng` (a DFA small enough for a shuffle tier, on a target with a native byte shuffle) | Sheng (`sheng.mojo`): the same walkers with each transition as one `tbl` shuffle. `sheng_cap_for` picks the NARROWEST tier that holds the DFA — 16/32/64 states on NEON, 16 only on x86 (`pshufb` has no multi-register form) — because a wider tier is not free |
+| `Regex._use_onepass` (captures, one-pass NFA — at most one thread consumes each byte — with an alternation inside a general loop, `onepass_shape`) | One-pass DFA (`onepass.mojo`): `match()` is one forward table walk writing the slots; the capture lane below uses it for the span confirm instead of the backtracker/Pike. Other shapes stay on the backtracker (faster on short/simple inputs) |
+| `Regex._use_dfa_span` (captures, same shape, no backrefs/lookaround) | search-family verbs: leftmost-first DFA + reverse DFA for the span, then the one-pass DFA (or, when not one-pass, the backtracker anchored at the start and pinned to the end) in `_span_fill_slots` for the slots; Pike VM on that span if the backtracker gives up. `match()` stays on the backtracker when not one-pass |
 | otherwise | Specialized backtracker (`backtrack.mojo`), with Pike VM fallback |
 
 `extract_literal_prefix` (`optimize.mojo`) walks the NFA at compile time to find any guaranteed literal byte sequence at the start. If found, `search` / `findall` / `replace` use `simd_find_prefix` (`simd_scan.mojo`) to skip non-candidate positions before invoking the engine.
 
 ### 4. Execution engines
 
-**Eager DFA** (`static_dfa.mojo`) — the default DFA engine when `can_use_dfa` is true and `group_count == 0`. Subset construction runs at **compile time** over the comptime NFA (byte-equivalence classes bound the per-state work); the transition table (`num_states x 256` of `Int32`) and per-state match/EOL flag bytes materialize as constant data in the binary. The runtime engine is a pure table walk: no lazy construction, no hashing, no `raises` path, no runtime NFA copy in `__init__`. Handles the same three start contexts (pos 0 / after `\n` / mid-line) and EOL flags as the lazy DFA. Two structural optimizations are applied at comptime: states are permuted so match states occupy ids `[0, num_match_states)` (the per-byte match test is an integer compare, not a flags load), and states that self-loop on all but ≤ 2 bytes (e.g. the `.*` state of `.*x`) are **accelerated** — the walkers SIMD-scan to the next exit byte instead of stepping the table (states carrying `EOL_AT_NEWLINE` are excluded to keep per-`\n` match tracking). Patterns whose determinization exceeds `EDFA_STATE_CAP` (128) states are detected at compile time and stay on the lazy DFA.
+**Eager DFA** (`static_dfa.mojo`) — the default DFA engine when `can_use_dfa` is true and `group_count == 0` (with captures the same tables serve the search verbs through `_use_dfa_span`; `match()` does not use them). Subset construction runs at **compile time** over the comptime NFA (byte-equivalence classes bound the per-state work); the transition table (`num_states x 256`, materialized in the narrowest element type the state ids fit — `Int8`/`Int16`/`Int32`, `edfa_id_dtype`, padded to `EDFA_TABLE_MIN_BYTES`) and per-state match/EOL flag bytes materialize as constant data in the binary. The runtime engine is a pure table walk: no lazy construction, no hashing, no `raises` path, no runtime NFA copy in `__init__`. Handles the same three start contexts (pos 0 / after `\n` / mid-line) and EOL flags as the lazy DFA. Three structural passes run at comptime, in order: the DFA is **Hopcroft-minimized** over its byte classes (`_minimize`, initial partition by full flag byte, so states with different EOL flags never merge); states are then permuted so match states occupy ids `[0, num_match_states)` (the per-byte match test is an integer compare, not a flags load) followed by the word-conditional match states; and states that self-loop on all but ≤ 2 bytes (e.g. the `.*` state of `.*x`) are **accelerated** — the walkers SIMD-scan to the next exit byte instead of stepping the table (states carrying `EOL_AT_NEWLINE` or a word-conditional flag are excluded to keep per-byte match tracking), as are **regions** of start states whose rows agree outside a sparse exit set (the look-behind-split restart states of a `\b` pattern). Word boundaries: a state keeps the anchor as a pending member plus the word class of the byte that led to it, resolves it against the next byte's class on the transition, and carries `EDFA_MATCH_IF_WORD` / `_NONWORD` flags the walkers check before consuming (end of input is non-word). Patterns whose determinization exceeds `EDFA_STATE_CAP` (128) states are detected at compile time and stay on the lazy DFA.
 
-**Lazy DFA** (`dfa.mojo`) — fallback DFA engine for patterns that blow the comptime state cap. Builds DFA states on demand from NFA epsilon closures and caches transitions in a 256-entry table per state. Single-pass O(n), no capture overhead. Handles simple line anchors directly: BOL/BOL_MULTILINE resolved in epsilon closure, EOL/EOL_MULTILINE checked at `\n` positions and end-of-input via precomputed flags. Raises `DFA_STATE_CAP` at 4096 runtime states; callers fall back to the Pike VM.
+The classic table is leftmost-LONGEST (its states are sets), which is exactly what `match()` — Python `fullmatch`, a language-membership question — needs. The search-family verbs (`search`/`finditer`/`findall`/`replace`/`split`) run on a second table instead: the **leftmost-first DFA** (`static_lfdfa.mojo`, `build_lf_dfa`), whose states are priority-ORDERED lists of NFA states (DFS order of the epsilon closure, `out1` before `out2`) with truncation at MATCH and a `restart` bit that folds the unanchored start in as the lowest-priority threads. One unanchored forward walk (`lfdfa_find_end`, the same `edfa_walk_from` walker in the unanchored start states) yields Python's leftmost-first END directly — lazy quantifiers ride this lane too, `<.*?>` stops at its first `>` — and the **reverse DFA** (`static_rdfa.mojo`, `rdfa_find_start`) walks back from that end, never below the previous match end, for the start. The LF table reuses `_edfa_finish` (minimization, match-state permutation, acceleration) and the Sheng masks; its anchored start states are opt-in (`build_lf_dfa(..., anchored=True)` → `lfdfa_match_at`). A lazy pattern whose LF determinization overflows goes to the backtracker, never the lazy DFA (whose leftmost-longest walk is the wrong engine for `.*?`); a greedy one whose classic table fits but whose LF table overflows runs its search verbs on the backtracker too. The lazy DFA (`_use_lazy_dfa`) backs only patterns whose CLASSIC determinization overflowed, and it re-runs `_lf_end_at` for the leftmost-first end. Before the unanchored scan, `_lf_next_match` tries the first prefilter candidate **anchored** when a cheap anchored engine exists for the shape (`_lf_anchored_classic`: the classic table, when its longest end is the leftmost-first end — one greedy loop at most; `_lf_anchored_sbt`: the backtracker, for lazy patterns whose loops are all simple): a success needs no reverse walk, a failure hands the next candidate to the scan (one attempt per match, so the lane stays linear). When the lane has no filter/Teddy prefix but the pattern carries a **required inner literal** of ≥ 2 bytes (`extract_inner_literal`: `\w+\.txt` must contain ".txt"), `_use_rev_literal` memmems it first (`simd_find_literal_rare`): no occurrence means no match — one SIMD pass instead of the scan — and a comptime-bounded pre-literal gap moves the scan start to `lit_pos - max_offset` (Rust regex's ReverseSuffix/ReverseInner, effects (a)+(b); no leftward walking, so no backscan guard is needed). Materialized tables are padded to `EDFA_TABLE_MIN_BYTES` (1 KB) — smaller comptime constants lower to a per-call stack copy in the walkers.
+
+**Lazy DFA** (`dfa.mojo`) — fallback DFA engine for patterns that blow the comptime state cap. Builds DFA states on demand from NFA epsilon closures and caches transitions in a 256-entry table per state. Single-pass O(n), no capture overhead. Handles simple line anchors directly: BOL/BOL_MULTILINE resolved in epsilon closure, EOL/EOL_MULTILINE checked at `\n` positions and end-of-input via precomputed flags. At `DFA_STATE_CAP` (4096) runtime states it clears the state cache and continues the walk (the current state is re-interned from its NFA set, the three start states are rebuilt); it only raises `DFA_STATE_CAP` — sending callers to the Pike VM — once it has cleared `MIN_CACHE_CLEARS` (3) times and is still consuming fewer than `MIN_BYTES_PER_STATE` (10) input bytes per state minted since the last clear.
 
 **Pike VM** (`executor.mojo`) — fallback for patterns where the specialized backtracker exhausts its budget (e.g. pathological patterns like `(a+)+`). Parallel NFA simulation: two lists of `(state_idx, slots)` pairs swap at each input byte. Capture positions are carried per-thread through SAVE states via `_add_state()`.
 
 **Specialized backtracker** (`backtrack.mojo`) — `_sbt_try_match[nfa, state_idx, num_slots]` is specialized per NFA state via comptime parameters. Each state becomes a distinct function instantiation whose body is a `comptime if` chain over the state kind, so every branch belonging to the other kinds is eliminated and what remains is straight-line code for that one state with its fields baked in — no runtime dispatch on state kind. The leaf primitives (`_sbt_bitmap_check`, `_sbt_check_anchor`, case folding) are `@always_inline` and fold into that code, and the acyclic parts of the call graph are small and terminating, so chains inline aggressively.
 
-It is **not** flattened into a single function, and `_sbt_try_match` itself is deliberately not `@always_inline`. A cyclic SPLIT can reach its own instantiation, so the general-SPLIT branch is real recursion: that is why `SBT_MAX_DEPTH` (10,000) exists as a *stack* bound distinct from `SBT_BUDGET`, and why `(?:ab)+` on 50KB once overflowed the stack (see ROADMAP.md). Two cyclic shapes escape it — a greedy or lazy SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back compiles to iteration (`is_simple_loop` / `is_simple_lazy`), which is what `_sbt_needs_depth_guard` keys off to skip depth tracking entirely.
+It is **not** flattened into a single function, and `_sbt_try_match` itself is deliberately not `@always_inline`. A cyclic SPLIT can reach its own instantiation, so the general-SPLIT branch is real recursion: that is why `SBT_STACK_BUDGET` (4 MiB) exists as a *stack* bound distinct from `SBT_BUDGET`, and why `(?:ab)+` on 50KB once overflowed the stack (see ROADMAP.md). The stack bound counts **bytes**, not calls — the walk compares the stack pointer against a floor that is the higher of `sp - SBT_STACK_BUDGET` at `_sbt_run` entry and `stack_low + SBT_STACK_RESERVE`, the latter read from the platform (`pthread_get_stackaddr_np` on macOS, `pthread_getattr_np` on Linux) once per `Regex` and re-asked only when the stack pointer leaves the cached range — because a frame measures ~120 B in a release build and 600-1500 B under `-D ASSERT=all`, so no call count is safe in both, and a purely relative floor says nothing about what the caller already spent. Two cyclic shapes escape the recursion entirely — a greedy or lazy SPLIT whose body is a single ANY/CHAR/CHARSET looping straight back compiles to iteration (`is_simple_loop` / `is_simple_lazy`) — and `sbt_depth_plan` looks for a cycle in the *specialized call graph* (which models those rewrites) to decide whether any guard is needed at all, plus whether the general-SPLIT states cut every cycle so the check can stay in that one branch.
+
+A counted repetition (`x{n,m}`) whose body is a single ANY/CHAR/CHARSET gets the same treatment one level up: `_sbt_counted_shape` (`backtrack.mojo`) recognises the required-copies + star-loop / `?`-ladder chain `_build_repetition` emits and compiles it to one bounded loop, so `a{1,2000}` costs one instantiation and one frame instead of ~4000 and 2000. The NFA keeps the expansion for the DFA lanes. Two exclusions matter: fixed chains (`hi == lo`) are already tail calls and are left alone, and NFAs where `_sbt_needs_depth_guard` is true are refused outright — the counted loop's exit call is not in tail position, and trading free frames for real ones inside a walk that recurses per input byte overflows the stack.
 
 ### 5. Result (`result.mojo`)
-`MatchResult` stores a flat `slots: List[Int]` — pairs of `[start, end]` byte offsets, one pair per group. Group 0 is the full match. `group_str(input, n)` slices the input using those offsets.
+`MatchResult` stores capture-group offsets in `slots: InlineArray[Int, num_slots]` (`num_slots = 2 * group_count`), pairs of `[start, end]` byte offsets for groups 1..N — a stack value, not a heap allocation. Group 0 (the full match) lives in `start`/`end` on the struct itself, not in `slots`. `group_str(input, n)` slices the input using the group's slot offsets.
 
 ## Mojo-specific patterns in this codebase
 
@@ -80,6 +89,45 @@ It is **not** flattened into a single function, and `_sbt_try_match` itself is d
 - **Never use `String[byte=a:b]` slicing** — it has poor performance. Always fetch a byte span first with `input.as_bytes()` and slice that. To construct a String from a span use `String(unsafe_from_utf8=span[a:b])`.
 - **Use `elif`/`else` with `comptime if` for exclusive branches** — when a `comptime if` is followed by another `comptime if` testing a mutually exclusive condition (e.g. `comptime if X:` … `comptime if not X:`), use `elif` or `else` instead. The successive branches are still evaluated at compile time. Only use separate `comptime if` blocks when the conditions are truly independent.
 
+
+## Tests must earn their keep
+
+Be **extremely intentional** about adding tests. The suite is compile-bound:
+the bill is **distinct comptime `Regex[...]` instantiations** (~537 across
+`test/`), not test-function count. Files elaborate in parallel, so the suite's
+wall clock is the slowest single file — `test_utf8.mojo` alone is ~364 s.
+
+- **One purpose per test, covered nowhere else.** If an existing test already
+  asserts the same thing on the same pattern, verb, and input, extend it rather
+  than adding a sibling. A test whose assertions, patterns and
+  (pattern, verb, input) triples are all a subset of another test's is dead
+  weight and should be deleted.
+- **Reuse a pattern the file already instantiates.** A test that reuses an
+  existing `Regex[...]` is nearly free; one that introduces a new pattern adds
+  a full comptime elaboration to that file's critical path.
+- **A lane test MUST assert the lane it resolved to.** Engine selection is a
+  silent comptime function of the pattern string with no runtime override, so a
+  test can drift onto a different engine and keep passing — it just quietly
+  stops testing what its filename claims. Pin with `_strategy.use_*`,
+  `_use_lf_dfa`, `_use_onepass`, `_use_dfa_span`, `_SHENG_CAP`,
+  `accel_nib_states`, or the engine's own runtime state (`clear_count`).
+- **Pin exclusively, never with a disjunction.**
+  `assert_true(use_teddy or use_eager_dfa)` passes on either arm and therefore
+  cannot catch a lane change. Use `comptime if HAS_FAST_BYTE_SHUFFLE:` with the
+  positive pin plus the matching `assert_false` for the lane that must NOT
+  claim the pattern.
+- **Verify the pattern actually reaches the lane before writing the test.** A
+  pure literal alternation (`cat|dog`) is Teddy's on any shuffle target and
+  Sheng never claims it; a small DFA is Sheng's, not the eager table's; most
+  capture shapes are the backtracker's, not one-pass. Probe in
+  `playground.mojo` first — do not assume from the filename.
+- **A differential sweep may already cover it.** The
+  `_assert_pike_agreement`-style sweeps run every verb over LCG inputs at SIMD
+  boundary lengths. A hand-written test beside one earns its keep only by
+  pinning something the sweep cannot: a selection flag, a structural invariant,
+  or an exact expected value rather than mere agreement with Pike.
+- **Tests that call an engine directly** (`build_lf_dfa`, `_sbt_*`, the memo
+  internals) bypass selection and cannot be mislabeled — they need no lane pin.
 
 ## Benchmarks must have matching tests
 

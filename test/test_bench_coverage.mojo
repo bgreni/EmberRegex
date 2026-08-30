@@ -7,6 +7,7 @@ meaningless numbers. When you add a new bench, add a corresponding test here.
 """
 
 from emberregex import Regex
+from emberregex.simd_kernels import HAS_WIDE_BYTE_SHUFFLE
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -282,6 +283,37 @@ def test_bench_alternation_4_search_2KB() raises:
     assert_false(re.search(lines).matched)
 
 
+def test_bench_sheng64_alt_32_search_2KB() raises:
+    # Mirrors bench_sheng64_alt_32_search_2KB: the 44-state DFA must ride
+    # the 64-lane Sheng tier (that is what the row measures), the haystack
+    # must contain exactly the one intended match, and it must be at the
+    # very end so the row times a full scan.
+    comptime P = (
+        "cat|cow|dog|doe|bat|bit|fig|fin|gum|gas|hen|hex|jam|jab|kit|keg"
+        "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap"
+        "|[0-9]{3}"
+    )
+    comptime S = Regex[P]
+    assert_false(S._strategy.use_teddy)
+    comptime if HAS_WIDE_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+        assert_equal(S._SHENG_CAP, 64)
+    var re = S()
+    var lines = String("")
+    for i in range(80):
+        if i > 0:
+            lines += "\n"
+        lines += "line " + String(i) + " some text here"
+    var input = lines + " tap"
+    assert_true(input.byte_length() > 1500)
+    assert_false(re.search(lines).matched)
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, input.byte_length() - 3)
+    assert_equal(r.end, input.byte_length())
+    assert_equal(len(re.findall(input)), 1)
+
+
 def test_bench_alternation_16() raises:
     var re = Regex[
         "alpha|beta|gamma|delta|epsilon|zeta|eta|theta"
@@ -483,6 +515,353 @@ def test_bench_teddy_prefix_search() raises:
     assert_true(r.matched)
     assert_equal(r.start, filler.byte_length())
     assert_equal(r.end, input.byte_length())
+
+
+def test_bench_lf_dfa_lazy_findall() raises:
+    # bench lf_dfa_lazy_findall_64KB: every tag is a match, none spans
+    # past its own `>`.
+    comptime S = Regex["<.*?>"]
+    assert_true(S._use_lf_dfa)
+    var re = S()
+    var parts = List[String]()
+    var n = 64 * 1024 // 14
+    for _ in range(n):
+        parts.append("<tag>")
+    var input = String(" text ").join(parts)
+    var all = re.findall(input)
+    assert_equal(len(all), n)
+    assert_equal(all[0], "<tag>")
+    assert_equal(all[n - 1], "<tag>")
+
+
+def test_bench_match_single_byte_run() raises:
+    # bench match_single_byte_run_20KB: the classic table's `a+` state
+    # stays accelerated (a single-byte self-loop is a genuine run).
+    comptime S = Regex["a+e|x"]
+    assert_true(S._strategy.use_eager_dfa)
+    comptime n_accel = len(S._edfa.accel_states) + len(S._edfa.accel_nib_states)
+    assert_true(n_accel >= 1)
+    var re = S()
+    var input = "a" * 20480 + "e"
+    var r = re.match(input)
+    assert_true(r.matched)
+    assert_equal(r.end, 20481)
+    assert_false(re.match("a" * 20480 + "f").matched)
+
+
+def test_bench_lf_dfa_class_run_search() raises:
+    # bench lf_dfa_class_run_search_20KB: the whole run plus the x.
+    comptime S = Regex["[a-z]+x"]
+    assert_true(S._use_lf_dfa)
+    var re = S()
+    var input = "a" * (20 * 1024) + "x"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 20 * 1024 + 1)
+
+
+def _lcg_prose(n: Int) -> String:
+    """bench.mojo's `lcg_prose`, byte for byte."""
+    var out = List[Byte]()
+    var x: UInt64 = 12345
+    while len(out) < n:
+        x = x * 6364136223846793005 + 1442695040888963407
+        var r = Int((x >> 33) % 40)
+        if r < 26:
+            out.append(Byte(97 + r))
+        elif r < 30:
+            out.append(Byte(32))
+        elif r < 33:
+            out.append(Byte(65 + r - 30))
+        elif r < 36:
+            out.append(Byte(48 + r - 33))
+        elif r == 36:
+            out.append(Byte(44))
+        elif r == 37:
+            out.append(Byte(46))
+        elif r == 38:
+            out.append(Byte(10))
+        else:
+            out.append(Byte(95))
+    return String(unsafe_from_utf8=Span(out))
+
+
+def test_bench_word_boundary_findall() raises:
+    # bench word_boundary_findall_64KB: thousands of words, every one
+    # agreeing with the Pike VM, and the count pinned so a silent
+    # no-match run cannot hide.
+    comptime S = Regex["\\b\\w+\\b"]
+    var re = S()
+    var input = _lcg_prose(64 * 1024)
+    var all = re.findall(input)
+    var exp = re._pike_findall(input)
+    assert_equal(len(all), len(exp))
+    assert_true(len(all) > 5000)
+    for i in range(len(all)):
+        assert_equal(all[i], exp[i])
+
+
+def test_bench_anchor_word_boundary() raises:
+    # bench anchor_word_boundary / anchor_word_boundary_miss.
+    var re = Regex["\\bworld\\b"]()
+    var r = re.search("say hello world today")
+    assert_true(r.matched)
+    assert_equal(r.start, 10)
+    assert_equal(r.end, 15)
+    var miss = Regex["\\borld\\b"]()
+    assert_false(miss.search("say hello world today").matched)
+
+
+def test_bench_memo_ambiguous_plus_miss() raises:
+    # bench memo_ambiguous_plus_miss_1500: 1500 `a`s then `c`, so there is
+    # no `b` anywhere and every candidate position fails — that is the
+    # search the memo has to carry. Positive control with a `b` appended.
+    var re = Regex["(a|aa)+b"]()
+    var miss = String("a") * 1500 + "c"
+    assert_false(re.search(miss).matched)
+    var hit = re.search(String("a") * 20 + "b")
+    assert_true(hit.matched)
+    assert_equal(hit.start, 0)
+    assert_equal(hit.end, 21)
+
+
+def test_bench_memo_ambiguous_plus_in_span() raises:
+    # bench memo_ambiguous_plus_in_span_1500: the span is the whole input,
+    # the first arm cannot match (no `c`), so group 1 is unset and the
+    # answer comes from `a+b`. Pinned against the Pike VM slot for slot.
+    comptime S = Regex["(a|aa)+c|a+b"]
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = String("a") * 1500 + "b"
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_equal(r.start, 0)
+    assert_equal(r.end, 1501)
+    assert_equal(r.slots[0], -1)
+    assert_equal(r.slots[1], -1)
+    var exp = re._pike_search(input)
+    assert_equal(exp.end, 1501)
+    assert_equal(exp.slots[0], -1)
+
+
+def test_bench_capture_search_miss() raises:
+    # bench capture_search_miss_100KB: `.`, `@` AND `.com` are all
+    # present (`x.com` tokens without a preceding `@\w+` run), so the
+    # required-byte prescan and the reverse-literal memmem both pass and
+    # the search is a genuine miss the DFA scan has to earn.
+    comptime S = Regex["(\\w+)@(\\w+)\\.com"]
+    assert_true(S._use_dfa_span)
+    assert_true(S._use_rev_literal)
+    var re = S()
+    var input = String("user@example.org x.com ") * (100 * 1024 // 23)
+    assert_false(re.search(input).matched)
+    assert_false(re._pike_search(input).matched)
+    # Positive control: one `.com` token at the end is found with groups.
+    var hit = input + "x@y.com"
+    var r = re.search(hit)
+    assert_true(r.matched)
+    assert_equal(r.group_str(hit, 1), "x")
+    assert_equal(r.group_str(hit, 2), "y")
+
+
+def _capture_sparse_input() -> String:
+    """bench.mojo's `capture_sparse_input`, byte for byte."""
+    var filler = String("lorem ipsum 42 dolor sit amet ") * 43
+    var parts = List[String]()
+    for _ in range(50):
+        parts.append("123-4567")
+    return filler.join(parts) + filler
+
+
+def test_bench_capture_findall_sparse() raises:
+    # bench capture_findall_sparse_64KB: exactly 50 matches, each
+    # reporting group 1 (findall's Python-flavored group-1 text), and the
+    # filler's `42` runs never produce one.
+    comptime S = Regex["(\\d+)-(\\d+)"]
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = _capture_sparse_input()
+    assert_true(input.byte_length() > 60 * 1024)
+    var all = re.findall(input)
+    assert_equal(len(all), 50)
+    assert_equal(all[0], "123")
+    assert_equal(all[49], "123")
+    var spans = re.finditer(input)
+    assert_equal(len(spans), 50)
+    assert_equal(spans[7].group_str(input, 2), "4567")
+    assert_equal(
+        len(re.findall(String("lorem ipsum 42 dolor sit amet ") * 3)), 0
+    )
+
+
+def test_bench_onepass_match_kv() raises:
+    # bench onepass_match_kv: one-pass AND selected (an alternation loop),
+    # the 40-byte input fullmatches, the groups report the last
+    # letter/digit token, and the slots are the Pike VM's.
+    comptime S = Regex["(?:([a-z])|(\\d)|[=;&])+"]
+    assert_true(S._use_onepass)
+    var re = S()
+    var input = "host=db01&port=5432&user=admin&retry=55&"
+    assert_equal(input.byte_length(), 40)
+    var r = re.match(input)
+    assert_true(r.matched)
+    var p = re._pike_match(input)
+    for s in range(4):
+        assert_equal(r.slots[s], p.slots[s])
+    assert_false(re.match("host=db01&port=5432&user=admin&retry=55!").matched)
+
+
+def test_bench_onepass_findall_2KB() raises:
+    # bench onepass_findall_2KB: two long alternation-loop matches on the
+    # one-pass capture lane, same spans and slots as the Pike VM.
+    comptime S = Regex["(?:(x)|(y)|z)+"]
+    assert_true(S._use_onepass)
+    assert_true(S._use_dfa_span)
+    var re = S()
+    var input = String("xyz") * 340 + " " + String("zyx") * 340
+    assert_true(input.byte_length() > 2000)
+    var got = re.finditer(input)
+    var exp = re._pike_finditer(input)
+    assert_equal(len(got), len(exp))
+    assert_equal(len(got), 2)
+    for i in range(len(got)):
+        assert_equal(got[i].start, exp[i].start)
+        assert_equal(got[i].end, exp[i].end)
+        for s in range(4):
+            assert_equal(got[i].slots[s], exp[i].slots[s])
+    assert_equal(got[0].end - got[0].start, 1020)
+
+
+def _bench_counted_haystack(n: Int) -> String:
+    """Mirror of `make_counted_haystack` in bench/bench.mojo."""
+    var parts = List[String]()
+    for i in range(n):
+        if i == 59 or i == 74 or i == 89:
+            parts.append("code" + String(i % 10) + " and more words")
+        else:
+            parts.append("plain words here again")
+    return String(" ").join(parts)
+
+
+def test_bench_counted_repeat_search_2KB() raises:
+    # bench counted_repeat_search_2KB: the leading lookahead keeps it on
+    # the backtracker for EVERY verb (`_use_lf_lane` governs search /
+    # findall; `_strategy.use_dfa` only match() — a capture alone rides
+    # the DFA-bounded capture lane and the row would time the wrong
+    # engine), the haystack is ~2 KB, and the first match is far enough
+    # in that the row really walks it.
+    comptime S = Regex["(?=[a-z])([a-z]{3,7})\\d"]
+    assert_false(S._strategy.use_dfa)
+    assert_false(S._use_lf_lane)
+    assert_false(S._use_dfa_span)
+    var re = S()
+    var input = _bench_counted_haystack(90)
+    assert_true(input.byte_length() > 1800)
+    assert_true(input.byte_length() < 2400)
+    var r = re.search(input)
+    assert_true(r.matched)
+    # "code9" — token 59 of 90, two thirds of the way in.
+    assert_true(r.start > input.byte_length() // 2)
+    assert_equal(r.end - r.start, 5)
+    assert_equal(r.group_str(input, 1), "code")
+    # A few matches, not one: findall must see all three.
+    assert_equal(len(re.findall(input)), 3)
+
+
+def _bench_giveback_haystack(n: Int) -> String:
+    """Mirror of `make_giveback_haystack` in bench/bench.mojo."""
+    var parts = List[String]()
+    for i in range(n):
+        if i == 59 or i == 74 or i == 89:
+            parts.append("abcdefgx")
+        else:
+            parts.append("abcdefg")
+    return String(" ").join(parts)
+
+
+def test_bench_counted_repeat_giveback_2KB() raises:
+    # bench counted_repeat_giveback_2KB: the exit starts on the body's own
+    # class, so the counted loop cannot possessify and really hands bytes
+    # back. Pin that the row is on the backtracker, that the giveback mode
+    # really is SBT_GIVEBACK_ALL, and that the match is the SHORTER count
+    # (6, not 7) — which is exactly what a hand-back produces.
+    comptime S = Regex["(?=[a-z])([a-z]{3,7})[a-z]x"]
+    assert_false(S._strategy.use_dfa)
+    assert_false(S._use_lf_lane)
+    assert_false(S._use_dfa_span)
+    var re = S()
+    var input = _bench_giveback_haystack(90)
+    assert_true(input.byte_length() > 600)
+    var r = re.search(input)
+    assert_true(r.matched)
+    assert_true(r.start > input.byte_length() // 2)
+    # "abcdefgx": the loop reaches 7, the exit fails, and it gives one
+    # byte back so `[a-z]x` can take "g" then "x".
+    assert_equal(r.group_str(input, 1), "abcdef")
+    assert_equal(r.end - r.start, 8)
+    assert_equal(len(re.findall(input)), 3)
+    # A 7-letter run with no `x` is refuted at every count from 7 to 3.
+    assert_false(re.search("abcdefg qrstuvw").matched)
+
+
+def _reverse_suffix_miss_input() -> String:
+    """bench.mojo's `reverse_suffix_miss_input`, byte for byte."""
+    var filler = "log.tx err.txx data.ttx x.t wo.rd "
+    var input = String("")
+    for _ in range(64 * 1024 // 34):
+        input += filler
+    return input
+
+
+def test_bench_reverse_suffix_search() raises:
+    # bench reverse_suffix_search_64KB: '.' (the required byte) and the
+    # ".tx" probe-pair near-miss are everywhere, ".txt" nowhere — the
+    # required-literal memmem answers the search and it is a genuine
+    # miss.
+    comptime S = Regex["\\w+\\.txt"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._use_rev_literal)
+    var re = S()
+    var input = _reverse_suffix_miss_input()
+    assert_true(input.byte_length() > 60 * 1024)
+    assert_false(re.search(input).matched)
+    assert_false(re._pike_search(input).matched)
+    # Positive control: one real token at the end is found exactly.
+    var hit = input + "file.txt"
+    var r = re.search(hit)
+    assert_true(r.matched)
+    assert_equal(r.start, input.byte_length())
+    assert_equal(r.end, hit.byte_length())
+
+
+def _reverse_inner_miss_input() -> String:
+    """bench.mojo's `reverse_inner_miss_input`, byte for byte."""
+    var filler = "svc: api / level: info /x msg: ok :/ trace: nine "
+    var input = String("")
+    for _ in range(64 * 1024 // 49):  # filler is 49 bytes
+        input += filler
+    return input
+
+
+def test_bench_reverse_inner_search() raises:
+    # bench reverse_inner_search_64KB: ':' and '/' (and the ":/" probe
+    # pair) are everywhere, "://" nowhere — a genuine miss the memmem
+    # answers.
+    comptime S = Regex["[a-z]+://[^ ]+"]
+    assert_true(S._use_lf_dfa)
+    assert_true(S._use_rev_literal)
+    var re = S()
+    var input = _reverse_inner_miss_input()
+    assert_true(input.byte_length() > 60 * 1024)
+    assert_false(re.search(input).matched)
+    assert_false(re._pike_search(input).matched)
+    # Positive control, with the reverse walk recovering the run start.
+    var hit = input + "see http://example.com now"
+    var r = re.search(hit)
+    assert_true(r.matched)
+    assert_equal(r.start, input.byte_length() + 4)
+    assert_equal(r.end, hit.byte_length() - 4)
 
 
 def main() raises:

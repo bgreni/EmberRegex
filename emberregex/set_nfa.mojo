@@ -234,6 +234,13 @@ def build_union_subset_nfa(
     for j in range(len(sel)):
         nfa.pattern_starts[sel[j]] = starts[j]
 
+    # The set lanes (set_dfa, set_reverse, set_bitnfa, set_rose, streaming)
+    # resolve anchors with one bit of per-state context and cannot model a
+    # word boundary, which needs both neighbours; such unions stay off the
+    # DFA lanes exactly as before the single-pattern lanes learned `\b`.
+    if nfa.has_word_boundary:
+        nfa.can_use_dfa = False
+
     # Right-to-left SPLIT chain: out1 (higher priority) holds lower ids.
     var cur = starts[len(starts) - 1]
     for j in range(len(starts) - 2, -1, -1):
