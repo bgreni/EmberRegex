@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pixi run test          # run all tests
 pixi run bench         # single-pattern (`Regex`) benchmark suite
 pixi run bench_all     # run all benchmarks
+pixi build             # build the conda package (pixi-build-mojo -> lib/mojo/emberregex.mojoc)
 
 # Run a single test file (`mojo` is not on PATH outside pixi)
 pixi run mojo -D ASSERT=all -I . test/test_eager_dfa.mojo

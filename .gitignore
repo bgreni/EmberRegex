@@ -12,3 +12,5 @@ comparisons/pcre2_build/
 comparisons/bench_pcre2
 comparisons/bench_hyperscan
 FEATURES.md
+*.conda
+docs/superpowers

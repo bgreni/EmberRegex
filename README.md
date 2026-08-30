@@ -22,10 +22,54 @@ def main():
 
 ## Installation
 
-EmberRegex requires Mojo and [Pixi](https://pixi.sh). Clone the repository and add it to your project's include path:
+EmberRegex requires Mojo and [Pixi](https://pixi.sh). It builds as a Pixi package, so
+another workspace can depend on it straight from this repository:
+
+```toml
+[workspace]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+platforms = ["osx-arm64"]          # and/or linux-64
+preview = ["pixi-build"]           # required for git/source dependencies
+
+[dependencies]
+mojo = "=1.0.0"
+emberregex = { git = "https://github.com/bgreni/EmberRegex.git" }
+```
+
+Then `pixi install` (or any `pixi run`) clones the repo, compiles the package with
+`pixi-build-mojo`, and drops `emberregex.mojoc` into the environment — no include path
+needed:
+
+```mojo
+from emberregex import Regex
+
+def main():
+    var text = "contact: dev@example.com now"
+    var re = Regex["\\w+@\\w+\\.com"]()
+    var result = re.search(text)
+    if result:
+        print(text[byte=result.start:result.end])  # dev@example.com
+```
+
+Pin a specific revision with `branch`, `tag`, or `rev`:
+
+```toml
+emberregex = { git = "https://github.com/bgreni/EmberRegex.git", tag = "v0.1.0" }
+emberregex = { git = "https://github.com/bgreni/EmberRegex.git", rev = "28d5baa" }
+```
+
+Notes for consumers:
+
+- The `https://conda.modular.com/max` channel must be in your workspace — the package's
+  build and run dependency is `mojo-compiler ==1.0.0`, and a `.mojoc` is only loadable by
+  the compiler version that produced it.
+- `preview = ["pixi-build"]` is required; without it Pixi rejects `git` dependencies.
+
+To work against a checkout instead (or to hack on EmberRegex itself), clone it and use
+the include path:
 
 ```bash
-git clone https://github.com/user/emberregex.git
+git clone https://github.com/bgreni/EmberRegex.git
 mojo -I /path/to/emberregex your_file.mojo
 ```
 

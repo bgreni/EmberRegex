@@ -4,6 +4,27 @@ channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "emberregex"
 platforms = ["osx-arm64"]
 version = "0.1.0"
+preview = ["pixi-build"]
+
+# Package definition: lets other Mojo workspaces depend on emberregex directly
+# from this repository, e.g.
+#   [dependencies]
+#   emberregex = { git = "https://github.com/bgreni/EmberRegex.git" }
+[package]
+name = "emberregex"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.build.config]
+pkg = { name = "emberregex", path = "emberregex" }
+
+[package.build-dependencies]
+mojo-compiler = "==1.0.0"
+
+[package.run-dependencies]
+mojo-compiler = "==1.0.0"
 
 [tasks]
 test = { cmd = "python3 run_test.py" }
