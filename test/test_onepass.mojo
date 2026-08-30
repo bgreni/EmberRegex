@@ -7,6 +7,15 @@ written during a single forward table walk. `match()` (fullmatch) runs
 that walk over the whole input; the DFA-bounded capture lane's span
 confirm (`_span_fill_slots`) runs it over the exact span. Every slot must
 equal the capture-exact Pike VM's, slot for slot.
+
+Not every test here runs the one-pass walk. C1 narrowed `_use_onepass` to
+an alternation inside a general loop, so the simpler capture shapes below
+(`()`, `(a)?b`, `((a)(b))`, the anchor forms) fall to the backtracker and
+the digit-pair form to the DFA-bounded span lane. Those are kept on purpose,
+as the CONTROL group: the same slot expectations must hold whichever lane
+serves them. Every one is pinned with an explicit `_use_onepass`
+assertion so a selection change cannot silently move a test onto — or off
+— the lane it was written to exercise.
 """
 
 from emberregex import Regex
@@ -252,7 +261,9 @@ def _assert_groups[
 
 
 def test_match_digits_pair() raises:
-    var re = Regex["(\\d+)-(\\d+)"]()
+    comptime S_re = Regex["(\\d+)-(\\d+)"]
+    assert_false(S_re._use_onepass)
+    var re = S_re()
     var r = re.match("123-4567")
     assert_true(r.matched)
     assert_equal(r.group_str("123-4567", 1), "123")
@@ -265,12 +276,16 @@ def test_match_digits_pair() raises:
 
 
 def test_match_empty_groups() raises:
-    var re = Regex["()"]()
+    comptime S_re = Regex["()"]
+    assert_false(S_re._use_onepass)
+    var re = S_re()
     var r = re.match("")
     assert_true(r.matched)
     assert_equal(r.group_span(1)[0], 0)
     assert_equal(r.group_span(1)[1], 0)
-    var re2 = Regex["(a*)"]()
+    comptime S_re2 = Regex["(a*)"]
+    assert_false(S_re2._use_onepass)
+    var re2 = S_re2()
     var r2 = re2.match("")
     assert_true(r2.matched)
     assert_equal(r2.group_span(1)[0], 0)
@@ -281,7 +296,9 @@ def test_match_empty_groups() raises:
     assert_equal(r3.group_span(1)[1], 3)
     # Fullmatch is language membership, not leftmost-first: the lazy
     # loop must still consume the whole input.
-    var re3 = Regex["(a*?)"]()
+    comptime S_re3 = Regex["(a*?)"]
+    assert_false(S_re3._use_onepass)
+    var re3 = S_re3()
     var r4 = re3.match("aaa")
     assert_true(r4.matched)
     assert_equal(r4.group_span(1)[1], 3)
@@ -289,7 +306,9 @@ def test_match_empty_groups() raises:
 
 
 def test_match_unmatched_optional_group() raises:
-    var re = Regex["(a)?b"]()
+    comptime S_re = Regex["(a)?b"]
+    assert_false(S_re._use_onepass)
+    var re = S_re()
     var r = re.match("b")
     assert_true(r.matched)
     assert_equal(r.slots[0], -1)
@@ -298,7 +317,9 @@ def test_match_unmatched_optional_group() raises:
     assert_true(r2.matched)
     assert_equal(r2.slots[0], 0)
     assert_equal(r2.slots[1], 1)
-    var re2 = Regex["(x)|(y)"]()
+    comptime S_re2 = Regex["(x)|(y)"]
+    assert_false(S_re2._use_onepass)
+    var re2 = S_re2()
     var ry = re2.match("y")
     assert_true(ry.matched)
     assert_equal(ry.slots[0], -1)
@@ -310,7 +331,9 @@ def test_match_unmatched_optional_group() raises:
 def test_match_last_iteration_capture() raises:
     # Python reports the LAST iteration's capture; an iteration through
     # the other arm does not clear it.
-    var re = Regex["(?:(x)|y)+"]()
+    comptime S_re = Regex["(?:(x)|y)+"]
+    assert_true(S_re._use_onepass)
+    var re = S_re()
     var r = re.match("xyx")
     assert_true(r.matched)
     assert_equal(r.slots[0], 2)
@@ -327,7 +350,9 @@ def test_match_last_iteration_capture() raises:
 
 
 def test_match_nested_groups() raises:
-    var re = Regex["((a)(b))"]()
+    comptime S_re = Regex["((a)(b))"]
+    assert_false(S_re._use_onepass)
+    var re = S_re()
     var r = re.match("ab")
     assert_true(r.matched)
     assert_equal(r.group_str("ab", 1), "ab")
@@ -337,18 +362,28 @@ def test_match_nested_groups() raises:
 
 
 def test_match_anchors() raises:
-    var re = Regex["^(\\w+)$"]()
+    comptime S_re = Regex["^(\\w+)$"]
+    assert_false(S_re._use_onepass)
+    var re = S_re()
     _assert_groups(re.match("hello"), re._pike_match("hello"), "bol eol")
     assert_false(re.match("hel lo").matched)
-    var rm = Regex["(?m)^(\\w+)$"]()
+    comptime S_rm = Regex["(?m)^(\\w+)$"]
+    assert_false(S_rm._use_onepass)
+    var rm = S_rm()
     _assert_groups(rm.match("hello"), rm._pike_match("hello"), "ml")
     assert_false(rm.match("hello\n").matched)
-    var rb = Regex["\\b(\\w+)\\b"]()
+    comptime S_rb = Regex["\\b(\\w+)\\b"]
+    assert_false(S_rb._use_onepass)
+    var rb = S_rb()
     _assert_groups(rb.match("hello"), rb._pike_match("hello"), "wb")
-    var rnb = Regex["(\\w+)\\B"]()
+    comptime S_rnb = Regex["(\\w+)\\B"]
+    assert_false(S_rnb._use_onepass)
+    var rnb = S_rnb()
     assert_false(rnb.match("hello").matched)
     # `(a)\b|(a)` on "a": the first arm holds at end of input.
-    var ra = Regex["(a)\\b|(a)"]()
+    comptime S_ra = Regex["(a)\\b|(a)"]
+    assert_false(S_ra._use_onepass)
+    var ra = S_ra()
     _assert_groups(ra.match("a"), ra._pike_match("a"), "a wb")
 
 
@@ -485,10 +520,14 @@ def test_conditional_path_shadowing_rejected() raises:
 
 
 def test_utf8_mode() raises:
-    var re = Regex["(*UTF8)(\\w+)"]()
+    comptime S_re = Regex["(*UTF8)(\\w+)"]
+    assert_true(S_re._use_onepass)
+    var re = S_re()
     _assert_groups(re.match("héllo"), re._pike_match("héllo"), "utf8")
     _assert_groups(re.search("  héllo"), re._pike_search("  héllo"), "utf8 s")
-    var re2 = Regex["(*UTF8)([^\\d]+)(\\d+)"]()
+    comptime S_re2 = Regex["(*UTF8)([^\\d]+)(\\d+)"]
+    assert_false(S_re2._use_onepass)
+    var re2 = S_re2()
     _assert_groups(re2.match("é€x42"), re2._pike_match("é€x42"), "utf8 neg")
 
 

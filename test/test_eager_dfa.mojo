@@ -6,6 +6,7 @@ regression can't hide behind the identical-semantics lazy path.
 """
 
 from emberregex import Regex
+from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from emberregex.static_dfa import (
     EDFA_DEAD,
     EDFA_STATE_CAP,
@@ -43,8 +44,14 @@ def test_eager_selected_for_alternation() raises:
     assert_true(S._strategy.use_dfa)
     # Pure literal alternations are Teddy-claimed on byte-shuffle targets
     # (the eager DFA isn't built for them at all); elsewhere they run on
-    # the eager table.
-    assert_true(S._strategy.use_teddy or S._strategy.use_eager_dfa)
+    # the eager table. Pinned exclusively per host: a disjunction passes
+    # on either arm, so it cannot catch the lane silently changing.
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_teddy)
+        assert_false(S._strategy.use_eager_dfa)
+    else:
+        assert_false(S._strategy.use_teddy)
+        assert_true(S._strategy.use_eager_dfa)
 
 
 def test_eager_selected_for_quantifier_with_suffix() raises:
@@ -130,8 +137,18 @@ def test_eager_search_and_match() raises:
 
 
 def test_eager_findall_and_split() raises:
+    # `cat|dog` is a pure literal alternation, so on a byte-shuffle target
+    # Teddy claims it and this exercises the Teddy verbs, not the eager
+    # table (test_teddy.mojo owns that arm). It is the eager table's
+    # findall/split coverage only on a non-shuffle host — pinned per host
+    # so the file never claims coverage it does not have.
     var re = Regex["cat|dog"]()
-    assert_true(re._strategy.use_teddy or re._strategy.use_eager_dfa)
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(re._strategy.use_teddy)
+        assert_false(re._strategy.use_eager_dfa)
+    else:
+        assert_false(re._strategy.use_teddy)
+        assert_true(re._strategy.use_eager_dfa)
     var all = re.findall("a cat, a dog, a cat")
     assert_equal(len(all), 3)
     assert_equal(all[0], "cat")
@@ -210,7 +227,12 @@ def test_eager_leftmost_first_end_resolution() raises:
     # claims this pure literal alternation on shuffle targets) still
     # re-resolves through _lf_end_at; the eager table yields it directly.
     var re = Regex["a|ab"]()
-    assert_true(re._strategy.use_teddy or re._strategy.use_eager_dfa)
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(re._strategy.use_teddy)
+        assert_false(re._strategy.use_eager_dfa)
+    else:
+        assert_false(re._strategy.use_teddy)
+        assert_true(re._strategy.use_eager_dfa)
     var r = re.search("ab")
     assert_true(r.matched)
     assert_equal(r.end, 1)

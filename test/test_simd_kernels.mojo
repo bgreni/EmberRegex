@@ -155,7 +155,11 @@ def test_nibble_accel_long_runs() raises:
     # Runs much longer than W force many accelerated iterations; the match
     # boundaries must still land exactly.
     comptime W = simd_width_of[DType.uint8]()
-    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    comptime S = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime n_nib = len(S._edfa.accel_nib_states)
+        assert_true(n_nib >= 1)
+    var re = S()
     var user = String("u") * (3 * W + 1)
     var host = String("h") * (2 * W + 5)
     var input = "@@ " + user + "@" + host + ".com !"
@@ -184,7 +188,11 @@ def test_shufti_state_pattern() raises:
 def test_nibble_accel_high_bytes() raises:
     # Bytes >= 0x80 (UTF-8 continuation range) in skipped and terminating
     # regions exercise the high-nibble table half.
-    var re = Regex["[^a-z]*[a-z]+"]()
+    comptime S = Regex["[^a-z]*[a-z]+"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime n_nib = len(S._edfa.accel_nib_states)
+        assert_true(n_nib >= 1)
+    var re = S()
     var buf = List[Byte]()
     comptime W = simd_width_of[DType.uint8]()
     for _ in range(2 * W + 3):
@@ -216,7 +224,11 @@ def test_dotstar_suffix_still_accelerated() raises:
 
 def test_nibble_accel_findall_multiline() raises:
     # Accel must not skip past '\n' boundaries that end matches.
-    var re = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]()
+    comptime S = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        comptime n_nib = len(S._edfa.accel_nib_states)
+        assert_true(n_nib >= 1)
+    var re = S()
     var text = "a@b.com\nnope\nlong.user@sub.host.org\n"
     var all = re.findall(text)
     assert_equal(len(all), 2)

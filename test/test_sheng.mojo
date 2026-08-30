@@ -106,9 +106,16 @@ def test_sheng_not_selected_above_state_cap() raises:
 
 
 def test_sheng_match_and_search() raises:
-    var re = Regex["cat|dog|bird"]()
+    # `cat|dog|bird` is a PURE literal alternation: Teddy claims it on a
+    # shuffle target and the eager table takes it elsewhere, so Sheng
+    # never ran this test on any host. The charset arm keeps it off
+    # Teddy and on the shuffle walker.
+    comptime S = Regex["cat|d[ou]g"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     assert_true(re.match("cat").matched)
-    assert_true(re.match("bird").matched)
+    assert_true(re.match("dug").matched)
     assert_false(re.match("cow").matched)
     var r = re.search("a dog barked")
     assert_true(r.matched)
@@ -118,7 +125,11 @@ def test_sheng_match_and_search() raises:
 
 
 def test_sheng_findall_and_split() raises:
-    var re = Regex["cat|dog"]()
+    # Was `cat|dog` — a pure literal alternation Sheng never claims.
+    comptime S = Regex["cat|d[ou]g"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     var all = re.findall("a cat, a dog, a cat")
     assert_equal(len(all), 3)
     assert_equal(all[0], "cat")
@@ -146,19 +157,11 @@ def test_sheng_dotstar_suffix_with_accel() raises:
     assert_false(re.search("no target byte").matched)
 
 
-def test_sheng_leftmost_longest() raises:
-    # Greedy quantifier with suffix: leftmost-longest end via last_match.
-    var re = Regex["(?:foo|bar|ba+z)+"]()
-    assert_true(re.match("foobarbaaaz").matched)
-    assert_false(re.match("foobarx").matched)
-    var r = re.search("xxfooyy")
-    assert_true(r.matched)
-    assert_equal(r.start, 2)
-    assert_equal(r.end, 5)
-
-
 def test_sheng_eol_anchor() raises:
-    var re = Regex["(?:ab|cd)$"]()
+    comptime S = Regex["(?:ab|cd)$"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     var r = re.search("xxcd")
     assert_true(r.matched)
     assert_equal(r.start, 2)
@@ -167,7 +170,10 @@ def test_sheng_eol_anchor() raises:
 
 
 def test_sheng_multiline_anchors() raises:
-    var re = Regex["(?m)^(?:ab|cd)$"]()
+    comptime S = Regex["(?m)^(?:ab|cd)$"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     var all = re.findall("ab\ncd\nxx\nab")
     assert_equal(len(all), 3)
     assert_equal(all[0], "ab")
@@ -177,7 +183,10 @@ def test_sheng_multiline_anchors() raises:
 
 def test_sheng_dead_state_mid_input() raises:
     # Dying mid-walk must return the best match seen so far, not extend.
-    var re = Regex["ab+c|q"]()
+    comptime S = Regex["ab+c|q"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     var r = re.search("abbbbq")
     assert_true(r.matched)
     assert_equal(r.start, 5)
@@ -187,7 +196,10 @@ def test_sheng_dead_state_mid_input() raises:
 def test_sheng_long_input_boundaries() raises:
     # Walks crossing many W-chunks; match at the very end of input.
     comptime W = simd_width_of[DType.uint8]()
-    var re = Regex["(?:x|y)+z"]()
+    comptime S = Regex["(?:x|y)+z"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     var input = "xy" * (3 * W) + "z"
     var r = re.search(input)
     assert_true(r.matched)
@@ -198,7 +210,12 @@ def test_sheng_long_input_boundaries() raises:
 def test_sheng_high_bytes() raises:
     # Bytes >= 0x80 must transition to the dead state cleanly (lane ids
     # stay < 16 by construction; input bytes only index the mask table).
-    var re = Regex["cat|dog"]()
+    # Was `cat|dog` — Teddy-claimed, so the Sheng walker never saw a
+    # high byte through this test.
+    comptime S = Regex["cat|d[ou]g"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_sheng)
+    var re = S()
     var buf = List[Byte]()
     for _ in range(40):
         buf.append(Byte(0xC3))

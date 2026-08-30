@@ -12,6 +12,7 @@ newlines and bytes >= 0x80.
 """
 
 from emberregex import Regex
+from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from emberregex.static_dfa import (
     EDFA_TABLE_MIN_BYTES,
     EagerDFA,
@@ -199,7 +200,9 @@ def _lf_row_dead_after(d: EagerDFA, s: String) -> Bool:
 
 def test_alternation_priority_end() raises:
     # First arm wins even though the second is longer.
-    var re = Regex["a|a[bc]"]()
+    comptime S = Regex["a|a[bc]"]
+    assert_true(S._use_lf_dfa)
+    var re = S()
     var r = re.search("ab")
     assert_equal(r.end, 1)
     # Longer first arm: it wins when it matches, else the short one.
@@ -242,7 +245,9 @@ def test_lazy_scan_does_not_walk_the_line() raises:
     # 64 KB line with the first `>` at offset 3: a walk to end of line
     # would cost ~1000x a 64 B one. Min of several timings each, ratio
     # bounded loosely so a shared machine cannot flip it.
-    var re = Regex["<.*?>"]()
+    comptime S = Regex["<.*?>"]
+    assert_true(S._use_lf_dfa)
+    var re = S()
     var big = "<ab>" + "x" * (64 * 1024)
     var small = "<ab>" + "x" * 60
     var r = re.search(big)
@@ -590,7 +595,18 @@ def test_reverse_acceleration_bounds() raises:
 
 
 def test_findall_alternation_prefix_order() raises:
-    var re = Regex["foo|foobar"]()
+    # `foo|foobar` is a PURE literal alternation, so on a shuffle target
+    # Teddy claims it and this does not exercise the leftmost-first
+    # table — Teddy re-resolves the end through `_lf_end_at`, which is
+    # what the prefix ordering below actually pins. Asserted per host so
+    # the file never implies LF-table coverage it does not have.
+    comptime S = Regex["foo|foobar"]
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._strategy.use_teddy)
+        assert_false(S._use_lf_dfa)
+    else:
+        assert_true(S._use_lf_dfa)
+    var re = S()
     var all = re.findall("foobarfoo")
     assert_equal(len(all), 2)
     assert_equal(all[0], "foo")
@@ -630,7 +646,9 @@ def test_class_run_search_is_linear() raises:
 
 
 def test_high_bytes_in_scan() raises:
-    var re = Regex["d[ou]g|cat"]()
+    comptime S = Regex["d[ou]g|cat"]
+    assert_true(S._use_lf_dfa)
+    var re = S()
     var buf = List[Byte]()
     for _ in range(40):
         buf.append(Byte(0xC3))

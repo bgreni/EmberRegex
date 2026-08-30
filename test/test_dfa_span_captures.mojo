@@ -1,5 +1,9 @@
 """Tests for the DFA-bounded capture lane (`Regex._use_dfa_span`).
 
+`(a)|(b)` and `(a)?b|(c)` are on the backtracker, not this lane — they are
+kept as the control that unmatched-group slots read the same either way,
+and are pinned `assert_false(_use_dfa_span)` so that stays deliberate.
+
 A capture pattern whose NFA is otherwise DFA-representable (no lookaround,
 no backreferences) runs its search-family verbs as: leftmost-first DFA scan
 for the END, reverse DFA for the START, then the specialized backtracker
@@ -82,7 +86,9 @@ def test_priority_order_captures() raises:
     # and still reaches the end). The assignment "ab", "c", "d" has the
     # SAME span [2, 6) and lower priority — a span-pinned confirm that
     # did not explore in priority order could return it.
-    var re = Regex["(a|ab)(c|bcd)(d*)"]()
+    comptime S_re = Regex["(a|ab)(c|bcd)(d*)"]
+    assert_true(S_re._use_dfa_span)
+    var re = S_re()
     var r = re.search("xxabcdxx")
     assert_true(r.matched)
     assert_equal(r.start, 2)
@@ -95,7 +101,9 @@ def test_priority_order_captures() raises:
 
 
 def test_digits_pair() raises:
-    var re = Regex["(\\d+)-(\\d+)"]()
+    comptime S_re = Regex["(\\d+)-(\\d+)"]
+    assert_true(S_re._use_dfa_span)
+    var re = S_re()
     var input = "tel 123-4567 and 89-0"
     var r = re.search(input)
     assert_equal(r.group_str(input, 1), "123")
@@ -111,7 +119,9 @@ def test_digits_pair() raises:
 
 
 def test_unmatched_group_is_minus_one() raises:
-    var re = Regex["(a)|(b)"]()
+    comptime S_re = Regex["(a)|(b)"]
+    assert_false(S_re._use_dfa_span)
+    var re = S_re()
     var r = re.search("zzb")
     assert_true(r.matched)
     assert_equal(r.slots[0], -1)
@@ -121,7 +131,9 @@ def test_unmatched_group_is_minus_one() raises:
     var r2 = re.search("zza")
     assert_equal(r2.slots[0], 2)
     assert_equal(r2.slots[2], -1)
-    var opt = Regex["(a)?b|(c)"]()
+    comptime S_opt = Regex["(a)?b|(c)"]
+    assert_false(S_opt._use_dfa_span)
+    var opt = S_opt()
     var r3 = opt.search("xb")
     assert_true(r3.matched)
     assert_equal(r3.slots[0], -1)
@@ -143,7 +155,9 @@ def test_last_iteration_capture() raises:
     var r2 = re.search("xyy")
     assert_equal(r2.slots[0], 0)
     _assert_groups(r2, re._pike_search("xyy"), "xyy")
-    var nested = Regex["((a)(b))+|q"]()
+    comptime S_nested = Regex["((a)(b))+|q"]
+    assert_true(S_nested._use_dfa_span)
+    var nested = S_nested()
     var r3 = nested.search("zababab")
     assert_equal(r3.start, 1)
     assert_equal(r3.end, 7)
@@ -155,13 +169,17 @@ def test_last_iteration_capture() raises:
 
 
 def test_empty_loop_captures() raises:
-    var re = Regex["(a*)*b"]()
+    comptime S_re = Regex["(a*)*b"]
+    assert_true(S_re._use_dfa_span)
+    var re = S_re()
     var r = re.search("xaaab")
     assert_true(r.matched)
     assert_equal(r.start, 1)
     assert_equal(r.end, 5)
     _assert_groups(r, re._pike_search("xaaab"), "(a*)*b")
-    var two = Regex["(a*)(a*)"]()
+    comptime S_two = Regex["(a*)(a*)"]
+    assert_true(S_two._use_dfa_span)
+    var two = S_two()
     var r2 = two.search("aaa")
     assert_equal(r2.slots[0], 0)
     assert_equal(r2.slots[1], 3)
@@ -172,19 +190,25 @@ def test_empty_loop_captures() raises:
 def test_anchors_see_the_real_neighbours() raises:
     # `$` and `\b` resolve against the real input, not a slice ending at
     # the span — on both the backtracker and the Pike-on-span fallback.
-    var eol = Regex["(?m)^(\\w+)$|q"]()
+    comptime S_eol = Regex["(?m)^(\\w+)$|q"]
+    assert_true(S_eol._use_dfa_span)
+    var eol = S_eol()
     var input = "one\ntwo three\nfour"
     var all = eol.finditer(input)
     assert_equal(len(all), 2)
     assert_equal(all[0].group_str(input, 1), "one")
     assert_equal(all[1].group_str(input, 1), "four")
-    var wb = Regex["\\b(\\w+)\\b|q"]()
+    comptime S_wb = Regex["\\b(\\w+)\\b|q"]
+    assert_true(S_wb._use_dfa_span)
+    var wb = S_wb()
     var words = wb.findall("ab cd\nef")
     assert_equal(len(words), 3)
     assert_equal(words[2], "ef")
     # A span-pinned confirm must not let `$` hold at the pin: the
     # leftmost-first match of `(a)$|(a)` on "ab" is the second arm.
-    var pin = Regex["(a)$|(a)"]()
+    comptime S_pin = Regex["(a)$|(a)"]
+    assert_true(S_pin._use_dfa_span)
+    var pin = S_pin()
     var r = pin.search("ab")
     assert_true(r.matched)
     assert_equal(r.slots[0], -1)
@@ -256,7 +280,9 @@ def test_anchored_first_attempt_paths() raises:
 
 
 def test_lazy_group() raises:
-    var re = Regex["<(.*?)>"]()
+    comptime S_re = Regex["<(.*?)>"]
+    assert_true(S_re._use_dfa_span)
+    var re = S_re()
     var input = "x<a><bb> <c\n<dd>"
     var all = re.findall(input)
     assert_equal(len(all), 3)

@@ -220,15 +220,21 @@ def test_mode_lazy_loop_filters() raises:
 
 
 def test_possessive_disjoint_exit() raises:
-    # \d+ followed by 'x': giveback can never succeed
-    var re = Regex["\\d+x"]()
+    # \d+ followed by 'x': giveback can never succeed.
+    # This is the DFA-lane half of the pair below — pinned so the two
+    # halves cannot silently become the same test.
+    comptime S = Regex["\\d+x"]
+    assert_true(S._strategy.use_dfa)
+    var re = S()
     assert_true(re.search("aaa123x").matched)
     assert_false(re.search("aaa123y").matched)
     assert_equal(re.search("1x2x").span()[1], 2)
 
 
 def test_partial_overlap_exit_filtering() raises:
-    var re = Regex["[a-z]+ab"]()  # exit first byte 'a' in body
+    comptime S = Regex["[a-z]+ab"]  # exit first byte 'a' in body
+    assert_true(S._strategy.use_dfa)
+    var re = S()
     var r = re.search("zzzab")
     assert_equal(r.start, 0)
     assert_equal(r.end, 5)
@@ -236,13 +242,17 @@ def test_partial_overlap_exit_filtering() raises:
 
 
 def test_exit_can_be_empty_disables_filter() raises:
-    var re = Regex["a+(?:b|$)"]()
+    comptime S = Regex["a+(?:b|$)"]
+    assert_true(S._strategy.use_dfa)
+    var re = S()
     assert_true(re.match("aaa").matched)
     assert_equal(re.search("aaab").end, 4)
 
 
 def test_lazy_loop_skip() raises:
-    var re = Regex["<.*?>"]()
+    comptime S = Regex["<.*?>"]
+    assert_true(S._strategy.use_dfa)
+    var re = S()
     var r = re.search("xx<abc>yy<d>")
     assert_equal(r.start, 2)
     assert_equal(r.end, 7)

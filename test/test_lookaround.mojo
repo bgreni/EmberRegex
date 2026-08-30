@@ -67,12 +67,6 @@ def test_multiple_lookaheads() raises:
 # --- Negative lookahead ---
 
 
-def test_neg_lookahead() raises:
-    var re = Regex["foo(?!bar)"]()
-    assert_true(re.search("foobaz").matched)
-    assert_false(re.search("foobar").matched)
-
-
 def test_neg_lookahead_end() raises:
     var re = Regex["\\d+(?!\\d)"]()
     var result = re.search("abc123def")

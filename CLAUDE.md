@@ -9,8 +9,11 @@ pixi run test          # run all tests
 pixi run bench         # single-pattern (`Regex`) benchmark suite
 pixi run bench_all     # run all benchmarks
 
-# Run a single test file
-mojo -D ASSERT=all -I . test/static/test_static.mojo
+# Run a single test file (`mojo` is not on PATH outside pixi)
+pixi run mojo -D ASSERT=all -I . test/test_eager_dfa.mojo
+
+# Run one test file through the runner (substring match on the filename)
+pixi run test --only eager_dfa
 
 # Run benchmarks against Python re for comparison
 python3 bench/bench_compare.py
@@ -86,6 +89,45 @@ A counted repetition (`x{n,m}`) whose body is a single ANY/CHAR/CHARSET gets the
 - **Never use `String[byte=a:b]` slicing** — it has poor performance. Always fetch a byte span first with `input.as_bytes()` and slice that. To construct a String from a span use `String(unsafe_from_utf8=span[a:b])`.
 - **Use `elif`/`else` with `comptime if` for exclusive branches** — when a `comptime if` is followed by another `comptime if` testing a mutually exclusive condition (e.g. `comptime if X:` … `comptime if not X:`), use `elif` or `else` instead. The successive branches are still evaluated at compile time. Only use separate `comptime if` blocks when the conditions are truly independent.
 
+
+## Tests must earn their keep
+
+Be **extremely intentional** about adding tests. The suite is compile-bound:
+the bill is **distinct comptime `Regex[...]` instantiations** (~537 across
+`test/`), not test-function count. Files elaborate in parallel, so the suite's
+wall clock is the slowest single file — `test_utf8.mojo` alone is ~364 s.
+
+- **One purpose per test, covered nowhere else.** If an existing test already
+  asserts the same thing on the same pattern, verb, and input, extend it rather
+  than adding a sibling. A test whose assertions, patterns and
+  (pattern, verb, input) triples are all a subset of another test's is dead
+  weight and should be deleted.
+- **Reuse a pattern the file already instantiates.** A test that reuses an
+  existing `Regex[...]` is nearly free; one that introduces a new pattern adds
+  a full comptime elaboration to that file's critical path.
+- **A lane test MUST assert the lane it resolved to.** Engine selection is a
+  silent comptime function of the pattern string with no runtime override, so a
+  test can drift onto a different engine and keep passing — it just quietly
+  stops testing what its filename claims. Pin with `_strategy.use_*`,
+  `_use_lf_dfa`, `_use_onepass`, `_use_dfa_span`, `_SHENG_CAP`,
+  `accel_nib_states`, or the engine's own runtime state (`clear_count`).
+- **Pin exclusively, never with a disjunction.**
+  `assert_true(use_teddy or use_eager_dfa)` passes on either arm and therefore
+  cannot catch a lane change. Use `comptime if HAS_FAST_BYTE_SHUFFLE:` with the
+  positive pin plus the matching `assert_false` for the lane that must NOT
+  claim the pattern.
+- **Verify the pattern actually reaches the lane before writing the test.** A
+  pure literal alternation (`cat|dog`) is Teddy's on any shuffle target and
+  Sheng never claims it; a small DFA is Sheng's, not the eager table's; most
+  capture shapes are the backtracker's, not one-pass. Probe in
+  `playground.mojo` first — do not assume from the filename.
+- **A differential sweep may already cover it.** The
+  `_assert_pike_agreement`-style sweeps run every verb over LCG inputs at SIMD
+  boundary lengths. A hand-written test beside one earns its keep only by
+  pinning something the sweep cannot: a selection flag, a structural invariant,
+  or an exact expected value rather than mere agreement with Pike.
+- **Tests that call an engine directly** (`build_lf_dfa`, `_sbt_*`, the memo
+  internals) bypass selection and cannot be mislabeled — they need no lane pin.
 
 ## Benchmarks must have matching tests
 

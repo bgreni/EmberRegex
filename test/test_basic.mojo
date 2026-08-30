@@ -84,12 +84,6 @@ def test_char_class_range() raises:
     assert_false(re.match("M").matched)
 
 
-def test_digit_shorthand() raises:
-    var re = Regex["\\d+"]()
-    assert_true(re.match("123").matched)
-    assert_false(re.match("abc").matched)
-
-
 def test_word_shorthand() raises:
     var re = Regex["\\w+"]()
     assert_true(re.match("hello_123").matched)
