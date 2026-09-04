@@ -587,6 +587,11 @@ def _emit_bits[
         out.append(SetMatch(ids[i], end))
 
 
+# `@always_inline` for the same reason as `mdfa_scan`: `d` is a
+# List-carrying value parameter printed into an out-of-line
+# instantiation's symbol name (macOS ld asserts past its maximum symbol
+# length). Inlined, no symbol is emitted.
+@always_inline
 def bitnfa_scan[
     origin: Origin,
     rn: Int,

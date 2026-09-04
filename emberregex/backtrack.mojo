@@ -53,7 +53,13 @@ from .constants import (
     CHAR_Z_UPPER,
     is_word_byte,
 )
-from .nfa import split_cycle_flags, NFA, NFAState, NFAStateKind
+from .nfa import (
+    _build_static_nfa,
+    split_cycle_flags,
+    NFA,
+    NFAState,
+    NFAStateKind,
+)
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
 from .optimize import first_byte_bitmap_of, loop_body_bitmap
@@ -891,45 +897,10 @@ struct SbtDepthPlan(Copyable, Movable):
         self.splits_are_fvs = splits_are_fvs
 
 
-def sbt_depth_plan(nfa: NFA) -> SbtDepthPlan:
-    """Comptime: whether the backtracker can recurse without bound on
-    `nfa`, and if so where the stack check has to go.
-
-    The graph walked here is the **specialized call graph** — the edges
-    `_sbt_try_match[v]` can actually recurse along, not the NFA's — so
-    the answer is exact rather than an over-approximation:
-
-    - a simple greedy loop consumes its body ITERATIVELY and only ever
-      calls its exit (`out2`); a simple lazy loop likewise (`out1`).
-      That is why `a+`, `[a-z]*` and `.*?` are cycles in the NFA and not
-      in this graph, and why they pay nothing;
-    - MATCH calls nothing; lookaround calls its sub-NFA then its
-      continuation; everything else calls `out1`.
-
-    The counted-repeat rewrite (`_sbt_counted_shape`) is deliberately
-    NOT modelled: it replaces a chain of states with a direct edge to
-    that chain's exit, so ignoring it can only leave edges in, never
-    take reachability out — the conservative direction — and it is
-    gated on this very analysis reporting no cycle.
-
-    `needs_guard` keeps the older predicate (a cyclic SPLIT the walker
-    runs recursively) as a floor, OR'd with the call-graph answer, so
-    nothing that used to be guarded — or gated off the memo lane and the
-    counted-repeat rewrite, which both key off this — can silently stop
-    being.
-
-    `splits_are_fvs` re-runs the same walk with the general-SPLIT states
-    deleted. False there means those states are NOT a feedback vertex
-    set and a check confined to them would miss a cycle, so the walker
-    checks on entry to every state instead.
-
-    **Cost.** Everything is one flat pass over lists. A comptime call
-    that takes the NFA copies it (~0.7 ms per 100 states), so calling
-    `_sbt_is_simple_body` from inside these walks would make the pass
-    quadratic in the NFA — on the ~2100-state `(?u)\\p{L}+` that crashed
-    the compiler outright. The body test is therefore written out here,
-    once per state, and must stay in step with `_sbt_is_simple_body`.
-    """
+def _sbt_depth_plan_list(nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
+    """`sbt_depth_plan` over Lists — the reference semantics, and the
+    version NFAs past 4096 states take. `cyclic` is the caller's
+    `split_cycle_flags` result (see `sbt_depth_plan`)."""
     var n = len(nfa.states)
     # c0/c1: the (at most two) states `_sbt_try_match[i]` can call.
     var c0 = List[Int](fill=-1, length=n)
@@ -966,7 +937,6 @@ def sbt_depth_plan(nfa: NFA) -> SbtDepthPlan:
         c0[i] = s.out1
 
     # The older predicate: a cyclic SPLIT the walker runs recursively.
-    var cyclic = split_cycle_flags(nfa)
     var old = False
     for i in range(n):
         if gsplit[i] and cyclic[i] and nfa.states[i].out2 != -1:
@@ -1027,6 +997,201 @@ def sbt_depth_plan(nfa: NFA) -> SbtDepthPlan:
     return SbtDepthPlan(True, not found[1])
 
 
+def _sbt_depth_plan_simd[
+    W: Int
+](nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
+    """`sbt_depth_plan` over SIMD lanes: same algorithm as
+    `_sbt_depth_plan_list`, with the state columns, the specialized call
+    graph (`c0`/`c1`/`gsplit`), the DFS colors and both stack arrays as
+    lanes — see `_split_cycle_flags_simd` for the interpreter cost model.
+    """
+    var n = len(nfa.states)
+    comptime KSPLIT = Int32(NFAStateKind.SPLIT)
+    comptime KMATCH = Int32(NFAStateKind.MATCH)
+    comptime KANY = Int32(NFAStateKind.ANY)
+    comptime KCHAR = Int32(NFAStateKind.CHAR)
+    comptime KCHARSET = Int32(NFAStateKind.CHARSET)
+    comptime KLOOKAHEAD = Int32(NFAStateKind.LOOKAHEAD)
+    comptime KLOOKBEHIND = Int32(NFAStateKind.LOOKBEHIND)
+    var kind = SIMD[DType.int32, W](0)
+    var out1 = SIMD[DType.int32, W](-1)
+    var out2 = SIMD[DType.int32, W](-1)
+    var greedy = SIMD[DType.int32, W](0)
+    var sub = SIMD[DType.int32, W](-1)
+    for i in range(n):
+        ref s = nfa.states[i]
+        var k = s.kind
+        kind[i] = Int32(k)
+        out1[i] = Int32(s.out1)
+        out2[i] = Int32(s.out2)
+        if k == NFAStateKind.SPLIT:
+            if s.greedy:
+                greedy[i] = 1
+        elif k == NFAStateKind.LOOKAHEAD or k == NFAStateKind.LOOKBEHIND:
+            sub[i] = Int32(s.sub_start)
+    var c0 = SIMD[DType.int32, W](-1)
+    var c1 = SIMD[DType.int32, W](-1)
+    var gsplit = SIMD[DType.int32, W](0)
+    for i in range(n):
+        var k = kind[i]
+        if k == KMATCH:
+            continue
+        if k == KSPLIT:
+            var g = greedy[i] != 0
+            var b = Int(out1[i]) if g else Int(out2[i])
+            var simple = False
+            if b >= 0 and b < n and Int(out1[b]) == i:
+                var bk = kind[b]
+                simple = bk == KANY or bk == KCHAR or bk == KCHARSET
+            if simple:
+                c0[i] = out2[i] if g else out1[i]
+            else:
+                gsplit[i] = 1
+                c0[i] = out1[i]
+                c1[i] = out2[i]
+            continue
+        if k == KLOOKAHEAD or k == KLOOKBEHIND:
+            c0[i] = sub[i]
+            c1[i] = out1[i]
+            continue
+        c0[i] = out1[i]
+    var old = False
+    for i in range(n):
+        if gsplit[i] != 0 and cyclic[i] and Int(out2[i]) != -1:
+            old = True
+            break
+    var found0 = False
+    var found1 = False
+    for p in range(2):
+        var cut = p == 1
+        if cut and not old and not found0:
+            break
+        var color = SIMD[DType.int32, W](0)  # 0 white, 1 grey, 2 black
+        var fs = SIMD[DType.int32, W](0)  # DFS frame: state
+        var fc = SIMD[DType.int32, W](0)  # DFS frame: next child cursor
+        var fp = 0
+        var hit = False
+        for root in range(n):
+            if hit:
+                break
+            if color[root] != 0:
+                continue
+            if cut and gsplit[root] != 0:
+                color[root] = 2
+                continue
+            color[root] = 1
+            fs[fp] = Int32(root)
+            fc[fp] = 0
+            fp += 1
+            while fp > 0:
+                var top = fp - 1
+                var v = Int(fs[top])
+                var k = Int(fc[top])
+                if k > 1:
+                    color[v] = 2
+                    fp -= 1
+                    continue
+                fc[top] = Int32(k + 1)
+                var child = Int(c0[v]) if k == 0 else Int(c1[v])
+                if child < 0 or child >= n:
+                    continue
+                if cut and gsplit[child] != 0:
+                    continue
+                if color[child] == 1:
+                    hit = True
+                    break
+                if color[child] == 0:
+                    color[child] = 1
+                    fs[fp] = Int32(child)
+                    fc[fp] = 0
+                    fp += 1
+        if p == 0:
+            found0 = hit
+        else:
+            found1 = hit
+    if not old and not found0:
+        return SbtDepthPlan(False, True)
+    return SbtDepthPlan(True, not found1)
+
+
+def sbt_depth_plan[
+    fast: Bool = True
+](nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
+    """Comptime: whether the backtracker can recurse without bound on
+    `nfa`, and if so where the stack check has to go.
+
+    The graph walked here is the **specialized call graph** — the edges
+    `_sbt_try_match[v]` can actually recurse along, not the NFA's — so
+    the answer is exact rather than an over-approximation:
+
+    - a simple greedy loop consumes its body ITERATIVELY and only ever
+      calls its exit (`out2`); a simple lazy loop likewise (`out1`).
+      That is why `a+`, `[a-z]*` and `.*?` are cycles in the NFA and not
+      in this graph, and why they pay nothing;
+    - MATCH calls nothing; lookaround calls its sub-NFA then its
+      continuation; everything else calls `out1`.
+
+    The counted-repeat rewrite (`_sbt_counted_shape`) is deliberately
+    NOT modelled: it replaces a chain of states with a direct edge to
+    that chain's exit, so ignoring it can only leave edges in, never
+    take reachability out — the conservative direction — and it is
+    gated on this very analysis reporting no cycle.
+
+    `needs_guard` keeps the older predicate (a cyclic SPLIT the walker
+    runs recursively) as a floor, OR'd with the call-graph answer, so
+    nothing that used to be guarded — or gated off the memo lane and the
+    counted-repeat rewrite, which both key off this — can silently stop
+    being.
+
+    `splits_are_fvs` re-runs the same walk with the general-SPLIT states
+    deleted. False there means those states are NOT a feedback vertex
+    set and a check confined to them would miss a cycle, so the walker
+    checks on entry to every state instead.
+
+    **Cost.** Everything is one flat pass over lists. A comptime call
+    that takes the NFA copies it (~0.7 ms per 100 states), so calling
+    `_sbt_is_simple_body` from inside these walks would make the pass
+    quadratic in the NFA — on the ~2100-state `(?u)\\p{L}+` that crashed
+    the compiler outright. The body test is therefore written out here,
+    once per state, and must stay in step with `_sbt_is_simple_body`.
+
+    `fast` selects the SIMD-lane implementation, which exists for the
+    comptime interpreter ONLY: compiled for the CPU, its 4096-lane locals
+    with dynamic lane writes cost LLVM ~45 s. A caller that runs the
+    analysis at runtime (tests that build NFAs natively) passes
+    `fast=False` and gets the List version.
+
+    `cyclic` is `split_cycle_flags(nfa)`, THREADED IN rather than
+    recomputed: calls made inside a comptime body are never memoized
+    (only decl-level `comptime x = f(args)` applies are), so computing
+    the flags here re-ran a full Tarjan pass for every distinct caller
+    of the plan. The single-pattern engine passes `Regex._cyclic` and
+    reads the plan once as `Regex._sbt_plan`; the walkers (`_sbt_run*`,
+    `_sbt_try_match`, `confirm_span`) obtain both through decl-level
+    applies on the memoized NFA, which hit the same cache entries.
+    """
+    var n = len(nfa.states)
+    comptime if not fast:
+        return _sbt_depth_plan_list(nfa, cyclic)
+    if n <= 256:
+        return _sbt_depth_plan_simd[256](nfa, cyclic)
+    elif n <= 1024:
+        return _sbt_depth_plan_simd[1024](nfa, cyclic)
+    elif n <= 2048:
+        return _sbt_depth_plan_simd[2048](nfa, cyclic)
+    elif n <= 4096:
+        return _sbt_depth_plan_simd[4096](nfa, cyclic)
+    else:
+        return _sbt_depth_plan_list(nfa, cyclic)
+
+
+def sbt_depth_plan_of[fast: Bool = True](nfa: NFA) -> SbtDepthPlan:
+    """Convenience form that runs its own cycle pass. For tests and
+    one-off callers only — production code threads the flags (see
+    `sbt_depth_plan`) so the Tarjan pass runs once per pattern."""
+    return sbt_depth_plan[fast](nfa, split_cycle_flags[fast](nfa))
+
+
 def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
     """Comptime: True when the backtracker can recurse to a depth that
     grows with the input, so the walk has to watch its stack.
@@ -1043,8 +1208,14 @@ def _sbt_needs_depth_guard(nfa: NFA) -> Bool:
     leftmost-first lane's anchored backtracker attempt
     (`_lf_anchored_sbt`): all three want "can this pattern recurse per
     input byte".
+
+    Runs its own cycle pass and its own plan — for tests,
+    `sbt_counted_shapes` and one-off callers. Production code reads
+    `Regex._sbt_plan.needs_guard` (`Regex._sbt_general_loop`) or a
+    decl-level `sbt_depth_plan(nfa, cyclic)` apply instead: a call to
+    THIS from inside a comptime body re-runs both passes.
     """
-    return sbt_depth_plan(nfa).needs_guard
+    return sbt_depth_plan_of(nfa).needs_guard
 
 
 # Cap on the (state, pos) memo: 2Mi bits = 256KB of zeroed scratch. A walk
@@ -1128,9 +1299,11 @@ def sbt_memo_ok(nfa: NFA) -> Bool:
     return True
 
 
-def sbt_memo_rows(nfa: NFA) -> Int:
+def sbt_memo_rows(nfa: NFA, needs_guard: Bool) -> Int:
     """Comptime: how many rows the memo bitset needs, or 0 when this NFA
-    gets no memo at all. Tests read it to pin the gate.
+    gets no memo at all. Tests read it to pin the gate. `needs_guard` is
+    the caller's `sbt_depth_plan(...).needs_guard` (threaded, not
+    recomputed — see `sbt_depth_plan`).
 
     A pattern only re-explores a (state, pos) pair by going round a cycle,
     every cycle crosses a SPLIT, and cyclic *simple* loops are compiled to
@@ -1155,15 +1328,21 @@ def sbt_memo_rows(nfa: NFA) -> Int:
         return 0
     if not sbt_memo_ok(nfa):
         return 0
-    if not _sbt_needs_depth_guard(nfa):
+    if not needs_guard:
         return 0
     return len(nfa.states)
+
+
+def sbt_memo_rows_of(nfa: NFA) -> Int:
+    """Convenience form for tests: runs the depth plan itself. The
+    walkers pass `plan.needs_guard` from their decl-level plan apply."""
+    return sbt_memo_rows(nfa, _sbt_needs_depth_guard(nfa))
 
 
 def _sbt_try_match[
     origin: Origin,
     //,
-    nfa: NFA,
+    pattern: String,
     state_idx: Int,
     num_slots: Int,
     anchored_end: Bool = False,
@@ -1179,7 +1358,7 @@ def _sbt_try_match[
 ) -> Int:
     """Compile-time specialized backtracking match.
 
-    Each instantiation of [nfa, state_idx] produces a specialized function
+    Each instantiation of [pattern, state_idx] produces a specialized function
     that handles exactly one NFA state kind with all fields baked in.
     Charset membership uses bitmaps extracted at compile time.
 
@@ -1198,6 +1377,10 @@ def _sbt_try_match[
     every other walk, which is all of them until one exhausts the budget
     (see `_sbt_run_memo`).
     """
+    # The NFA rides behind the pattern string: this is the same memoized
+    # comptime call as `Regex.nfa` (one evaluation per pattern), and the
+    # instantiation's symbol name carries the pattern, not a printed NFA.
+    comptime nfa = _build_static_nfa(pattern)
     budget -= 1
     if budget < 0:
         return -1
@@ -1210,7 +1393,11 @@ def _sbt_try_match[
         # Stack tracking is free for NFAs that cannot recurse without
         # bound: GUARD folds to False, `stack_floor` stays the constant
         # 0 its callers pass, and every check below compiles out.
-        comptime PLAN = sbt_depth_plan(nfa)
+        # Decl-level applies on the memoized NFA: the same cache entries
+        # `Regex._cyclic` / `Regex._sbt_plan` filled, so neither pass
+        # re-runs per state instantiation (see `sbt_depth_plan`).
+        comptime CYC = split_cycle_flags(nfa)
+        comptime PLAN = sbt_depth_plan(nfa, CYC)
         comptime GUARD = PLAN.needs_guard
         # Where the check goes. General SPLITs are a feedback vertex set
         # of the call graph for every shape seen so far, so the check
@@ -1354,7 +1541,7 @@ def _sbt_try_match[
                         # byte, so end of input cannot match either.
                         if max_pos < input_len:
                             return _sbt_try_match[
-                                nfa=nfa,
+                                pattern=pattern,
                                 state_idx=cexit,
                                 num_slots=num_slots,
                                 anchored_end=anchored_end,
@@ -1381,7 +1568,7 @@ def _sbt_try_match[
                                     p -= 1
                                     continue
                             var result = _sbt_try_match[
-                                nfa=nfa,
+                                pattern=pattern,
                                 state_idx=cexit,
                                 num_slots=num_slots,
                                 anchored_end=anchored_end,
@@ -1428,7 +1615,7 @@ def _sbt_try_match[
                     if budget < 0:
                         return -1
                     var result = _sbt_try_match[
-                        nfa=nfa,
+                        pattern=pattern,
                         state_idx=cexit,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -1470,7 +1657,7 @@ def _sbt_try_match[
                 return -1
             if UInt32(input.unsafe_get(pos)) == state.char_value:
                 return _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1491,7 +1678,7 @@ def _sbt_try_match[
                 return -1
             if input.unsafe_get(pos) != CHAR_NEWLINE:
                 return _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1519,7 +1706,7 @@ def _sbt_try_match[
             var ch = UInt32(input.unsafe_get(pos))
             if _sbt_bitmap_check(bitmap, negated, ch):
                 return _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1646,7 +1833,7 @@ def _sbt_try_match[
                         # that test, specialized, one call deeper.
                         if max_pos < input_len:
                             return _sbt_try_match[
-                                nfa=nfa,
+                                pattern=pattern,
                                 state_idx=out2,
                                 num_slots=num_slots,
                                 anchored_end=anchored_end,
@@ -1675,7 +1862,7 @@ def _sbt_try_match[
                                     p -= 1
                                     continue
                             var result = _sbt_try_match[
-                                nfa=nfa,
+                                pattern=pattern,
                                 state_idx=out2,
                                 num_slots=num_slots,
                                 anchored_end=anchored_end,
@@ -1721,7 +1908,7 @@ def _sbt_try_match[
                     if budget < 0:
                         return -1
                     var result = _sbt_try_match[
-                        nfa=nfa,
+                        pattern=pattern,
                         state_idx=out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -1827,7 +2014,7 @@ def _sbt_try_match[
                         # conceding is the better bet.
                         return -1
                     var memo_r = _sbt_try_match[
-                        nfa=nfa,
+                        pattern=pattern,
                         state_idx=out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -1844,7 +2031,7 @@ def _sbt_try_match[
                     if memo_r >= 0:
                         return memo_r
                     memo_r = _sbt_try_match[
-                        nfa=nfa,
+                        pattern=pattern,
                         state_idx=out2,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -1869,7 +2056,7 @@ def _sbt_try_match[
                         mp[unsafe_offset=word] |= mask
                     return memo_r
                 var result = _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1878,7 +2065,7 @@ def _sbt_try_match[
                 if result >= 0:
                     return result
                 return _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=out2,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1891,7 +2078,7 @@ def _sbt_try_match[
                 var old_val = slots[slot]
                 slots[slot] = pos
                 var result = _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1902,7 +2089,7 @@ def _sbt_try_match[
                 return result
             else:
                 return _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1914,7 +2101,7 @@ def _sbt_try_match[
                 input, len(input), pos
             ):
                 return _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.out1,
                     num_slots=num_slots,
                     anchored_end=anchored_end,
@@ -1925,7 +2112,7 @@ def _sbt_try_match[
         elif kind == NFAStateKind.LOOKAHEAD:
             var sub_slots = slots.copy()
             var sub_result = _sbt_try_match[
-                nfa=nfa,
+                pattern=pattern,
                 state_idx=state.sub_start,
                 num_slots=num_slots,
                 anchored_end=False,
@@ -1935,7 +2122,7 @@ def _sbt_try_match[
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
-                        nfa=nfa,
+                        pattern=pattern,
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -1952,8 +2139,14 @@ def _sbt_try_match[
                 return -1
             else:
                 if matched:
-                    return _sbt_try_match[
-                        nfa=nfa,
+                    # A successful positive assertion KEEPS its capture
+                    # writes (Python/PCRE/Perl/Ruby/JS all agree); restore
+                    # them if the continuation fails so outer backtracking
+                    # cannot leak them into other attempts.
+                    var saved_slots = slots.copy()
+                    slots = sub_slots^
+                    var cont = _sbt_try_match[
+                        pattern=pattern,
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -1967,15 +2160,18 @@ def _sbt_try_match[
                         stack_floor,
                         end_at,
                     )
+                    if cont < 0:
+                        slots = saved_slots^
+                    return cont
                 return -1
 
         elif kind == NFAStateKind.LOOKBEHIND:
             comptime lb_len = state.lookbehind_len
             var matched = False
+            var sub_slots = slots.copy()
             if pos >= lb_len:
-                var sub_slots = slots.copy()
                 var sub_result = _sbt_try_match[
-                    nfa=nfa,
+                    pattern=pattern,
                     state_idx=state.sub_start,
                     num_slots=num_slots,
                     anchored_end=False,
@@ -1993,7 +2189,7 @@ def _sbt_try_match[
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
-                        nfa=nfa,
+                        pattern=pattern,
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -2010,8 +2206,11 @@ def _sbt_try_match[
                 return -1
             else:
                 if matched:
-                    return _sbt_try_match[
-                        nfa=nfa,
+                    # Same keep/restore rule as LOOKAHEAD above.
+                    var saved_slots = slots.copy()
+                    slots = sub_slots^
+                    var cont = _sbt_try_match[
+                        pattern=pattern,
                         state_idx=state.out1,
                         num_slots=num_slots,
                         anchored_end=anchored_end,
@@ -2025,6 +2224,9 @@ def _sbt_try_match[
                         stack_floor,
                         end_at,
                     )
+                    if cont < 0:
+                        slots = saved_slots^
+                    return cont
                 return -1
 
         elif kind == NFAStateKind.BACKREF:
@@ -2049,7 +2251,7 @@ def _sbt_try_match[
                     if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
                         return -1
             return _sbt_try_match[
-                nfa=nfa,
+                pattern=pattern,
                 state_idx=state.out1,
                 num_slots=num_slots,
                 anchored_end=anchored_end,

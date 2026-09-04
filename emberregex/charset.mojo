@@ -103,8 +103,9 @@ struct CharSet(Copyable):
         """Build the 256-bit bitmap for ASCII fast path."""
         self.bitmap = SIMD[DType.uint8, BITMAP_WIDTH](0)
         for i in range(len(self.ranges)):
-            var lo = Int(self.ranges[i].lo)
-            var hi = Int(self.ranges[i].hi)
+            ref rg = self.ranges[i]
+            var lo = Int(rg.lo)
+            var hi = Int(rg.hi)
             if lo > 255:
                 continue
             if hi > 255:

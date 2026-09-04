@@ -40,6 +40,7 @@ from std.collections import InlineArray
 from std.sys import simd_width_of
 
 from .constants import CHAR_NEWLINE
+from .static_bytes import filled_string
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
@@ -78,7 +79,6 @@ comptime _ShengState = SIMD[DType.uint8, SHUFFLE_INDEX_LANES]
 # SIMD-element shape is equally fast if `materialize`d ONCE into an
 # instance field and passed by reference, at the cost of the table per
 # regex instance plus init plumbing; the flat constant needs neither.
-comptime ShengMasks[cap: Int] = InlineArray[UInt8, 256 * cap]
 
 
 def sheng_viable(d: EagerDFA) -> Bool:
@@ -111,41 +111,51 @@ def sheng_cap_for(d: EagerDFA, enabled: Bool) -> Int:
     return 64
 
 
-def sheng_masks_arr[cap: Int](d: EagerDFA, enabled: Bool) -> ShengMasks[cap]:
-    """Comptime: one shuffle mask per input byte; lane s = next state.
+def sheng_masks_str[cap: Int](d: EagerDFA, enabled: Bool) -> String:
+    """Comptime: one shuffle mask per input byte, `cap` bytes each (lane
+    s = next state), packed as one string (see static_bytes.mojo).
 
     Dead transitions (and all lanes past num_states) map to the dead
     state id `d.num_states`, which self-loops on every byte.
     """
     var dead = UInt8(d.num_states)
-    var arr = ShengMasks[cap](fill=dead)
+    var out = filled_string(256 * cap, dead)
     if not enabled:
-        return arr^
-    for b in range(256):
+        return out^
+    var p = out.unsafe_ptr_mut()
+    # The masks are the table transposed (byte-major). Build them CHUNK
+    # bytes at a time in one wide vector — lane inserts on a <= 1 KB
+    # vector cost ~1-3 us in the comptime interpreter, where the
+    # cell-by-cell form paid a List read plus an InlineArray write
+    # (~100 us) per (byte, state): a 63-state table went ~1.6 s -> ~50 ms.
+    comptime CHUNK = 16
+    comptime WIDE = CHUNK * cap
+    var deadv = SIMD[DType.uint8, 256](dead)
+    var zero = SIMD[DType.int64, 256](0)
+    for c in range(256 // CHUNK):
+        var wide = SIMD[DType.uint8, WIDE](dead)
         for s in range(d.num_states):
-            var nxt = d.table[s * 256 + b]
-            if nxt >= 0:
-                arr[b * cap + s] = UInt8(nxt)
-    return arr^
+            var row = Pointer(to=d.table[s * 256]).unsafe_bitcast[
+                Int64
+            ]().unsafe_load[width=256]()
+            var nxt = row.lt(zero).select(deadv, row.cast[DType.uint8]())
+            for j in range(CHUNK):
+                wide[j * cap + s] = nxt[c * CHUNK + j]
+        Pointer(to=p[unsafe_offset=c * WIDE]).unsafe_store(wide)
+    return out^
 
 
 @always_inline
 def _sheng_step[
-    ml: Int, //
-](
-    masks: InlineArray[UInt8, ml], b: Byte, state_vec: _ShengState
-) -> _ShengState:
+    cap: Int
+](masks: StringLiteral, b: Byte, state_vec: _ShengState) -> _ShengState:
     """One transition: shuffle the byte's mask by the state vector.
 
-    The mask width comes from the array length, so each branch loads and
-    shuffles at a literal width: only the tier this DFA needs is emitted,
+    Each branch loads and shuffles at the literal tier width `cap`: only the tier this DFA needs is emitted,
     and the NEON-only tiers are never elaborated where cap is always
     NIBBLE_TABLE_SIZE.
     """
-    comptime assert ml % 256 == 0
-    comptime cap = ml // 256
-    ref first = masks.unsafe_get(Int(b) * cap)
-    var p = Pointer(to=first)
+    var p = Pointer(to=masks.unsafe_ptr()[unsafe_offset=Int(b) * cap])
     comptime if cap == NIBBLE_TABLE_SIZE:
         return nibble_lookup(
             p.unsafe_load[width=NIBBLE_TABLE_SIZE](), state_vec
@@ -202,10 +212,10 @@ def sheng_short_input(cap: Int) -> Int:
 def _sheng_scalar_full_match[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """The same anchored full match, walked one scalar load per byte.
@@ -232,15 +242,14 @@ def _sheng_scalar_full_match[
     `sheng_short_input` holds the per-tier bound and the measurements it
     came from.
     """
-    comptime cap = ml // 256
     comptime dead = UInt8(d.num_states)
-    var msk = materialize[masks]()
+    var msk = masks.unsafe_ptr()
     var flg = materialize[flags]()
     var cur = UInt8(d.start_at_0)
     var input_len = len(input)
     var pos = 0
     while pos < input_len:
-        cur = msk.unsafe_get(Int(input.unsafe_get(pos)) * cap + Int(cur))
+        cur = msk[unsafe_offset=Int(input.unsafe_get(pos)) * cap + Int(cur)]
         if cur == dead:
             return False
         pos += 1
@@ -257,17 +266,16 @@ def _sheng_scalar_full_match[
 def _sheng_full_match_impl[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
     comptime dead = d.num_states
     # `masks` / `flags` are comptime arrays; `materialize` binds them to the
     # constant data emitted in the binary (no copy) so the walk can index them.
-    var msk = materialize[masks]()
     var flg = materialize[flags]()
     var cur_vec = _ShengState(UInt8(d.start_at_0))
     var cur = d.start_at_0
@@ -285,7 +293,7 @@ def _sheng_full_match_impl[
             pos = skipped
             if pos >= input_len:
                 break
-            cur_vec = _sheng_step(msk, input.unsafe_get(pos), cur_vec)
+            cur_vec = _sheng_step[cap](masks, input.unsafe_get(pos), cur_vec)
             cur = Int(cur_vec[0])
             if cur == dead:
                 return False
@@ -298,7 +306,7 @@ def _sheng_full_match_impl[
         while pos < input_len:
             var chunk_end = min(pos + _SHENG_DEAD_CHECK_STRIDE, input_len)
             while pos < chunk_end:
-                cur_vec = _sheng_step(msk, input.unsafe_get(pos), cur_vec)
+                cur_vec = _sheng_step[cap](masks, input.unsafe_get(pos), cur_vec)
                 pos += 1
             cur = Int(cur_vec[0])
             if cur == dead:
@@ -316,10 +324,10 @@ def _sheng_full_match_impl[
 def sheng_full_match[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """Anchored full match (mirrors edfa_full_match).
@@ -330,19 +338,19 @@ def sheng_full_match[
     the acceleration checks, and the rest shuffle. The first bound is per
     tier and is 0 — no scalar lane, nothing emitted — at 16 lanes.
     """
-    comptime short = sheng_short_input(ml // 256)
+    comptime short = sheng_short_input(cap)
     comptime if short > 0:
         if len(input) < short:
-            return _sheng_scalar_full_match[d=d, masks=masks, flags=flags](
+            return _sheng_scalar_full_match[d=d, cap=cap, masks=masks, flags=flags](
                 input
             )
     comptime if _edfa_has_accel(d):
         comptime W = simd_width_of[DType.uint8]()
         if len(input) >= W:
             return _sheng_full_match_impl[
-                d=d, masks=masks, flags=flags, accel=True
+                d=d, cap=cap, masks=masks, flags=flags, accel=True
             ](input)
-    return _sheng_full_match_impl[d=d, masks=masks, flags=flags, accel=False](
+    return _sheng_full_match_impl[d=d, cap=cap, masks=masks, flags=flags, accel=False](
         input
     )
 
@@ -351,10 +359,10 @@ def sheng_full_match[
 def _sheng_walk_impl[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
     accel: Bool,
     s_at0: Int,
@@ -363,7 +371,6 @@ def _sheng_walk_impl[
     s_other_w: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
     comptime dead = d.num_states
-    var msk = materialize[masks]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
@@ -408,7 +415,7 @@ def _sheng_walk_impl[
                 var f = flg.unsafe_get(cur)
                 if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
                     last_match = pos
-        cur_vec = _sheng_step(msk, b, cur_vec)
+        cur_vec = _sheng_step[cap](masks, b, cur_vec)
         cur = Int(cur_vec[0])
         if cur == dead:
             # Died mid-input: EOL-at-end flags don't apply (mirrors
@@ -427,10 +434,10 @@ def _sheng_walk_impl[
 def sheng_walk_from[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
     s_at0: Int,
     s_nl: Int,
@@ -444,6 +451,7 @@ def sheng_walk_from[
         if len(input) - start >= W:
             return _sheng_walk_impl[
                 d=d,
+                cap=cap,
                 masks=masks,
                 flags=flags,
                 accel=True,
@@ -454,6 +462,7 @@ def sheng_walk_from[
             ](input, start)
     return _sheng_walk_impl[
         d=d,
+        cap=cap,
         masks=masks,
         flags=flags,
         accel=False,
@@ -468,16 +477,17 @@ def sheng_walk_from[
 def sheng_match_at[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     d: EagerDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Anchored match at `start` (mirrors edfa_match_at): `sheng_walk_from`
     in the DFA's own start states."""
     return sheng_walk_from[
         d=d,
+        cap=cap,
         masks=masks,
         flags=flags,
         s_at0=d.start_at_0,

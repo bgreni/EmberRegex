@@ -14,12 +14,13 @@ from emberregex.set_bitnfa import (
     bitnfa_u64_arr,
     build_bitnfa,
 )
+from emberregex.static_bytes import static_bytes
 from emberregex.set_dfa import (
     build_multi_dfa,
     mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
-    mdfa_table_arr,
+    mdfa_table_str,
 )
 from emberregex.set_nfa import build_union_nfa
 from emberregex.set_pike import set_pike_scan
@@ -142,7 +143,7 @@ def mdfa_direct_scan[
     """Mirror of the bench's phase-2 baseline helper."""
     comptime S = RegexSet[patterns]
     comptime MD = build_multi_dfa(S.nfa, S.nfa.can_use_dfa)
-    comptime T = mdfa_table_arr[MD.num_states * 256](MD)
+    comptime T = static_bytes[mdfa_table_str[MD.num_states * 256](MD)]()
     comptime P = mdfa_pool_arr[len(MD.pool)](MD)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
@@ -226,7 +227,10 @@ def _check_against_pike[
 ](input: String, label: String) raises -> List[SetMatch]:
     var db = RegexSet[patterns]()
     var got = db.scan(input)
-    var unfa = build_union_nfa(materialize[patterns]())
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     var expected = set_pike_scan(unfa, input.as_bytes())
     assert_equal(len(got), len(expected), label + ": count vs reference")
     for i in range(len(got)):

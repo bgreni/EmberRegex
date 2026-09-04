@@ -91,7 +91,10 @@ def _assert_matches_pike[
 ](data: List[Byte], label: String) raises:
     var db = RegexSet[patterns]()
     var got = db.scan(Span(data))
-    var unfa = build_union_nfa(materialize[patterns]())
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     var expected = set_pike_scan(unfa, Span(data))
     assert_reports(got, expected, label)
 

@@ -24,6 +24,8 @@ from .constants import (
     CHAR_DOT,
     CHAR_D_LOWER,
     CHAR_FF,
+    CHAR_BELL,
+    CHAR_BACKSPACE,
     CHAR_H_LOWER,
     CHAR_H_UPPER,
     CHAR_D_UPPER,
@@ -87,12 +89,19 @@ struct Parser[origin: Origin](Movable):
     var pos: Int
     var ast: AST
     var inline_flags: RegexFlags  # collected from (?i), (?m), (?s) in the pattern
+    var content_seen: Bool
+    """True once any real construct has been parsed. Bare global flag
+    groups like (?i) are only legal BEFORE any content (Python's rule) —
+    the old anywhere-goes reading applied them retroactively, which
+    matches no other engine. Comments (?#...) and other bare flag groups
+    do not count as content."""
 
     def __init__(out self, pattern: Span[Byte, Self.origin]):
         self.pattern = pattern
         self.pos = 0
         self.ast = AST()
         self.inline_flags = RegexFlags()
+        self.content_seen = False
 
     def parse(mut self) raises -> AST:
         """Parse the pattern and return the AST."""
@@ -181,7 +190,7 @@ struct Parser[origin: Origin](Movable):
         """quantified = atom ('*' | '+' | '?' | '{n,m}')?  '?'?"""
         var atom_idx = self._parse_atom()
 
-        self._skip_verbose()
+        self._skip_ws_and_comments()
 
         if self._at_end():
             return atom_idx
@@ -226,19 +235,44 @@ struct Parser[origin: Origin](Movable):
             ASTNode.quantifier(atom_idx, min_rep, max_rep, greedy)
         )
 
-    def _try_parse_repetition(mut self) raises -> Tuple[Bool, Int, Int]:
-        """Try to parse {n}, {n,}, {n,m}. Returns (success, min, max).
+    def _skip_ws_and_comments(mut self) raises:
+        """Skip verbose-mode whitespace and (?#...) comments between an
+        atom and its quantifier. Both are quantifier-transparent in
+        Python/PCRE/Perl: `a(?#c){3}` quantifies `a`, and `(?x)a (?#c)
+        {3}` interleaves the two. Comments consumed here emit no AST
+        node at all; comments elsewhere still parse via _parse_group."""
+        while True:
+            var before = self.pos
+            self._skip_verbose()
+            if (
+                self.pos + 2 < len(self.pattern)
+                and self._peek() == CHAR_LPAREN
+                and self.pattern.unsafe_get(self.pos + 1) == CHAR_QUESTION
+                and self.pattern.unsafe_get(self.pos + 2) == CHAR_HASH
+            ):
+                self.pos += 3
+                while not self._at_end() and self._peek() != CHAR_RPAREN:
+                    self.pos += 1
+                self._expect(CHAR_RPAREN)
+            if self.pos == before:
+                return
 
-        If parsing fails (not a valid repetition), restores position.
+    def _try_parse_repetition(mut self) raises -> Tuple[Bool, Int, Int]:
+        """Try to parse {n}, {n,}, {n,m}, {,m}, {,}. Returns (success, min, max).
+
+        A missing lower bound reads as 0 (Python 3.13 / PCRE2 10.43+ /
+        Perl 5.34+ semantics: `{,m}` is `{0,m}`, `{,}` is `{0,}`). If
+        parsing fails (not a valid repetition), restores position so the
+        braces stay literal text — `{}`, `a{`, `a{x}` all remain literals.
         """
         var save_pos = self.pos
         self.pos += 1  # consume '{'
 
-        if self._at_end() or not self._is_digit(self._peek()):
-            self.pos = save_pos
-            return (False, 0, 0)
-
-        var min_val = self._parse_int()
+        var saw_lower_digits = False
+        var min_val = 0
+        if not self._at_end() and self._is_digit(self._peek()):
+            min_val = self._parse_int()
+            saw_lower_digits = True
 
         if self._at_end():
             self.pos = save_pos
@@ -246,6 +280,10 @@ struct Parser[origin: Origin](Movable):
 
         var next_ch = self._peek()
         if next_ch == CHAR_RBRACE:
+            if not saw_lower_digits:
+                # bare "{}" — literal text
+                self.pos = save_pos
+                return (False, 0, 0)
             # {n} — exact
             self.pos += 1
             return (True, min_val, min_val)
@@ -332,6 +370,64 @@ struct Parser[origin: Origin](Movable):
                 )
         return value
 
+    def _parse_brace_hex(mut self) raises -> UInt32:
+        """PCRE's \\x{...}: one to six hex digits between braces. The
+        caller has consumed the '{'. Values > 0xFF need UTF-8 mode,
+        checked at the call sites (same gate as \\uHHHH)."""
+        var value: UInt32 = 0
+        var ndig = 0
+        while not self._at_end() and self._peek() != CHAR_RBRACE:
+            var ch = self._advance()
+            if ch >= CHAR_ZERO and ch <= CHAR_NINE:
+                value = value * 16 + UInt32(ch - CHAR_ZERO)
+            elif ch >= CHAR_A_LOWER and ch <= CHAR_F_LOWER:
+                value = value * 16 + UInt32(ch - CHAR_A_LOWER + 10)
+            elif ch >= CHAR_A_UPPER and ch <= CHAR_F_UPPER:
+                value = value * 16 + UInt32(ch - CHAR_A_UPPER + 10)
+            else:
+                raise Error(
+                    String(
+                        RegexError(
+                            "Invalid hex digit in \\x{...}", self.pos - 1
+                        )
+                    )
+                )
+            ndig += 1
+            if ndig > 6:
+                raise Error(
+                    String(RegexError("\\x{...} escape too long", self.pos))
+                )
+        if ndig == 0:
+            raise Error(
+                String(RegexError("Empty \\x{...} escape", self.pos))
+            )
+        self._expect(CHAR_RBRACE)
+        if value > 0x10FFFF:
+            raise Error(
+                String(
+                    RegexError(
+                        "\\x{...} value above U+10FFFF", self.pos - 1
+                    )
+                )
+            )
+        return value
+
+    def _check_needs_unicode(mut self, cp: UInt32, at: Int) raises:
+        """Codepoints above U+00FF only have a byte-level meaning in
+        UTF-8 mode — shared gate for \\u, \\U and \\x{...}."""
+        if cp > 255 and not self.inline_flags.unicode():
+            raise Error(
+                String(
+                    RegexError(
+                        (
+                            "Unicode code point > U+00FF needs UTF-8 mode"
+                            " — prefix the pattern with (?u) or (*UTF8)"
+                        ),
+                        at,
+                    )
+                )
+            )
+
     def _skip_verbose(mut self):
         """Skip whitespace and # comments when verbose mode is active."""
         if not self.inline_flags.verbose():
@@ -347,7 +443,11 @@ struct Parser[origin: Origin](Movable):
                 or ch == CHAR_TAB
                 or ch == CHAR_NEWLINE
                 or ch == CHAR_CR
+                or ch == CHAR_VTAB
+                or ch == CHAR_FF
             ):
+                # Python/PCRE strip ALL whitespace in verbose mode,
+                # vertical tab and form feed included.
                 self.pos += 1
             else:
                 break
@@ -361,6 +461,10 @@ struct Parser[origin: Origin](Movable):
             )
 
         var ch = self._peek()
+        if ch != CHAR_LPAREN:
+            # Any non-group atom is content; groups decide for themselves
+            # in _parse_group (comments and bare flag groups don't count).
+            self.content_seen = True
         if ch == CHAR_DOT:
             self.pos += 1
             return self.ast.add_node(ASTNode.dot())
@@ -465,6 +569,8 @@ struct Parser[origin: Origin](Movable):
         """
         self.pos += 1  # consume '('
 
+        var was_content_seen = self.content_seen
+        self.content_seen = True
         var group_index = -1  # -1 = non-capturing by default
 
         # Check for group modifiers
@@ -482,7 +588,9 @@ struct Parser[origin: Origin](Movable):
             if modifier == CHAR_HASH:
                 # (?# comment) — consumed and contributes nothing. An
                 # empty CONCAT is what the NFA builder turns into
-                # epsilon, so the comment disappears entirely.
+                # epsilon, so the comment disappears entirely. Comments
+                # are not content for the global-flag position rule.
+                self.content_seen = was_content_seen
                 self.pos += 1  # consume '#'
                 while not self._at_end() and self._peek() != CHAR_RPAREN:
                     self.pos += 1
@@ -552,7 +660,24 @@ struct Parser[origin: Origin](Movable):
                 # Inline flags: (?i), (?m), (?s), (?x), (?i-m), (?-i), etc.
                 var add_flags, remove_flags = self._parse_inline_flags()
                 if not self._at_end() and self._peek() == CHAR_RPAREN:
-                    # (?flags) or (?-flags) — apply globally
+                    # (?flags) or (?-flags) — apply globally. Only legal
+                    # before any content: applying retroactively matches
+                    # no engine (Python/JS reject; PCRE/Perl/Ruby/Rust
+                    # apply rightward only). Use (?flags:...) to scope.
+                    if was_content_seen:
+                        raise Error(
+                            String(
+                                RegexError(
+                                    (
+                                        "global flags not at the start of"
+                                        " the pattern — use (?flags:...)"
+                                        " to scope flags to part of it"
+                                    ),
+                                    self.pos,
+                                )
+                            )
+                        )
+                    self.content_seen = was_content_seen
                     self.pos += 1  # consume ')'
                     self.inline_flags = RegexFlags(
                         (self.inline_flags.value | add_flags.value)
@@ -754,9 +879,45 @@ struct Parser[origin: Origin](Movable):
                 ndig += 1
             return self.ast.add_node(ASTNode.literal(cp))
 
-        # Backreferences \1 through \9
+        # Digit escapes, Python's rule: exactly three octal digits form
+        # an octal character escape (\101 is 'A'); otherwise one or two
+        # digits form a backreference (\12 is group 12), which must
+        # exist.
         if ch >= CHAR_ONE and ch <= CHAR_NINE:
-            var group_index = Int(ch - CHAR_ZERO)
+            var d1 = Int(ch - CHAR_ZERO)
+            # Peek at the following digits without consuming.
+            var n_following = 0
+            while (
+                n_following < 2
+                and self.pos + n_following < len(self.pattern)
+                and Self._is_digit(
+                    self.pattern.unsafe_get(self.pos + n_following)
+                )
+            ):
+                n_following += 1
+            if n_following == 2 and ch <= CHAR_SEVEN:
+                var d2 = Int(self.pattern.unsafe_get(self.pos) - CHAR_ZERO)
+                var d3 = Int(self.pattern.unsafe_get(self.pos + 1) - CHAR_ZERO)
+                if d2 <= 7 and d3 <= 7:
+                    var val = d1 * 64 + d2 * 8 + d3
+                    if val > 255:
+                        raise Error(
+                            String(
+                                RegexError(
+                                    "Octal escape outside 0-\\377",
+                                    self.pos - 2,
+                                )
+                            )
+                        )
+                    self.pos += 2
+                    return self.ast.add_node(ASTNode.literal(UInt32(val)))
+            var group_index = d1
+            if n_following >= 1:
+                # Python consumes both digits: \12 is group 12 (or an
+                # error), never group 1 followed by a literal '2'.
+                var d2 = Int(self.pattern.unsafe_get(self.pos) - CHAR_ZERO)
+                self.pos += 1
+                group_index = d1 * 10 + d2
             if group_index > self.ast.group_count:
                 raise Error(
                     String(
@@ -804,8 +965,13 @@ struct Parser[origin: Origin](Movable):
                 )
             )
 
-        # Hex escape: \xHH
+        # Hex escapes: \xHH, or PCRE's \x{...}
         if ch == CHAR_X_LOWER:
+            if not self._at_end() and self._peek() == CHAR_LBRACE:
+                self.pos += 1  # consume '{'
+                var bcp = self._parse_brace_hex()
+                self._check_needs_unicode(bcp, self.pos - 1)
+                return self.ast.add_node(ASTNode.literal(bcp))
             var cp = self._parse_hex_digits(2)
             return self.ast.add_node(ASTNode.literal(cp))
 
@@ -841,7 +1007,9 @@ struct Parser[origin: Origin](Movable):
                 )
             return self.ast.add_node(ASTNode.literal(cp))
 
-        # Control character: \cX  (value = X & 0x1F)
+        # Control character: \cX — PCRE/Perl formula: uppercase X, then
+        # XOR 0x40 (identical to & 0x1F for letters, differs for
+        # punctuation: \c{ is ';', \c; is '{').
         if ch == CHAR_C_LOWER:
             if self._at_end():
                 raise Error(
@@ -849,9 +1017,10 @@ struct Parser[origin: Origin](Movable):
                         RegexError("Expected character after \\c", self.pos - 1)
                     )
                 )
-            var ctrl = self._advance()
-            var cp = UInt32(ctrl) & 0x1F
-            return self.ast.add_node(ASTNode.literal(cp))
+            var ctrl = Int(self._advance())
+            if ctrl >= 97 and ctrl <= 122:
+                ctrl -= 32
+            return self.ast.add_node(ASTNode.literal(UInt32(ctrl ^ 0x40)))
 
         # Unicode properties: \p{L}, \P{Nd}, \p{Greek}. The ranges are
         # CODEPOINT ranges; UTF-8 mode compiles them to byte sequences,
@@ -876,10 +1045,19 @@ struct Parser[origin: Origin](Movable):
                 )
             if negated_prop:
                 pranges = negate_ranges(pranges)
+            # Appending to `ranges` directly rather than through
+            # `add_range`: that is a `mut self` method, and the comptime
+            # interpreter copies the aggregate across every call — over
+            # the 684 ranges of `\p{L}` (934 of `\p{Word}`) that is a
+            # quadratic ~470k scalar copies for what is 684 appends.
+            # `add_range` does nothing else but clear `bitmap_valid`,
+            # which `build_bitmap` sets again below.
             var pcs = CharSet()
             for i in range(len(pranges) // 2):
-                pcs.add_range(
-                    UInt32(pranges[2 * i]), UInt32(pranges[2 * i + 1])
+                pcs.ranges.append(
+                    CharRange(
+                        UInt32(pranges[2 * i]), UInt32(pranges[2 * i + 1])
+                    )
                 )
             pcs.build_bitmap()
             var pidx = self.ast.add_charset(pcs^)
@@ -918,6 +1096,10 @@ struct Parser[origin: Origin](Movable):
             return self.ast.add_node(ASTNode.literal(UInt32(CHAR_NEWLINE)))
         elif ch == CHAR_r:
             return self.ast.add_node(ASTNode.literal(UInt32(CHAR_CR)))
+        elif ch == CHAR_F_LOWER:
+            return self.ast.add_node(ASTNode.literal(UInt32(CHAR_FF)))
+        elif ch == CHAR_A_LOWER:
+            return self.ast.add_node(ASTNode.literal(UInt32(CHAR_BELL)))
 
         # Metacharacter escapes
         if (
@@ -998,14 +1180,46 @@ struct Parser[origin: Origin](Movable):
             return UInt32(CHAR_NEWLINE)
         elif esc == CHAR_r:
             return UInt32(CHAR_CR)
-        # NOTE: charset context deliberately does NOT consume octal
-        # digits after \0 (atom-level \012 is LF; [\012] stays
-        # {NUL,'1','2'}). Aligning this with the atom path (and
-        # Python) is a known open item — do not "fix" the atom path
-        # to match this one.
-        elif esc == CHAR_ZERO:
-            return 0
+        # Control escapes every engine agrees on: in a class \b is
+        # BACKSPACE (not a word boundary), \f is form feed, \a is bell.
+        elif esc == CHAR_B_LOWER:
+            return UInt32(CHAR_BACKSPACE)
+        elif esc == CHAR_F_LOWER:
+            return UInt32(CHAR_FF)
+        elif esc == CHAR_A_LOWER:
+            return UInt32(CHAR_BELL)
+        # Python's in-class rule: ALL numeric escapes are octal
+        # characters ([\101] is 'A', [\40] is ' ', [\012] is LF); \8
+        # and \9 fall through to the bad-escape rejection below. This
+        # resolves the old deliberately-unaligned reading that kept
+        # [\012] as {NUL,'1','2'}.
+        elif esc >= CHAR_ZERO and esc <= CHAR_SEVEN:
+            var ocp = UInt32(esc - CHAR_ZERO)
+            var ndig = 1
+            while (
+                ndig < 3
+                and not self._at_end()
+                and self._peek() >= CHAR_ZERO
+                and self._peek() <= CHAR_SEVEN
+            ):
+                ocp = (ocp << 3) | UInt32(self._advance() - CHAR_ZERO)
+                ndig += 1
+            if ocp > 255:
+                raise Error(
+                    String(
+                        RegexError(
+                            "Octal escape outside 0-\\377 in character class",
+                            self.pos - 1,
+                        )
+                    )
+                )
+            return ocp
         elif esc == CHAR_X_LOWER:
+            if not self._at_end() and self._peek() == CHAR_LBRACE:
+                self.pos += 1  # consume '{'
+                var bcp = self._parse_brace_hex()
+                self._check_needs_unicode(bcp, self.pos - 1)
+                return bcp
             return self._parse_hex_digits(2)
         elif esc == CHAR_U_LOWER:
             var cp = self._parse_hex_digits(4)
@@ -1038,14 +1252,36 @@ struct Parser[origin: Origin](Movable):
                 )
             return cp
         elif esc == CHAR_C_LOWER:
+            # Same PCRE/Perl formula as the atom path: uppercase, XOR 0x40.
             if self._at_end():
                 raise Error(
                     String(
                         RegexError("Expected character after \\c", self.pos - 1)
                     )
                 )
-            return UInt32(self._advance()) & 0x1F
-        # Any other escaped char is taken literally (metacharacter or letter)
+            var ctrl = Int(self._advance())
+            if ctrl >= 97 and ctrl <= 122:
+                ctrl -= 32
+            return UInt32(ctrl ^ 0x40)
+        # Python's rule: an escaped ASCII letter or digit that is not a
+        # recognized escape is an ERROR ([\p{L}] silently becoming the
+        # literal set {p,{,L,}} was worse than a rejection). Escaped
+        # punctuation stays literal ([\-], [\]], [\^], ...).
+        if (
+            (esc >= CHAR_A_LOWER and esc <= CHAR_Z_LOWER)
+            or (esc >= CHAR_A_UPPER and esc <= CHAR_Z_UPPER)
+            or (esc >= CHAR_ZERO and esc <= CHAR_NINE)
+        ):
+            raise Error(
+                String(
+                    RegexError(
+                        "Invalid escape sequence '\\"
+                        + chr(Int(esc))
+                        + "' in character class",
+                        self.pos - 2,
+                    )
+                )
+            )
         return UInt32(esc)
 
     @staticmethod
@@ -1094,6 +1330,8 @@ struct Parser[origin: Origin](Movable):
             cs.add_range(32, 126)
         elif name == "graph":
             cs.add_range(33, 126)
+        elif name == "ascii":
+            cs.add_range(0, 127)
         else:
             return False
         return True
@@ -1183,9 +1421,17 @@ struct Parser[origin: Origin](Movable):
                     cs.add_range(UInt32(CHAR_ZERO), UInt32(CHAR_NINE))
                     continue
                 elif esc == CHAR_D_UPPER:
+                    # The negated shorthands complement over EVERY
+                    # codepoint (0x10FFFF), exactly like their atom-level
+                    # forms, which go through `CharSet.negate()` and are
+                    # complemented by the NFA builder: under (?u) `[\D]`
+                    # must accept α. Byte mode is unaffected — the bitmap
+                    # clamps at 255 (see the byte-mode DOTALL class).
+                    # A whole-class `negate()` cannot be used here: the
+                    # class may mix positive and negated members.
                     self.pos += 2
                     cs.add_range(0, UInt32(CHAR_ZERO) - 1)
-                    cs.add_range(UInt32(CHAR_NINE) + 1, 255)
+                    cs.add_range(UInt32(CHAR_NINE) + 1, 0x10FFFF)
                     continue
                 elif esc == CHAR_W_LOWER:
                     self.pos += 2
@@ -1202,7 +1448,7 @@ struct Parser[origin: Origin](Movable):
                     cs.add_range(58, 64)
                     cs.add_range(91, 94)
                     cs.add_range(96, 96)
-                    cs.add_range(123, 255)
+                    cs.add_range(123, 0x10FFFF)
                     continue
                 elif esc == CHAR_S_LOWER:
                     self.pos += 2
@@ -1217,7 +1463,29 @@ struct Parser[origin: Origin](Movable):
                     self.pos += 2
                     cs.add_range(0, 8)
                     cs.add_range(14, 31)
-                    cs.add_range(33, 255)
+                    cs.add_range(33, 0x10FFFF)
+                    continue
+                elif esc == CHAR_H_LOWER:
+                    # \h in a class is the same horizontal-whitespace
+                    # class as at atom level (PCRE), not a literal 'h'.
+                    self.pos += 2
+                    cs.add_range(UInt32(CHAR_TAB), UInt32(CHAR_TAB))
+                    cs.add_range(UInt32(CHAR_SPACE), UInt32(CHAR_SPACE))
+                    continue
+                elif esc == CHAR_H_UPPER:
+                    self.pos += 2
+                    cs.add_range(0, 8)
+                    cs.add_range(10, 31)
+                    cs.add_range(33, 0x10FFFF)
+                    continue
+                elif esc == CHAR_V_LOWER:
+                    self.pos += 2
+                    cs.add_range(0x0A, 0x0D)
+                    continue
+                elif esc == CHAR_V_UPPER:
+                    self.pos += 2
+                    cs.add_range(0, 9)
+                    cs.add_range(14, 0x10FFFF)
                     continue
 
             # Single code-point (literal or single-char escape)
@@ -1245,6 +1513,10 @@ struct Parser[origin: Origin](Movable):
                         or esc == CHAR_W_UPPER
                         or esc == CHAR_S_LOWER
                         or esc == CHAR_S
+                        or esc == CHAR_H_LOWER
+                        or esc == CHAR_H_UPPER
+                        or esc == CHAR_V_LOWER
+                        or esc == CHAR_V_UPPER
                     ):
                         raise Error(
                             String(

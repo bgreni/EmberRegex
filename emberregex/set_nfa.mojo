@@ -93,6 +93,14 @@ def matches_empty_buffer(nfa: NFA, start: Int) -> Bool:
     return False
 
 
+def _union_any_unicode(nfa: NFA) -> Bool:
+    """Comptime: does any pattern in this union use UTF-8 mode?"""
+    for i in range(len(nfa.pattern_unicode)):
+        if nfa.pattern_unicode[i]:
+            return True
+    return False
+
+
 def build_union_nfa(
     patterns: List[String],
     allow_empty: Bool = False,
@@ -140,6 +148,7 @@ def build_union_subset_nfa(
 
     var nfa = NFA()
     nfa.group_count = 0
+    nfa.pattern_unicode = List[Bool](length=len(patterns), fill=False)
     var starts = List[Int]()
     var confirm = List[Int]()
 
@@ -152,6 +161,7 @@ def build_union_subset_nfa(
             confirm.append(i)
         _demote_captures(ast)
         var flags = ast.flags
+        nfa.pattern_unicode[i] = flags.unicode()
 
         # Approximate matching replaces the pattern's automaton wholesale
         # (set_approx.mojo), so it is built standalone and spliced rather

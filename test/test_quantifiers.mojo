@@ -229,5 +229,30 @@ def test_escape_backslash() raises:
     assert_false(re.match("ab").matched)
 
 
+def test_comma_first_bounded_repetition() raises:
+    # Python 3.13 / PCRE2 10.43+ / Perl 5.34+ / Ruby: {,n} means {0,n}.
+    var re = Regex["x{,2}y"]()
+    assert_true(re.match("xy").matched)
+    assert_true(re.match("y").matched)
+    assert_true(re.match("xxy").matched)
+    assert_false(re.match("xxxy").matched)
+    # It is a quantifier even when the input contains the literal text:
+    # only the trailing 'y' (zero x's) matches — Python span (5, 6).
+    var m = re.search("x{,2}y")
+    assert_true(m.matched)
+    assert_equal(m.start, 5)
+    assert_equal(m.end, 6)
+
+
+def test_comma_only_repetition_is_unbounded() raises:
+    # Python 3.13: {,} means {0,} — a{,}B on 'Xa{,}BB' matches 'B' at (5,6).
+    var re = Regex["a{,}B"]()
+    var m = re.search("Xa{,}BB")
+    assert_true(m.matched)
+    assert_equal(m.start, 5)
+    assert_equal(m.end, 6)
+    assert_true(re.match("aaaB").matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

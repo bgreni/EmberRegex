@@ -13,6 +13,7 @@ shapes engine selection leaves on the backtracker.
 """
 
 from emberregex import Regex
+from emberregex.static_bytes import static_bytes
 from emberregex.static_dfa import (
     EDFA_MATCH_IF_NONWORD,
     EDFA_MATCH_IF_WORD,
@@ -24,14 +25,14 @@ from emberregex.static_dfa import (
     edfa_full_match,
     edfa_id_dtype,
     edfa_match_at,
-    edfa_table_arr,
+    edfa_table_str,
 )
 from emberregex.static_lfdfa import LFDFA, build_lf_dfa, lfdfa_find_end
 from emberregex.static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
     rdfa_flags_arr,
-    rdfa_table_arr,
+    rdfa_table_str,
 )
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -238,19 +239,19 @@ def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     comptime assert ed.valid
     comptime ETN = ed.num_states * 256
     comptime EDT = edfa_id_dtype(ed.num_states)
-    comptime etbl = edfa_table_arr[ETN, EDT](ed)
+    comptime etbl = static_bytes[edfa_table_str[ETN, EDT](ed)]()
     comptime efl = edfa_flags_arr[ed.num_states](ed)
     comptime lf = build_lf_dfa(nfa, True)
     comptime assert lf.valid
     comptime LTN = lf.d.num_states * 256
     comptime LDT = edfa_id_dtype(lf.d.num_states)
-    comptime ltbl = edfa_table_arr[LTN, LDT](lf.d)
+    comptime ltbl = static_bytes[edfa_table_str[LTN, LDT](lf.d)]()
     comptime lfl = edfa_flags_arr[lf.d.num_states](lf.d)
     comptime rd = build_reverse_dfa(nfa, True)
     comptime assert rd.valid
     comptime RTN = rd.num_states * 256
     comptime RDT = edfa_id_dtype(rd.num_states)
-    comptime rtbl = rdfa_table_arr[RTN, RDT](rd)
+    comptime rtbl = static_bytes[rdfa_table_str[RTN, RDT](rd)]()
     comptime rfl = rdfa_flags_arr[rd.num_states](rd)
 
     var re = Regex[p]()

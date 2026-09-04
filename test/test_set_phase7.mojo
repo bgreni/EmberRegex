@@ -173,6 +173,28 @@ def test_backref_is_exact_not_a_superset() raises:
     )
 
 
+def test_backref_confirm_is_exact_past_the_stack_bound() raises:
+    # The widened superset `(x|y)(?:ab|c)+(?:x|y)` matches "x(ab)^n y";
+    # the exact pattern does not (`\1` is "x"). Confirming the candidate
+    # walks `(?:ab|c)+` — a general loop, one frame per iteration — over
+    # 100k iterations, past SBT_STACK_BUDGET in any build. The confirm
+    # used to KEEP the candidate on exhaustion (superset semantics: a
+    # false report). A backreference confirm is now exact, like the
+    # single-pattern lane: unbudgeted, and continued on the heap-stack
+    # backtracker when the stack guard trips. Lookaround-only confirms
+    # keep the keep-on-exhaustion policy.
+    comptime S = RegexSet[["(x|y)(?:ab|c)+\\1"]]
+    comptime n_confirm = len(S._confirm_ids)
+    assert_equal(n_confirm, 1)
+    var db = RegexSet[["(x|y)(?:ab|c)+\\1"]]()
+    var body = String("ab") * 100000
+    assert_equal(len(db.scan(String("x") + body + "y")), 0)
+    var hit = db.scan(String("x") + body + "x")
+    assert_equal(len(hit), 1)
+    assert_equal(hit[0].id, 0)
+    assert_equal(hit[0].end, 200002)
+
+
 def test_backref_multi_byte_group() raises:
     var db = RegexSet[["(ab)\\1", "xy"]]()
     assert_reports(

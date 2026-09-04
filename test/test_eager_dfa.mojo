@@ -7,11 +7,21 @@ regression can't hide behind the identical-semantics lazy path.
 
 from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
+from emberregex.constants import CHAR_NEWLINE
+from emberregex.engine import _build_static_nfa
+from emberregex.nfa import NFA
 from emberregex.static_dfa import (
     EDFA_DEAD,
     EDFA_STATE_CAP,
     EagerDFA,
+    WB_PENDING,
     _MIN_CAP,
+    _StateBits,
+    _bs_eq,
+    _byte_classes,
+    _closure_pool,
+    _flat_closure,
+    _flatten_nfa,
     _minimize,
     build_eager_dfa,
     edfa_id_dtype,
@@ -22,14 +32,15 @@ from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
 def _table_roundtrips[
-    n: Int, dt: DType, //
-](d: EagerDFA, arr: InlineArray[Scalar[dt], n]) -> Bool:
+    n: Int, dt: DType
+](d: EagerDFA, lit: StringLiteral) -> Bool:
     """Comptime: every materialized cell reads back as the comptime cell.
 
     Both directions matter: a live id must not wrap in the narrowed type,
     and a dead cell must still read back as EDFA_DEAD so the walkers'
     `next < 0` test keeps working.
     """
+    var arr = lit.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     for i in range(n):
         var want = d.table[i]
         if Int(arr[i]) != want:
@@ -78,7 +89,9 @@ def test_table_dead_sentinel_roundtrip() raises:
     # and dead cells stay EDFA_DEAD.
     comptime S = Regex["[a-z]{5,10}[0-9]{3,5}"]
     assert_true(S._strategy.use_eager_dfa)
-    comptime ok = _table_roundtrips(S._edfa, S._EDFA_TABLE)
+    comptime ok = _table_roundtrips[S._EDFA_TN, S._EDFA_DT](
+        S._edfa, S._EDFA_TABLE
+    )
     assert_true(ok)
     # And through the walkers: a dead transition mid-input must still end
     # the walk at the last match rather than run on.
@@ -349,9 +362,9 @@ def test_eol_continuation_crossing_bol_leaves_dfa_lane() raises:
     # A BOL anchor after an EOL depends on the PRECEDING byte, which the
     # per-state flag byte cannot carry — so the pattern must leave the
     # DFA lanes rather than be resolved by guesswork.
-    comptime S = Regex["(?:a\nx|b)$(?m)^"]
+    comptime S = Regex["(?m)(?:a\nx|b)$^"]
     assert_false(S._strategy.use_dfa)
-    var re = Regex["(?:a\nx|b)$(?m)^"]()
+    var re = Regex["(?m)(?:a\nx|b)$^"]()
     assert_false(re.search("a\nxy").matched)
 
 
@@ -587,6 +600,77 @@ def test_differential_table_walk_big_merge() raises:
     # is the one pattern here that walks the eager TABLE rather than the
     # shuffle engine.
     _differential[ALT31](_ALPHA_ANIMALS, "p21")
+
+
+
+
+def _pool_parity_impl(nfa: NFA) -> Bool:
+    """Comptime: `_closure_pool` agrees with a per-target `_flat_closure`
+    DFS for EVERY state, in both `after_newline` variants."""
+    var class_of = List[Int](fill=-1, length=256)
+    var reps = _byte_classes(nfa, class_of)
+    var nclasses = len(reps)
+    var nl_class = class_of[Int(CHAR_NEWLINE)]
+    var kinds = List[Int]()
+    var out1s = List[Int]()
+    var out2s = List[Int]()
+    var anchors = List[Int]()
+    var cls_mask = List[SIMD[DType.uint64, 4]]()
+    var consuming_bits = _StateBits(0)
+    var match_bits = _StateBits(0)
+    var eol_bits = _StateBits(0)
+    var has_bol_ml = False
+    _flatten_nfa(
+        nfa,
+        class_of,
+        nclasses,
+        nl_class,
+        kinds,
+        out1s,
+        out2s,
+        anchors,
+        cls_mask,
+        consuming_bits,
+        match_bits,
+        eol_bits,
+        has_bol_ml,
+    )
+    var n = len(kinds)
+    var pool_o = _closure_pool(kinds, out1s, out2s, anchors, False)
+    var pool_n = _closure_pool(kinds, out1s, out2s, anchors, True)
+    for s in range(n):
+        var ref_o = _flat_closure(
+            kinds, out1s, out2s, anchors, s, False, False, WB_PENDING
+        )
+        var ref_n = _flat_closure(
+            kinds, out1s, out2s, anchors, s, False, True, WB_PENDING
+        )
+        if not _bs_eq(pool_o.unsafe_get(s), ref_o):
+            return False
+        if not _bs_eq(pool_n.unsafe_get(s), ref_n):
+            return False
+    return True
+
+
+def _assert_pool_parity[pattern: String]() raises:
+    comptime ok = _pool_parity_impl(_build_static_nfa(pattern))
+    assert_true(ok, "closure pool diverges from per-target DFS: " + pattern)
+
+
+def test_closure_pool_parity() raises:
+    # Counted ladder (the shape the pool exists for), cyclic splits,
+    # alternations, SAVE states, multiline anchors, EOL pendings, word
+    # boundaries, lazy loops, and a UTF-8 trie with a loop back.
+    _assert_pool_parity["a{1,30}b"]()
+    _assert_pool_parity["(?:ab)+c"]()
+    _assert_pool_parity["(a|b|c)d"]()
+    _assert_pool_parity["(a)(b)+c?"]()
+    _assert_pool_parity["(?m)^ab|cd$"]()
+    _assert_pool_parity["a+$"]()
+    _assert_pool_parity["\\ba+\\b"]()
+    _assert_pool_parity["<.*?>"]()
+    _assert_pool_parity["(?:a*)*b"]()
+    _assert_pool_parity["(?u)[α-ω]+x"]()
 
 
 def main() raises:

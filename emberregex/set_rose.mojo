@@ -98,6 +98,7 @@ from .simd_kernels import (
     nibble_lookup,
 )
 from .simd_scan import clear_first_lane, first_lane_index, lane_bits
+from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
@@ -1152,11 +1153,21 @@ def build_rose(
 
         var slot = len(covered)
         var base = len(conf_flags)
+        # Rows re-based as 256-lane vectors: one load, one select, one
+        # store per state instead of 256 List reads + appends.
+        var off = len(conf_table)
+        conf_table.resize(off + edfa.num_states * 256, -1)
+        var zero = SIMD[DType.int64, 256](0)
+        var basev = SIMD[DType.int64, 256](base)
+        var deadv = SIMD[DType.int64, 256](-1)
         for s in range(edfa.num_states):
             conf_flags.append(edfa.flags[s])
-            for b in range(256):
-                var t = edfa.table[s * 256 + b]
-                conf_table.append(base + t if t >= 0 else -1)
+            var row = Pointer(to=edfa.table[s * 256]).unsafe_bitcast[
+                Int64
+            ]().unsafe_load[width=256]()
+            Pointer(to=conf_table[off + s * 256]).unsafe_bitcast[
+                Int64
+            ]().unsafe_store(row.ge(zero).select(row + basev, deadv))
         starts0.append(base + edfa.start_at_0)
         starts_nl.append(base + edfa.start_after_nl)
         starts_other.append(base + edfa.start_other)
@@ -1228,11 +1239,10 @@ def build_rose(
 # --- Comptime materialization helpers ---------------------------------------
 
 
-def rose_table_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=-1)
-    for i in range(n):
-        arr[i] = Int32(r.conf_table[i])
-    return arr^
+def rose_table_str[n: Int](r: RoseSet) -> String:
+    """The concatenated confirm tables as `n` little-endian Int32
+    entries; see static_bytes.mojo for why a string."""
+    return table_bytes[DType.int32](r.conf_table, n)
 
 
 def rose_flags_arr[n: Int](r: RoseSet) -> InlineArray[UInt8, n]:
@@ -1369,14 +1379,13 @@ def _look_ok[
 @always_inline
 def _rose_walk[
     origin: Origin,
-    tn: Int,
     fn_: Int,
     mn: Int,
     ln: Int,
     bn: Int,
     //,
     r: RoseView,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, fn_],
     meta: InlineArray[Int32, mn],
     lits: InlineArray[Int32, ln],
@@ -1397,7 +1406,7 @@ def _rose_walk[
     which is what keeps per-candidate cost near the match length.
     """
     # Comptime arrays bound to the binary's constant data (no copy).
-    var tbl = materialize[table]()
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
     var flg = materialize[flags]()
     var cur = start_state
     var pos = start_pos
@@ -1412,7 +1421,7 @@ def _rose_walk[
                 and (flg.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
             ):
                 out.append(SetMatch(pid, pos))
-        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(b)))
+        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
         if nxt < 0:
             return  # died mid-input: EOL-at-end flags cannot apply
         cur = nxt
@@ -1427,14 +1436,13 @@ def _rose_walk[
 @always_inline
 def _rose_confirm[
     origin: Origin,
-    tn: Int,
     fn_: Int,
     mn: Int,
     ln: Int,
     bn: Int,
     //,
     r: RoseView,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, fn_],
     meta: InlineArray[Int32, mn],
     lits: InlineArray[Int32, ln],
@@ -1468,7 +1476,6 @@ def _rose_confirm[
 @always_inline
 def _rose_verify_at[
     origin: Origin,
-    tn: Int,
     fn_: Int,
     mn: Int,
     ln: Int,
@@ -1476,7 +1483,7 @@ def _rose_verify_at[
     kn: Int,
     //,
     r: RoseView,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, fn_],
     meta: InlineArray[Int32, mn],
     lits: InlineArray[Int32, ln],
@@ -1579,9 +1586,14 @@ def _rose_verify_at[
                             ](input, at - off, out)
 
 
+# `@always_inline` for the same reason as `mdfa_scan`: `r` is a
+# List-carrying value parameter and `table` a string literal, and an
+# out-of-line instantiation prints both into its symbol name (160 KB for
+# the bench's Rose sets; macOS ld asserts past its maximum). Inlined, no
+# symbol is emitted; each caller has exactly one call.
+@always_inline
 def rose_scan[
     origin: Origin,
-    tn: Int,
     fn_: Int,
     mn: Int,
     ln: Int,
@@ -1589,7 +1601,7 @@ def rose_scan[
     kn: Int,
     //,
     r: RoseView,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, fn_],
     meta: InlineArray[Int32, mn],
     lits: InlineArray[Int32, ln],

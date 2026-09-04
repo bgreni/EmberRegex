@@ -14,3 +14,4 @@ comparisons/bench_hyperscan
 FEATURES.md
 *.conda
 docs/superpowers
+.test_cache/

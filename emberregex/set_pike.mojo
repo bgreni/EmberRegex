@@ -236,6 +236,15 @@ def set_pike_som_scan[
         current_som = next_som^
         next_som = tmp2^
         pos += 1
+        if _mid_codepoint(nfa, input, pos):
+            var kept = List[Int]()
+            var kept_som = List[Int]()
+            for i in range(len(ids)):
+                if _keep_id_at(nfa, ids[i]):
+                    kept.append(ids[i])
+                    kept_som.append(id_som[i])
+            ids = kept^
+            id_som = kept_som^
         _flush_spans(ids, id_som, pos, out)
 
     return out^
@@ -319,6 +328,64 @@ def _set_add_state[
             # Consuming state (CHAR, CHARSET, ANY)
             state_list.append(idx)
             return
+
+
+@always_inline
+def utf8_mid_codepoint[
+    origin: Origin, //
+](input: Span[Byte, origin], end: Int) -> Bool:
+    """True when byte offset `end` falls strictly INSIDE a well-formed
+    multi-byte UTF-8 sequence: `input[end]` is a continuation byte AND a
+    lead byte within the previous three bytes spans it.
+
+    The one rule shared by the set engine's post-filter (`_scan_raw`)
+    and the tagged Pike oracle, so the two can only agree. It is a
+    boundary test, not a "next byte is a continuation byte" test: on
+    invalid input a STRAY continuation byte after a complete sequence
+    ("A" then 0x80) does not make offset 1 mid-codepoint — a (?u)
+    pattern's non-empty match "A" ends there and is real (Rust
+    regex::bytes and the single-pattern lane both report it). Offset 0
+    and the end of input are always boundaries."""
+    if end <= 0 or end >= len(input):
+        return False
+    if (Int(input.unsafe_get(end)) & 0xC0) != 0x80:
+        return False
+    var k = 1
+    while k <= 3 and end - k >= 0:
+        var b = Int(input.unsafe_get(end - k))
+        if (b & 0xC0) != 0x80:
+            # The nearest non-continuation byte: a lead byte covers the
+            # `need - 1` bytes after it, so it spans `end` iff k < need.
+            # ASCII and invalid leads (0x80..0xBF handled above, 0xF8+)
+            # cover nothing.
+            var need = 1
+            if (b & 0xE0) == 0xC0:
+                need = 2
+            elif (b & 0xF0) == 0xE0:
+                need = 3
+            elif (b & 0xF8) == 0xF0:
+                need = 4
+            return k < need
+        k += 1
+    return False
+
+
+@always_inline
+def _mid_codepoint[
+    origin: Origin, //
+](nfa: NFA, input: Span[Byte, origin], end: Int) -> Bool:
+    """True when a UTF-8-mode gate applies at `end`: the set carries
+    unicode patterns and `end` is mid-codepoint (`utf8_mid_codepoint`).
+    No engine (PCRE2/utf, Hyperscan, Python, Rust) ever reports a
+    mid-codepoint offset; byte-mode ids in a mixed set stay untouched."""
+    if len(nfa.pattern_unicode) == 0:
+        return False
+    return utf8_mid_codepoint(input, end)
+
+
+@always_inline
+def _keep_id_at(nfa: NFA, id: Int) -> Bool:
+    return id >= len(nfa.pattern_unicode) or not nfa.pattern_unicode[id]
 
 
 def _flush_reports(mut ids: List[Int], end: Int, mut out: List[SetMatch]):
@@ -428,6 +495,12 @@ def set_pike_scan[
         current = next_states^
         next_states = tmp^
         pos += 1
+        if _mid_codepoint(nfa, input, pos):
+            var kept = List[Int]()
+            for i in range(len(ids)):
+                if _keep_id_at(nfa, ids[i]):
+                    kept.append(ids[i])
+            ids = kept^
         _flush_reports(ids, pos, out)
 
     return out^

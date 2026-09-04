@@ -89,6 +89,7 @@ from .ast import AnchorKind
 from .backtrack import _sbt_is_simple_body
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind, split_cycle_flags
+from .static_bytes import filled_string
 from .static_dfa import (
     EDFA_NFA_CAP,
     EDFA_TABLE_MIN_BYTES,
@@ -226,7 +227,7 @@ def _op_loop_has_alternation(nfa: NFA, body: Int, split_idx: Int) -> Bool:
     return False
 
 
-def onepass_shape(nfa: NFA) -> Bool:
+def onepass_shape(nfa: NFA, cyclic: List[Bool]) -> Bool:
     """Comptime: the shape on which the one-pass walk beats the
     specialized backtracker — a general loop (a cyclic two-armed SPLIT
     the backtracker runs by recursion, not one of the iterative
@@ -249,7 +250,6 @@ def onepass_shape(nfa: NFA) -> Bool:
     lane admission it forces); a simple loop hands its bytes to the
     backtracker's class scan outright (`(?:(\\w+)=(\\w+);)+` 55 vs 30).
     """
-    var cyclic = split_cycle_flags(nfa)
     var found = False
     for i in range(len(nfa.states)):
         ref st = nfa.states[i]
@@ -451,9 +451,10 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     while d < len(st_nfa):
         # Rows are appended as states are created below; make sure this
         # state's row exists before its transitions are written.
-        while len(trans_next) < (d + 1) * nclasses:
-            trans_next.append(-1)
-            trans_eps.append(0)
+        if len(trans_next) < (d + 1) * nclasses:
+            # resize fills at ~1.6 us per cell; appends cost ~35 us each.
+            trans_next.resize((d + 1) * nclasses, -1)
+            trans_eps.resize((d + 1) * nclasses, 0)
         while len(match_eps) <= d:
             match_eps.append(0)
             match_flags.append(0)
@@ -608,14 +609,24 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     var accel = EagerDFA()
     accel.num_states = num_states
     accel.num_match_states = 0
+    # Byte -> class as one 256-lane vector: a state's loop-byte set is
+    # then `nclasses` vector compares instead of 768 List reads (~50 us
+    # each) per state.
+    var classv = Pointer(to=class_of[0]).unsafe_bitcast[Int64]().unsafe_load[
+        width=256
+    ]()
     for s in range(num_states):
         if match_flags[s] & Int(_OP_NEED_ANY) != 0:
             continue
+        var loopb = SIMD[DType.bool, 256](fill=False)
+        for c in range(nclasses):
+            var cell = s * nclasses + c
+            if trans_next[cell] == s and trans_eps[cell] == 0:
+                loopb |= classv.eq(SIMD[DType.int64, 256](c))
         var exits = List[Int]()
         var loops = 0
         for b in range(256):
-            var cell = s * nclasses + class_of[b]
-            if trans_next[cell] == s and trans_eps[cell] == 0:
+            if loopb[b]:
                 loops += 1
             else:
                 exits.append(b)
@@ -673,9 +684,11 @@ def onepass_table_len(op: OnePass) -> Int:
     return n if n > min_n else min_n
 
 
-def onepass_table_arr[n: Int](op: OnePass) -> InlineArray[Int32, n]:
-    """Comptime: the packed transition table (see `_OP_*`)."""
-    var arr = InlineArray[Int32, n](fill=-1)
+def onepass_table_str[n: Int](op: OnePass) -> String:
+    """Comptime: the packed transition table (see `_OP_*`) as `n`
+    little-endian Int32 entries (see static_bytes.mojo)."""
+    var out = filled_string(n * 4, 0xFF)
+    var p = out.unsafe_ptr_mut()
     var m = op.num_states * op.nclasses
     if n < m:
         m = n
@@ -688,8 +701,8 @@ def onepass_table_arr[n: Int](op: OnePass) -> InlineArray[Int32, n]:
             | (t << _OP_SID_SHIFT)
             | (op.trans_eps[i] << _OP_EPS_SHIFT)
         )
-        arr[i] = Int32(v)
-    return arr^
+        Pointer(to=p[unsafe_offset=i * 4]).unsafe_bitcast[Int32]().unsafe_store(Int32(v))
+    return out^
 
 
 # Byte-to-class map padded to EDFA_TABLE_MIN_BYTES entries (only the
@@ -818,12 +831,11 @@ def _op_match_ok[
 @always_inline
 def _onepass_match_impl[
     origin: Origin,
-    tn: Int,
     ne: Int,
     ns: Int,
     //,
     op: OnePass,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
     eps: InlineArray[UInt64, ne],
     states: InlineArray[Int32, ns],
@@ -835,7 +847,7 @@ def _onepass_match_impl[
     end_pin: Int,
     mut slots: InlineArray[Int, num_slots],
 ) -> Int:
-    var tbl = materialize[table]()
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
     var cls = materialize[classes]()
     var ep = materialize[eps]()
     var st = materialize[states]()
@@ -851,9 +863,9 @@ def _onepass_match_impl[
             if pos >= end_pin:
                 break
         var v = Int(
-            tbl.unsafe_get(
+            tbl[unsafe_offset=
                 row + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
-            )
+            ]
         )
         if v < 0:
             return -1
@@ -873,12 +885,11 @@ def _onepass_match_impl[
 @always_inline
 def onepass_match[
     origin: Origin,
-    tn: Int,
     ne: Int,
     ns: Int,
     //,
     op: OnePass,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
     eps: InlineArray[UInt64, ne],
     states: InlineArray[Int32, ns],
@@ -931,12 +942,11 @@ def onepass_match[
 @always_inline
 def _onepass_find_end_impl[
     origin: Origin,
-    tn: Int,
     ne: Int,
     ns: Int,
     //,
     op: OnePass,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
     eps: InlineArray[UInt64, ne],
     states: InlineArray[Int32, ns],
@@ -948,7 +958,7 @@ def _onepass_find_end_impl[
     mut slots: InlineArray[Int, num_slots],
     mut steps: Int,
 ) -> Int:
-    var tbl = materialize[table]()
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
     var cls = materialize[classes]()
     var ep = materialize[eps]()
     var st = materialize[states]()
@@ -977,9 +987,9 @@ def _onepass_find_end_impl[
                 if pos >= input_len:
                     break
         var v = Int(
-            tbl.unsafe_get(
+            tbl[unsafe_offset=
                 row + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
-            )
+            ]
         )
         if info & Int(OP_MATCH) != 0 and _op_match_ok[op](
             input, pos, info & 0xFF
@@ -1015,12 +1025,11 @@ def _onepass_find_end_impl[
 @always_inline
 def onepass_find_end[
     origin: Origin,
-    tn: Int,
     ne: Int,
     ns: Int,
     //,
     op: OnePass,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
     eps: InlineArray[UInt64, ne],
     states: InlineArray[Int32, ns],

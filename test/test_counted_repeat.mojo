@@ -423,7 +423,7 @@ def _sbt_end[p: String](input: String, pos: Int = 0) raises -> Int:
     comptime R = Regex[p]
     var slots = InlineArray[Int, R._num_slots](fill=-1)
     var memo = List[UInt64]()
-    return _sbt_run[nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots](
+    return _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
         input.as_bytes(), pos, slots, memo
     )
 

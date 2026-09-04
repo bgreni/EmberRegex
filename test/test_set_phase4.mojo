@@ -56,7 +56,10 @@ def _assert_matches_pike[
 ](data: List[Byte], label: String) raises:
     var db = RegexSet[patterns]()
     var got = db.scan(Span(data))
-    var unfa = build_union_nfa(materialize[patterns]())
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     var expected = set_pike_scan(unfa, Span(data))
     assert_reports(got, expected, label)
 
@@ -337,10 +340,10 @@ def test_anchor_chain_after_eol() raises:
     assert_reports(bol.scan("ab"), [SetMatch(0, 2)], "^ab$$")
     # A BOL anchor after an EOL is context-dependent, so the pattern must
     # leave the DFA-backed lanes rather than guess.
-    comptime T = RegexSet[["a\\n$(?m)^", "cd[0-9]", "ef[0-9]"]]
+    comptime T = RegexSet[["(?m)a\\n$^", "cd[0-9]", "ef[0-9]"]]
     comptime t_res_n = len(T._rose.residual)
     assert_equal(t_res_n, 1)
-    var t = RegexSet[["a\\n$(?m)^", "cd[0-9]", "ef[0-9]"]]()
+    var t = RegexSet[["(?m)a\\n$^", "cd[0-9]", "ef[0-9]"]]()
     assert_reports(t.scan("xa\n"), [SetMatch(0, 3)], "$ then (?m)^")
 
 
@@ -402,7 +405,10 @@ def test_vacuous_patterns_never_join_the_factor_group() raises:
     assert_equal(t_cov0, 1)  # only `hello`
     assert_equal(t_res0, 0)  # `a*` stays on the per-byte lane
     var db = RegexSet[PATS, True]()
-    var unfa = build_union_nfa(materialize[PATS](), True)
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     for inp in ["", "ha", "hello", "aaahelloaaa"]:
         var got = db.scan(inp)
         var expected = set_pike_scan(unfa, inp.as_bytes())

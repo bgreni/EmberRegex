@@ -13,12 +13,13 @@ newlines and bytes >= 0x80.
 
 from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
+from emberregex.static_bytes import static_bytes
 from emberregex.static_dfa import (
     EDFA_TABLE_MIN_BYTES,
     EagerDFA,
     edfa_flags_arr,
     edfa_id_dtype,
-    edfa_table_arr,
+    edfa_table_str,
 )
 from emberregex.static_rdfa import rdfa_find_start
 from emberregex.static_lfdfa import (
@@ -337,10 +338,20 @@ def test_anchored_first_attempt_on_classic_table() raises:
     assert_equal(len(all), 2)
     assert_equal(all[0], "ax1")
     assert_equal(all[1], "ax2")
-    # Shapes with two loops or an alternation keep the pure lane.
+    # A deterministic two-loop shape also rides it: the loops are
+    # separated by a non-overlapping literal, so every SPLIT branches on
+    # disjoint first bytes (`_dfa_end_is_leftmost_first` proves
+    # leftmost-first == leftmost-longest), and the classic table's end is
+    # the answer. Verified against Pike, so the anchored attempt is sound.
     comptime T = Regex["[a-z]+@[a-z]+"]
     assert_true(T._use_lf_dfa)
-    assert_false(T._lf_anchored_classic)
+    assert_true(T._lf_anchored_classic)
+    var t_re = T()
+    assert_equal(t_re.search("  ab@cd  ").start, 2)
+    assert_equal(t_re.search("  ab@cd  ").end, 7)
+    assert_false(t_re.search("aaa@").matched)
+    # A lazy shape keeps the pure lane (leftmost-first genuinely prefers
+    # the shorter end, so the classic longest end is wrong).
     comptime U = Regex["<.*?>"]
     assert_false(U._lf_anchored_classic)
     # The bench shapes ride it.
@@ -672,7 +683,7 @@ def test_anchored_lf_dfa_match_at() raises:
     assert_true(lf.has_anchored)
     comptime tn = lf.d.num_states * 256
     comptime dt = edfa_id_dtype(lf.d.num_states)
-    comptime table = edfa_table_arr[tn, dt](lf.d)
+    comptime table = static_bytes[edfa_table_str[tn, dt](lf.d)]()
     comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
     var input = String("xaab")
     var bytes = input.as_bytes()
@@ -686,9 +697,11 @@ def test_anchored_lf_dfa_match_at() raises:
     assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 0)
     comptime Q = "b[cd]"
     comptime lfq = build_lf_dfa(Regex[Q].nfa, True, anchored=True)
-    comptime tq = edfa_table_arr[
+    comptime tq = static_bytes[
+        edfa_table_str[
         lfq.d.num_states * 256, edfa_id_dtype(lfq.d.num_states)
-    ](lfq.d)
+        ](lfq.d)
+    ]()
     comptime fq = edfa_flags_arr[lfq.d.num_states](lfq.d)
     assert_equal(lfdfa_find_end[lf=lfq, table=tq, flags=fq](bytes2, 0), 4)
     assert_equal(lfdfa_match_at[lf=lfq, table=tq, flags=fq](bytes2, 0), -1)
@@ -716,7 +729,7 @@ def test_wide_list_signature_renumbering() raises:
     assert_true(lf.valid)
     comptime tn = lf.d.num_states * 256
     comptime dt = edfa_id_dtype(lf.d.num_states)
-    comptime table = edfa_table_arr[tn, dt](lf.d)
+    comptime table = static_bytes[edfa_table_str[tn, dt](lf.d)]()
     comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
     var input = String("!!!!!!!!!!!!!!!!!!!!q!!")
     var bytes = input.as_bytes()

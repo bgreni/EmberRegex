@@ -445,10 +445,31 @@ struct PikeVM[num_slots: Int](Copyable):
 
             elif kind == NFAStateKind.LOOKAHEAD:
                 gen.unsafe_set(state_idx, gen_val)
+                var sub_slots = slots.copy()
                 var match_end = _bt_try_match(
-                    self.nfa, input, state.sub_start, pos, slots, 0
+                    self.nfa, input, state.sub_start, pos, sub_slots
                 )
                 if (match_end >= 0) != state.negated:
+                    if match_end >= 0:
+                        # Successful POSITIVE assertion: the continuation
+                        # sees its capture writes; restore after the
+                        # subtree so sibling threads are unaffected
+                        # (mirrors the SAVE branch above).
+                        var saved_slots = slots.copy()
+                        slots = sub_slots^
+                        self._add_state(
+                            state_list,
+                            slot_data,
+                            gen,
+                            gen_val,
+                            state.out1,
+                            slots,
+                            input,
+                            input_len,
+                            pos,
+                        )
+                        slots = saved_slots^
+                        return
                     state_idx = state.out1
                     continue
                 return
@@ -457,12 +478,30 @@ struct PikeVM[num_slots: Int](Copyable):
                 gen.unsafe_set(state_idx, gen_val)
                 var lb_len = state.lookbehind_len
                 var lb_matched = False
+                var lb_slots = slots.copy()
                 if pos >= lb_len:
                     var match_end = _bt_try_match(
-                        self.nfa, input, state.sub_start, pos - lb_len, slots, 0
+                        self.nfa, input, state.sub_start, pos - lb_len, lb_slots
                     )
                     lb_matched = match_end == pos
                 if lb_matched != state.negated:
+                    if lb_matched:
+                        # Same keep/restore rule as LOOKAHEAD above.
+                        var saved_slots = slots.copy()
+                        slots = lb_slots^
+                        self._add_state(
+                            state_list,
+                            slot_data,
+                            gen,
+                            gen_val,
+                            state.out1,
+                            slots,
+                            input,
+                            input_len,
+                            pos,
+                        )
+                        slots = saved_slots^
+                        return
                     state_idx = state.out1
                     continue
                 return
@@ -530,149 +569,274 @@ def _bt_try_match[
     state_idx: Int,
     pos: Int,
     mut slots: List[Int],
-    depth: Int,
 ) -> Int:
-    """Generic backtracking matcher used by the Pike VM for lookahead/lookbehind.
+    """The backtracking sub-match the Pike VM runs for a lookaround body:
+    the heap-stack walk (`_heapbt_core`) over the thread's slot row,
+    unanchored, MATCH accepting anywhere.
+
+    This used to be its own recursive walker with a silent
+    `depth > 10000 -> -1` cap — a WRONG answer on a body longer than
+    that, and under `-D ASSERT=all` a native stack overflow well before
+    the cap (`(?:ab)+c` over 6000 iterations). `slots` is a Pike thread's
+    row: the capture slots plus the trailing start slot, which no state
+    ever indexes, so passing the whole row is harmless."""
+    return _heapbt_core(
+        nfa, input, state_idx, pos, Int(slots.unsafe_ptr()), len(slots)
+    )
+
+
+# --- Heap-stack backtracker -------------------------------------------------
+#
+# Frame tags for `heapbt_match`'s explicit stack. A frame is three Ints
+# pushed as (tag, a, b) and popped in reverse.
+comptime _HBT_TRY = 0  # explore state `a` at position `b`
+comptime _HBT_RESTORE = 1  # undo of a SAVE: slots[a] = b
+comptime _HBT_SNAPSHOT = 2  # undo of a kept lookaround: slots = snapshot at a
+comptime _HBT_LEAVE = 3  # undo of a SPLIT entry mark: entry_pos[a] = b
+
+
+def heapbt_match[
+    origin: Origin, //, num_slots: Int
+](
+    nfa: NFA,
+    input: Span[Byte, origin],
+    start_state: Int,
+    start_pos: Int,
+    mut slots: InlineArray[Int, num_slots],
+    anchored_end: Bool = False,
+    end_at: Int = -1,
+) -> Int:
+    """Leftmost-first backtracking over the runtime NFA with an explicit,
+    heap-allocated stack, on a `Regex` verb's `InlineArray` slots. See
+    `_heapbt_core` for the walk; this is the entry `_sbt_run` continues
+    a backreference pattern on when the specialized walk's stack guard
+    trips. Returns the match end, or -1."""
+    return _heapbt_core(
+        nfa,
+        input,
+        start_state,
+        start_pos,
+        Int(slots.unsafe_ptr()),
+        num_slots,
+        anchored_end,
+        end_at,
+    )
+
+
+def _heapbt_core[
+    origin: Origin, //
+](
+    nfa: NFA,
+    input: Span[Byte, origin],
+    start_state: Int,
+    start_pos: Int,
+    slots_addr: Int,
+    num_slots: Int,
+    anchored_end: Bool = False,
+    end_at: Int = -1,
+) -> Int:
+    """Leftmost-first backtracking over the runtime NFA with an explicit,
+    heap-allocated stack. Returns the match end, or -1. The slots live at
+    `slots_addr` (`num_slots` Ints) — an address rather than a container
+    so the same walk serves a verb's `InlineArray` (`heapbt_match`) and a
+    Pike thread's `List` row (`_bt_try_match`) without a copy.
+
+    The walk is the one `_sbt_try_match` makes — `out1` before `out2`, a
+    SAVE restored when its subtree fails, a positive lookaround keeping
+    its capture writes until its continuation fails, MATCH accepting only
+    at `end_at`/end of input when `anchored_end` — with its frames on a
+    `List` instead of the native stack, so it is bounded by memory rather
+    than by the thread's stack, and it is unbudgeted. It is the engine a
+    backreference pattern continues on when the specialized walk's stack
+    guard trips: the Pike VM cannot run a BACKREF (a thread's own
+    captures decide the match, so threads cannot be merged by state) and
+    no table can, so before this the only alternatives were a wrong
+    answer or an abort. It is also the Pike VM's lookaround sub-matcher.
+
+    Frames are pushed only where the walk can come back: the alternative
+    of a SPLIT, the undo of a SAVE, the undo of a kept lookaround, and
+    the undo of a SPLIT's entry mark. Popping in LIFO order reproduces
+    the recursive engine's order exactly — every frame pushed inside a
+    subtree sits above the frame that resumes after it.
+
+    Epsilon cycles (`(a*)*`, an empty loop iteration) would recurse
+    forever in the specialized walk, which is why that walk concedes them
+    to the Pike VM. Here a SPLIT re-entered at the position it is already
+    active at on the current path fails that path: an empty iteration
+    does not repeat — the ECMAScript rule, and what the Pike VM's
+    per-position state dedup yields.
+
+    Lookaround sub-matches recurse natively once per nesting level of the
+    PATTERN (each level with its own frame list), never per input byte.
     """
-    if depth > 10000:
-        return -1
-    if state_idx < 0 or state_idx >= len(nfa.states):
-        return -1
-
-    ref state = nfa.states.unsafe_get(state_idx)
-    var kind = state.kind
-
-    if kind == NFAStateKind.MATCH:
-        return pos
-
-    elif kind == NFAStateKind.CHAR:
-        if pos >= len(input):
-            return -1
-        var ch = input.unsafe_get(pos)
-        if UInt32(ch) == state.char_value:
-            return _bt_try_match(
-                nfa, input, state.out1, pos + 1, slots, depth + 1
-            )
-        return -1
-
-    elif kind == NFAStateKind.ANY:
-        if pos >= len(input):
-            return -1
-        var ch = input.unsafe_get(pos)
-        if ch != CHAR_NEWLINE:
-            return _bt_try_match(
-                nfa, input, state.out1, pos + 1, slots, depth + 1
-            )
-        return -1
-
-    elif kind == NFAStateKind.CHARSET:
-        if pos >= len(input):
-            return -1
-        var ch = UInt32(input.unsafe_get(pos))
-        var cs_idx = state.charset_index
-        if nfa.charsets.unsafe_get(cs_idx).contains(ch):
-            return _bt_try_match(
-                nfa, input, state.out1, pos + 1, slots, depth + 1
-            )
-        return -1
-
-    elif kind == NFAStateKind.SPLIT:
-        var out1 = state.out1
-        var out2 = state.out2
-        if state.greedy and out1 >= 0 and out1 < len(nfa.states):
-            ref any_state = nfa.states.unsafe_get(out1)
-            if (
-                any_state.kind == NFAStateKind.ANY
-                and any_state.out1 == state_idx
+    var sl = Pointer[Int, MutAnyOrigin](unsafe_from_address=slots_addr)
+    var input_len = len(input)
+    var num_states = len(nfa.states)
+    var target = end_at if end_at >= 0 else input_len
+    var stack = List[Int]()
+    var snapshots = List[Int]()
+    # The position each SPLIT is active at on the current path, or -1.
+    var entry_pos = List[Int](length=num_states, fill=-1)
+    stack.append(_HBT_TRY)
+    stack.append(start_state)
+    stack.append(start_pos)
+    while len(stack) > 0:
+        var b = stack.pop()
+        var a = stack.pop()
+        var tag = stack.pop()
+        if tag == _HBT_RESTORE:
+            sl[unsafe_offset=a] = b
+            continue
+        if tag == _HBT_LEAVE:
+            entry_pos[a] = b
+            continue
+        if tag == _HBT_SNAPSHOT:
+            for i in range(num_slots):
+                sl[unsafe_offset=i] = snapshots[a + i]
+            for _ in range(num_slots):
+                _ = snapshots.pop()
+            continue
+        var s = a
+        var pos = b
+        # Follow the chain; `break` fails this path and pops the next
+        # frame.
+        while s >= 0 and s < num_states:
+            ref state = nfa.states.unsafe_get(s)
+            var kind = state.kind
+            if kind == NFAStateKind.MATCH:
+                if anchored_end and pos != target:
+                    break
+                return pos
+            elif kind == NFAStateKind.CHAR:
+                if (
+                    pos >= input_len
+                    or UInt32(input.unsafe_get(pos)) != state.char_value
+                ):
+                    break
+                pos += 1
+                s = state.out1
+            elif kind == NFAStateKind.ANY:
+                if pos >= input_len or input.unsafe_get(pos) == CHAR_NEWLINE:
+                    break
+                pos += 1
+                s = state.out1
+            elif kind == NFAStateKind.CHARSET:
+                if pos >= input_len or not nfa.charsets.unsafe_get(
+                    state.charset_index
+                ).contains(UInt32(input.unsafe_get(pos))):
+                    break
+                pos += 1
+                s = state.out1
+            elif kind == NFAStateKind.SPLIT:
+                if entry_pos[s] == pos:
+                    # Re-entered without consuming: an empty iteration.
+                    break
+                stack.append(_HBT_LEAVE)
+                stack.append(s)
+                stack.append(entry_pos[s])
+                entry_pos[s] = pos
+                stack.append(_HBT_TRY)
+                stack.append(state.out2)
+                stack.append(pos)
+                s = state.out1
+            elif kind == NFAStateKind.SAVE:
+                var slot = state.save_slot
+                if slot >= 0 and slot < num_slots:
+                    stack.append(_HBT_RESTORE)
+                    stack.append(slot)
+                    stack.append(sl[unsafe_offset=slot])
+                    sl[unsafe_offset=slot] = pos
+                s = state.out1
+            elif kind == NFAStateKind.ANCHOR:
+                if not _bt_check_anchor(
+                    state.anchor_type, input, input_len, pos
+                ):
+                    break
+                s = state.out1
+            elif (
+                kind == NFAStateKind.LOOKAHEAD
+                or kind == NFAStateKind.LOOKBEHIND
             ):
-                var max_pos = pos
-                var input_len = len(input)
-                while (
-                    max_pos < input_len
-                    and input.unsafe_get(max_pos) != CHAR_NEWLINE
-                ):
-                    max_pos += 1
-                var p = max_pos
-                while p >= pos:
-                    var result = _bt_try_match(
-                        nfa, input, out2, p, slots, depth + 1
+                # The sub-walk gets its own copy of the slots (its own
+                # frame list too — one native level per nesting level
+                # of the pattern).
+                var sub = List[Int](capacity=num_slots)
+                for i in range(num_slots):
+                    sub.append(sl[unsafe_offset=i])
+                var matched = False
+                if kind == NFAStateKind.LOOKAHEAD:
+                    matched = (
+                        _heapbt_core(
+                            nfa,
+                            input,
+                            state.sub_start,
+                            pos,
+                            Int(sub.unsafe_ptr()),
+                            num_slots,
+                        )
+                        >= 0
                     )
-                    if result >= 0:
-                        return result
-                    p -= 1
-                return -1
-        var result = _bt_try_match(nfa, input, out1, pos, slots, depth + 1)
-        if result >= 0:
-            return result
-        return _bt_try_match(nfa, input, out2, pos, slots, depth + 1)
-
-    elif kind == NFAStateKind.SAVE:
-        var slot = state.save_slot
-        var old_val = -1
-        if slot >= 0 and slot < len(slots):
-            old_val = slots.unsafe_get(slot)
-            slots.unsafe_set(slot, pos)
-        var result = _bt_try_match(
-            nfa, input, state.out1, pos, slots, depth + 1
-        )
-        if result < 0 and slot >= 0 and slot < len(slots):
-            slots.unsafe_set(slot, old_val)
-        return result
-
-    elif kind == NFAStateKind.ANCHOR:
-        if _bt_check_anchor(state.anchor_type, input, len(input), pos):
-            return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
-        return -1
-
-    elif kind == NFAStateKind.LOOKAHEAD:
-        var sub_slots = slots.copy()
-        var sub_result = _bt_try_match(
-            nfa, input, state.sub_start, pos, sub_slots, depth + 1
-        )
-        if (sub_result >= 0) != state.negated:
-            return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
-        return -1
-
-    elif kind == NFAStateKind.LOOKBEHIND:
-        var lb_len = state.lookbehind_len
-        var matched = False
-        if pos >= lb_len:
-            var sub_slots = slots.copy()
-            var sub_result = _bt_try_match(
-                nfa, input, state.sub_start, pos - lb_len, sub_slots, depth + 1
-            )
-            matched = sub_result >= 0 and sub_result == pos
-        if matched != state.negated:
-            return _bt_try_match(nfa, input, state.out1, pos, slots, depth + 1)
-        return -1
-
-    elif kind == NFAStateKind.BACKREF:
-        var group = state.backref_group
-        var slot_start = 2 * group - 2
-        var slot_end = 2 * group - 1
-        if slot_start >= len(slots) or slot_end >= len(slots):
-            return -1
-        var gs = slots[slot_start]
-        var ge = slots[slot_end]
-        if gs < 0 or ge < 0:
-            return -1
-        var ref_len = ge - gs
-        if pos + ref_len > len(input):
-            return -1
-        if state.icase:
-            for i in range(ref_len):
-                if _bt_to_lower(input.unsafe_get(gs + i)) != _bt_to_lower(
-                    input.unsafe_get(pos + i)
-                ):
-                    return -1
-        else:
-            for i in range(ref_len):
-                if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
-                    return -1
-        return _bt_try_match(
-            nfa, input, state.out1, pos + ref_len, slots, depth + 1
-        )
-
+                else:
+                    var lb = state.lookbehind_len
+                    if pos >= lb:
+                        matched = (
+                            _heapbt_core(
+                                nfa,
+                                input,
+                                state.sub_start,
+                                pos - lb,
+                                Int(sub.unsafe_ptr()),
+                                num_slots,
+                            )
+                            == pos
+                        )
+                if matched == state.negated:
+                    break
+                if matched:
+                    # A successful positive assertion keeps its capture
+                    # writes (Python/PCRE semantics); the snapshot puts
+                    # the old slots back if the continuation fails.
+                    var base = len(snapshots)
+                    for i in range(num_slots):
+                        snapshots.append(sl[unsafe_offset=i])
+                    stack.append(_HBT_SNAPSHOT)
+                    stack.append(base)
+                    stack.append(0)
+                    for i in range(num_slots):
+                        sl[unsafe_offset=i] = sub[i]
+                s = state.out1
+            elif kind == NFAStateKind.BACKREF:
+                var group = state.backref_group
+                var s0 = 2 * group - 2
+                var s1 = 2 * group - 1
+                if s0 < 0 or s1 >= num_slots:
+                    break
+                var gs = sl[unsafe_offset=s0]
+                var ge = sl[unsafe_offset=s1]
+                if gs < 0 or ge < 0:
+                    break
+                var n = ge - gs
+                if pos + n > input_len:
+                    break
+                var same = True
+                if state.icase:
+                    for i in range(n):
+                        if _bt_to_lower(input.unsafe_get(gs + i)) != _bt_to_lower(
+                            input.unsafe_get(pos + i)
+                        ):
+                            same = False
+                            break
+                else:
+                    for i in range(n):
+                        if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
+                            same = False
+                            break
+                if not same:
+                    break
+                pos += n
+                s = state.out1
+            else:
+                break
     return -1
 
 

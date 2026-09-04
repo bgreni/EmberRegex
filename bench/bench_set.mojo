@@ -44,8 +44,9 @@ from emberregex.set_dfa import (
     mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
-    mdfa_table_arr,
+    mdfa_table_str,
 )
+from emberregex.static_bytes import static_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +195,7 @@ def mdfa_direct_scan[
     engine selection (which now sends these sets to Rose)."""
     comptime S = RegexSet[patterns]
     comptime MD = build_multi_dfa(S.nfa, S.nfa.can_use_dfa)
-    comptime T = mdfa_table_arr[MD.num_states * 256](MD)
+    comptime T = static_bytes[mdfa_table_str[MD.num_states * 256](MD)]()
     comptime P = mdfa_pool_arr[len(MD.pool)](MD)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)

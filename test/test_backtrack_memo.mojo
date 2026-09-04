@@ -15,7 +15,7 @@ from emberregex.backtrack import (
     SBT_MEMO_BUDGET_FACTOR,
     SBT_MEMO_BUDGET_MIN,
     sbt_memo_budget,
-    sbt_memo_rows,
+    sbt_memo_rows_of,
 )
 from emberregex.engine import _sbt_run
 from std.collections import InlineArray
@@ -30,7 +30,7 @@ def _sbt_end[p: String](input: String, pos: Int = 0) raises -> Int:
     comptime R = Regex[p]
     var slots = InlineArray[Int, R._num_slots](fill=-1)
     var memo = List[UInt64]()
-    return _sbt_run[nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots](
+    return _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
         input.as_bytes(), pos, slots, memo
     )
 
@@ -94,7 +94,7 @@ def test_memo_unsound_for_backreferences() raises:
     # function of (state, pos) and the memo must stay off.
     comptime R = Regex[r"(a+)\1b"]
     assert_false(R._sbt_memo_ok)
-    comptime ROWS = sbt_memo_rows(R.nfa)
+    comptime ROWS = sbt_memo_rows_of(R.nfa)
     assert_equal(ROWS, 0)
 
 
@@ -104,7 +104,7 @@ def test_memo_unsound_for_lookaround() raises:
     # accepts anywhere.
     comptime R = Regex["(?:a|aa)+(?=b)b"]
     assert_false(R._sbt_memo_ok)
-    comptime ROWS = sbt_memo_rows(R.nfa)
+    comptime ROWS = sbt_memo_rows_of(R.nfa)
     assert_equal(ROWS, 0)
     comptime L = Regex["(?:a|aa)+(?<=aa)b"]
     assert_false(L._sbt_memo_ok)
@@ -115,15 +115,15 @@ def test_memo_only_for_general_cyclic_splits() raises:
     # backtracker runs as iteration, and a leading alternation is acyclic.
     comptime SIMPLE = Regex["a+b"]
     assert_true(SIMPLE._sbt_memo_ok)
-    comptime SIMPLE_ROWS = sbt_memo_rows(SIMPLE.nfa)
+    comptime SIMPLE_ROWS = sbt_memo_rows_of(SIMPLE.nfa)
     assert_equal(SIMPLE_ROWS, 0)
     comptime ALT = Regex["(cat|dog)food"]
-    comptime ALT_ROWS = sbt_memo_rows(ALT.nfa)
+    comptime ALT_ROWS = sbt_memo_rows_of(ALT.nfa)
     assert_equal(ALT_ROWS, 0)
     # The loop over an alternation is the shape that re-explores.
     comptime AMBIG = Regex["(a|aa)+b"]
     assert_true(AMBIG._sbt_memo_ok)
-    comptime AMBIG_ROWS = sbt_memo_rows(AMBIG.nfa)
+    comptime AMBIG_ROWS = sbt_memo_rows_of(AMBIG.nfa)
     # One row per state, so the memo covers the whole NFA once the pattern
     # has a general cyclic SPLIT at all.
     assert_true(AMBIG_ROWS > 0)
@@ -220,7 +220,7 @@ def test_aborted_attempt_leaves_no_poisoned_bits() raises:
     var slots = InlineArray[Int, R._num_slots](fill=-1)
     var raised = False
     try:
-        _ = _sbt_run[nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots](
+        _ = _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
             aborts.as_bytes(), 0, slots, memo
         )
     except:
@@ -228,7 +228,7 @@ def test_aborted_attempt_leaves_no_poisoned_bits() raises:
     assert_true(raised, "2200 a's must exhaust the backtracker")
     assert_equal(len(memo), 0, "an aborted attempt's bits are discarded")
     var slots2 = InlineArray[Int, R._num_slots](fill=-1)
-    var end = _sbt_run[nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots](
+    var end = _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
         matches.as_bytes(), 0, slots2, memo
     )
     assert_equal(end, 3)

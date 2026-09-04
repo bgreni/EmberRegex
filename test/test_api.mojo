@@ -265,5 +265,74 @@ def test_split_empty_and_nonempty_matches() raises:
     assert_equal(parts[6], "")
 
 
+def test_unicode_zero_width_advance() raises:
+    # CPython (byte offsets): [m.span() for m in re.finditer(r'A*', 'AABģBAA')]
+    # -> [(0,2),(2,2),(3,3),(5,5),(6,8),(8,8)]. NO engine (Python, PCRE2,
+    # Perl, Ruby, JS, Rust regex) ever reports an empty match inside the
+    # two-byte ģ — the zero-width bump must advance a whole codepoint.
+    comptime S = Regex["(?u)A*"]
+    assert_false(S._use_lf_lane)  # vacuous A* resolves to the backtracker
+    assert_false(S._strategy.use_teddy)
+    assert_false(S._use_lazy_dfa)
+    var re = Regex["(?u)A*"]()
+    var input = "AABģBAA"
+    var ms = re.finditer(input)
+    assert_equal(len(ms), 6)
+    assert_equal(ms[0].start, 0)
+    assert_equal(ms[0].end, 2)
+    assert_equal(ms[1].start, 2)
+    assert_equal(ms[1].end, 2)
+    assert_equal(ms[2].start, 3)
+    assert_equal(ms[2].end, 3)
+    assert_equal(ms[3].start, 5)
+    assert_equal(ms[3].end, 5)
+    assert_equal(ms[4].start, 6)
+    assert_equal(ms[4].end, 8)
+    assert_equal(ms[5].start, 8)
+    assert_equal(ms[5].end, 8)
+    # Same rule through replace and split.
+    # Python: re.sub(r'A*','-','AABģBAA') == '--B-ģ-B--'
+    assert_equal(re.replace(input, "-"), "--B-ģ-B--")
+    # Python: re.split(r'A*','AABģBAA') == ['', '', 'B', 'ģ', 'B', '', '']
+    var parts = re.split(input)
+    assert_equal(len(parts), 7)
+    assert_equal(parts[2], "B")
+    assert_equal(parts[3], "ģ")
+    assert_equal(parts[4], "B")
+
+
+def test_unicode_zero_width_advance_backtracker() raises:
+    # The lookahead forces the backtracker lane (lookaround clears
+    # can_use_dfa); byte spans must be identical to the plain A* run
+    # above (CPython agrees).
+    comptime S = Regex["(?u)A*(?=B?)"]
+    assert_false(S._use_lf_lane)
+    var re = Regex["(?u)A*(?=B?)"]()
+    var ms = re.finditer("AABģBAA")
+    assert_equal(len(ms), 6)
+    assert_equal(ms[2].start, 3)
+    assert_equal(ms[2].end, 3)
+    assert_equal(ms[3].start, 5)
+    assert_equal(ms[3].end, 5)
+
+
+def test_unicode_zero_width_advance_lf_lane() raises:
+    # A? rides the leftmost-first DFA lane — its finditer loop has its own
+    # empty-match bump. CPython byte spans for A? on 'AABģBAA':
+    # [(0,1),(1,2),(2,2),(3,3),(5,5),(6,7),(7,8),(8,8)] — nothing at byte 4.
+    comptime S = Regex["(?u)A?"]
+    assert_true(S._use_lf_lane)
+    var re = Regex["(?u)A?"]()
+    var input = "AABģBAA"
+    var ms = re.finditer(input)
+    assert_equal(len(ms), 8)
+    assert_equal(ms[3].start, 3)
+    assert_equal(ms[3].end, 3)
+    assert_equal(ms[4].start, 5)
+    assert_equal(ms[4].end, 5)
+    # Python: re.sub(r'A?','-','AABģBAA') == '---B-ģ-B---'
+    assert_equal(re.replace(input, "-"), "---B-ģ-B---")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

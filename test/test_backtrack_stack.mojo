@@ -21,7 +21,7 @@ from emberregex.backtrack import (
     SBT_STACK_RESERVE,
     _sbt_needs_depth_guard,
     _sbt_try_match,
-    sbt_depth_plan,
+    sbt_depth_plan_of,
     sbt_stack_floor,
     sbt_stack_here,
     sbt_stack_low,
@@ -60,19 +60,19 @@ def test_general_splits_cut_every_cycle() raises:
     # acyclic. That is computed, not assumed — pin it for every shape
     # this file walks deeply.
     assert_true(
-        comptime (sbt_depth_plan(Regex["((?:ab)+)c"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan_of(Regex["((?:ab)+)c"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime (sbt_depth_plan(Regex["((?:a|a{2,})+)b"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan_of(Regex["((?:a|a{2,})+)b"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime (sbt_depth_plan(Regex["((?:a*?b?)+)c"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan_of(Regex["((?:a*?b?)+)c"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime (sbt_depth_plan(Regex["((x?){1,})y"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan_of(Regex["((x?){1,})y"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime (sbt_depth_plan(Regex["((?:a+)+)b"].nfa).splits_are_fvs)
+        comptime (sbt_depth_plan_of(Regex["((?:a+)+)b"].nfa).splits_are_fvs)
     )
 
 
@@ -93,7 +93,7 @@ def test_guard_trips_and_is_not_luck() raises:
     var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
     var budget = SBT_BUDGET
     var got = _sbt_try_match[
-        nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](text.as_bytes(), 0, slots, budget, 0, 0, -1)
     assert_equal(got, -1)
     # Work was never the binding constraint for this walk.
@@ -104,7 +104,7 @@ def test_guard_trips_and_is_not_luck() raises:
     var budget2 = SBT_BUDGET
     var floor = sbt_stack_here() - 65536
     var got2 = _sbt_try_match[
-        nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](text.as_bytes(), 0, slots2, budget2, 0, floor, -1)
     assert_equal(got2, -1)
     # A negative budget is the "concede to the Pike VM" signal (the guard
@@ -122,7 +122,7 @@ def test_guard_does_not_fire_when_it_should_not() raises:
     var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
     var budget = SBT_BUDGET
     var got = _sbt_try_match[
-        nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](
         text.as_bytes(),
         0,
@@ -177,7 +177,7 @@ def _burn_then_walk[
         var memo = List[UInt64]()
         try:
             return _sbt_run[
-                nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+                pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
             ](text.as_bytes(), 0, slots, memo)
         except:
             return -2  # conceded to the Pike VM
@@ -239,7 +239,7 @@ def _check[p: String](text: String) raises:
     var memo = List[UInt64]()
     try:
         var end = _sbt_run[
-            nfa=R.nfa, state_idx=R._start, num_slots=R._num_slots
+            pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
         ](text.as_bytes(), 0, slots, memo)
         assert_equal(end, want_end)
     except e:

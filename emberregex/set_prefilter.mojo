@@ -32,17 +32,16 @@ superset match rather than to the input.
 """
 
 from std.collections import InlineArray
-from std.os import abort
 
 from .ast import AST, ASTNode, ASTNodeKind
 from .backtrack import (
     SBT_BUDGET,
-    _sbt_needs_depth_guard,
     _sbt_try_match,
+    sbt_depth_plan,
     sbt_stack_floor,
 )
-from .nfa import NFA, build_nfa
-from .parser import parse
+from .executor import heapbt_match
+from .nfa import _build_static_nfa, _nfa_has_backref, NFA, split_cycle_flags
 
 
 def _clone_subtree(mut ast: AST, node_idx: Int, depth: Int) -> Int:
@@ -149,7 +148,7 @@ def ast_needs_prefilter(ast: AST) -> Bool:
 
 @always_inline
 def confirm_span[
-    origin: Origin, //, nfa: NFA
+    origin: Origin, //, pattern: String
 ](input: Span[Byte, origin], leftmost: Int, end: Int) -> Bool:
     """Does the EXACT pattern have a match ending exactly at `end`?
 
@@ -167,19 +166,46 @@ def confirm_span[
     because truncating to `[0, end)` would hide the right-hand context a
     lookahead asserts about — that was a real bug before this note.
 
-    On budget exhaustion the candidate is KEPT. That degrades to the
-    superset — extra reports, never missing ones — which is the safe
-    direction for a pathological backtracking pattern.
+    Two policies, by what the pattern carries (the same split as the
+    single-pattern engine's `_sbt_run`):
+
+    - **backreference** — the confirm is EXACT. It runs unbudgeted, like
+      Python and PCRE (the exponential worst case is inherent to
+      backreferences), and when the specialized walk's stack guard trips
+      it continues on the heap-stack backtracker (`heapbt_match`) over
+      the materialized NFA, with the same start and the same end pin.
+      The Pike VM cannot execute a BACKREF, so before this the only
+      alternative was to keep the candidate — a superset report that a
+      long enough input (`(x|y)(?:ab|c)+\\1` over 100k iterations) turned
+      into a false positive.
+    - **lookaround only** — on budget exhaustion the candidate is KEPT.
+      That degrades to the superset — extra reports, never missing ones —
+      which is the safe direction for a pathological backtracking pattern
+      that has a linear engine's worth of alternatives elsewhere.
     """
+    # The EXACT (un-widened) NFA of the pattern, re-derived through the
+    # memoized comptime call the backtracker's own instantiations use, so
+    # the pattern string — not a printed NFA — names every specialization.
+    comptime nfa = _build_static_nfa(pattern)
+    # Decl-level applies: the plan (and the cycle pass it needs) run once
+    # per pattern and hit the same cache entries the walker's own `PLAN`
+    # and the single-pattern engine fill (see `sbt_depth_plan`).
+    comptime cyclic = split_cycle_flags(nfa)
+    comptime plan = sbt_depth_plan(nfa, cyclic)
     comptime NS = 2 if nfa.group_count <= 0 else 2 * nfa.group_count
+    comptime unbudgeted = _nfa_has_backref(nfa)
     var lo = leftmost if leftmost >= 0 else 0
     for s in range(lo, end + 1):
         var slots = InlineArray[Int, NS](fill=-1)
-        var budget = SBT_BUDGET
+        var budget: Int
+        comptime if unbudgeted:
+            budget = Int.MAX
+        else:
+            budget = SBT_BUDGET
         # Full input, not a slice: `end_at` pins the match end while
         # lookahead and anchors still see the real surrounding text.
         var r = _sbt_try_match[
-            nfa=nfa,
+            pattern=pattern,
             state_idx=nfa.start,
             num_slots=NS,
             anchored_end=True,
@@ -196,25 +222,44 @@ def confirm_span[
             # confirm, reached once per surviving candidate on patterns
             # the prefilter could not settle, so the thread query is far
             # below the walk it guards.
-            stack_floor=sbt_stack_floor[_sbt_needs_depth_guard(nfa)](),
+            stack_floor=sbt_stack_floor[plan.needs_guard](),
             end_at=end,
         )
         if budget < 0:
-            return True  # pathological: fall back to superset semantics
+            comptime if unbudgeted:
+                # Only the stack guard can get here (the budget is MAX):
+                # finish this start on the heap-stack backtracker, same
+                # end pin. Every SAVE on the unwind restored its slot,
+                # so `slots` are as this attempt found them.
+                r = _confirm_stack_continue[pattern=pattern, NS=NS](
+                    input, s, slots, end
+                )
+            else:
+                return True  # pathological: fall back to superset semantics
         if r >= 0:
             return True
     return False
 
 
-def build_confirm_nfas(patterns: List[String], ids: List[Int]) -> List[NFA]:
-    """Comptime: the EXACT (un-widened) NFA for each pattern needing
-    confirmation, in the same order as `ids`."""
-    var out = List[NFA]()
-    for i in ids:
-        try:
-            var ast = parse(patterns[i])
-            var flags = ast.flags
-            out.append(build_nfa(ast^, flags))
-        except e:
-            abort(String("RegexSet confirm: ", e))
-    return out^
+@no_inline
+def _confirm_stack_continue[
+    origin: Origin, //, pattern: String, NS: Int
+](
+    input: Span[Byte, origin],
+    start: Int,
+    mut slots: InlineArray[Int, NS],
+    end: Int,
+) -> Int:
+    """Finish one backreference confirm attempt on the heap-stack
+    backtracker after the specialized walk's stack guard tripped: the
+    exact NFA, anchored at `start`, MATCH accepting only at `end`. One
+    out-of-line instantiation per pattern, elaborated only for patterns
+    that carry a BACKREF (`confirm_span` names it under `comptime if
+    unbudgeted`)."""
+    comptime nfa = _build_static_nfa(pattern)
+    var rt = materialize[nfa]()
+    return heapbt_match[num_slots=NS](
+        rt, input, nfa.start, start, slots, anchored_end=True, end_at=end
+    )
+
+

@@ -18,7 +18,8 @@ from std.sys import simd_width_of
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
-from .optimize import _probe_rank_table
+from .optimize import PROBE_RANKS
+from .static_bytes import table_bytes
 from .dfa import _epsilon_closure, _check_eol_match, _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
@@ -62,6 +63,17 @@ comptime EDFA_MATCH_IF_NONWORD: UInt8 = 32
 # pattern needing more states than this is better served by the lazy DFA
 # discovering only the states the input actually reaches.
 comptime EDFA_STATE_CAP = 128
+comptime EDFA_WORK_BUDGET = 32768
+"""Comptime budget for one classic determinization ATTEMPT, in member-class
+visits (one NFA member of one DFA state stepping one byte class). The
+state cap alone does not bound the attempt: a counted ladder like
+`a{1,2000}b` fills each of its first 128 DFA states with ~2000 members, so
+reaching the cap took ~70 s. Calibration (2026-09-02): every DFA that FITS
+the cap in a spread of shapes used <= 408 visits (`(?u)\\p{Greek}+`, 23
+states); the ladders that blow the cap used 33k-63k, at ~7k visits/s. A
+pattern past the budget stays on the lazy DFA, exactly like one past the
+state cap.
+"""
 
 # Largest exit set a region acceleration (EagerDFA.region_states) is
 # built for: the scan restarts after every candidate, so it only pays
@@ -285,6 +297,149 @@ def _flat_closure(
             # CHAR, CHARSET, ANY, MATCH, and non-DFA kinds
             _bs_set(bits, s)
     return bits
+
+
+def _closure_pool(
+    kinds: List[Int],
+    out1s: List[Int],
+    out2s: List[Int],
+    anchors: List[Int],
+    after_newline: Bool,
+) -> List[_StateBits]:
+    """Comptime: `_flat_closure(s, at_start=False, after_newline,
+    WB_PENDING)` for EVERY state s, as one pool.
+
+    The determinizer's main loop needs exactly these closures (its two
+    memo variants differ only in `after_newline`), and used to compute
+    each with a fresh per-target DFS. On a counted-repetition ladder
+    (`a{1,2000}b`) every one of the ~2000 targets reaches the whole
+    remaining ladder, so the lazily-built memo cost O(n^2) List ops —
+    measured MINUTES of comptime for one such pattern. This pool is one
+    iterative Tarjan pass over the epsilon edges instead: closures
+    compose (closure of a state is the union of its epsilon-children's
+    closures), SCCs share one closure, and cross-SCC children are final
+    before their parents pop, so the whole pool is O(states + edges).
+
+    Per-state semantics mirror `_flat_closure` exactly:
+    - SPLIT expands out1+out2, SAVE expands out1 — no self bit;
+    - BOL is dead here (at_start is always False in the main loop);
+      BOL_MULTILINE expands out1 only when `after_newline`;
+    - EOL kinds and word anchors stay as pending SELF members;
+    - everything else (consuming, MATCH, non-DFA kinds) is a self bit.
+    """
+    var n = len(kinds)
+    var clo = List[_StateBits](fill=_StateBits(0), length=n)
+    # Epsilon-expanding states: children per the rules above. -2 marks
+    # "no child in this slot" (a dead anchor arm or single-child kind).
+    var ch1 = List[Int](fill=-2, length=n)
+    var ch2 = List[Int](fill=-2, length=n)
+    var expands = List[Bool](fill=False, length=n)
+    for s in range(n):
+        var kind = kinds.unsafe_get(s)
+        if kind == NFAStateKind.SPLIT:
+            expands[s] = True
+            ch1[s] = out1s.unsafe_get(s)
+            ch2[s] = out2s.unsafe_get(s)
+        elif kind == NFAStateKind.SAVE:
+            expands[s] = True
+            ch1[s] = out1s.unsafe_get(s)
+        elif kind == NFAStateKind.ANCHOR:
+            var at = anchors.unsafe_get(s)
+            if at == AnchorKind.BOL:
+                expands[s] = True  # dead: no children, empty closure
+            elif at == AnchorKind.BOL_MULTILINE:
+                expands[s] = True
+                if after_newline:
+                    ch1[s] = out1s.unsafe_get(s)
+            elif (
+                at == AnchorKind.EOL
+                or at == AnchorKind.EOL_MULTILINE
+                or at == AnchorKind.WORD_BOUNDARY
+                or at == AnchorKind.NOT_WORD_BOUNDARY
+            ):
+                # EOL kinds and word anchors: pending self members.
+                _bs_set(clo[s], s)
+            else:
+                # Any other anchor kind contributes NOTHING, exactly as
+                # `_flat_closure`'s if/elif chain does by falling off its
+                # end. Only the AST-only BOS/EOS markers can land here and
+                # the NFA builder lowers those to BOL/EOL, so this is
+                # unreachable today — it is written out so the pool cannot
+                # silently diverge from the reference if that changes.
+                expands[s] = True  # no children => empty closure
+        else:
+            _bs_set(clo[s], s)
+
+    # Iterative Tarjan over the expanding states. A non-expanding child
+    # contributes its self bit directly; a child in an already-closed
+    # SCC contributes its final closure; a same-SCC child contributes
+    # nothing (the close step unions all members). On close, members
+    # share the union of what they accumulated.
+    var idx = List[Int](fill=-1, length=n)
+    var low = List[Int](fill=0, length=n)
+    var on = List[Bool](fill=False, length=n)
+    var sstack = List[Int]()
+    var fs = List[Int]()  # DFS frame: state
+    var fc = List[Int]()  # DFS frame: next child cursor (0, 1, 2=done)
+    var counter = 0
+    for root in range(n):
+        if not expands.unsafe_get(root) or idx[root] >= 0:
+            continue
+        idx[root] = counter
+        low[root] = counter
+        counter += 1
+        sstack.append(root)
+        on[root] = True
+        fs.append(root)
+        fc.append(0)
+        while len(fs) > 0:
+            var v = fs[len(fs) - 1]
+            var c = fc[len(fs) - 1]
+            if c < 2:
+                fc[len(fs) - 1] = c + 1
+                var u = ch1.unsafe_get(v) if c == 0 else ch2.unsafe_get(v)
+                if u < 0 or u >= n:
+                    continue
+                if not expands.unsafe_get(u):
+                    _bs_set(clo[v], u)
+                    continue
+                if idx[u] < 0:
+                    idx[u] = counter
+                    low[u] = counter
+                    counter += 1
+                    sstack.append(u)
+                    on[u] = True
+                    fs.append(u)
+                    fc.append(0)
+                elif on.unsafe_get(u):
+                    if idx[u] < low[v]:
+                        low[v] = idx[u]
+                else:
+                    clo[v] = clo[v] | clo.unsafe_get(u)
+                continue
+            # Children done: close the SCC if v is its root, then fold
+            # into the parent frame.
+            _ = fs.pop()
+            _ = fc.pop()
+            if low[v] == idx[v]:
+                var acc = clo.unsafe_get(v)
+                var members = List[Int]()
+                while True:
+                    var w = sstack.pop()
+                    on[w] = False
+                    members.append(w)
+                    if w == v:
+                        break
+                    acc = acc | clo.unsafe_get(w)
+                for m in members:
+                    clo[m] = acc
+            if len(fs) > 0:
+                var p = fs[len(fs) - 1]
+                if low[v] < low[p]:
+                    low[p] = low[v]
+                if not on.unsafe_get(v):
+                    clo[p] = clo[p] | clo.unsafe_get(v)
+    return clo^
 
 
 def _word_anchor_bits(kinds: List[Int], anchors: List[Int]) -> _StateBits:
@@ -698,6 +853,16 @@ def _accepts(nfa: NFA, state: Int, byte: Int) -> Bool:
     return False
 
 
+def _mk_iota256_i64() -> SIMD[DType.int64, 256]:
+    var v = SIMD[DType.int64, 256](0)
+    for i in range(256):
+        v[i] = Int64(i)
+    return v
+
+
+comptime _IOTA256_I64 = _mk_iota256_i64()
+
+
 def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
     """Partition bytes into classes the determinizer can treat as one column.
 
@@ -719,29 +884,35 @@ def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
     Fills `class_of` (256 entries) and returns one representative byte per
     class (the first byte of each interval).
     """
-    var mark = List[Bool](fill=False, length=257)
-    mark[0] = True
-    mark[Int(CHAR_NEWLINE)] = True
-    mark[Int(CHAR_NEWLINE) + 1] = True
+    # Class boundaries as a 256-lane vector (lane b set = a class starts
+    # at byte b; the boundary at 256 is never read). The prefix sum below
+    # turns it into `class_of` in 8 vector ops plus one vector store,
+    # where the List form paid ~50 us per element for 512 element ops
+    # per builder — four builders per pattern.
+    var mark = SIMD[DType.int64, 256](0)
+    mark[0] = 1
+    mark[Int(CHAR_NEWLINE)] = 1
+    mark[Int(CHAR_NEWLINE) + 1] = 1
     # A word anchor resolves by the class of the byte being consumed, so
     # the word set `[A-Za-z0-9_]` must be a union of classes. Only cut
     # when an anchor exists: `\b`-free tables stay byte-identical.
     if _nfa_has_word_anchor(nfa):
-        mark[0x30] = True
-        mark[0x3A] = True
-        mark[0x41] = True
-        mark[0x5B] = True
-        mark[0x5F] = True
-        mark[0x60] = True
-        mark[0x61] = True
-        mark[0x7B] = True
+        mark[0x30] = 1
+        mark[0x3A] = 1
+        mark[0x41] = 1
+        mark[0x5B] = 1
+        mark[0x5F] = 1
+        mark[0x60] = 1
+        mark[0x61] = 1
+        mark[0x7B] = 1
     for i in range(len(nfa.states)):
         var kind = nfa.states[i].kind
         if kind == NFAStateKind.CHAR:
             var c = Int(nfa.states[i].char_value)
             if c < 256:
-                mark[c] = True
-                mark[c + 1] = True
+                mark[c] = 1
+                if c + 1 < 256:
+                    mark[c + 1] = 1
         elif kind == NFAStateKind.CHARSET:
             var cs = nfa.states[i].charset_index
             for r in range(len(nfa.charsets[cs].ranges)):
@@ -751,16 +922,23 @@ def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
                     continue
                 if hi > 255:
                     hi = 255
-                mark[lo] = True
-                mark[hi + 1] = True
+                mark[lo] = 1
+                if hi + 1 < 256:
+                    mark[hi + 1] = 1
         # ANY accepts all but newline; newline is already marked.
+    # class_of[b] = (marks in [0, b]) - 1: one vector compare-and-add per
+    # class boundary (`shift_right` lowers to an LLVM splice intrinsic the
+    # interpreter cannot fold at 256 lanes, so no prefix-sum ladder).
+    var iota = _IOTA256_I64
+    var one = SIMD[DType.int64, 256](1)
+    var zero = SIMD[DType.int64, 256](0)
+    var cls = SIMD[DType.int64, 256](-1)
     var reps = List[Int]()
-    var cls = -1
     for b in range(256):
-        if mark[b]:
-            cls += 1
+        if mark[b] != 0:
             reps.append(b)
-        class_of[b] = cls
+            cls += iota.ge(SIMD[DType.int64, 256](b)).select(one, zero)
+    Pointer(to=class_of[0]).unsafe_bitcast[Int64]().unsafe_store(cls)
     return reps^
 
 
@@ -1263,6 +1441,31 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     var gslot = List[Int](fill=-1, length=n)
     var gval_o = List[_StateBits]()
     var gval_n = List[_StateBits]()
+    # Every continuation closure the main loop can ask for, precomputed
+    # compositionally (see _closure_pool). The per-target lazy DFS this
+    # replaces was O(n^2) on counted-repetition ladders.
+    # ADAPTIVE, not eager. `_closure_pool` costs O(states) List ops for
+    # the WHOLE NFA, which is a large win when many targets are queried
+    # and each per-target DFS would walk a long epsilon chain (a counted
+    # ladder: 762s -> 126s), but pure waste for an NFA whose
+    # determinization blows EDFA_STATE_CAP after a handful of states and
+    # is thrown away — a UTF-8 property class builds a ~2000-state trie,
+    # bails at the cap, and paid ~1.2s per pattern for a pool it never
+    # finished using (measured: test_utf8.mojo 364s -> 396s when this was
+    # unconditional).
+    #
+    # So: stay lazy, and switch only once the lazy path has already spent
+    # what the pool costs. `lazy_members` accumulates the size of every
+    # closure computed the slow way; the pool's own cost is O(n), so
+    # switching at 2n bounds the total at ~2x the better of the two
+    # strategies whichever one wins, while still catching the ladder
+    # (whose closures are O(n) each, so it trips the threshold after two
+    # or three targets).
+    var pool_o = List[_StateBits]()
+    var pool_n = List[_StateBits]()  # read only when has_bol_ml
+    var pool_built = False
+    var lazy_members = 0
+    var pool_threshold = 2 * n
 
     # Pending-EOL resolution per anchor state, as bitsets: does the
     # continuation reach MATCH at end of input / at a '\n'? (Same
@@ -1366,6 +1569,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     var accu_gen = SIMD[DType.int32, 256](-1)
     var gen = 0
     var cur = 0
+    var work = 0
     while cur < len(sets_bits):
         var r_w = _StateBits(0)
         var r_n = _StateBits(0)
@@ -1391,28 +1595,49 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
                         continue  # dangling out — accepts into nothing
                     slot = tslot.unsafe_get(t)
                     if slot < 0:
-                        var c_o = _flat_closure(
-                            kinds,
-                            out1s,
-                            out2s,
-                            anchors,
-                            t,
-                            False,
-                            False,
-                            WB_PENDING,
-                        )
-                        var c_n = c_o
-                        if has_bol_ml:
-                            c_n = _flat_closure(
+                        var c_o: _StateBits
+                        var c_n: _StateBits
+                        if pool_built:
+                            c_o = pool_o.unsafe_get(t)
+                            c_n = pool_n.unsafe_get(t) if has_bol_ml else c_o
+                        else:
+                            c_o = _flat_closure(
                                 kinds,
                                 out1s,
                                 out2s,
                                 anchors,
                                 t,
                                 False,
-                                True,
+                                False,
                                 WB_PENDING,
                             )
+                            c_n = c_o
+                            if has_bol_ml:
+                                c_n = _flat_closure(
+                                    kinds,
+                                    out1s,
+                                    out2s,
+                                    anchors,
+                                    t,
+                                    False,
+                                    True,
+                                    WB_PENDING,
+                                )
+                            # Closure size stands in for the DFS's cost:
+                            # a long epsilon chain yields a big closure.
+                            var sz = 0
+                            for l in range(64):
+                                sz += Int(pop_count(c_o[l]))
+                            lazy_members += sz
+                            if lazy_members > pool_threshold:
+                                pool_o = _closure_pool(
+                                    kinds, out1s, out2s, anchors, False
+                                )
+                                if has_bol_ml:
+                                    pool_n = _closure_pool(
+                                        kinds, out1s, out2s, anchors, True
+                                    )
+                                pool_built = True
                         gval_o.append(c_o)
                         gval_n.append(c_n)
                         slot = len(gval_o) - 1
@@ -1432,6 +1657,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
                     while cwbits != 0:
                         var ci = 64 * cw + Int(count_trailing_zeros(cwbits))
                         cwbits &= cwbits - 1
+                        work += 1
                         var gv = g_o
                         if ci == nl_class and has_bol_ml:
                             gv = gval_n.unsafe_get(slot)
@@ -1441,6 +1667,8 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
                             accu_gen[ci] = Int32(gen)
                             accu[ci] = gv
 
+        if work > EDFA_WORK_BUDGET:
+            return result^  # attempt too expensive: stay invalid, use LazyDFA
         var row = SIMD[DType.int32, 256](-1)
         for ci in range(nclasses):
             if Int(accu_gen[ci]) != gen:
@@ -1718,11 +1946,14 @@ def _edfa_finish(
     for s in range(nsets):
         new_flags[s] &= ~Int(EDFA_NO_ACCEL)
 
-    var new_table = List[Int]()
+    # One 256-lane vector store per row: the comptime interpreter runs it
+    # as a single op, where the 256 appends it replaces cost ~35 us each
+    # (a 128-state table: ~1.1 s -> ~0). `fill=` is ~1.6 us per element.
+    var new_table = List[Int](fill=EDFA_DEAD, length=nsets * 256)
     for s in range(nsets):
-        var row = new_rows.unsafe_get(s)
-        for byte in range(256):
-            new_table.append(Int(row[byte]))
+        Pointer(to=new_table[s * 256]).unsafe_bitcast[Int64]().unsafe_store(
+            new_rows.unsafe_get(s).cast[DType.int64]()
+        )
 
     result.valid = True
     result.num_states = nsets
@@ -1748,27 +1979,18 @@ def _edfa_finish(
     return pstarts^
 
 
-def edfa_table_arr[
-    n: Int, dt: DType
-](d: EagerDFA) -> InlineArray[Scalar[dt], n]:
-    """Comptime conversion of the flat table to a materializable array.
+def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
+    """Comptime: the flat table as `n` little-endian `dt` entries (see
+    static_bytes.mojo for why a string, not an InlineArray).
 
     `dt` comes from `edfa_id_dtype`, `n` from `edfa_table_len` (it may
     exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
     survives the narrowing, so the walkers keep their sign-bit dead test.
     """
-    var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
-    # Padding only ever grows the array; a shorter `n` would silently
-    # drop rows.
     debug_assert(
-        n == 0 or n >= len(d.table), "table array shorter than the table"
+        n == 0 or n >= len(d.table), "table string shorter than the table"
     )
-    var m = len(d.table)
-    if n < m:
-        m = n
-    for i in range(m):
-        arr[i] = Scalar[dt](d.table[i])
-    return arr^
+    return table_bytes[dt](d.table, n)
 
 
 def edfa_flags_arr[n: Int](d: EagerDFA) -> InlineArray[UInt8, n]:
@@ -1978,23 +2200,32 @@ def _start_run_skip_idx(d: EagerDFA) -> Int:
         # a different start state: the run-skip argument does not hold.
         return -1
     var s0 = d.start_other
+    # Rows as 256-lane vectors: one load + a few lane-wise compares per
+    # state instead of 512 List element reads (~50 us each).
+    var row0 = (
+        Pointer(to=d.table[s0 * 256])
+        .unsafe_bitcast[Int64]()
+        .unsafe_load[width=256]()
+    )
     for i in range(len(d.accel_nib_states)):
         var s1 = d.accel_nib_states[i]
-        var uniform = True
-        var any_loop = False
-        for b in range(256):
-            if d.table[s1 * 256 + b] == s1:  # b self-loops in S1
-                any_loop = True
-                if d.table[s0 * 256 + b] != s1:  # S0 doesn't enter S1 on b
-                    uniform = False
-                    break
+        var row1 = (
+            Pointer(to=d.table[s1 * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
+        )
+        var s1v = SIMD[DType.int64, 256](s1)
+        var loops = row1.eq(s1v)  # bytes that self-loop in S1
+        var enters = row0.eq(s1v)  # bytes on which S0 enters S1
+        var any_loop = loops.reduce_or()
+        var uniform = not (loops & ~enters).reduce_or()
         # Soundness requires every skipped start to be in the start_other
         # context. If '\n' self-loops in S1, a start inside the run can sit
         # right after a newline and would use start_after_nl instead — only
         # safe when the two start states coincide (a `(?m)^` alternation arm
         # makes them differ, and skipping would then miss its matches).
         var nl_ok = (
-            d.table[s1 * 256 + Int(CHAR_NEWLINE)] != s1
+            Int(row1[Int(CHAR_NEWLINE)]) != s1
             or d.start_after_nl == d.start_other
         )
         if uniform and any_loop and nl_ok:
@@ -2026,37 +2257,55 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
         return (-1, -1)
     var s1 = d.accel_nib_states[rs]
     var n = d.num_states
+    # Rows as 256-lane vectors throughout: the cell-by-cell form read the
+    # whole table several times over at ~50 us per List element.
+    var s1v = SIMD[DType.int64, 256](s1)
+    var zero = SIMD[DType.int64, 256](0)
+    var one = SIMD[DType.int64, 256](1)
+    var row1 = (
+        Pointer(to=d.table[s1 * 256])
+        .unsafe_bitcast[Int64]()
+        .unsafe_load[width=256]()
+    )
+    var loops1 = row1.eq(s1v)
 
     # In-edges of S1: only from start contexts, only on self-loop bytes.
+    # `live` counts the live entries per column for the pivot search.
+    var live = zero
     for s in range(n):
-        for b in range(256):
-            if d.table[s * 256 + b] != s1 or s == s1:
-                continue
-            var is_start = (
-                s == d.start_at_0 or s == d.start_after_nl or s == d.start_other
-            )
-            if not is_start:
-                return (-1, -1)
-            if d.table[s1 * 256 + b] != s1:
-                return (-1, -1)  # start enters S1 on a non-loop byte
+        var row = (
+            Pointer(to=d.table[s * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
+        )
+        live += row.ge(zero).select(one, zero)
+        if s == s1:
+            continue
+        var enters = row.eq(s1v)
+        if not enters.reduce_or():
+            continue
+        var is_start = (
+            s == d.start_at_0 or s == d.start_after_nl or s == d.start_other
+        )
+        if not is_start:
+            return (-1, -1)
+        if (enters & ~loops1).reduce_or():
+            return (-1, -1)  # start enters S1 on a non-loop byte
 
     # Pivot byte: the only live P-column entry is from S1, leaving S1.
     # Among qualifying bytes prefer the statistically rarest (background
     # frequency): fewer occurrences means fewer candidate attempts.
-    var ranks = _probe_rank_table()
+    var ranks = PROBE_RANKS
     var pivot = -1
     var best_rank = 1_000_000
     for b in range(256):
-        var t1 = d.table[s1 * 256 + b]
+        var t1 = Int(row1[b])
         if t1 < 0 or t1 == s1:
             continue
-        var unique = True
-        for s in range(n):
-            if s != s1 and d.table[s * 256 + b] >= 0:
-                unique = False
-                break
-        if unique and ranks[b] < best_rank:
-            best_rank = ranks[b]
+        if Int(live[b]) != 1:  # another state's live entry in column b
+            continue
+        if Int(ranks[b]) < best_rank:
+            best_rank = Int(ranks[b])
             pivot = b
     if pivot < 0:
         return (-1, -1)
@@ -2072,10 +2321,25 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
         reach[s] = True
         if s < d.num_match_states or d.flags[s] != 0:
             return (-1, -1)
+        var row = (
+            Pointer(to=d.table[s * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
+        )
+        # Push each distinct target once (a bitset over state ids), not
+        # one append per byte.
+        var seen = SIMD[DType.uint64, 64](0)
         for b in range(256):
             if b == pivot:
                 continue
-            stack.append(d.table[s * 256 + b])
+            var t = Int(row[b])
+            if t < 0:
+                continue
+            var w = t >> 6
+            var bit = UInt64(1) << UInt64(t & 63)
+            if (seen[w] & bit) == 0:
+                seen[w] |= bit
+                stack.append(t)
     return (rs, pivot)
 
 
@@ -2098,10 +2362,15 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
     while cap > 0 and cur >= 0:
         if cur < d.num_match_states or d.flags[cur] != 0:
             break  # accept-capable: nothing further is forced
+        var row = (
+            Pointer(to=d.table[cur * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
+        )
         var only = -1
         var count = 0
         for b in range(256):
-            if d.table[cur * 256 + b] >= 0:
+            if Int(row[b]) >= 0:
                 count += 1
                 only = b
                 if count > 1:
@@ -2109,7 +2378,7 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
         if count != 1:
             break
         chain.append(only)
-        cur = d.table[cur * 256 + only]
+        cur = Int(row[only])
         cap -= 1
     return chain^
 
@@ -2117,18 +2386,17 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
 @always_inline
 def _edfa_full_match_impl[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
     # `table` / `flags` are comptime arrays; `materialize` binds them to the
     # constant data emitted in the binary (no copy) so the walk can index them.
-    var tbl = materialize[table]()
+    comptime dt = edfa_id_dtype(d.num_states)
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur = d.start_at_0
     var pos = 0
@@ -2141,7 +2409,7 @@ def _edfa_full_match_impl[
                 pos = _edfa_region_skip[d=d](input, cur, pos)
             if pos >= input_len:
                 break
-        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(input.unsafe_get(pos))))
+        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(input.unsafe_get(pos))])
         if nxt < 0:
             return False
         cur = nxt
@@ -2158,12 +2426,10 @@ def _edfa_full_match_impl[
 @always_inline
 def edfa_full_match[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """Anchored full match (mirrors LazyDFA.full_match).
@@ -2186,12 +2452,10 @@ def edfa_full_match[
 @always_inline
 def _edfa_walk_impl[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
     accel: Bool,
     s_at0: Int,
@@ -2199,7 +2463,8 @@ def _edfa_walk_impl[
     s_other: Int,
     s_other_w: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
-    var tbl = materialize[table]()
+    comptime dt = edfa_id_dtype(d.num_states)
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
@@ -2242,7 +2507,7 @@ def _edfa_walk_impl[
                 var f = flg.unsafe_get(cur)
                 if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
                     last_match = pos
-        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(b)))
+        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
         if nxt < 0:
             # Died mid-input: EOL-at-end flags don't apply (mirrors the
             # `current >= 0` guard in LazyDFA.match_at).
@@ -2260,12 +2525,10 @@ def _edfa_walk_impl[
 @always_inline
 def edfa_walk_from[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
     s_at0: Int,
     s_nl: Int,
@@ -2316,12 +2579,10 @@ def edfa_walk_from[
 @always_inline
 def edfa_match_at[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     d: EagerDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Anchored match at `start`; returns leftmost-longest end or -1

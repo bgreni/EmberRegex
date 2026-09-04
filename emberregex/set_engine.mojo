@@ -49,12 +49,13 @@ from std.math import max
 from std.os import abort
 
 from .nfa import NFA
+from .static_bytes import static_bytes
 from .set_ac import (
     ac_cls_arr,
     ac_pool_arr,
     ac_rep_arr,
     ac_scan,
-    ac_table_arr,
+    ac_table_str,
     ac_view,
     build_ac,
 )
@@ -70,10 +71,11 @@ from .set_dfa import (
     mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
-    mdfa_table_arr,
+    mdfa_table_str,
 )
 from .set_literal import extract_literal_set, litset_scan
-from .set_nfa import build_union_nfa, build_union_subset_nfa
+from .set_nfa import build_union_nfa, build_union_subset_nfa, _union_any_unicode
+from .set_pike import utf8_mid_codepoint
 from .set_pike import (
     SetMatch,
     SetSpan,
@@ -93,7 +95,7 @@ from .set_rose import (
     rose_meta_arr,
     rose_meta_len,
     rose_scan,
-    rose_table_arr,
+    rose_table_str,
     rose_view,
 )
 from .set_reverse import (
@@ -101,7 +103,7 @@ from .set_reverse import (
     leftmost_nonoverlapping,
     rdfa_pool_arr,
     rdfa_slices_arr,
-    rdfa_table_arr,
+    rdfa_table_str,
     rdfa_view,
     reverse_som,
 )
@@ -111,7 +113,7 @@ from .set_combine import (
     combos_rpn_arr,
     evaluate_combinations,
 )
-from .set_prefilter import build_confirm_nfas, confirm_span
+from .set_prefilter import confirm_span
 from .set_semantics import (
     EXT_STRIDE,
     ExprInfo,
@@ -251,7 +253,8 @@ struct RegexSet[
     comptime _ac = build_ac(Self.nfa, Self.num_patterns, not Self._use_litset)
     comptime _use_ac = Self._ac.valid
     comptime _ac_v = ac_view(Self._ac)
-    comptime _AC_TABLE = ac_table_arr[
+    comptime _AC_TABLE = static_bytes[Self._AC_TABLE_S]()
+    comptime _AC_TABLE_S = ac_table_str[
         Self._ac.num_states * Self._ac.num_classes
     ](Self._ac)
     comptime _AC_CLS = ac_cls_arr(Self._ac)
@@ -267,7 +270,8 @@ struct RegexSet[
         Self.ext,
     )
     comptime _use_rose = Self._rose.valid
-    comptime _ROSE_TABLE = rose_table_arr[Self._rose.num_conf_states * 256](
+    comptime _ROSE_TABLE = static_bytes[Self._ROSE_TABLE_S]()
+    comptime _ROSE_TABLE_S = rose_table_str[Self._rose.num_conf_states * 256](
         Self._rose
     )
     comptime _ROSE_FLAGS = rose_flags_arr[Self._rose.num_conf_states](
@@ -296,7 +300,8 @@ struct RegexSet[
         Self._res_nfa, Self._has_residual and Self._res_nfa.can_use_dfa
     )
     comptime _use_res_mdfa = Self._res_mdfa.valid
-    comptime _RES_TABLE = mdfa_table_arr[Self._res_mdfa.num_states * 256](
+    comptime _RES_TABLE = static_bytes[Self._RES_TABLE_S]()
+    comptime _RES_TABLE_S = mdfa_table_str[Self._res_mdfa.num_states * 256](
         Self._res_mdfa
     )
     comptime _RES_POOL = mdfa_pool_arr[len(Self._res_mdfa.pool)](Self._res_mdfa)
@@ -342,7 +347,8 @@ struct RegexSet[
         and not Self._use_rose,
     )
     comptime _use_mdfa = Self._mdfa.valid
-    comptime _MDFA_TABLE = mdfa_table_arr[Self._mdfa.num_states * 256](
+    comptime _MDFA_TABLE = static_bytes[Self._MDFA_TABLE_S]()
+    comptime _MDFA_TABLE_S = mdfa_table_str[Self._mdfa.num_states * 256](
         Self._mdfa
     )
     comptime _MDFA_POOL = mdfa_pool_arr[len(Self._mdfa.pool)](Self._mdfa)
@@ -419,7 +425,8 @@ struct RegexSet[
     )
     comptime _use_rdfa = Self._rdfa.valid
     comptime _rdfa_v = rdfa_view(Self._rdfa)
-    comptime _RD_TABLE = rdfa_table_arr[Self._rdfa.num_states * 256](Self._rdfa)
+    comptime _RD_TABLE = static_bytes[Self._RD_TABLE_S]()
+    comptime _RD_TABLE_S = rdfa_table_str[Self._rdfa.num_states * 256](Self._rdfa)
     comptime _RD_POOL = rdfa_pool_arr[len(Self._rdfa.pool)](Self._rdfa)
     comptime _RD_SLICES = rdfa_slices_arr[6 * Self._rdfa.num_states](Self._rdfa)
 
@@ -428,9 +435,6 @@ struct RegexSet[
     # their reports are candidates until the exact backtracker agrees.
     comptime _confirm_ids = Self.nfa.confirm_ids
     comptime _needs_confirm = len(Self._confirm_ids) > 0
-    comptime _confirm_nfas = build_confirm_nfas(
-        Self.patterns, Self._confirm_ids
-    )
 
     # --- Logical combinations (phase 7) ------------------------------------
     comptime _num_combos = len(Self.combos)
@@ -666,9 +670,11 @@ struct RegexSet[
                 var keep = True
                 comptime for k in range(len(Self._confirm_ids)):
                     comptime cid = Self._confirm_ids[k]
-                    comptime cnfa = Self._confirm_nfas[k]
+                    comptime cpat = Self.patterns[cid]
                     if sp.id == cid:
-                        keep = confirm_span[nfa=cnfa](input, sp.start, sp.end)
+                        keep = confirm_span[pattern=cpat](
+                            input, sp.start, sp.end
+                        )
                 if keep:
                     out.append(sp)
             return out^
@@ -676,7 +682,47 @@ struct RegexSet[
     def _scan_raw[
         origin: Origin, //
     ](self, input: Span[Byte, origin]) -> List[SetMatch]:
-        """The engine ladder itself, before any semantic filtering."""
+        """The engine ladder plus the UTF-8 boundary gate, before any
+        semantic filtering.
+
+        A UTF-8-mode pattern must never report an end offset that is
+        mid-codepoint — strictly inside a well-formed multi-byte
+        sequence (`utf8_mid_codepoint`, the rule the Pike oracle shares).
+        On valid input only a zero-width match can land there (a
+        non-empty (?u) match consumes whole codepoints); on invalid input
+        a match ending before a STRAY continuation byte is real and is
+        kept. Byte-mode ids in a mixed set pass through untouched.
+        Compiles away entirely for byte-only sets.
+
+        The unicode flags are read from the NFA materialized once in
+        `__init__`, and the list is compacted in place only when a report
+        is actually dropped — the common case (valid UTF-8, no zero-width
+        matches) costs one pass over the ends and no allocation."""
+        var reports = self._scan_ladder(input)
+        comptime if _union_any_unicode(Self.nfa):
+            ref uni = self._nfa.pattern_unicode
+            var w = 0
+            for i in range(len(reports)):
+                var m = reports[i]
+                if (
+                    m.id < len(uni)
+                    and uni[m.id]
+                    and utf8_mid_codepoint(input, m.end)
+                ):
+                    continue
+                if w != i:
+                    reports[w] = m
+                w += 1
+            while len(reports) > w:
+                _ = reports.pop()
+            return reports^
+        else:
+            return reports^
+
+    def _scan_ladder[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin]) -> List[SetMatch]:
+        """The engine ladder itself."""
         comptime if Self._use_litset:
             return litset_scan[ls=Self._litset](input)
         elif Self._use_ac:

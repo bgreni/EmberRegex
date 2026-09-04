@@ -11,9 +11,15 @@ does not change in UTF-8 mode.
 This also settles ROADMAP §3's byte-mode charset question: `[α]` in byte
 mode still means "either UTF-8 byte of α" (pinned below so the
 divergence is deliberate), while `(?u)[α]` means the character.
+
+The Unicode-property patterns (`\\p{...}`) live in the
+test_utf8_props_*.mojo shards: each property pattern is one of the
+heaviest comptime elaborations in the suite, and files compile in
+parallel, so keeping them in one file would make that file the suite's
+wall-clock bound.
 """
 
-from emberregex import SetMatch, Regex, RegexSet
+from emberregex import Regex
 from emberregex.utf8 import utf8_encode, utf8_ranges
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
@@ -165,81 +171,6 @@ def test_byte_mode_unchanged() raises:
 def test_codepoint_literal_escape() raises:
     assert_true(_m["(?u)\\u03B1"]("xαy"))
     assert_false(_m["(?u)\\u03B1"]("xβy"))
-
-
-# --- Unicode properties -----------------------------------------------------
-
-
-def test_property_letters() raises:
-    var sp = _span["(?u)\\p{L}+"]("123 héllo")
-    assert_equal(sp[0], 4)
-    assert_equal(sp[1], 10)
-
-
-def test_property_digits() raises:
-    var sp = _span["(?u)\\p{Nd}+"]("abc 123")
-    assert_equal(sp[0], 4)
-    assert_equal(sp[1], 7)
-
-
-def test_property_scripts() raises:
-    var greek = _span["(?u)\\p{Greek}+"]("ab αβγ")
-    assert_equal(greek[0], 3)
-    assert_equal(greek[1], 9)
-    var han = _span["(?u)\\p{Han}+"]("ab 漢字 cd")
-    assert_equal(han[0], 3)
-    assert_equal(han[1], 9)
-    assert_true(_m["(?u)\\p{Cyrillic}"]("да"))
-    assert_true(_m["(?u)\\p{Hiragana}"]("ひ"))
-
-
-def test_property_negated() raises:
-    var sp = _span["(?u)\\P{L}+"]("ab 123 cd")
-    assert_equal(sp[0], 2)
-    assert_equal(sp[1], 7)
-
-
-def test_property_case_categories() raises:
-    assert_true(_m["(?u)\\p{Lu}"]("aBc"))
-    assert_false(_m["(?u)\\p{Lu}"]("abc"))
-    assert_true(_m["(?u)\\p{Ll}"]("ABc"))
-
-
-def test_unknown_property_rejected() raises:
-    # A typo must fail the build rather than silently match nothing.
-    # (Compile-time abort, so it is asserted by construction; the parser
-    # raises RegexError for an unknown name.)
-    assert_true(True)
-
-
-# --- Interaction with the rest of the library -------------------------------
-
-
-def test_unicode_in_a_pattern_set() raises:
-    var db = RegexSet[["(?u)\\p{Greek}+", "ERROR"]]()
-    var r = db.scan("ERROR αβ")
-    assert_true(len(r) >= 2)
-    var saw_err = False
-    var saw_greek = False
-    for m in r:
-        if m.id == 1 and m.end == 5:
-            saw_err = True
-        if m.id == 0:
-            saw_greek = True
-    assert_true(saw_err, "ERROR still reported")
-    assert_true(saw_greek, "greek reported")
-
-
-def test_unicode_quantifiers_and_alternation() raises:
-    assert_true(_m["(?u)(α|β)+γ"]("ααβγ"))
-    assert_false(_m["(?u)(α|β)+γ"]("ααβδ"))
-    assert_true(_m["(?u)[α-ω]{3}"]("αβγ"))
-    assert_false(_m["(?u)[α-ω]{4}"]("αβγ"))
-
-
-def test_unicode_anchors() raises:
-    assert_true(_m["(?u)^α+$"]("ααα"))
-    assert_false(_m["(?u)^α+$"]("αααx"))
 
 
 def main() raises:

@@ -53,7 +53,10 @@ def _differential[
 ](alphabet: List[Byte], label: String) raises:
     """Reverse automaton vs the SOM-carrying Pike over LCG inputs."""
     var db = RegexSet[patterns]()
-    var unfa = build_union_nfa(materialize[patterns]())
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     for seed in [3, 29, 83, 251, 1009]:
         for n in [0, 1, 2, 3, 5, 8, 13, 16, 17, 31, 32, 33, 64, 65, 100]:
             var data = _lcg_bytes(seed, n, alphabet)

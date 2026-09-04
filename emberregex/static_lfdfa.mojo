@@ -1134,12 +1134,10 @@ def build_lf_dfa(
 @always_inline
 def lfdfa_find_end[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     lf: LFDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Unanchored scan from `start`: the END of the leftmost-first match
@@ -1160,12 +1158,10 @@ def lfdfa_find_end[
 @always_inline
 def lfdfa_match_at[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     lf: LFDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], pos: Int) -> Int:
     """Anchored at `pos`: the leftmost-first END of a match starting
@@ -1186,15 +1182,16 @@ def lfdfa_match_at[
 def sheng_lfdfa_find_end[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     lf: LFDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """`lfdfa_find_end` on the shuffle engine."""
     return sheng_walk_from[
         d=lf.d,
+        cap=cap,
         masks=masks,
         flags=flags,
         s_at0=lf.d.start_at_0,
@@ -1208,16 +1205,17 @@ def sheng_lfdfa_find_end[
 def sheng_lfdfa_match_at[
     origin: Origin,
     ns: Int,
-    ml: Int,
     //,
     lf: LFDFA,
-    masks: InlineArray[UInt8, ml],
+    cap: Int,
+    masks: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], pos: Int) -> Int:
     """`lfdfa_match_at` on the shuffle engine."""
     comptime assert lf.has_anchored, "lfdfa_match_at needs anchored starts"
     return sheng_walk_from[
         d=lf.d,
+        cap=cap,
         masks=masks,
         flags=flags,
         s_at0=lf.astart_at_0,

@@ -347,6 +347,12 @@ def _sort_reports(mut r: List[SetMatch]):
         r[j + 1] = key
 
 
+# `@always_inline` for the same reason as `mdfa_scan` and the eager
+# walkers: `ls` is a List-carrying value parameter, and an out-of-line
+# instantiation prints it into its symbol name (a 1 MB symbol for the
+# bench's literal sets; macOS ld asserts past its maximum). Inlined, no
+# symbol is emitted; each caller has exactly one call.
+@always_inline
 def litset_scan[
     origin: Origin, //, ls: LiteralSet
 ](input: Span[Byte, origin]) -> List[SetMatch]:

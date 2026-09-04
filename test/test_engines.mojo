@@ -284,5 +284,55 @@ def test_search_run_skip_class_arm_still_matches() raises:
     assert_equal(r2.end, 5)
 
 
+def test_backref_pattern_never_falls_to_pike() raises:
+    # The Pike VM cannot execute BACKREF states (its step loop has no
+    # BACKREF arm), so a backref pattern whose walk exhausts SBT_BUDGET
+    # must keep backtracking unbudgeted — like Python/PCRE — instead of
+    # falling back. The optional nested quantifier burns ~2^18 steps
+    # (> SBT_BUDGET) failing at position 0 before the true match.
+    # Python: re.search(r'(x?)(?:(a+)+b)?c\1', 'a'*18+'c') -> (18,19).
+    comptime S = Regex["(x?)(?:(a+)+b)?c\\1"]
+    assert_true(S._has_backref)
+    var re = Regex["(x?)(?:(a+)+b)?c\\1"]()
+    var input = String("")
+    for _ in range(18):
+        input += "a"
+    input += "c"
+    var m = re.search(input)
+    assert_true(m.matched)
+    assert_equal(m.start, 18)
+    assert_equal(m.end, 19)
+
+
+def test_backref_stack_exhaustion_continues_on_heap_backtracker() raises:
+    # `(?:ab|c)+` is a general loop — the specialized backtracker recurses
+    # once per iteration — and `\1` keeps the pattern off every linear
+    # engine (the Pike VM has no BACKREF arm). 100k iterations exceed
+    # SBT_STACK_BUDGET in any build (a frame is >= ~120 B), so the walk
+    # must continue on the heap-stack backtracker and answer correctly
+    # rather than abort or concede a false negative.
+    # Python: re.search(r'(x)(?:ab|c)+\1', 'x'+'ab'*100000+'x') -> (0, 200002).
+    comptime S = Regex["(x)(?:ab|c)+\\1"]
+    assert_true(S._has_backref)
+    assert_true(S._sbt_general_loop)
+    var re = S()
+    var body = String("ab") * 100000
+    var hit = String("x") + body + "x"
+    var m = re.search(hit)
+    assert_true(m.matched)
+    assert_equal(m.start, 0)
+    assert_equal(m.end, 200002)
+    assert_equal(m.group_str(hit, 1), "x")
+    var full = re.match(hit)
+    assert_true(full.matched)
+    assert_equal(full.end, 200002)
+    assert_equal(full.group_str(hit, 1), "x")
+    # No trailing `x`: every iteration count is refuted in turn (linear
+    # work), and the answer is a true negative.
+    var miss = String("x") + body
+    assert_false(re.search(miss).matched)
+    assert_false(re.match(miss).matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

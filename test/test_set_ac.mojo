@@ -18,6 +18,7 @@ tests one rung down the ladder:
 """
 
 from emberregex import SetMatch, SetSpan, RegexSet
+from emberregex.static_bytes import static_bytes
 from emberregex.set_ac import (
     AC_MAX,
     AC_POOL_CAP,
@@ -26,7 +27,7 @@ from emberregex.set_ac import (
     ac_pool_arr,
     ac_rep_arr,
     ac_scan,
-    ac_table_arr,
+    ac_table_str,
     ac_view,
     build_ac,
 )
@@ -66,7 +67,7 @@ def ac_direct_scan[
     comptime S = RegexSet[patterns]
     comptime A = build_ac(S.nfa, S.num_patterns, True)
     comptime V = ac_view(A)
-    comptime T = ac_table_arr[A.num_states * A.num_classes](A)
+    comptime T = static_bytes[ac_table_str[A.num_states * A.num_classes](A)]()
     comptime C = ac_cls_arr(A)
     comptime R = ac_rep_arr[2 * A.num_states](A)
     comptime P = ac_pool_arr[len(A.pool)](A)
@@ -137,7 +138,10 @@ def _differential[
     them per input dominated the test.
     """
     var db = RegexSet[patterns]()
-    var unfa = build_union_nfa(materialize[patterns]())
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     for seed in seeds:
         for n in [0, 1, 2, 3, 5, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 130]:
             var data = _lcg_bytes(seed, n, alphabet)

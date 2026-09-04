@@ -19,6 +19,7 @@ assertion so a selection change cannot silently move a test onto — or off
 """
 
 from emberregex import Regex
+from emberregex.static_bytes import static_bytes
 from emberregex.onepass import (
     OnePass,
     OP_MATCH,
@@ -34,7 +35,7 @@ from emberregex.onepass import (
     onepass_match,
     onepass_state_arr,
     onepass_state_len,
-    onepass_table_arr,
+    onepass_table_str,
     onepass_table_len,
 )
 from emberregex.engine import _build_static_nfa
@@ -200,7 +201,7 @@ def test_onepass_walker_acceleration() raises:
     comptime accel = len(op.accel.accel_states) + len(op.accel.accel_nib_states)
     assert_true(accel >= 1)
     comptime TN = onepass_table_len(op)
-    comptime TBL = onepass_table_arr[TN](op)
+    comptime TBL = static_bytes[onepass_table_str[TN](op)]()
     comptime CLS = onepass_class_arr(op)
     comptime NE = onepass_eps_len(op)
     comptime EPS = onepass_eps_arr[NE](op)

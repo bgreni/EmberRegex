@@ -62,6 +62,7 @@ Caps (all comptime, all "decline the lane and fall through"):
 
 from std.collections import InlineArray
 
+from .static_bytes import filled_string
 from .nfa import NFA
 from .set_literal import extract_literal_chains
 from .set_pike import SetMatch
@@ -473,16 +474,20 @@ def ac_view(d: ACSet) -> ACView:
     return v^
 
 
-def ac_table_arr[n: Int](d: ACSet) -> InlineArray[UInt16, n]:
-    """Dense `num_states x num_classes` transition table. UInt16 ids:
-    AC_NODE_CAP keeps every state addressable."""
-    var arr = InlineArray[UInt16, n](fill=0)
+def ac_table_str[n: Int](d: ACSet) -> String:
+    """Dense `num_states x num_classes` transition table as `n`
+    little-endian UInt16 entries (AC_NODE_CAP keeps every state
+    addressable); see static_bytes.mojo for why a string."""
+    var out = filled_string(n * 2, 0)
+    var p = out.unsafe_ptr_mut()
     var nc = d.num_classes
     for s in range(d.num_states):
         var row = d.rows[s]
         for c in range(nc):
-            arr[s * nc + c] = row[c]
-    return arr^
+            Pointer(to=p[unsafe_offset=(s * nc + c) * 2]).unsafe_bitcast[UInt16]().unsafe_store(
+                row[c]
+            )
+    return out^
 
 
 def ac_cls_arr(d: ACSet) -> InlineArray[UInt8, 256]:
@@ -523,14 +528,18 @@ def _ac_emit[
         out.append(SetMatch(Int(pl.unsafe_get(off + i)), end))
 
 
+# `@always_inline` for the same reason as `mdfa_scan`: `v` is a
+# List-carrying value parameter and `table` a string literal, both
+# printed into an out-of-line instantiation's symbol name (macOS ld
+# asserts past its maximum symbol length). Inlined, no symbol is emitted.
+@always_inline
 def ac_scan[
     origin: Origin,
-    tn: Int,
     rn: Int,
     pn: Int,
     //,
     v: ACView,
-    table: InlineArray[UInt16, tn],
+    table: StringLiteral,
     cls: InlineArray[UInt8, 256],
     rep: InlineArray[Int32, rn],
     pool: InlineArray[Int32, pn],
@@ -544,7 +553,7 @@ def ac_scan[
     """
     comptime NC = v.num_classes
     var out = List[SetMatch]()
-    var tbl = materialize[table]()
+    var tbl = table.unsafe_ptr().unsafe_bitcast[UInt16]()
     var cm = materialize[cls]()
     var rp = materialize[rep]()
     var input_len = len(input)
@@ -562,7 +571,7 @@ def ac_scan[
                 if pos >= input_len:
                     break
         var c = Int(cm.unsafe_get(Int(input.unsafe_get(pos))))
-        cur = Int(tbl.unsafe_get(cur * NC + c))
+        cur = Int(tbl[unsafe_offset=cur * NC + c])
         pos += 1
         var n_rep = Int(rp.unsafe_get(2 * cur + 1))
         if n_rep != 0:

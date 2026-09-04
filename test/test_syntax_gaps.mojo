@@ -192,5 +192,99 @@ def test_octal_stops_at_non_octal_digit() raises:
     assert_true(_m["a\\08b"](String("a") + chr(0) + String("8b")))
 
 
+def test_comment_transparent_to_quantifier() raises:
+    # Python/PCRE2/Perl all quantify the atom BEFORE a (?#comment):
+    # a(?#c){2}b == a{2}b (pcre2 testinput1:699). The old parser
+    # quantified the comment's empty node instead.
+    var re = Regex["a(?#c){2}b"]()
+    assert_true(re.match("aab").matched)
+    assert_false(re.match("ab").matched)
+    # Verbose mode interleaves spaces and comments (testinput1:700).
+    var re2 = Regex["(?x)^a (?#xxx) (?#yyy) {3}c"]()
+    assert_true(re2.match("aaac").matched)
+
+
+def test_verbose_strips_vtab_formfeed() raises:
+    # Python's (?x) strips ALL whitespace including VT and FF
+    # (testinput1:773); PCRE agrees.
+    var re = Regex["(?x)a\x0b\x0cb"]()
+    assert_true(re.match("ab").matched)
+
+
+def test_control_escape_pcre_formula() raises:
+    # \cX = uppercase(X) XOR 0x40 — the PCRE/Perl definition (Python has
+    # no \c). Differs from a plain `& 0x1F` only for non-letters:
+    # \c{ -> ';' (0x3B) and [\c;] -> '{' (0x7B), per hscollider
+    # metacharacters 24003/24004/24018.
+    var re = Regex["\\c{"]()
+    assert_true(re.match(";").matched)
+    var re2 = Regex["[\\c;]"]()
+    assert_true(re2.match("{").matched)
+    assert_false(re2.match("\x1b").matched)
+
+
+def test_class_hHvV_are_classes() raises:
+    # PCRE reads \h \H \v \V inside a class as the same classes as at
+    # atom level. The old unknown-escape fallthrough made them literal
+    # letters, so [\h\H] matched only 'h'/'H' (hscollider charclass 11002).
+    var re = Regex["[\\h\\H]+"]()
+    var m = re.match(chr(0) + "hx")
+    assert_true(m.matched)
+    assert_equal(m.end, 3)
+    var re2 = Regex["[\\v]+"]()
+    var m2 = re2.match("\n\x0b\x0c\r")
+    assert_true(m2.matched)
+    assert_equal(m2.end, 4)
+    assert_false(re2.search("v").matched)
+
+
+def test_class_octal_escapes() raises:
+    # Python treats in-class numeric escapes as octal characters:
+    # [\40] is a space, [\101] is 'A' (this resolves the old
+    # deliberately-unaligned charset octal reading).
+    var re = Regex["[\\40\\101]+"]()
+    var m = re.match(" A A")
+    assert_true(m.matched)
+    assert_equal(m.end, 4)
+    assert_false(re.search("401").matched)
+
+
+def test_brace_hex_escape() raises:
+    # PCRE \x{...}: variable-width hex. \x{41}='A'; works as a class
+    # range endpoint; > 0xFF needs (?u) like \uHHHH.
+    var re = Regex["\\x{41}[\\x{30}-\\x{39}]"]()
+    var m = re.match("A5")
+    assert_true(m.matched)
+    assert_equal(m.end, 2)
+    assert_false(re.match("a5").matched)
+    var re2 = Regex["(?u)\\x{2603}"]()
+    var m2 = re2.match("☃")
+    assert_true(m2.matched)
+    assert_equal(m2.end, 3)
+
+
+def test_bare_octal_and_multidigit_backref() raises:
+    # Python's digit-escape rule: exactly three octal digits form an
+    # octal escape (\101 = 'A'); otherwise one or two digits form a
+    # backreference (\12 = group 12), which must exist.
+    var re = Regex["\\101\\102"]()
+    assert_true(re.match("AB").matched)
+    var re2 = Regex["(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12"]()
+    var input = "abcdefghijkll"
+    var m = re2.match(input)
+    assert_true(m.matched)
+    assert_equal(m.end, 13)
+    assert_equal(m.group_str(input, 12), "l")
+
+
+def test_posix_ascii_class() raises:
+    # [[:ascii:]] = 0x00-0x7F (PCRE).
+    var re = Regex["[[:ascii:]]+"]()
+    var m = re.search("éab")
+    assert_true(m.matched)
+    assert_equal(m.start, 2)
+    assert_equal(m.end, 4)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

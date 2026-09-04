@@ -49,6 +49,7 @@ from .simd_kernels import (
     shufti_encodable,
 )
 from .simd_scan import first_lane_index, lane_bits
+from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
     _StateBits,
@@ -614,11 +615,12 @@ def _mdfa_finish(
             result.accel_nib_t0.extend(t0^)
             result.accel_nib_t1.extend(t1^)
 
-    var new_table = List[Int]()
+    # One 256-lane vector store per row (see static_dfa `_edfa_finish`).
+    var new_table = List[Int](fill=-1, length=n * 256)
     for s in range(n):
-        var row = new_rows.unsafe_get(s)
-        for byte in range(256):
-            new_table.append(Int(row[byte]))
+        Pointer(to=new_table[s * 256]).unsafe_bitcast[Int64]().unsafe_store(
+            new_rows.unsafe_get(s).cast[DType.int64]()
+        )
 
     result.valid = True
     result.num_states = n
@@ -715,13 +717,10 @@ def _build_multi_dfa_list(nfa: NFA) -> MultiDFA:
 # --- Comptime materialization helpers ---------------------------------------
 
 
-def mdfa_table_arr[n: Int](d: MultiDFA) -> InlineArray[Int16, n]:
-    """Int16 state ids: MDFA_STATE_CAP < 32768 by construction, and the
-    narrower table keeps more of it in cache (plan phase 2.4)."""
-    var arr = InlineArray[Int16, n](fill=0)
-    for i in range(n):
-        arr[i] = Int16(d.table[i])
-    return arr^
+def mdfa_table_str[n: Int](d: MultiDFA) -> String:
+    """Int16 state ids (MDFA_STATE_CAP < 32768 by construction) as `n`
+    little-endian entries; see static_bytes.mojo for why a string."""
+    return table_bytes[DType.int16](d.table, n)
 
 
 def mdfa_pool_arr[n: Int](d: MultiDFA) -> InlineArray[Int32, n]:
@@ -872,18 +871,17 @@ def _emit_merged[
 @always_inline
 def _mdfa_scan_impl[
     origin: Origin,
-    tn: Int,
     pn: Int,
     sn: Int,
     //,
     d: MultiDFA,
-    table: InlineArray[Int16, tn],
+    table: StringLiteral,
     pool: InlineArray[Int32, pn],
     slices: InlineArray[Int32, sn],
     accel: Bool,
 ](input: Span[Byte, origin], mut out: List[SetMatch]):
     # Comptime arrays bound to the binary's constant data (no copy).
-    var tbl = materialize[table]()
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Int16]()
     var pl = materialize[pool]()
     var sl = materialize[slices]()
     var input_len = len(input)
@@ -919,23 +917,31 @@ def _mdfa_scan_impl[
             if skipped > pos:
                 pos = skipped
                 continue  # re-check reports/EOF at the landing position
-        cur = Int(tbl.unsafe_get(cur * 256 + Int(input.unsafe_get(pos))))
+        cur = Int(tbl[unsafe_offset=cur * 256 + Int(input.unsafe_get(pos))])
         pos += 1
 
 
+@always_inline
 def mdfa_scan[
     origin: Origin,
-    tn: Int,
     pn: Int,
     sn: Int,
     //,
     d: MultiDFA,
-    table: InlineArray[Int16, tn],
+    table: StringLiteral,
     pool: InlineArray[Int32, pn],
     slices: InlineArray[Int32, sn],
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan the whole input, reporting every (id, end) per the set
-    contract. Non-mutating; one pass, one table load per byte."""
+    contract. Non-mutating; one pass, one table load per byte.
+
+    `@always_inline` for the same reason as the eager walkers: `d` is a
+    List-carrying value parameter and `table` a string literal, and an
+    out-of-line instantiation prints both into its symbol name — the
+    bench's LOG_PATS union produced a 3.9 MB symbol that macOS ld
+    refuses (`name.size() <= maxLength` assertion). Inlined, no symbol
+    is emitted; the callers (`_scan_ladder`, the bench's phase-2 helper)
+    each have exactly one call."""
     var out = List[SetMatch]()
     comptime if _mdfa_has_accel(d):
         comptime W = simd_width_of[DType.uint8]()

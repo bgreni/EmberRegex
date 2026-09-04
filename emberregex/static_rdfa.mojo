@@ -63,7 +63,9 @@ from .simd_kernels import (
     shufti_encodable,
 )
 from .simd_scan import lane_bits, last_lane_index
+from .static_bytes import table_bytes
 from .static_dfa import (
+    edfa_id_dtype,
     EDFA_DEAD,
     EDFA_NFA_CAP,
     _MIN_CAP,
@@ -677,11 +679,12 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     _minimize(rows, flags, starts, rep_lo, rep_hi, nclasses)
 
     var nfinal = len(rows)
-    var table = List[Int]()
+    # One 256-lane vector store per row (see `_edfa_finish`).
+    var table = List[Int](fill=EDFA_DEAD, length=nfinal * 256)
     for si in range(nfinal):
-        var row = rows.unsafe_get(si)
-        for byte in range(256):
-            table.append(Int(row[byte]))
+        Pointer(to=table[si * 256]).unsafe_bitcast[Int64]().unsafe_store(
+            rows.unsafe_get(si).cast[DType.int64]()
+        )
     for f in flags:
         if f & Int(RDFA_BOL0) != 0:
             result.any_bol0 = True
@@ -743,23 +746,14 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     return result^
 
 
-def rdfa_table_arr[n: Int, dt: DType](d: RDFA) -> InlineArray[Scalar[dt], n]:
-    """Comptime conversion of the flat table to a materializable array
-    (narrow id type from `edfa_id_dtype`, `n` from `edfa_table_len` so a
-    tiny table is padded with dead rows to EDFA_TABLE_MIN_BYTES,
-    EDFA_DEAD survives)."""
-    var arr = InlineArray[Scalar[dt], n](fill=EDFA_DEAD)
-    # Padding only ever grows the array; a shorter `n` would silently
-    # drop rows.
+def rdfa_table_str[n: Int, dt: DType](d: RDFA) -> String:
+    """Comptime: the flat table as `n` little-endian `dt` entries (narrow id
+    type from `edfa_id_dtype`, `n` from `edfa_table_len`; EDFA_DEAD
+    survives). See static_bytes.mojo for why a string."""
     debug_assert(
-        n == 0 or n >= len(d.table), "table array shorter than the table"
+        n == 0 or n >= len(d.table), "table string shorter than the table"
     )
-    var m = len(d.table)
-    if n < m:
-        m = n
-    for i in range(m):
-        arr[i] = Scalar[dt](d.table[i])
-    return arr^
+    return table_bytes[dt](d.table, n)
 
 
 def rdfa_flags_arr[n: Int](d: RDFA) -> InlineArray[UInt8, n]:
@@ -855,12 +849,10 @@ def _rdfa_accel_skip[
 @always_inline
 def rdfa_find_start[
     origin: Origin,
-    dt: DType,
-    tn: Int,
     ns: Int,
     //,
     d: RDFA,
-    table: InlineArray[Scalar[dt], tn],
+    table: StringLiteral,
     flags: InlineArray[UInt8, ns],
 ](input: Span[Byte, origin], end: Int, floor: Int) -> Int:
     """Leftmost (smallest) position >= `floor` from which a match ends
@@ -871,7 +863,8 @@ def rdfa_find_start[
     when the reverse automaton dies. An accelerated state skips its run
     first and records its flags at the run's leftmost position.
     """
-    var tbl = materialize[table]()
+    comptime dt = edfa_id_dtype(d.num_states)
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var input_len = len(input)
     var cur: Int
@@ -912,7 +905,7 @@ def rdfa_find_start[
                     best = pos
         if pos <= floor:
             return best
-        var nxt = Int(tbl.unsafe_get(cur * 256 + Int(b)))
+        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
         if nxt < 0:
             return best
         cur = nxt

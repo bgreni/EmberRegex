@@ -183,6 +183,10 @@ var re4 = Regex["(?s)a.b"]()
 re4.match("a\nb").matched  # True
 ```
 
+Bare inline flag groups like `(?i)` must appear **before any pattern
+content** (Python's rule — `a(?i)b` is a compile error). To apply flags
+to part of a pattern, use a scoped group: `a(?i:b)` or `(?-i:...)`.
+
 ## Capture Groups
 
 Use parentheses to capture submatches. Groups are 1-indexed:
@@ -243,9 +247,14 @@ The `MatchResult` type is returned by `match()` and `search()`:
 | `\w`, `\W` | Word character `[a-zA-Z0-9_]` / non-word |
 | `\s`, `\S` | Whitespace / non-whitespace |
 | `\t`, `\n`, `\r` | Tab, newline, carriage return |
+| `\f`, `\a` | Form feed (`\x0c`), bell (`\x07`) |
+| `[\b]` | Backspace (`\x08`) **inside a class** — outside, `\b` is a word boundary |
+| `\xHH`, `\x{...}` | Hex escape: exactly two digits, or PCRE's braced form (`\x{2603}` needs `(?u)` above U+00FF) |
+| `\0oo`, `\ooo` | Octal escape: `\0` plus up to two octal digits, or exactly three (`\101` = `A`); inside a class all numeric escapes are octal |
+| `\cX` | Control character (PCRE formula: uppercase X, then XOR `0x40`) |
 | `\h`, `\H` | Horizontal whitespace `[ \t]` / negation |
 | `\v`, `\V` | Vertical whitespace `[\n\x0b\f\r]` / negation (PCRE reading, **not** Python's vertical-tab character) |
-| `[[:alpha:]]` | POSIX class (also `digit alnum upper lower space blank punct xdigit word cntrl print graph`) |
+| `[[:alpha:]]` | POSIX class (also `digit alnum upper lower space blank punct xdigit word cntrl print graph ascii`) |
 | `[[:^alpha:]]` | Negated POSIX class |
 | `[abc]` | Character class |
 | `[a-z]` | Character range |
@@ -305,6 +314,7 @@ Three caveats worth knowing:
 | `?` | Zero or one (greedy) |
 | `{n}` | Exactly n |
 | `{n,m}` | Between n and m |
+| `{,m}`, `{,}` | Missing lower bound reads as 0: `{0,m}` / `{0,}` (Python 3.13 / PCRE2 10.43+) |
 | `{n,}` | At least n |
 | `*?`, `+?`, `??`, `{n,m}?` | Lazy (non-greedy) variants |
 
@@ -330,7 +340,7 @@ Three caveats worth knowing:
 | `(...)` | Capture group |
 | `(?:...)` | Non-capturing group |
 | `(?P<name>...)` | Named capture group |
-| `\1` - `\9` | Backreference to captured group |
+| `\1` - `\99` | Backreference to captured group (Python's rule: exactly three octal digits read as an octal escape instead) |
 | `a\|b` | Alternation |
 | `(?# ...)` | Comment (ignored) |
 
@@ -412,7 +422,10 @@ the report stream. Compile-time facts are available too:
 
 Hyperscan rejects both. EmberRegex accepts them in a set and reports them
 exactly, by widening the pattern into a superset for the fast lanes and
-confirming each candidate on the exact backtracking engine:
+confirming each candidate on the exact backtracking engine (a backreference
+confirm is unbudgeted and continues on the heap-stack backtracker if it
+exhausts the stack bound, so it is never a superset; a lookaround-only
+confirm that exhausts its work budget keeps the candidate):
 
 ```mojo
 var db = RegexSet[["(\\w)\\1", "foo(?=bar)"]]()
@@ -423,7 +436,7 @@ db.scan("aa ab foobar")   # (0,2) (0,9) (1,9) — "aa", "oo", "foo"; "ab" is not
 
 `Regex` parses the pattern and builds the NFA at compile time. The backtracking engine is specialized per NFA state via comptime parameters: each state becomes a distinct function instantiation whose body is a `comptime if` chain over the state kind, so every branch belonging to the other kinds is eliminated and what is left is straight-line code for that one state with its fields baked in. There is no runtime dispatch on state kind, the leaf primitives (charset bitmap tests, anchor checks, case folding) are `@always_inline`, and the acyclic parts of the call graph inline aggressively.
 
-Recursion does not disappear entirely: a cyclic split whose body is not a single-character self-loop — `(?:ab)+`, `(a+)+` — recurses for real, which is why the engine carries both a work budget and a stack bound, and falls back to the Pike VM when either is hit. Simple greedy and lazy quantifiers (`a+`, `[a-z]*`, `.*?`) are compiled to iteration instead and never grow the stack.
+Recursion does not disappear entirely: a cyclic split whose body is not a single-character self-loop — `(?:ab)+`, `(a+)+` — recurses for real, which is why the engine carries both a work budget and a stack bound, and falls back to the Pike VM when either is hit. Simple greedy and lazy quantifiers (`a+`, `[a-z]*`, `.*?`) are compiled to iteration instead and never grow the stack. A pattern with a backreference is the exception: the Pike VM cannot execute one (a thread's own captures decide the match), so such a pattern runs unbudgeted — like Python and PCRE, the exponential worst case is inherent — and when its walk exhausts the stack bound it continues on a second backtracker whose frames live on the heap, bounded by memory rather than by the thread's stack.
 
 The stack bound is measured in bytes, not in calls: the walk compares the stack pointer against a floor that is the higher of "4 MiB below where this walk started" and "512 KiB above the end of this thread's stack", the latter read from the platform (`pthread_get_stackaddr_np` on macOS, `pthread_getattr_np` on Linux) once per `Regex` and cached. So a pattern that would otherwise recurse per input byte concedes to the linear-time Pike VM rather than overflowing — including when it is called from a caller that has already consumed most of the stack, or on a thread whose stack was never 8 MiB. On a platform that cannot report its stack bounds only the relative rule applies, which bounds the walk's own growth but not the caller's.
 
@@ -441,7 +454,7 @@ At compile time, EmberRegex selects the fastest engine for the pattern:
 | captures, one-pass NFA with an alternation loop | one-pass DFA |
 | captures, same shape, search-family verbs | DFA-bounded span, then the slots filled on that span |
 | backrefs / lookaround / other capture shapes | specialized backtracker |
-| backtracker budget or stack bound exhausted | Pike VM |
+| backtracker budget or stack bound exhausted | Pike VM (backreference patterns: heap-stack backtracker, the Pike VM cannot run a backreference) |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full selection logic and the
 multi-pattern (`RegexSet`) engine ladder.

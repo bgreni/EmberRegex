@@ -13,12 +13,13 @@ instead, which would silently stop exercising this engine.
 """
 
 from emberregex import SetMatch, RegexSet
+from emberregex.static_bytes import static_bytes
 from emberregex.set_dfa import (
     build_multi_dfa,
     mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
-    mdfa_table_arr,
+    mdfa_table_str,
 )
 from emberregex.set_nfa import build_union_nfa
 from emberregex.set_pike import set_pike_scan
@@ -32,7 +33,7 @@ def _mdfa_scan[
     """Scan on the multi-accept DFA, bypassing engine selection."""
     comptime S = RegexSet[patterns]
     comptime MD = build_multi_dfa(S.nfa, S.nfa.can_use_dfa)
-    comptime T = mdfa_table_arr[MD.num_states * 256](MD)
+    comptime T = static_bytes[mdfa_table_str[MD.num_states * 256](MD)]()
     comptime P = mdfa_pool_arr[len(MD.pool)](MD)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
@@ -152,12 +153,12 @@ def test_strict_vs_multiline_eol_at_trailing_newline() raises:
 
 
 def test_same_id_in_norm_and_eol_slices_dedups() raises:
-    # `ab|(?m)b$` puts id 0 in BOTH the norm slice and the nl/end slice
+    # `(?m)ab|b$` puts id 0 in BOTH the norm slice and the nl/end slice
     # at one position; the merged emit must collapse it.
-    comptime S = RegexSet[["ab|(?m)b$"]]
+    comptime S = RegexSet[["(?m)ab|b$"]]
     comptime s_mdfa = S._use_mdfa
     assert_true(s_mdfa)
-    var db = RegexSet[["ab|(?m)b$"]]()
+    var db = RegexSet[["(?m)ab|b$"]]()
     assert_reports(
         db.scan("ab\nab"),
         [SetMatch(0, 2), SetMatch(0, 5)],
@@ -243,7 +244,10 @@ def _assert_matches_pike[
 ](data: List[Byte], label: String) raises:
     var db = RegexSet[patterns]()
     var got = db.scan(Span(data))
-    var unfa = build_union_nfa(materialize[patterns]())
+    # The database already holds the materialized union NFA: rebuilding
+    # it here elaborated the runtime parser + union builder into every
+    # instantiation of this helper.
+    ref unfa = db._nfa
     var expected = set_pike_scan(unfa, Span(data))
     assert_reports(got, expected, label)
 

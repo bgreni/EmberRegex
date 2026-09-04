@@ -90,5 +90,24 @@ def test_charset_combined() raises:
     assert_false(re.match("hello world").matched)
 
 
+def test_class_control_escapes() raises:
+    # Python/PCRE2/Perl/Ruby/JS all agree: [\b] is backspace \x08, [\f] is
+    # form feed \x0c, [\a] is bell \x07 — NOT the literal letters (which is
+    # what an unknown-escape literal fallthrough would give).
+    var re = Regex["[\\b\\f\\a]+"]()
+    var ctl = chr(8) + chr(12) + chr(7)
+    var m = re.match(ctl)
+    assert_true(m.matched)
+    assert_equal(m.end, 3)
+    assert_false(re.search("bfa").matched)
+
+
+def test_atom_control_escapes() raises:
+    # Python: \f (form feed) and \a (bell) are valid escapes at atom level.
+    var re = Regex["\\f\\a"]()
+    assert_true(re.match(chr(12) + chr(7)).matched)
+    assert_false(re.search("fa").matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

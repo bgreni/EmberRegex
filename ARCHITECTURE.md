@@ -105,11 +105,12 @@ Selected fastest-first at compile time:
 | DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng | `sheng.mojo` |
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
-| `can_use_dfa`, CLASSIC table over `EDFA_STATE_CAP` | lazy DFA | `dfa.mojo` |
+| `can_use_dfa`, CLASSIC table over `EDFA_STATE_CAP` (or the attempt past `EDFA_WORK_BUDGET` member-class visits) | lazy DFA | `dfa.mojo` |
 | captures, one-pass NFA with an alternation loop | one-pass DFA: `match()`, and the span confirm of the lane below (`_use_onepass`) | `onepass.mojo` |
 | captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
 | backrefs / lookaround / captures (`match()`, not one-pass); also a greedy pattern whose classic table fits but whose leftmost-first table overflowed | specialized backtracker | `backtrack.mojo` |
 | backtracker budget exhausted | Pike VM | `executor.mojo` |
+| backreference pattern (unbudgeted) whose walk exhausts the stack bound | heap-stack backtracker (`heapbt_match`) — the Pike VM has no BACKREF arm | `executor.mojo` |
 
 **The eager DFA is the interesting one.** Subset construction runs in the
 comptime interpreter over the comptime NFA; byte equivalence classes bound
@@ -163,9 +164,12 @@ is 3.7 µs here against 2.3 s on the backtracker alone. One attempt per
 match, never one per candidate. Every materialized table holds its state
 ids in the narrowest integer type that fits them (`edfa_id_dtype`:
 `Int8`, `Int16` or `Int32` — the table is the walk's hot data) and is
-padded to `EDFA_TABLE_MIN_BYTES` (1 KB): below that the constant lowers to
-a per-call stack copy inside the walker, which cost more than the walk
-itself on 3-state tables.
+travels as a comptime string literal (`static_bytes.mojo`): a materialized
+`InlineArray` global costs O(n²) in the MLIR→LLVM translation (one folded
+`insertvalue` per cell, ~6 s per 128-state table), while a `!kgen.string`
+lowers to one static `c"..."` global that the walkers read through a
+bitcast pointer — the same load, no per-call copy. `EDFA_TABLE_MIN_BYTES`
+(1 KB) still pads the element count.
 
 A pattern with no start-anchored scanner may still carry a **required
 inner literal** — a byte run every match must contain, sitting after an
@@ -287,7 +291,9 @@ stays off the lanes, as does the runtime lazy DFA, which does not model
 the anchor. Sets keep word-boundary patterns off their DFA lanes.
 
 The **specialized backtracker** is comptime-specialized per NFA state: each
-`_sbt_try_match[nfa, state_idx]` instantiation handles exactly one state kind
+`_sbt_try_match[pattern, state_idx]` instantiation (the NFA is re-derived
+inside via the memoized `_build_static_nfa(pattern)`, so symbol names carry
+the pattern string rather than a printed NFA) handles exactly one state kind
 with all fields baked in. The body is a `comptime if` chain over the kind, so
 every branch belonging to the other kinds is eliminated — what survives is
 straight-line code for that state, with no runtime dispatch on kind and no
@@ -303,7 +309,16 @@ branch is genuine recursion, and the engine carries **two** independent caps:
 `SBT_BUDGET` bounds total work, while `SBT_STACK_BUDGET` bounds the *stack* —
 budget alone does not, since `(?:ab)+` recurses once per byte consumed and has
 overflowed the stack on a 50KB input. Exhausting either falls through to the
-Pike VM. The stack bound is measured in **bytes**, not calls: the walk reads
+Pike VM — except for a pattern with a backreference, which the Pike VM cannot
+execute (a thread's own captures decide the match, so threads cannot be merged
+by state): such a pattern runs unbudgeted, like Python and PCRE, and when its
+walk exhausts the stack bound it continues on `heapbt_match` (executor.mojo),
+the same leftmost-first walk over the materialized NFA with its frames on a
+heap `List`, so it is bounded by memory rather than by the thread's stack. An
+empty loop iteration (`(a*)*`) fails that path there, the ECMAScript rule the
+Pike VM's per-position dedup also yields. Both are gated at compile time on
+the pattern actually carrying a BACKREF, so no other pattern's binary
+elaborates them. The stack bound is measured in **bytes**, not calls: the walk reads
 the stack pointer at the checked frames and concedes when it drops below a
 floor taken at `_sbt_run` entry. A call count cannot do the job — the same
 frame measures ~120 B in a release build and 600-1500 B under
@@ -521,7 +536,13 @@ superset you confirm yourself) or the separate Chimera library
    referenced group's body (the captured text is always in that group's
    language).
 2. **Confirm** each candidate on the exact specialized backtracker, anchored
-   at the superset's start-of-match and pinned to the candidate end.
+   at the superset's start-of-match and pinned to the candidate end. A
+   backreference confirm is exact all the way down: it runs unbudgeted and,
+   when the walk exhausts the stack bound, continues on the heap-stack
+   backtracker (`heapbt_match`) with the same pin — the single-pattern
+   lane's policy, since the Pike VM cannot execute a backreference. A
+   lookaround-only confirm that exhausts its work budget keeps the
+   candidate instead (a superset report, never a missing one).
 
 The pin matters: the engine sees the **whole input** with an `end_at`
 target rather than a truncated slice, because truncating would hide the

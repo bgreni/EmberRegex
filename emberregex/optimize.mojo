@@ -855,7 +855,7 @@ def _alt_join(
     return _SegRes(True, join, minb, maxb, SIMD[DType.uint8, _INNER_BITS](0))
 
 
-def extract_inner_literal(nfa: NFA) -> InnerLiteral:
+def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
     """Comptime: the best REQUIRED literal run that does not sit at fixed
     offset 0 (see InnerLiteral). Walks the NFA's mandatory spine from the
     start: CHAR and filterable CHARSET states (exact byte or ASCII case
@@ -875,7 +875,7 @@ def extract_inner_literal(nfa: NFA) -> InnerLiteral:
     var n = len(nfa.states)
     if n == 0 or n > INNER_LIT_MAX_STATES:
         return res^
-    var oncycle = split_cycle_flags(nfa)
+    ref oncycle = cyclic
 
     # Completed runs.
     var run_bytes = List[List[UInt8]]()
@@ -1011,7 +1011,7 @@ def extract_inner_literal(nfa: NFA) -> InnerLiteral:
 
     # Selection: drop fixed-offset-0 runs, require length >= 2, prefer
     # the rarest (then the longer) run.
-    var ranks = _probe_rank_table()
+    var ranks = PROBE_RANKS
     var best = -1
     var best_score = 1 << 30
     for i in range(len(run_bytes)):
@@ -1021,9 +1021,9 @@ def extract_inner_literal(nfa: NFA) -> InnerLiteral:
             continue
         var score = 1 << 29
         for k in range(len(run_bytes[i])):
-            var r = ranks[Int(run_bytes[i][k])]
+            var r = Int(ranks[Int(run_bytes[i][k])])
             if run_cl[i][k]:
-                r += ranks[Int(run_bytes[i][k]) - 32]
+                r += Int(ranks[Int(run_bytes[i][k]) - 32])
             if r < score:
                 score = r
         var better = False
@@ -1068,14 +1068,18 @@ def lit_flags_arr[n: Int](l: List[Bool]) -> InlineArray[Bool, n]:
     return a^
 
 
-def _probe_rank_table() -> List[Int]:
+def _probe_rank_vec() -> SIMD[DType.int32, 256]:
     """Comptime: approximate background byte frequency (0 = rarest, 255 =
     most common) over typical text/code, for prefilter probe selection.
 
     Precision is irrelevant — only the relative order of the pattern's own
     prefix bytes matters, and even a rough order beats always probing
-    first+last (the memchr-crate heuristic this follows)."""
-    var t = List[Int](fill=20, length=256)
+    first+last (the memchr-crate heuristic this follows).
+
+    A 256-lane vector: lane reads are interpreter-native (~1 us), and the
+    module-level `PROBE_RANKS` evaluates once per compile, where the List
+    form was rebuilt (~95 element writes at ~50 us) at every use."""
+    var t = SIMD[DType.int32, 256](20)
     for b in range(128, 256):
         t[b] = 100  # UTF-8 payload bytes: middling
     t[0x20] = 255  # space
@@ -1085,8 +1089,8 @@ def _probe_rank_table() -> List[Int]:
     var lower = "etaoinshrdlcumwfgypbvkjxqz"
     var lb = lower.as_bytes()
     for i in range(len(lb)):
-        t[Int(lb[i])] = 250 - 4 * i  # 250 down to 150
-        t[Int(lb[i]) - 32] = 170 - 4 * i  # uppercase: same order, rarer
+        t[Int(lb[i])] = Int32(250 - 4 * i)  # 250 down to 150
+        t[Int(lb[i]) - 32] = Int32(170 - 4 * i)  # uppercase: same order, rarer
     var digits = "0123456789"
     var db = digits.as_bytes()
     for i in range(len(db)):
@@ -1094,7 +1098,20 @@ def _probe_rank_table() -> List[Int]:
     var punct = ".,-_'\"/:=();<>*!+%[]{}#|&@?$^~`\\"
     var pb = punct.as_bytes()
     for i in range(len(pb)):
-        t[Int(pb[i])] = 190 - 5 * i  # 190 down to 35
+        t[Int(pb[i])] = Int32(190 - 5 * i)  # 190 down to 35
+    return t
+
+
+comptime PROBE_RANKS = _probe_rank_vec()
+
+
+def _probe_rank_table() -> List[Int]:
+    """`PROBE_RANKS` as a List, for callers that thread it through
+    List-typed helpers (one vector store, not 256 element writes)."""
+    var t = List[Int](fill=0, length=256)
+    Pointer(to=t[0]).unsafe_bitcast[Int64]().unsafe_store(
+        PROBE_RANKS.cast[DType.int64]()
+    )
     return t^
 
 
@@ -1107,13 +1124,13 @@ def select_probe_offsets(
     Ties prefer later offsets (larger spread rejects repeated-byte runs
     sooner). Requires len(prefix) >= 2; returns (off_a, off_b) with
     off_a < off_b."""
-    var ranks = _probe_rank_table()
+    var ranks = PROBE_RANKS
     var n = len(prefix)
     var pr = List[Int]()
     for i in range(n):
-        var r = ranks[Int(prefix[i])]
+        var r = Int(ranks[Int(prefix[i])])
         if caseless[i]:
-            r += ranks[Int(prefix[i]) - 32]
+            r += Int(ranks[Int(prefix[i]) - 32])
         pr.append(r)
     var best1 = 0
     for i in range(1, n):

@@ -56,6 +56,7 @@ from .set_dfa import (
     new_set_index,
 )
 from .set_pike import SetSpan
+from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
     _StateBits,
@@ -213,6 +214,45 @@ def _start_ids(nfa: NFA, states: List[Int]) -> List[Int]:
                 ids.append(i)
                 break
     return _sorted_dedup(ids^)
+
+
+def _start_id_map(nfa: NFA) -> List[Int]:
+    """Comptime: NFA state -> the pattern id whose fragment entry it is,
+    -1 elsewhere; -2 in slot 0 when two patterns share an entry state
+    (then `_start_ids` must do the exact scan)."""
+    var m = List[Int](fill=-1, length=len(nfa.states))
+    var dup = False
+    for i in range(len(nfa.pattern_starts)):
+        var st = nfa.pattern_starts[i]
+        if st < 0:
+            continue
+        if m[st] >= 0:
+            dup = True
+        m[st] = i
+    if dup and len(m) > 0:
+        m[0] = -2
+    return m^
+
+
+def _start_ids_mapped(start_id_of: List[Int], states: List[Int]) -> List[Int]:
+    """`_start_ids` in O(members): one map read per member. Same ids in
+    the same (sorted, deduplicated) order."""
+    var ids = List[Int]()
+    for s in states:
+        var i = start_id_of[s]
+        if i >= 0:
+            ids.append(i)
+    return _sorted_dedup(ids^)
+
+
+def _nfa_has_bol(nfa: NFA) -> Bool:
+    for i in range(len(nfa.states)):
+        if nfa.states[i].kind != NFAStateKind.ANCHOR:
+            continue
+        var at = nfa.states[i].anchor_type
+        if at == AnchorKind.BOL or at == AnchorKind.BOL_MULTILINE:
+            return True
+    return False
 
 
 def _bol_start_ids(
@@ -651,11 +691,12 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
                 members.append(64 * l + Int(count_trailing_zeros(w)))
                 w &= w - 1
         sets.append(members^)
-    var table = List[Int]()
+    # One 256-lane vector store per row (see static_dfa `_edfa_finish`).
+    var table = List[Int](fill=-1, length=n_sets * 256)
     for si in range(n_sets):
-        var row = rows.unsafe_get(si)
-        for byte in range(256):
-            table.append(Int(row[byte]))
+        Pointer(to=table[si * 256]).unsafe_bitcast[Int64]().unsafe_store(
+            rows.unsafe_get(si).cast[DType.int64]()
+        )
 
     return _rdfa_finish(nfa, preds, sets, table^, s_end, s_nl, s_other, result^)
 
@@ -774,17 +815,33 @@ def _rdfa_finish(
     result.bol0_len = List[Int](fill=0, length=n)
     result.bolnl_off = List[Int](fill=0, length=n)
     result.bolnl_len = List[Int](fill=0, length=n)
+    # One NFA-state -> pattern-id map for the whole finish: `_start_ids`
+    # scanned every pattern against every member per state, O(patterns x
+    # members) List reads — ~17 s for a 456-state reverse DFA over 100
+    # literals. The BOL walks are skipped outright when the union has no
+    # BOL anchor (they return empty then): they allocate a visited array
+    # per member anchor and walk the predecessor lists.
+    var start_id_of = _start_id_map(nfa)
+    var exact_starts = len(start_id_of) > 0 and start_id_of[0] == -2
+    var has_bol = _nfa_has_bol(nfa)
     for s in range(n):
-        var sn = _pool_slice(result.pool, _start_ids(nfa, sets[s]))
+        var ids: List[Int]
+        if exact_starts:
+            ids = _start_ids(nfa, sets[s])
+        else:
+            ids = _start_ids_mapped(start_id_of, sets[s])
+        var sn = _pool_slice(result.pool, ids)
         result.norm_off[s] = sn[0]
         result.norm_len[s] = sn[1]
         var s0 = _pool_slice(
-            result.pool, _bol_start_ids(nfa, preds, sets[s], True)
+            result.pool,
+            _bol_start_ids(nfa, preds, sets[s], True) if has_bol else List[Int](),
         )
         result.bol0_off[s] = s0[0]
         result.bol0_len[s] = s0[1]
         var sl = _pool_slice(
-            result.pool, _bol_start_ids(nfa, preds, sets[s], False)
+            result.pool,
+            _bol_start_ids(nfa, preds, sets[s], False) if has_bol else List[Int](),
         )
         result.bolnl_off[s] = sl[0]
         result.bolnl_len[s] = sl[1]
@@ -803,11 +860,10 @@ def _rdfa_finish(
 # --- Comptime materialization helpers ---------------------------------------
 
 
-def rdfa_table_arr[n: Int](d: ReverseDFA) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=-1)
-    for i in range(n):
-        arr[i] = Int32(d.table[i])
-    return arr^
+def rdfa_table_str[n: Int](d: ReverseDFA) -> String:
+    """The flat table as `n` little-endian Int32 entries; see
+    static_bytes.mojo for why a string."""
+    return table_bytes[DType.int32](d.table, n)
 
 
 def rdfa_pool_arr[n: Int](d: ReverseDFA) -> InlineArray[Int32, n]:
@@ -934,12 +990,11 @@ def _record[
 
 def reverse_som[
     origin: Origin,
-    tn: Int,
     pn: Int,
     sn: Int,
     //,
     d: ReverseView,
-    table: InlineArray[Int32, tn],
+    table: StringLiteral,
     pool: InlineArray[Int32, pn],
     slices: InlineArray[Int32, sn],
 ](
@@ -954,7 +1009,7 @@ def reverse_som[
     `starts` must be `num_patterns` long; the caller resets it per end.
     """
     # Comptime arrays bound to the binary's constant data (no copy).
-    var tbl = materialize[table]()
+    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
     var sl = materialize[slices]()
     var input_len = len(input)
     var cur: Int
@@ -990,7 +1045,7 @@ def reverse_som[
                 starts,
             )
         var nxt = Int(
-            tbl.unsafe_get(cur * 256 + Int(input.unsafe_get(pos - 1)))
+            tbl[unsafe_offset=cur * 256 + Int(input.unsafe_get(pos - 1))]
         )
         if nxt < 0:
             return

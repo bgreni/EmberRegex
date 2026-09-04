@@ -122,7 +122,7 @@ def test_sandwich_still_used_for_plain_patterns() raises:
 def test_sandwich_leading_and_trailing_line_anchors_ok() raises:
     # ^ before any prefix char and $ after the suffix are implied by the
     # full-input check, so the sandwich stays valid and correct.
-    var re = Regex["^abc(?s).*xyz$"]()
+    var re = Regex["(?s)^abc.*xyz$"]()
     assert_true(re.match("abcMxyz").matched)
     assert_false(re.match("Xabcxyz").matched)
 
