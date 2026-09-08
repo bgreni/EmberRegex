@@ -1162,9 +1162,11 @@ def build_rose(
         var deadv = SIMD[DType.int64, 256](-1)
         for s in range(edfa.num_states):
             conf_flags.append(edfa.flags[s])
-            var row = Pointer(to=edfa.table[s * 256]).unsafe_bitcast[
-                Int64
-            ]().unsafe_load[width=256]()
+            var row = (
+                Pointer(to=edfa.table[s * 256])
+                .unsafe_bitcast[Int64]()
+                .unsafe_load[width=256]()
+            )
             Pointer(to=conf_table[off + s * 256]).unsafe_bitcast[
                 Int64
             ]().unsafe_store(row.ge(zero).select(row + basev, deadv))

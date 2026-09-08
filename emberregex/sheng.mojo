@@ -135,9 +135,11 @@ def sheng_masks_str[cap: Int](d: EagerDFA, enabled: Bool) -> String:
     for c in range(256 // CHUNK):
         var wide = SIMD[DType.uint8, WIDE](dead)
         for s in range(d.num_states):
-            var row = Pointer(to=d.table[s * 256]).unsafe_bitcast[
-                Int64
-            ]().unsafe_load[width=256]()
+            var row = (
+                Pointer(to=d.table[s * 256])
+                .unsafe_bitcast[Int64]()
+                .unsafe_load[width=256]()
+            )
             var nxt = row.lt(zero).select(deadv, row.cast[DType.uint8]())
             for j in range(CHUNK):
                 wide[j * cap + s] = nxt[c * CHUNK + j]
@@ -306,7 +308,9 @@ def _sheng_full_match_impl[
         while pos < input_len:
             var chunk_end = min(pos + _SHENG_DEAD_CHECK_STRIDE, input_len)
             while pos < chunk_end:
-                cur_vec = _sheng_step[cap](masks, input.unsafe_get(pos), cur_vec)
+                cur_vec = _sheng_step[cap](
+                    masks, input.unsafe_get(pos), cur_vec
+                )
                 pos += 1
             cur = Int(cur_vec[0])
             if cur == dead:
@@ -341,18 +345,18 @@ def sheng_full_match[
     comptime short = sheng_short_input(cap)
     comptime if short > 0:
         if len(input) < short:
-            return _sheng_scalar_full_match[d=d, cap=cap, masks=masks, flags=flags](
-                input
-            )
+            return _sheng_scalar_full_match[
+                d=d, cap=cap, masks=masks, flags=flags
+            ](input)
     comptime if _edfa_has_accel(d):
         comptime W = simd_width_of[DType.uint8]()
         if len(input) >= W:
             return _sheng_full_match_impl[
                 d=d, cap=cap, masks=masks, flags=flags, accel=True
             ](input)
-    return _sheng_full_match_impl[d=d, cap=cap, masks=masks, flags=flags, accel=False](
-        input
-    )
+    return _sheng_full_match_impl[
+        d=d, cap=cap, masks=masks, flags=flags, accel=False
+    ](input)
 
 
 @always_inline

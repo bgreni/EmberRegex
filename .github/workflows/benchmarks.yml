@@ -1,0 +1,183 @@
+name: Benchmarks
+
+# Deliberately a workflow of its own, and deliberately advisory: it
+# reports a base-vs-head comparison and never fails the build.
+#
+# Calibrated against a pull request whose base and head compiled from
+# byte-identical sources, where every measured difference was noise by
+# construction: a hosted macOS runner still produced a +6.1% geometric
+# mean and three rows past a 20% gate, the worst at +202%. A gate on that
+# signal blocks pull requests at random, so the numbers are published for
+# a human to judge instead.
+on:
+  pull_request:
+
+# This workflow runs pull-request code, so its token stays read-only.
+# The report is handed to benchmark-comment.yml, which runs in the base
+# repository's context, to be posted.
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    strategy:
+      # Both platforms always report: one failing must not cancel the
+      # other, or a Linux-only break hides the macOS result and back.
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      HEAD_TREE: ${{ github.workspace }}
+      # Paired rounds per side, run in alternating order. One further
+      # pass per side runs first and is discarded as warmup.
+      ROUNDS: 5
+      # A row must be at least this slow on one side before it can fail
+      # the job. Calibrated on a hosted runner against a pull request
+      # whose base and head compiled from byte-identical sources: a
+      # 0.006 ms row swung +202% there on noise alone. 0.02 ms over the
+      # suites' 100 iterations per call is ~200 ns/op.
+      FLOOR_MS: 0.02
+      # Fractional slowdown that fails the job (0.20 == 20% slower). It
+      # must show on BOTH the minimum and the median of paired rounds.
+      THRESHOLD: 0.20
+    steps:
+      # Derived from $RUNNER_TEMP in a step rather than in a job-level
+      # `env:` block: the `runner` context is not available there, because
+      # the job's environment is evaluated before a runner is assigned.
+      # A workflow that references it fails to start at all.
+      - name: Configure paths
+        run: |
+          {
+            echo "MODULAR_CACHE_DIR=$RUNNER_TEMP/mojo-cache"
+            echo "BASE_TREE=$RUNNER_TEMP/base"
+            echo "RUNS=$RUNNER_TEMP/bench-runs"
+            echo "ARTIFACT_DIR=$RUNNER_TEMP/bench-artifact"
+            echo "REPORT=$RUNNER_TEMP/bench-artifact/report.md"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          # The base revision must be reachable for the worktree below.
+          fetch-depth: 0
+
+      - name: Install pixi
+        id: pixi
+        run: |
+          curl -fsSL https://pixi.sh/install.sh | bash
+          echo "$HOME/.pixi/bin" >> "$GITHUB_PATH"
+          echo "version=$("$HOME/.pixi/bin/pixi" --version | tr ' ' '-')" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Cache pixi environment
+        uses: actions/cache@v4
+        with:
+          path: .pixi
+          key: >-
+            pixi-${{ runner.os }}-${{ runner.arch }}-${{
+            steps.pixi.outputs.version }}-${{ hashFiles('pixi.lock') }}
+
+      # --locked also makes a pixi.lock that has drifted from
+      # pixi.toml fail here rather than silently re-solving.
+      - name: Install environment
+        run: pixi install --locked
+
+      - name: Check out the base revision beside the workspace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # fetch-depth: 0 above normally brings it; fall back for
+          # the case where it did not.
+          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null ||
+            git fetch --no-tags origin "$BASE_SHA"
+          # Outside the workspace on purpose: a replica placed inside the
+          # tree still resolves `emberregex` from the bench file's own
+          # directory, so an in-tree copy would silently measure head
+          # twice.
+          git worktree add --detach "$BASE_TREE" "$BASE_SHA"
+
+      - name: Note toolchain differences
+        id: toolchain
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if ! diff -q pixi.lock "$BASE_TREE/pixi.lock" >/dev/null 2>&1; then
+            echo "note=pixi.lock differs between base and head. Both sides build with the head toolchain, so a compiler change is not isolated by this comparison." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run interleaved benchmarks
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          bash .github/scripts/bench_ab.sh
+
+      - name: Compare
+        # --no-fail: a flagged row is reported in the comment and the job
+        # summary but never turns the check red. A non-zero exit here now
+        # means the comparison itself broke, which is worth failing on.
+        id: compare
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          NOTE: ${{ steps.toolchain.outputs.note }}
+        run: |
+          # `set --` rather than a bash array: macOS runners ship
+          # bash 3.2, where an empty array expansion is a trap.
+          set --
+          if [ -n "$NOTE" ]; then set -- --note "$NOTE"; fi
+          python3 tools/bench_regression.py compare \
+            --base "$RUNS/base.*.json" \
+            --head "$RUNS/head.*.json" \
+            --base-label "${BASE_SHA:0:7}" \
+            --head-label "${HEAD_SHA:0:7}" \
+            --threshold "$THRESHOLD" \
+            --floor "$FLOOR_MS" \
+            --no-fail \
+            "$@" \
+            --out "$REPORT"
+
+      # The per-round JSON is what makes a suspicious verdict
+      # diagnosable after the fact; without it a false positive can only
+      # be guessed at from the log.
+      - name: Keep the raw runs with the report
+        if: always()
+        run: |
+          mkdir -p "$ARTIFACT_DIR/runs"
+          cp "$RUNS"/*.json "$ARTIFACT_DIR/runs/" 2>/dev/null || true
+          cp "$RUNS"/*.txt "$ARTIFACT_DIR/runs/" 2>/dev/null || true
+
+      - name: Publish to the job summary
+        if: always()
+        run: |
+          if [ -f "$REPORT" ]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No benchmark report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # `workflow_run.pull_requests` is empty for forks, so the pull
+      # request number travels with the report and is verified against
+      # the API on the other side before anything is posted.
+      - name: Record the pull request number
+        if: always()
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          printf '%s' "$PR_NUMBER" > "$ARTIFACT_DIR/pr-number.txt"
+
+      # Handed to benchmark-comment.yml, which has the write token this
+      # job deliberately lacks. This is what makes the report reach pull
+      # requests opened from forks.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.os }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 7

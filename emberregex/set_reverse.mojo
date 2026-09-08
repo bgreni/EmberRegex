@@ -835,13 +835,17 @@ def _rdfa_finish(
         result.norm_len[s] = sn[1]
         var s0 = _pool_slice(
             result.pool,
-            _bol_start_ids(nfa, preds, sets[s], True) if has_bol else List[Int](),
+            _bol_start_ids(nfa, preds, sets[s], True) if has_bol else List[
+                Int
+            ](),
         )
         result.bol0_off[s] = s0[0]
         result.bol0_len[s] = s0[1]
         var sl = _pool_slice(
             result.pool,
-            _bol_start_ids(nfa, preds, sets[s], False) if has_bol else List[Int](),
+            _bol_start_ids(nfa, preds, sets[s], False) if has_bol else List[
+                Int
+            ](),
         )
         result.bolnl_off[s] = sl[0]
         result.bolnl_len[s] = sl[1]

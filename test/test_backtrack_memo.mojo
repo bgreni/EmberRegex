@@ -30,9 +30,9 @@ def _sbt_end[p: String](input: String, pos: Int = 0) raises -> Int:
     comptime R = Regex[p]
     var slots = InlineArray[Int, R._num_slots](fill=-1)
     var memo = List[UInt64]()
-    return _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
-        input.as_bytes(), pos, slots, memo
-    )
+    return _sbt_run[
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+    ](input.as_bytes(), pos, slots, memo)
 
 
 def test_ambiguous_alternation_plus_stays_in_backtracker() raises:
@@ -220,17 +220,17 @@ def test_aborted_attempt_leaves_no_poisoned_bits() raises:
     var slots = InlineArray[Int, R._num_slots](fill=-1)
     var raised = False
     try:
-        _ = _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
-            aborts.as_bytes(), 0, slots, memo
-        )
+        _ = _sbt_run[
+            pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+        ](aborts.as_bytes(), 0, slots, memo)
     except:
         raised = True
     assert_true(raised, "2200 a's must exhaust the backtracker")
     assert_equal(len(memo), 0, "an aborted attempt's bits are discarded")
     var slots2 = InlineArray[Int, R._num_slots](fill=-1)
-    var end = _sbt_run[pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots](
-        matches.as_bytes(), 0, slots2, memo
-    )
+    var end = _sbt_run[
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+    ](matches.as_bytes(), 0, slots2, memo)
     assert_equal(end, 3)
     # And through the public verb, which is what would silently miss.
     var re = Regex[P]()

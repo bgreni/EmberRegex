@@ -1,0 +1,120 @@
+name: Benchmark comment
+
+# Posts the report produced by the Benchmarks workflow.
+#
+# It exists as a second workflow because a `pull_request` run triggered
+# from a FORK gets a read-only GITHUB_TOKEN, so it cannot comment — which
+# is precisely the case that matters for outside contributors. A
+# `workflow_run` run instead executes in the base repository's context
+# with a write token.
+#
+# The safety property that makes this acceptable: this job never checks
+# out or executes pull-request code. It checks out the default branch,
+# downloads the report artifact, resolves which pull request the
+# triggering run belongs to, and posts. Nothing from the artifact reaches
+# a shell unquoted or an API path unvalidated.
+on:
+  workflow_run:
+    workflows: ["Benchmarks"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read # to download the triggering run's artifact
+  pull-requests: write # to post the comment
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Explicitly the default branch: this job must only ever run code
+      # that is already merged, never the pull request's version of it.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # One artifact per runner in the benchmark matrix; `pattern`
+      # without `merge-multiple` keeps each in its own directory, whose
+      # name is the platform label the combined report is grouped by.
+      - name: Download the reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-report-*
+          path: bench-artifacts
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # Every runner's report becomes ONE comment. Posting them
+      # separately would have them overwrite each other: the sticky
+      # comment is located by a marker that is identical in each.
+      - name: Combine the reports
+        id: combine
+        run: |
+          if ! ls bench-artifacts/*/report.md >/dev/null 2>&1; then
+            echo "No reports were uploaded; nothing to post."
+            exit 0
+          fi
+          python3 tools/bench_regression.py combine \
+            --glob 'bench-artifacts/*/report.md' --out comment-body.md
+
+      - name: Resolve the pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          # Preferred: ask the API which pull request this run's head
+          # commit belongs to. `workflow_run.pull_requests` is empty for
+          # forks, so it cannot be used here.
+          number="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" \
+            --jq '.[0].number // empty' 2>/dev/null || true)"
+
+          # Fallback: the number recorded in the artifact — accepted only
+          # after the API confirms that pull request really is the one
+          # this run built. Without that check a crafted artifact could
+          # post a report onto an unrelated pull request.
+          recorded="$(ls bench-artifacts/*/pr-number.txt 2>/dev/null | head -n 1)"
+          if [ -z "$number" ] && [ -n "$recorded" ]; then
+            candidate="$(tr -cd '0-9' < "$recorded")"
+            if [ -n "$candidate" ]; then
+              read -r ref repo sha <<<"$(
+                gh api "repos/$GITHUB_REPOSITORY/pulls/$candidate" \
+                  --jq '[.head.ref // "", .head.repo.full_name // "", .head.sha // ""] | @tsv' \
+                  2>/dev/null || true
+              )"
+              if [ "$sha" = "$HEAD_SHA" ] ||
+                 { [ -n "$ref" ] && [ "$ref" = "$HEAD_BRANCH" ] &&
+                   [ "$repo" = "$HEAD_REPO" ]; }; then
+                number="$candidate"
+              else
+                echo "::warning::artifact claims PR #$candidate ($repo:$ref@$sha)," \
+                     "which does not match this run ($HEAD_REPO:$HEAD_BRANCH@$HEAD_SHA); ignoring it."
+              fi
+            fi
+          fi
+
+          if [ -z "$number" ]; then
+            echo "::warning::could not resolve a pull request for $HEAD_SHA; not commenting."
+          else
+            echo "Resolved pull request #$number."
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Post the report
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          if [ ! -f comment-body.md ]; then
+            echo "No report to post — the benchmark run did not get far" \
+                 "enough to produce one."
+            exit 0
+          fi
+          bash .github/scripts/sticky_comment.sh comment-body.md

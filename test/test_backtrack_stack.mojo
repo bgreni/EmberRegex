@@ -63,7 +63,9 @@ def test_general_splits_cut_every_cycle() raises:
         comptime (sbt_depth_plan_of(Regex["((?:ab)+)c"].nfa).splits_are_fvs)
     )
     assert_true(
-        comptime (sbt_depth_plan_of(Regex["((?:a|a{2,})+)b"].nfa).splits_are_fvs)
+        comptime (
+            sbt_depth_plan_of(Regex["((?:a|a{2,})+)b"].nfa).splits_are_fvs
+        )
     )
     assert_true(
         comptime (sbt_depth_plan_of(Regex["((?:a*?b?)+)c"].nfa).splits_are_fvs)

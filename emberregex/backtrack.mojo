@@ -997,9 +997,7 @@ def _sbt_depth_plan_list(nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
     return SbtDepthPlan(True, not found[1])
 
 
-def _sbt_depth_plan_simd[
-    W: Int
-](nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
+def _sbt_depth_plan_simd[W: Int](nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
     """`sbt_depth_plan` over SIMD lanes: same algorithm as
     `_sbt_depth_plan_list`, with the state columns, the specialized call
     graph (`c0`/`c1`/`gsplit`), the DFS colors and both stack arrays as

@@ -398,16 +398,12 @@ struct Parser[origin: Origin](Movable):
                     String(RegexError("\\x{...} escape too long", self.pos))
                 )
         if ndig == 0:
-            raise Error(
-                String(RegexError("Empty \\x{...} escape", self.pos))
-            )
+            raise Error(String(RegexError("Empty \\x{...} escape", self.pos)))
         self._expect(CHAR_RBRACE)
         if value > 0x10FFFF:
             raise Error(
                 String(
-                    RegexError(
-                        "\\x{...} value above U+10FFFF", self.pos - 1
-                    )
+                    RegexError("\\x{...} value above U+10FFFF", self.pos - 1)
                 )
             )
         return value
