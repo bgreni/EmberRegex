@@ -821,14 +821,16 @@ def _heapbt_core[
                 var same = True
                 if state.icase:
                     for i in range(n):
-                        if _bt_to_lower(input.unsafe_get(gs + i)) != _bt_to_lower(
-                            input.unsafe_get(pos + i)
-                        ):
+                        if _bt_to_lower(
+                            input.unsafe_get(gs + i)
+                        ) != _bt_to_lower(input.unsafe_get(pos + i)):
                             same = False
                             break
                 else:
                     for i in range(n):
-                        if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
+                        if input.unsafe_get(gs + i) != input.unsafe_get(
+                            pos + i
+                        ):
                             same = False
                             break
                 if not same:

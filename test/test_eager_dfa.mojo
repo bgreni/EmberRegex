@@ -602,8 +602,6 @@ def test_differential_table_walk_big_merge() raises:
     _differential[ALT31](_ALPHA_ANIMALS, "p21")
 
 
-
-
 def _pool_parity_impl(nfa: NFA) -> Bool:
     """Comptime: `_closure_pool` agrees with a per-target `_flat_closure`
     DFS for EVERY state, in both `after_newline` variants."""

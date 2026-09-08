@@ -698,9 +698,9 @@ def test_anchored_lf_dfa_match_at() raises:
     comptime Q = "b[cd]"
     comptime lfq = build_lf_dfa(Regex[Q].nfa, True, anchored=True)
     comptime tq = static_bytes[
-        edfa_table_str[
-        lfq.d.num_states * 256, edfa_id_dtype(lfq.d.num_states)
-        ](lfq.d)
+        edfa_table_str[lfq.d.num_states * 256, edfa_id_dtype(lfq.d.num_states)](
+            lfq.d
+        )
     ]()
     comptime fq = edfa_flags_arr[lfq.d.num_states](lfq.d)
     assert_equal(lfdfa_find_end[lf=lfq, table=tq, flags=fq](bytes2, 0), 4)

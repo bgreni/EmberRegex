@@ -46,25 +46,25 @@ def table_bytes[dt: DType](table: List[Int], n: Int) -> String:
         m = n
     var rows = m // 256
     for s in range(rows):
-        var v = Pointer(to=table[s * 256]).unsafe_bitcast[Int64]().unsafe_load[
-            width=256
-        ]()
-        Pointer(to=p[unsafe_offset=s * 256 * eb]).unsafe_bitcast[Scalar[dt]]().unsafe_store(
-            v.cast[dt]()
+        var v = (
+            Pointer(to=table[s * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
         )
+        Pointer(to=p[unsafe_offset=s * 256 * eb]).unsafe_bitcast[
+            Scalar[dt]
+        ]().unsafe_store(v.cast[dt]())
     for i in range(rows * 256, m):
-        Pointer(to=p[unsafe_offset=i * eb]).unsafe_bitcast[Scalar[dt]]().unsafe_store(
-            Scalar[dt](table[i])
-        )
+        Pointer(to=p[unsafe_offset=i * eb]).unsafe_bitcast[
+            Scalar[dt]
+        ]().unsafe_store(Scalar[dt](table[i]))
     return out^
 
 
 def static_bytes[
     s: String
 ]() -> StringLiteral[
-    _get_kgen_string[
-        rebind[StringSpan[ImmStaticOrigin]](StringSpan(s))
-    ]()
+    _get_kgen_string[rebind[StringSpan[ImmStaticOrigin]](StringSpan(s))]()
 ]:
     """Comptime: the bytes of `s` as a string literal (static data)."""
     return {}

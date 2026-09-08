@@ -612,9 +612,9 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     # Byte -> class as one 256-lane vector: a state's loop-byte set is
     # then `nclasses` vector compares instead of 768 List reads (~50 us
     # each) per state.
-    var classv = Pointer(to=class_of[0]).unsafe_bitcast[Int64]().unsafe_load[
-        width=256
-    ]()
+    var classv = (
+        Pointer(to=class_of[0]).unsafe_bitcast[Int64]().unsafe_load[width=256]()
+    )
     for s in range(num_states):
         if match_flags[s] & Int(_OP_NEED_ANY) != 0:
             continue
@@ -701,7 +701,9 @@ def onepass_table_str[n: Int](op: OnePass) -> String:
             | (t << _OP_SID_SHIFT)
             | (op.trans_eps[i] << _OP_EPS_SHIFT)
         )
-        Pointer(to=p[unsafe_offset=i * 4]).unsafe_bitcast[Int32]().unsafe_store(Int32(v))
+        Pointer(to=p[unsafe_offset=i * 4]).unsafe_bitcast[Int32]().unsafe_store(
+            Int32(v)
+        )
     return out^
 
 
@@ -863,8 +865,9 @@ def _onepass_match_impl[
             if pos >= end_pin:
                 break
         var v = Int(
-            tbl[unsafe_offset=
-                row + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
+            tbl[
+                unsafe_offset=row
+                + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
             ]
         )
         if v < 0:
@@ -987,8 +990,9 @@ def _onepass_find_end_impl[
                 if pos >= input_len:
                     break
         var v = Int(
-            tbl[unsafe_offset=
-                row + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
+            tbl[
+                unsafe_offset=row
+                + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
             ]
         )
         if info & Int(OP_MATCH) != 0 and _op_match_ok[op](

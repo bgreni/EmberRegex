@@ -484,9 +484,9 @@ def ac_table_str[n: Int](d: ACSet) -> String:
     for s in range(d.num_states):
         var row = d.rows[s]
         for c in range(nc):
-            Pointer(to=p[unsafe_offset=(s * nc + c) * 2]).unsafe_bitcast[UInt16]().unsafe_store(
-                row[c]
-            )
+            Pointer(to=p[unsafe_offset=(s * nc + c) * 2]).unsafe_bitcast[
+                UInt16
+            ]().unsafe_store(row[c])
     return out^
 
 

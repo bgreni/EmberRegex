@@ -261,5 +261,3 @@ def _confirm_stack_continue[
     return heapbt_match[num_slots=NS](
         rt, input, nfa.start, start, slots, anchored_end=True, end_at=end
     )
-
-

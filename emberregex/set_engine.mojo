@@ -426,7 +426,9 @@ struct RegexSet[
     comptime _use_rdfa = Self._rdfa.valid
     comptime _rdfa_v = rdfa_view(Self._rdfa)
     comptime _RD_TABLE = static_bytes[Self._RD_TABLE_S]()
-    comptime _RD_TABLE_S = rdfa_table_str[Self._rdfa.num_states * 256](Self._rdfa)
+    comptime _RD_TABLE_S = rdfa_table_str[Self._rdfa.num_states * 256](
+        Self._rdfa
+    )
     comptime _RD_POOL = rdfa_pool_arr[len(Self._rdfa.pool)](Self._rdfa)
     comptime _RD_SLICES = rdfa_slices_arr[6 * Self._rdfa.num_states](Self._rdfa)
 
