@@ -95,9 +95,11 @@ def prefilter_ast(mut ast: AST, mut needs_confirm: Bool) -> Bool:
 
     Sets `needs_confirm` when anything was widened — those patterns'
     reports are candidates until the exact engine agrees. Returns False
-    when the pattern cannot be widened soundly (a backreference whose
-    group cannot be resolved, e.g. a forward reference), in which case
-    the caller rejects the set rather than guess.
+    when a backreference's group cannot be resolved, in which case the
+    caller rejects the set rather than guess. On parsed input this never
+    fires — the parser rejects forward references (`\\2(b)`) and every
+    GROUP it emits has exactly one child — so it guards a hand-built AST,
+    where the alternative is indexing the node pool at -1.
     """
     # The node pool grows while we walk it (cloning appends), so bound the
     # walk to the original nodes — clones contain no lookaround or

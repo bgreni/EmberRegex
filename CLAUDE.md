@@ -8,6 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pixi run test          # run all tests (incremental: skips unchanged green files; --all forces)
 pixi run bench         # single-pattern (`Regex`) benchmark suite
 pixi run bench_all     # run all benchmarks
+pixi run coverage      # line coverage of emberregex/ over the suite (runs in the `cov` env, conda-forge LLVM; inline-aware counters by default, --gcov for the plain gcov pass; --missing, --opt-level, see run_coverage.py)
+pixi run coverage --check-baseline   # the CI gate: fail if coverage falls below coverage-baseline.json
+pixi run coverage --update-baseline  # rewrite that baseline from this run (commit it, and say why in the PR)
 pixi build             # build the conda package (pixi-build-mojo -> lib/mojo/emberregex.mojoc)
 
 # Run a single test file (`mojo` is not on PATH outside pixi)

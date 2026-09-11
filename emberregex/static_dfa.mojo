@@ -1242,6 +1242,9 @@ def _minimize(
     for b0 in range(nblocks):
         wl[wl_n] = Int32(b0)
         wl_n += 1
+        # The high word is unreachable while the flag byte has <= 6 bits
+        # (at most 64 distinct values, so ids 0..63); the split is kept so
+        # a seventh bit cannot silently shift past the word.
         if b0 < 64:
             inwl0 |= UInt64(1) << UInt64(b0)
         else:
@@ -1269,10 +1272,10 @@ def _minimize(
             var inx = live & t.lt(64).select(m0, m1)
             var x0 = _lane_word(inx.slice[64, offset=0]())
             var x1 = _lane_word(inx.slice[64, offset=64]())
-            if x0 == 0 and x1 == 0:
-                continue
 
-            # Blocks holding at least one X member.
+            # Blocks holding at least one X member. X is non-empty: the
+            # image test above found a member of A among this column's
+            # targets, and the image was computed from this same column.
             var nt = 0
             var seen0 = UInt64(0)
             var seen1 = UInt64(0)
@@ -1987,9 +1990,7 @@ def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
     exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
     survives the narrowing, so the walkers keep their sign-bit dead test.
     """
-    debug_assert(
-        n == 0 or n >= len(d.table), "table string shorter than the table"
-    )
+    assert n == 0 or n >= len(d.table), "table string shorter than the table"
     return table_bytes[dt](d.table, n)
 
 

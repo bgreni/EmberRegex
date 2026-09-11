@@ -64,6 +64,10 @@ def test_result_group_matched_true() raises:
     assert_true(result.matched)
     assert_true(result.group_matched(1))
     assert_false(result.group_matched(2))
+    var input = String("a")
+    assert_equal(result.group_str(input, 1), "a")
+    # An unset group reads as empty, not as a slice of its -1 offsets.
+    assert_equal(result.group_str(input, 2), "")
 
 
 def test_result_group_matched_out_of_range() raises:

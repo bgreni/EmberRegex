@@ -195,6 +195,26 @@ def test_backref_confirm_is_exact_past_the_stack_bound() raises:
     assert_equal(hit[0].end, 200002)
 
 
+def test_lookaround_confirm_keeps_candidate_on_budget_exhaustion() raises:
+    # `(?!c)c` never matches, so the exact pattern has no match at all;
+    # the widened superset `(?:a+)+c` reports every `c` after a run of
+    # `a`. Confirming that candidate walks `(a+)+` — exponential in the
+    # run length, unmemoized — and a lookaround-only confirm runs
+    # BUDGETED: a short run is rejected exactly, a run long enough to
+    # exhaust SBT_BUDGET keeps the candidate (superset semantics — an
+    # extra report, never a missing one), unlike a backreference confirm.
+    comptime S = RegexSet[["(a+)+(?!c)c"]]
+    comptime needs = S._needs_confirm
+    assert_true(needs)
+    var db = RegexSet[["(a+)+(?!c)c"]]()
+    assert_reports(db.scan("aaac"), List[SetMatch](), "rejected exactly")
+    assert_reports(
+        db.scan(String("a") * 30 + "c"),
+        [SetMatch(0, 31)],
+        "kept on budget exhaustion",
+    )
+
+
 def test_backref_multi_byte_group() raises:
     var db = RegexSet[["(ab)\\1", "xy"]]()
     assert_reports(

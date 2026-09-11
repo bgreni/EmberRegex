@@ -108,8 +108,12 @@ struct Parser[origin: Origin](Movable):
         self._consume_verbs()
         var root = self._parse_alternation()
         self.ast.root = root
-        if self.pos < len(self.pattern):
-            raise Error(String(RegexError("Unexpected character", self.pos)))
+        if not self._at_end():
+            # The grammar stops without consuming on exactly one byte: a
+            # ')' no '(' opened (`_parse_concat` breaks on it, and at the
+            # top level there is no group to close). '|' is always eaten.
+            assert self._peek() == CHAR_RPAREN, "parse stopped early"
+            raise Error(String(RegexError("Unmatched ')'", self.pos)))
         # Build bitmaps for all charsets
         for i in range(len(self.ast.charsets)):
             self.ast.charsets[i].build_bitmap()
@@ -120,7 +124,11 @@ struct Parser[origin: Origin](Movable):
         return result^
 
     def _peek(self) -> Byte:
-        """Look at the current character without consuming it."""
+        """Look at the current character without consuming it.
+
+        Every caller tests `_at_end()` first; the guard keeps `_peek` and
+        `_advance` total so a missed test reads a 0 byte, not past the
+        pattern."""
         if self.pos >= len(self.pattern):
             return Byte(0)
         return self.pattern.unsafe_get(self.pos)
@@ -450,12 +458,11 @@ struct Parser[origin: Origin](Movable):
 
     def _parse_atom(mut self) raises -> Int:
         """atom = CHAR | '.' | '[' charset ']' | '(' regex ')' | '\\\\' ESCAPE | '^' | '$'
-        """
-        if self._at_end():
-            raise Error(
-                String(RegexError("Unexpected end of pattern", self.pos))
-            )
 
+        Never entered at the end of the pattern: `_parse_concat` tests
+        `_at_end()` before every `_parse_quantified`, the only caller.
+        """
+        assert not self._at_end(), "_parse_atom at end of pattern"
         var ch = self._peek()
         if ch != CHAR_LPAREN:
             # Any non-group atom is content; groups decide for themselves
@@ -485,8 +492,6 @@ struct Parser[origin: Origin](Movable):
                     )
                 )
             )
-        elif ch == CHAR_RPAREN:
-            raise Error(String(RegexError("Unmatched ')'", self.pos)))
         else:
             self.pos += 1
             # In UTF-8 mode a multi-byte character is ONE atom, so a
@@ -644,14 +649,6 @@ struct Parser[origin: Origin](Movable):
                 self.ast.group_count += 1
                 group_index = self.ast.group_count
                 self.ast.group_names[name^] = group_index
-            elif modifier == CHAR_HASH:
-                # Inline comment: (?#...) — skip until closing ')'
-                self.pos += 1  # consume '#'
-                while not self._at_end() and self._peek() != CHAR_RPAREN:
-                    self.pos += 1
-                self._expect(CHAR_RPAREN)
-                var node = ASTNode.concat(List[Int]())
-                return self.ast.add_node(node^)
             elif Self._is_flag_char(modifier) or modifier == CHAR_MINUS:
                 # Inline flags: (?i), (?m), (?s), (?x), (?i-m), (?-i), etc.
                 var add_flags, remove_flags = self._parse_inline_flags()

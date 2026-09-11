@@ -446,5 +446,42 @@ def test_wide_counted_repeat_stays_in_backtracker() raises:
     assert_equal(_sbt_end[P](miss), -1)
 
 
+def test_counted_giveback_stops_when_the_budget_runs_out() raises:
+    """Twenty `a{1,2}` chains in a row, greedy and lazy. Refuting the `c`
+    after 30 `a`s explores ~2^20 combinations, so SBT_BUDGET runs out deep
+    in the walk and every counted loop on the unwind must hand back at
+    once instead of trying its remaining counts; nothing here is cyclic,
+    so there is no memo retry and the verb goes to the Pike VM. The
+    lookahead keeps match() on the backtracker."""
+    comptime G = "(?=a)(?:a{1,2}){20}c"
+    comptime L = "(?=a)(?:a{1,2}?){20}c"
+    # The expansion is `a a? a a? ...`; a chain starts at each copy's
+    # optional `a` and runs through the next copy's required one, so the
+    # detector sees 19 fused `a{2,3}` chains (the path that skips an
+    # optional `a` enters the next chain one state later).
+    var want = String("2:3")
+    for _ in range(18):
+        want += " 2:3"
+    assert_equal(_bounds_str[G](), want)
+    assert_equal(_bounds_str[L](), want)
+    assert_false(Regex[G]._strategy.use_dfa)
+    assert_false(Regex[G]._sbt_general_loop)
+    assert_false(Regex[L]._strategy.use_dfa)
+    assert_false(Regex[L]._sbt_general_loop)
+    var run = String("a") * 30
+    var g = Regex[G]()
+    assert_false(g.match(run + "b").matched)
+    var gh = g.match(run + "c")
+    assert_true(gh.matched)
+    assert_equal(gh.end, 31)
+    assert_equal(gh.end, g._pike_match(run + "c").end)
+    var l = Regex[L]()
+    assert_false(l.match(run + "b").matched)
+    var lh = l.match(run + "c")
+    assert_true(lh.matched)
+    assert_equal(lh.end, 31)
+    assert_equal(lh.end, l._pike_match(run + "c").end)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

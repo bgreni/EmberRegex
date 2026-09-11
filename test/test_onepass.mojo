@@ -487,7 +487,7 @@ def test_conditional_path_shadowing_rejected() raises:
     # consuming state) outranking an unconditional path to the same NFA
     # state. First-visit-wins on the state id alone dropped the
     # unconditional arm — `match("ab")` returned no-match while the
-    # Pike VM matched, and the span confirm tripped its debug_assert.
+    # Pike VM matched, and the span confirm tripped its assert.
     # Now such patterns are NOT one-pass (pinned above) and the
     # backtracker/Pike ladder serves them; every verb must agree with
     # the Pike VM.

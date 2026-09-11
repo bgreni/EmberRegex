@@ -437,8 +437,6 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0
     while cur < len(sets_bits):
-        if len(sets_bits) > RDFA_STATE_CAP:
-            return result^
         var cur_bits = sets_bits.unsafe_get(cur)
         var cur_right = Int(rightv[cur]) != 0
         var cur_wb = has_wb and _bs_any(cur_bits & wb_bits)
@@ -750,9 +748,7 @@ def rdfa_table_str[n: Int, dt: DType](d: RDFA) -> String:
     """Comptime: the flat table as `n` little-endian `dt` entries (narrow id
     type from `edfa_id_dtype`, `n` from `edfa_table_len`; EDFA_DEAD
     survives). See static_bytes.mojo for why a string."""
-    debug_assert(
-        n == 0 or n >= len(d.table), "table string shorter than the table"
-    )
+    assert n == 0 or n >= len(d.table), "table string shorter than the table"
     return table_bytes[dt](d.table, n)
 
 

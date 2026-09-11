@@ -311,5 +311,77 @@ def test_memo_still_collapses_the_shape_it_is_for() raises:
     assert_equal(_sbt_end[P](String("a") * 1500 + "c"), -1)
 
 
+def test_search_reuses_the_memo_across_candidates() raises:
+    # A consuming continuation after a multiline `$` keeps the pattern off
+    # every DFA lane, so `search` walks the backtracker from each
+    # candidate with ONE memo: the attempt at position 0 exhausts
+    # SBT_BUDGET and builds it, every later candidate starts on the
+    # memoized walker straight away, and the match at the end is found
+    # by that walker rather than by a fresh budgeted attempt.
+    # Hand-derived (CPython explodes on this input):
+    #   re.search(r'(?m)(a|aa)+b$\n', 'a'*600 + 'c\naab\n') -> (602, 606),
+    #   group(1) == 'a'.
+    comptime P = "(?m)(a|aa)+b$\\n"
+    comptime R = Regex[P]
+    assert_false(R._strategy.use_dfa)
+    assert_false(R._use_dfa_span)
+    assert_true(comptime (sbt_memo_rows_of(R.nfa)) > 0)
+    var re = R()
+    var text = String("a") * 600 + "c\naab\n"
+    var m = re.search(text)
+    assert_true(m.matched)
+    assert_equal(m.start, 602)
+    assert_equal(m.end, 606)
+    assert_equal(m.group_str(text, 1), "a")
+    assert_false(re.search(String("a") * 600 + "c\naab").matched)
+
+
+def test_memo_reused_for_same_length_dropped_for_another() raises:
+    # `_sbt_run` keeps the memo an earlier attempt of the walk built (a
+    # later attempt on the same input starts memoized), and drops a
+    # buffer sized for a different input length as stale.
+    comptime P = "(a|aa)+b"
+    comptime R = Regex[P]
+    var memo = List[UInt64]()
+    var text = String("a") * 300 + "c" + "aab"
+    var slots = InlineArray[Int, R._num_slots](fill=-1)
+    var end0 = _sbt_run[
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+    ](text.as_bytes(), 0, slots, memo)
+    assert_equal(end0, -1)
+    var words = len(memo)
+    assert_true(words > 0, "the exhausted attempt built the memo")
+    var slots2 = InlineArray[Int, R._num_slots](fill=-1)
+    var end1 = _sbt_run[
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+    ](text.as_bytes(), 301, slots2, memo)
+    assert_equal(end1, 304)
+    assert_equal(slots2[0], 302)
+    assert_equal(slots2[1], 303)
+    assert_equal(len(memo), words)
+    # A different length: stale buffer dropped; the fresh attempt fits
+    # the budget, so no memo is rebuilt.
+    var other = String("aab")
+    var slots3 = InlineArray[Int, R._num_slots](fill=-1)
+    var end2 = _sbt_run[
+        pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+    ](other.as_bytes(), 0, slots3, memo)
+    assert_equal(end2, 3)
+    assert_equal(len(memo), 0)
+
+
+def test_backreference_gives_back_when_the_reference_overruns() raises:
+    # `(a+)\1b` on "aab": the greedy group takes both `a`s and the
+    # reference would run past the end of input, so the loop gives one
+    # back before `\1` and `b` can match.
+    var re = Regex[r"(a+)\1b"]()
+    var text = String("aab")
+    var m = re.match(text)
+    assert_true(m.matched)
+    assert_equal(m.end, 3)
+    assert_equal(m.group_str(text, 1), "a")
+    assert_false(re.match("aaab").matched)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

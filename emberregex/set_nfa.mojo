@@ -213,17 +213,14 @@ def build_union_subset_nfa(
             if ast.nodes[j].kind == ASTNodeKind.CHAR_CLASS:
                 ast.nodes[j].charset_index += cs_offset
 
-        var frag_start: Int
-        if ast.root == -1:
-            # Defensive: parse() never yields -1, but keep the invariant.
-            frag_start = nfa.add_state(NFAState.match_state())
-            nfa.states[frag_start].report_id = i
-        else:
-            var frag = _build_fragment(nfa, ast, ast.root, flags)
-            var match_idx = nfa.add_state(NFAState.match_state())
-            nfa.states[match_idx].report_id = i
-            nfa.patch(frag, match_idx)
-            frag_start = frag.start
+        # `parse()` always sets a root (an empty pattern is an empty
+        # CONCAT), so the bare-`AST()` shape build_nfa accepts cannot
+        # arrive here.
+        var frag = _build_fragment(nfa, ast, ast.root, flags)
+        var match_idx = nfa.add_state(NFAState.match_state())
+        nfa.states[match_idx].report_id = i
+        nfa.patch(frag, match_idx)
+        var frag_start = frag.start
 
         if not allow_empty and matches_empty_buffer(nfa, frag_start):
             raise Error(

@@ -20,7 +20,7 @@ wall-clock bound.
 """
 
 from emberregex import Regex
-from emberregex.utf8 import utf8_encode, utf8_ranges
+from emberregex.utf8 import negate_ranges, utf8_encode, utf8_ranges
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 
@@ -171,6 +171,23 @@ def test_byte_mode_unchanged() raises:
 def test_codepoint_literal_escape() raises:
     assert_true(_m["(?u)\\u03B1"]("xαy"))
     assert_false(_m["(?u)\\u03B1"]("xβy"))
+
+
+def test_negate_ranges_sorts_unordered_pairs() raises:
+    # The complement runs over the whole codepoint space; pairs arriving
+    # out of order are insertion-sorted first.
+    var out = negate_ranges([0x100, 0x200, 0x10, 0x20])
+    assert_equal(len(out), 6)
+    assert_equal(out[0], 0)
+    assert_equal(out[1], 0xF)
+    assert_equal(out[2], 0x21)
+    assert_equal(out[3], 0xFF)
+    assert_equal(out[4], 0x201)
+    assert_equal(out[5], 0x10FFFF)
+
+
+def test_utf8_ranges_inverted_range_is_empty() raises:
+    assert_equal(len(utf8_ranges(0x7A, 0x61)), 0)
 
 
 def main() raises:

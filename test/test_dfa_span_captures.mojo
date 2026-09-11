@@ -289,6 +289,15 @@ def test_lazy_group() raises:
     assert_equal(all[0], "a")
     assert_equal(all[1], "bb")
     assert_equal(all[2], "dd")
+    # The lane's anchored backtracker attempt at the first `<` walks the
+    # lazy `.*?` up to the newline it cannot cross and gives up there; the
+    # scan then finds the match on the next line.
+    var nl = String("<a\nb<c>")
+    var m = re.search(nl)
+    assert_true(m.matched)
+    assert_equal(m.start, 4)
+    assert_equal(m.end, 7)
+    assert_equal(m.group_str(nl, 1), "c")
 
 
 def test_pike_on_span_fallback() raises:

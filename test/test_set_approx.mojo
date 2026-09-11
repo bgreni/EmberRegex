@@ -10,9 +10,10 @@ The two metrics differ in exactly the way you would hope: Hamming
 preserves length (substitutions only), edit distance does not.
 """
 
-from emberregex import SetMatch, RegexSet
+from emberregex import SetMatch, SetSpan, RegexSet
 from emberregex.set_approx import approx_nfa, approx_supported
 from emberregex.set_nfa import build_union_nfa
+from emberregex.set_semantics import SetFlags
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 
@@ -110,6 +111,30 @@ def test_edit_distance_two() raises:
             SetMatch(0, 15),
         ],
         "hello @ edit<=2",
+    )
+    # Adjacent substitutions: `hexxo` spends both edits on consecutive
+    # bytes, which needs the layer-0 edit edge to land on layer 1's chain
+    # head (not its bare body) so the second edit has an edge to take.
+    # `hxlxo` keeps a byte between its two edits and never depended on
+    # that.
+    assert_reports(
+        db.scan("hexxo hxlxo"),
+        [SetMatch(0, 5), SetMatch(0, 11)],
+        "hello @ edit<=2, adjacent edits",
+    )
+
+
+def test_edits_at_one_position_cover_the_pattern() raises:
+    # `ab`@2 reaches "" by two deletions and "xy" by two substitutions,
+    # so it is vacuous (allow_empty) and every end of "xy" reports:
+    # end 0 is the empty string, end 1 one substitution plus one
+    # deletion, end 2 two substitutions.
+    comptime P: List[String] = ["ab"]
+    var db = RegexSet[P, True, List[Int](), EDIT2]()
+    assert_reports(
+        db.scan("xy"),
+        [SetMatch(0, 0), SetMatch(0, 1), SetMatch(0, 2)],
+        "ab @ edit<=2 on xy",
     )
 
 
@@ -215,6 +240,61 @@ def test_regex_not_just_literals() raises:
         r,
         [SetMatch(0, 3), SetMatch(0, 7), SetMatch(0, 11)],
         "a[0-9]c @ hamming<=1",
+    )
+
+
+# --- Interaction with the other set parameters ------------------------------
+
+
+def test_singlematch_with_edit_distance() raises:
+    # SINGLEMATCH keeps the first report per id; with a distance that is
+    # the first FUZZY end (`ab` is one deletion from `abc`), not the
+    # first exact one.
+    comptime P: List[String] = ["abc"]
+    comptime F: List[Int] = [SetFlags.SINGLEMATCH]
+    var db = RegexSet[P, False, F, EDIT1]()
+    assert_reports(db.scan("ab abc"), [SetMatch(0, 2)], "singlematch @ edit<=1")
+
+
+def test_som_uses_the_fuzzy_leftmost_start() raises:
+    # Start of match runs the reverse automaton over the layered NFA:
+    # the leftmost start of the end at 6 is 2, because ` abc` is one
+    # insertion away, not 3 where the exact `abc` begins.
+    comptime P: List[String] = ["abc"]
+    var db = RegexSet[P, False, List[Int](), EDIT1]()
+    var got = db.scan_som("ab abc abcd")
+    var expected: List[SetSpan] = [
+        SetSpan(0, 0, 2),
+        SetSpan(0, 0, 3),
+        SetSpan(0, 3, 5),
+        SetSpan(0, 2, 6),
+        SetSpan(0, 3, 7),
+        SetSpan(0, 7, 9),
+        SetSpan(0, 6, 10),
+        SetSpan(0, 7, 11),
+    ]
+    assert_equal(len(got), len(expected))
+    for i in range(len(expected)):
+        assert_equal(got[i], expected[i])
+
+
+def test_min_length_filters_on_the_fuzzy_span() raises:
+    # min_length constrains end - start on the leftmost fuzzy span: the
+    # two-byte `ab` ends (2, 5, 9) drop, `ab ` (0..3, one substitution)
+    # and ` abc` (2..6) stay.
+    comptime P: List[String] = ["abc"]
+    comptime E: List[Int] = [-1, -1, 3, 1, -1]
+    var db = RegexSet[P, False, List[Int](), E]()
+    assert_reports(
+        db.scan("ab abc abcd"),
+        [
+            SetMatch(0, 3),
+            SetMatch(0, 6),
+            SetMatch(0, 7),
+            SetMatch(0, 10),
+            SetMatch(0, 11),
+        ],
+        "min_length 3 @ edit<=1",
     )
 
 

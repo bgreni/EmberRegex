@@ -101,6 +101,9 @@ def test_replace_named_group_numeric_backref() raises:
 def test_replace_escaped_backslash() raises:
     var re = Regex["a"]()
     assert_equal(re.replace("a", "\\\\"), "\\")
+    # Text before the escape is flushed with it:
+    # Python re.sub('a', r'x\\y', 'a') == 'x\\y'.
+    assert_equal(re.replace("a", "x\\\\y"), "x\\y")
 
 
 def test_split_delimiter_at_start() raises:

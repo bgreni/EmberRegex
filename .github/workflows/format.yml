@@ -51,24 +51,8 @@ jobs:
       - name: Install environment
         run: pixi install --locked
 
-      # Two separate facts get conflated by `mojo format`'s exit code:
-      #
-      #  * A real formatting violation — the tool rewrites a tracked
-      #    file. That is what this job must fail on.
-      #  * An internal formatter crash. mojo 1.0.0 aborts with
-      #    "'_python_symbols' object has no attribute
-      #    'old_comptime_assert_stmt'" on any file containing a
-      #    triple-quoted string that spans more than one line — 70 of
-      #    this repo's 107 files, since that is every module and function
-      #    docstring. Those files are left untouched and the command
-      #    still exits non-zero. Failing on that would make this check
-      #    red regardless of the change under test, so it is surfaced as
-      #    a warning; when the formatter is fixed the count drops to 0
-      #    and the gate below starts covering the whole tree.
-      #
-      # `mojo format` also has no --check mode, so the gate is: format in
-      # place, then require the tree to be unchanged. Files the formatter
-      # could not parse are reported as a warning instead.
+      # `mojo format` has no --check mode, so the gate is: format in
+      # place, then require the tree to be unchanged.
       - name: Check formatting
         run: |
           set -o pipefail
@@ -83,7 +67,9 @@ jobs:
 
           unparseable="$(grep -c '^error: cannot format' "$RUNNER_TEMP/format.log" || true)"
           if [ "$unparseable" -gt 0 ]; then
-            echo "::warning title=Formatter::mojo format could not parse $unparseable file(s) and did not check them (internal formatter error, not a formatting violation)."
+            echo "::error title=Formatter::mojo format could not parse $unparseable file(s), so they were never checked. This is an internal formatter failure, not a formatting violation."
+            grep '^error: cannot format' "$RUNNER_TEMP/format.log"
+            exit 1
           fi
 
           echo "No formatting changes required (mojo format exit status: $status)."

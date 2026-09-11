@@ -128,24 +128,19 @@ def approx_nfa(base: NFA, k: Int, hamming: Bool) -> NFA:
             body[layer][s] = idx
             entry[layer][s] = idx
 
-    # Pass 2: wire same-layer transitions.
-    for layer in range(k + 1):
-        for s in range(n):
-            ref st = base.states[s]
-            var me = body[layer][s]
-            var t1 = st.out1
-            if t1 >= 0 and t1 < n:
-                out.states[me].out1 = entry[layer][t1]
-            if st.kind == NFAStateKind.SPLIT:
-                var t2 = st.out2
-                if t2 >= 0 and t2 < n:
-                    out.states[me].out2 = entry[layer][t2]
-
-    # Pass 3: edit edges. A consuming state gains a SPLIT chain in front
+    # Pass 2: edit edges. A consuming state gains a SPLIT chain in front
     # of it so predecessors reach the alternatives too; `entry` is
-    # repointed at the chain head, which is why pass 2 wired targets
-    # through `entry` rather than `body`.
-    for layer in range(k):
+    # repointed at the chain head, and pass 3 wires every same-layer
+    # target through `entry` rather than `body`.
+    #
+    # Layers are built from k-1 DOWN to 0. An edit edge out of layer L
+    # captures `entry[L + 1]`, and it must capture the chain HEAD there —
+    # the landing state's own edit alternatives are what let a second
+    # edit follow at the same or the next position (`ab`@2 on "xy",
+    # `hello`@2 on "hexxo") — so layer L + 1's chains must already exist.
+    # Layer k spends no edits and has no chains, so `entry[k]` is its
+    # bodies from pass 1 on.
+    for layer in range(k - 1, -1, -1):
         for s in range(n):
             ref st = base.states[s]
             var consuming = _is_consuming(st.kind)
@@ -190,8 +185,8 @@ def approx_nfa(base: NFA, k: Int, hamming: Bool) -> NFA:
             )
             entry[layer][s] = head
 
-    # Pass 4: entry indices changed for consuming states, so re-wire every
-    # target through the (possibly new) entry.
+    # Pass 3: same-layer transitions. Every target goes through `entry`,
+    # which now names the chain head wherever one was built.
     for layer in range(k + 1):
         for s in range(n):
             ref st = base.states[s]
@@ -203,14 +198,6 @@ def approx_nfa(base: NFA, k: Int, hamming: Bool) -> NFA:
                 var t2 = st.out2
                 if t2 >= 0 and t2 < n:
                     out.states[me].out2 = entry[layer][t2]
-    # ...and so do the edit edges built in pass 3, which pointed at the
-    # pass-2 entries of the next layer.
-    for _ in range(k):
-        for s in range(n):
-            if not _is_consuming(base.states[s].kind):
-                continue
-            var t = base.states[s].out1
-            _ = t  # targets were captured above; nothing further to fix
 
     out.start = entry[0][base.start]
     out.group_count = 0

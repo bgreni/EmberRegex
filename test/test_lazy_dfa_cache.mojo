@@ -22,11 +22,15 @@ Two input shapes drive the two regimes:
 
 from emberregex import Regex
 from emberregex.dfa import LazyDFA
+from emberregex.engine import _build_static_nfa
 from emberregex.nfa import NFA
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 
 comptime BLOWUP = "(?:a|b)*a(?:a|b){12}"
+# The same shape with an empty alternative: still past the eager cap, and
+# every position without the long match is an empty match.
+comptime EMPTY_ALT = BLOWUP + "|"
 
 
 def _lcg_ab(seed: Int, n: Int) -> String:
@@ -61,8 +65,14 @@ def _burst_ab(seed: Int, n: Int, gap: Int, burst: Int) -> String:
 def test_blowup_pattern_rides_the_lazy_dfa() raises:
     comptime S = Regex[BLOWUP]
     assert_true(S._strategy.use_dfa)
+    assert_true(S._use_lazy_dfa)
     assert_false(S._strategy.use_eager_dfa)
     assert_false(S._strategy.use_teddy)
+    assert_false(S._use_lf_lane)
+    # No literal prefix, so the search-family verbs scan with
+    # `_dfa_search_forward` (not the prefix-filter + `_dfa_match_at`
+    # branch): that unanchored walk is where the give-up below raises.
+    assert_false(S._use_scan_filter)
 
 
 def test_search_across_a_clear_matches_pike() raises:
@@ -81,6 +91,15 @@ def test_search_across_a_clear_matches_pike() raises:
     assert_equal(got[0], want.start)
     assert_equal(got[1], want.end)
     assert_true(dfa.clear_count > 0)
+    # The verb itself: the DFA reports the leftmost-LONGEST end, so
+    # `_lf_end_at` re-runs the backtracker from the start. Its general
+    # loop trips the stack guard on 400 KB and the memo it would retry
+    # with is wider than SBT_MEMO_BITS, so the end comes from the Pike
+    # VM run anchored on that start -- and must be the same end.
+    var verb = re.search(input)
+    assert_true(verb.matched)
+    assert_equal(verb.start, want.start)
+    assert_equal(verb.end, want.end)
 
 
 def test_full_match_across_a_clear_matches_pike() raises:
@@ -154,12 +173,171 @@ def test_hostile_search_still_matches_pike() raises:
     assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
 
 
+# --- Pike VM fallbacks of the search-family verbs ------------------------
+#
+# Each verb's lazy-lane loop opens with `_dfa_search_forward` from position
+# 0. Nothing in an a/b string kills `(?:a|b)*`, and the lazy DFA reports the
+# leftmost-LONGEST end, so that first walk covers the whole input: on
+# `_lcg_ab` it thrashes (a state every ~1.4 bytes), clears three times and
+# raises `DFA_STATE_CAP` on the fourth full cache, which `Regex` catches and
+# answers with `_pike_<verb>` for the entire call. `_burst_ab` never gets
+# there -- ~90 bytes per state, clearing keeps paying (see
+# `test_search_across_a_clear_matches_pike`) -- so the hostile input the
+# `match`/`search` give-up tests already build is reused (a fresh `_lcg_ab`
+# string first raises at ~24 KB, the fourth cache fill; anything shorter
+# completes with <= 3 clears). A completed walk over 200 KB would clear ~35
+# times (204800 / 1.4 / 4096); `clear_count == 3` after the verb pins that
+# the DFA was abandoned after the third clear.
+#
+# Expected values from Python on the same input (the pattern is Python
+# syntax): with s = _lcg_ab(4242, 204800) reproduced in Python,
+#   [m.span() for m in re.finditer(r'(?:a|b)*a(?:a|b){12}', s)] -> [(0, 204798)]
+#   re.sub(..., 'X', s) -> 'Xaa';  re.split(..., s) -> ['', 'aa']
+# By hand: `(?:a|b)*` eats the whole a/b input and backs off to the last `a`
+# at an index <= len - 13, which is 204785, so the match ends at 204798 and
+# leaves "aa"; no `a` after it can start a second 13-byte match.
+comptime HOSTILE_SEED = 4242
+comptime HOSTILE_LEN = 200 * 1024
+comptime HOSTILE_END = 204798
+comptime HOSTILE_TAIL = "aa"
+
+
+def test_hostile_finditer_falls_back_to_pike() raises:
+    var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
+    var re = Regex[BLOWUP]()
+    var it = re.finditer(input)
+    assert_equal(len(it), 1)
+    assert_equal(it[0].start, 0)
+    assert_equal(it[0].end, HOSTILE_END)
+    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+
+
+def test_hostile_findall_falls_back_to_pike() raises:
+    var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
+    var re = Regex[BLOWUP]()
+    var all = re.findall(input)
+    assert_equal(len(all), 1)
+    assert_equal(all[0].byte_length(), HOSTILE_END)
+    assert_equal(
+        all[0], String(unsafe_from_utf8=input.as_bytes()[0:HOSTILE_END])
+    )
+    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+
+
+def test_hostile_replace_falls_back_to_pike() raises:
+    var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
+    var re = Regex[BLOWUP]()
+    assert_equal(re.replace(input, "X"), "X" + HOSTILE_TAIL)
+    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+
+
+def test_hostile_split_falls_back_to_pike() raises:
+    var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
+    var re = Regex[BLOWUP]()
+    var parts = re.split(input)
+    assert_equal(len(parts), 2)
+    assert_equal(parts[0], "")
+    assert_equal(parts[1], HOSTILE_TAIL)
+    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+
+
 def test_small_inputs_never_clear() raises:
     var re = Regex[BLOWUP]()
     assert_true(re.match("ab" * 6 + "a" + "b" * 12).matched)
     assert_true(re.search("xx" + "ab" * 6 + "a" + "b" * 12).matched)
     assert_false(re.match("abc").matched)
     assert_equal(rebind[LazyDFA](re._dfa).clear_count, 0)
+
+
+def test_lazy_dfa_direct_eol_anchors_and_dead_cache() raises:
+    # Runtime-built NFAs walked straight on a LazyDFA: EOL anchors stay in
+    # the state set and resolve through the per-state flags, SAVE states
+    # are epsilons, and a transition computed dead once is answered from
+    # the cache on the next walk.
+    var eol = _build_static_nfa("(a)b$")
+    var dfa = LazyDFA()
+    assert_true(dfa.full_match(eol, "ab"))
+    assert_false(dfa.full_match(eol, "abx"))
+    assert_false(dfa.full_match(eol, "abx"))  # cached dead transition
+    var hit = String("xab")
+    var r = dfa.search_forward(
+        eol, hit.as_bytes(), 0, SIMD[DType.uint8, 32](0), False
+    )
+    assert_equal(r[0], 1)
+    assert_equal(r[1], 3)
+    var miss = String("xabx")
+    for _ in range(2):  # the second pass reads the cached dead transitions
+        var m = dfa.search_forward(
+            eol, miss.as_bytes(), 0, SIMD[DType.uint8, 32](0), False
+        )
+        assert_equal(m[0], -1)
+        assert_equal(m[1], -1)
+    # A consuming continuation after `$` never reaches MATCH ...
+    var cons = _build_static_nfa("a$b")
+    var d2 = LazyDFA()
+    assert_false(d2.full_match(cons, "a"))
+    # ... while epsilons after it (a group close, a second `$`) do.
+    var chain = _build_static_nfa("(a$)$")
+    var d3 = LazyDFA()
+    assert_true(d3.full_match(chain, "a"))
+    assert_false(d3.full_match(chain, "ab"))
+    var ml_chain = _build_static_nfa("(?m)a$$")
+    var d4 = LazyDFA()
+    assert_true(d4.full_match(ml_chain, "a"))
+    # An alternation after `$` is followed through both arms, a state
+    # both arms share is visited once, and neither reaches MATCH here.
+    var alt = _build_static_nfa("a$(?:x|)b")
+    var d5 = LazyDFA()
+    assert_false(d5.full_match(alt, "a"))
+    var shared = _build_static_nfa("a$(?:|)b")
+    var d6 = LazyDFA()
+    assert_false(d6.full_match(shared, "a"))
+
+
+def test_lazy_dfa_direct_multiline_contexts_and_any() raises:
+    # `.` consumes anything but a newline; a run started right after a
+    # newline takes the after-newline start state; a multiline `$` records
+    # the match at the newline the run then dies on.
+    var nfa = _build_static_nfa("(?m)^a.$")
+    var dfa = LazyDFA()
+    var text = String("\nab\nq")
+    var r = dfa.search_forward(
+        nfa, text.as_bytes(), 0, SIMD[DType.uint8, 32](0), False
+    )
+    assert_equal(r[0], 1)
+    assert_equal(r[1], 3)
+    assert_true(dfa.full_match(nfa, "ab"))
+    assert_false(dfa.full_match(nfa, "a\n"))
+
+
+def test_empty_alternative_bumps_past_empty_matches_on_the_lazy_lane() raises:
+    # Python: [m.span() for m in re.finditer(r'(?:a|b)*a(?:a|b){12}|', 'cc')]
+    #   -> [(0, 0), (1, 1), (2, 2)]; re.sub(..., 'X', 'cc') -> 'XcXcX';
+    #   re.split(..., 'cc') -> ['', 'c', 'c', '']
+    comptime S = Regex[EMPTY_ALT]
+    assert_true(S._use_lazy_dfa)
+    assert_false(S._strategy.use_eager_dfa)
+    var re = S()
+    var it = re.finditer("cc")
+    assert_equal(len(it), 3)
+    for i in range(3):
+        assert_equal(it[i].start, i)
+        assert_equal(it[i].end, i)
+    var all = re.findall("cc")
+    assert_equal(len(all), 3)
+    assert_equal(all[0], "")
+    assert_equal(re.replace("cc", "X"), "XcXcX")
+    var parts = re.split("cc")
+    assert_equal(len(parts), 4)
+    assert_equal(parts[0], "")
+    assert_equal(parts[1], "c")
+    assert_equal(parts[2], "c")
+    assert_equal(parts[3], "")
+    # The long alternative still wins where it can (leftmost-first end).
+    var hit = re.search("ab" * 6 + "a" + "b" * 12)
+    assert_true(hit.matched)
+    assert_equal(hit.start, 0)
+    assert_equal(hit.end, 25)
 
 
 def main() raises:

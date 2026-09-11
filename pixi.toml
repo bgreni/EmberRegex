@@ -26,6 +26,20 @@ mojo-compiler = "==1.0.0"
 [package.run-dependencies]
 mojo-compiler = "==1.0.0"
 
+# `mojo format` (mblack) caches its parsed blib2to3 grammar under
+# platformdirs' user cache, keyed on mblack's version string -- which is the
+# hardcoded placeholder "0.2.dev2" in EVERY mblack build. So every Mojo
+# toolchain on the machine shares ~/Library/Caches/mblack/0.2.dev2/, and the
+# pickle name embeds only the Python version (Grammar3.14.7.final.0.pickle),
+# not the grammar. load_grammar() reuses that pickle whenever it is
+# mtime-newer than the install's Grammar.txt (which carries the conda package
+# BUILD date), so a newer toolchain's grammar silently wins here and format
+# dies with e.g. "'_python_symbols' object has no attribute
+# 'old_comptime_assert_stmt'". Pin the cache inside this env's prefix so the
+# grammar pickle can never come from another Mojo version.
+[activation.env]
+MBLACK_CACHE_DIR = "$CONDA_PREFIX/.mblack-cache"
+
 [tasks]
 test = { cmd = "python3 run_test.py" }
 build = { cmd = "mojo precompile emberregex -o emberregex.mojoc"}
@@ -38,6 +52,19 @@ format = "mojo format emberregex test bench"
 
 [dependencies]
 mojo = "=1.0.0"
+
+[feature.cov.dependencies]
+# One LLVM for opt/llc/llvm-cov (llvm-tools), the link driver (clang), the
+# gcov runtime (compiler-rt) and the linker (lld: Apple's ld asserts on
+# Mojo's long symbol names). Mojo itself is LLVM 24 trunk; the closest
+# release keeps the IR parseable.
+llvm-tools = "23.*"
+clang = "23.*"
+compiler-rt = "23.*"
+lld = "23.*"
+
+[feature.cov.tasks]
+coverage = { cmd = "python3 run_coverage.py" }
 
 [feature.pdf.dependencies]
 reportlab = "*"
@@ -60,6 +87,7 @@ compare_pcre2_pdf = { cmd = "python3 bench/bench_compare_pcre2.py --pdf" }
 
 [environments]
 default = { features = [], solve-group = "default" }
+cov = { features = ["cov"], solve-group = "default" }
 pdf = { features = ["pdf"], solve-group = "default" }
 pcre = { features = ["pcre"], solve-group = "default" }
 pcre-pdf = { features = ["pcre", "pdf"], solve-group = "default" }

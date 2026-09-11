@@ -1964,7 +1964,7 @@ struct Regex[pattern: String](Copyable, Movable):
             table=Self._RDFA_TABLE,
             flags=Self._RDFA_FLAGS,
         ](input, end, s0)
-        debug_assert(start >= 0, "reverse DFA lost the match start")
+        assert start >= 0, "reverse DFA lost the match start"
         comptime if Self._use_dfa_span:
             if fill:
                 self._span_fill_slots(input, start, end, slots, pike)
@@ -2012,7 +2012,7 @@ struct Regex[pattern: String](Copyable, Movable):
         `pike[].sbt_ok` latches off so the rest of the walk's spans skip
         the backtracker (see `_SpanPike`). Should the Pike VM ALSO fail
         to match the span (a table/VM disagreement, which the
-        debug_assert in `_pike_span` flags under ASSERT), the slots are
+        `assert` in `_pike_span` flags under ASSERT), the slots are
         left all `-1`: the span is still reported, only its groups read
         as unset — the lane never drops a match the tables found.
         """
@@ -2025,7 +2025,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var got = self._onepass_walk(input, start, end, slots)
             if got == end:
                 return
-            debug_assert(False, "one-pass DFA rejects the DFA span")
+            assert False, "one-pass DFA rejects the DFA span"
             for s in range(Self._num_slots):
                 slots[s] = -1
         else:
@@ -2048,10 +2048,9 @@ struct Regex[pattern: String](Copyable, Movable):
                     )
                     if got == end:
                         return
-                    debug_assert(
-                        got < 0,
-                        "anchored_end backtracker returned another end",
-                    )
+                    assert (
+                        got < 0
+                    ), "anchored_end backtracker returned another end"
                 except:
                     pass
                 pike[].sbt_ok = False
@@ -2113,10 +2112,9 @@ struct Regex[pattern: String](Copyable, Movable):
             var result = vm_slot[0]._execute_with_bufs(
                 input, start, bufs_slot[0], end_at=end
             )
-            debug_assert(
-                result.matched and result.end == end,
-                "Pike VM disagrees with the DFA span",
-            )
+            assert (
+                result.matched and result.end == end
+            ), "Pike VM disagrees with the DFA span"
             for s in range(Self._num_slots):
                 slots[s] = result.slots[s] if result.matched else -1
 
@@ -2202,7 +2200,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._use_lazy_dfa:
                     return self._pike_match(input)
                 else:
-                    debug_assert(False, "eager DFA walker raised")
+                    assert False, "eager DFA walker raised"
                     return MatchResult[Self._num_slots].no_match()
         elif Self._use_onepass:
             # One-pass capture pattern: one forward table walk writes the
@@ -2260,7 +2258,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # Gated so the Pike VM (runtime NFA copy, buffers,
                 # walker) is not elaborated into those binaries.
                 comptime if Self._has_backref:
-                    debug_assert(False, "backref lane raised")
+                    assert False, "backref lane raised"
                     return MatchResult[Self._num_slots].no_match()
                 else:
                     return self._pike_match(input)
@@ -2397,7 +2395,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._use_lazy_dfa:
                     return self._pike_search(input)
                 else:
-                    debug_assert(False, "eager DFA walker raised")
+                    assert False, "eager DFA walker raised"
                     return MatchResult[Self._num_slots].no_match()
         else:
             # `else`, not a trailing fallthrough: a bare block after the
@@ -2409,7 +2407,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # See match(): dead for a backreference pattern, gated so
                 # the Pike VM is not elaborated into its binary.
                 comptime if Self._has_backref:
-                    debug_assert(False, "backref lane raised")
+                    assert False, "backref lane raised"
                     return MatchResult[Self._num_slots].no_match()
                 else:
                     return self._pike_search(input)
@@ -2724,7 +2722,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._use_lazy_dfa:
                     return self._pike_finditer(input)
                 else:
-                    debug_assert(False, "eager DFA walker raised")
+                    assert False, "eager DFA walker raised"
                     return List[MatchResult[Self._num_slots]]()
         else:
             # `else`, not a trailing fallthrough (see match()).
@@ -2734,7 +2732,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # See match(): dead for a backreference pattern, gated so
                 # the Pike VM is not elaborated into its binary.
                 comptime if Self._has_backref:
-                    debug_assert(False, "backref lane raised")
+                    assert False, "backref lane raised"
                     return List[MatchResult[Self._num_slots]]()
                 else:
                     return self._pike_finditer(input)
@@ -2917,7 +2915,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._use_lazy_dfa:
                     return self._pike_findall(input)
                 else:
-                    debug_assert(False, "eager DFA walker raised")
+                    assert False, "eager DFA walker raised"
                     return List[String]()
         else:
             # `else`, not a trailing fallthrough (see match()).
@@ -2927,7 +2925,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # See match(): dead for a backreference pattern, gated so
                 # the Pike VM is not elaborated into its binary.
                 comptime if Self._has_backref:
-                    debug_assert(False, "backref lane raised")
+                    assert False, "backref lane raised"
                     return List[String]()
                 else:
                     return self._pike_findall(input)
@@ -3279,7 +3277,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._use_lazy_dfa:
                     return self._pike_replace(input, replacement)
                 else:
-                    debug_assert(False, "eager DFA walker raised")
+                    assert False, "eager DFA walker raised"
                     return input
         else:
             try:
@@ -3288,7 +3286,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # See match(): dead for a backreference pattern, gated so
                 # the Pike VM is not elaborated into its binary.
                 comptime if Self._has_backref:
-                    debug_assert(False, "backref lane raised")
+                    assert False, "backref lane raised"
                     return input
                 else:
                     return self._pike_replace(input, replacement)
@@ -3572,7 +3570,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._use_lazy_dfa:
                     return self._pike_split(input)
                 else:
-                    debug_assert(False, "eager DFA walker raised")
+                    assert False, "eager DFA walker raised"
                     return List[String]()
             if prev_end <= input_len:
                 parts.append(
@@ -3587,7 +3585,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # See match(): dead for a backreference pattern, gated so
                 # the Pike VM is not elaborated into its binary.
                 comptime if Self._has_backref:
-                    debug_assert(False, "backref lane raised")
+                    assert False, "backref lane raised"
                     return [input]
                 else:
                     return self._pike_split(input)

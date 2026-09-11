@@ -20,6 +20,7 @@ from emberregex.set_dfa import (
     mdfa_scan,
     mdfa_slices_arr,
     mdfa_table_str,
+    MultiDFA,
 )
 from emberregex.set_nfa import build_union_nfa
 from emberregex.set_pike import set_pike_scan
@@ -37,6 +38,17 @@ def _mdfa_scan[
     comptime P = mdfa_pool_arr[len(MD.pool)](MD)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
+
+
+def _accelerates(d: MultiDFA, state: Int) -> Bool:
+    """Comptime: is `state` one of the SIMD-scanned self-loop states?"""
+    for s in d.accel_states:
+        if s == state:
+            return True
+    for s in d.accel_nib_states:
+        if s == state:
+            return True
+    return False
 
 
 def _mdfa_builds[patterns: List[String]]() -> Bool:
@@ -252,6 +264,17 @@ def _assert_matches_pike[
     assert_reports(got, expected, label)
 
 
+def _assert_mdfa_matches_pike[
+    patterns: List[String]
+](data: List[Byte], label: String) raises:
+    """The engine itself against the tagged Pike — for sets the ladder
+    would hand to another lane (Rose claims any literal factor)."""
+    var db = RegexSet[patterns]()
+    ref unfa = db._nfa
+    var expected = set_pike_scan(unfa, Span(data))
+    assert_reports(_mdfa_scan[patterns](Span(data)), expected, label)
+
+
 def test_differential_quantifiers_classes() raises:
     comptime PATS: List[String] = ["[a-c]+x", "ab{2,3}", "c.d", "x+"]
     var alphabet: List[Byte] = [97, 98, 99, 100, 120]  # a b c d x
@@ -299,8 +322,14 @@ def test_differential_dotall_mixed() raises:
 
 def test_differential_sparse_long_accel() raises:
     # Sparse hits over long filler: the folded start state self-loops on
-    # filler bytes, so the accelerated skip paths carry the scan.
+    # filler bytes, so the accelerated skip paths carry the scan. Both
+    # members carry literal factors, so `RegexSet.scan` would ride Rose
+    # here — the engine is driven directly, and the pin says it is the
+    # accelerated start state being exercised.
     comptime PATS: List[String] = ["needle\\d", "wa+ldo"]
+    comptime MD = build_multi_dfa(RegexSet[PATS].nfa, True)
+    comptime start_accel = _accelerates(MD, MD.start)
+    assert_true(start_accel)
     var alphabet: List[Byte] = [
         122,
         122,
@@ -318,7 +347,7 @@ def test_differential_sparse_long_accel() raises:
     for seed in [9, 63]:
         for n in [100, 1000, 4096]:
             var data = _lcg_bytes(seed, n, alphabet)
-            _assert_matches_pike[PATS](
+            _assert_mdfa_matches_pike[PATS](
                 data, String("accel seed=", seed, " n=", n)
             )
     # Deterministic hit at the very end of a long haystack.
@@ -327,7 +356,39 @@ def test_differential_sparse_long_accel() raises:
         tailhit.append(122)
     for b in "needle7".as_bytes():
         tailhit.append(b)
-    _assert_matches_pike[PATS](tailhit, "accel tailhit")
+    _assert_mdfa_matches_pike[PATS](tailhit, "accel tailhit")
+
+
+def test_mdfa_accel_exit_in_scalar_tail() raises:
+    # The folded start state of {`a$b`, `cd`} self-loops on everything but
+    # `a` and `c`, so it is accelerated: the exit scan takes one SIMD
+    # block at a time and finishes the last partial block byte by byte.
+    # An exit sitting in that tail — past the last full block, inside the
+    # final W bytes, for any W up to 64 — must be found there.
+    comptime S = RegexSet[["a$b", "cd"]]
+    comptime MD = build_multi_dfa(S.nfa, S.nfa.can_use_dfa)
+    comptime start_accel = _accelerates(MD, MD.start)
+    assert_true(start_accel)
+    var data = List[Byte]()
+    for _ in range(70):
+        data.append(32)
+    data.append(99)  # c
+    data.append(100)  # d
+    assert_reports(
+        _mdfa_scan[["a$b", "cd"]](Span(data)),
+        [SetMatch(1, 72)],
+        "exit byte in the scalar tail",
+    )
+    # With no exit byte at all the scan runs off the end through that
+    # tail and the walk ends with nothing to report.
+    var none = List[Byte]()
+    for _ in range(70):
+        none.append(32)
+    assert_reports(
+        _mdfa_scan[["a$b", "cd"]](Span(none)),
+        List[SetMatch](),
+        "exit scan runs off the end",
+    )
 
 
 def test_differential_allow_empty_vacuous() raises:

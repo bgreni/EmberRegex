@@ -1366,6 +1366,12 @@ def _look_ok[
             comptime rel = Int(look[rec])
             var p = at + rel
             comptime if rel < 0:
+                # Dead under the current callers — a fixed-offset entry is
+                # verified only when `at >= off`, and its records reach
+                # back at most `off`; a variable-offset entry carries
+                # forward records only (`_var_offset_run`) — but it is the
+                # one check between an invariant slip and a negative-index
+                # read, so it stays.
                 if p < 0:
                     return False
             else:

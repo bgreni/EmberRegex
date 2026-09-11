@@ -1,0 +1,97 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    # macOS only, and deliberately NOT a replacement for the Tests
+    # workflow: this pipeline builds every test at -O0 with counters
+    # injected, so a green run says nothing about the optimized codegen
+    # the library actually ships, and it skips test/compile_fail/
+    # entirely. It is the coverage ratchet, not the correctness gate.
+    # Linux is untried here (the link step has only ever run on Darwin)
+    # -- prove it by hand before matrixing it.
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      # Derived from $RUNNER_TEMP in a step rather than in a job-level
+      # `env:` block: the `runner` context is not available there, because
+      # the job's environment is evaluated before a runner is assigned.
+      # A workflow that references it fails to start at all.
+      - name: Configure paths
+        run: echo "MODULAR_CACHE_DIR=$RUNNER_TEMP/mojo-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Install pixi
+        id: pixi
+        run: |
+          curl -fsSL https://pixi.sh/install.sh | bash
+          echo "$HOME/.pixi/bin" >> "$GITHUB_PATH"
+          echo "version=$("$HOME/.pixi/bin/pixi" --version | tr ' ' '-')" \
+            >> "$GITHUB_OUTPUT"
+
+      # Its own key: this environment carries the `cov` feature's LLVM on
+      # top of the default one, so sharing a key with the Tests workflow
+      # would let whichever job finished first decide what the other
+      # restores.
+      - name: Cache pixi environment
+        uses: actions/cache@v4
+        with:
+          path: .pixi
+          key: >-
+            pixi-cov-${{ runner.os }}-${{ runner.arch }}-${{
+            steps.pixi.outputs.version }}-${{ hashFiles('pixi.lock') }}
+
+      - name: Install environment
+        run: pixi install --locked -e cov
+
+      # Restore-only, from whatever the Tests workflow last saved: this
+      # job writes no results of its own, it just reuses the precompiled
+      # package and the per-file durations that schedule the heaviest
+      # files first. A miss costs one precompile.
+      - name: Restore test cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .test_cache
+          key: >-
+            test-cache-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('pixi.lock') }}-
+          restore-keys: |
+            test-cache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Measure coverage
+        run: |
+          set -o pipefail
+          pixi run coverage --check-baseline 2>&1 | tee "$RUNNER_TEMP/coverage.log"
+
+      # Always: the per-file table is the thing you want on a failure,
+      # and `if: always()` is what makes it survive the step above.
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            sed -n '/^Line coverage of/,/lcov tracefile/p' "$RUNNER_TEMP/coverage.log"
+            echo '```'
+            grep -E '^(ERROR|skipped) ' "$RUNNER_TEMP/coverage.log" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov tracefile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-${{ github.sha }}
+          path: .coverage/lcov.info
+          if-no-files-found: warn

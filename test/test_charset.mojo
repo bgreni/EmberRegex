@@ -1,6 +1,7 @@
 """Tests for character class edge cases."""
 
 from emberregex import Regex
+from emberregex.charset import CharRange, CharSet
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -107,6 +108,48 @@ def test_atom_control_escapes() raises:
     var re = Regex["\\f\\a"]()
     assert_true(re.match(chr(12) + chr(7)).matched)
     assert_false(re.search("fa").matched)
+
+
+def test_charset_contains_range_fallback() raises:
+    # `contains` reads the bitmap only for ch < 256 AND after
+    # build_bitmap(); before that, and for any codepoint above the
+    # bitmap, it walks the range list (built at runtime: no comptime).
+    assert_true(CharRange(1, 5).contains(1))
+    assert_true(CharRange(1, 5).contains(5))
+    assert_false(CharRange(1, 5).contains(0))
+    assert_false(CharRange(1, 5).contains(6))
+    var cs = CharSet.from_range(0x100, 0x200)
+    cs.add_range(65, 90)  # A-Z spans four bitmap bytes
+    cs.add_range(97, 99)  # a-c sits inside one bitmap byte
+    assert_false(cs.bitmap_valid)
+    assert_true(cs.contains(0x150))
+    assert_true(cs.contains(65))  # < 256 but no bitmap yet: range walk
+    assert_true(cs.contains(90))
+    assert_true(cs.contains(98))
+    assert_false(cs.contains(64))
+    assert_false(cs.contains(91))
+    assert_false(cs.contains(100))
+    cs.build_bitmap()
+    assert_true(cs.bitmap_valid)
+    assert_true(cs.contains(65))  # bitmap
+    assert_true(cs.contains(77))
+    assert_true(cs.contains(90))
+    assert_true(cs.contains(97))
+    assert_true(cs.contains(99))
+    assert_false(cs.contains(64))
+    assert_false(cs.contains(91))
+    assert_false(cs.contains(96))
+    assert_false(cs.contains(100))
+    assert_true(cs.contains(0x100))  # above the bitmap: range walk
+    assert_true(cs.contains(0x200))
+    assert_false(cs.contains(0x201))
+    assert_false(cs.contains(0xFF))  # bitmap: the >255 range is clamped away
+    cs.negate()
+    assert_false(cs.bitmap_valid)  # negate invalidates the bitmap
+    assert_false(cs.contains(65))
+    assert_true(cs.contains(91))
+    assert_false(cs.contains(0x150))
+    assert_true(cs.contains(0x201))
 
 
 def main() raises:

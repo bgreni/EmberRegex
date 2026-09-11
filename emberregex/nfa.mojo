@@ -1272,8 +1272,9 @@ def _compute_fixed_length(
             total += child_len
         return total
     elif node.kind == ASTNodeKind.ALTERNATION:
-        if len(node.children) == 0:
-            return 0
+        # Always >= 2 arms from the parser; `_build_fragment` indexes the
+        # last child of the same node, so a childless one cannot be built
+        # either way.
         var first_len = _compute_fixed_length(ast, node.children[0], depth)
         if first_len < 0:
             return -1
@@ -1473,18 +1474,19 @@ def _build_repetition(
         copy.out_slots = []
 
     if max_rep == -1:
-        # {n,} — required copies + star loop
+        # {n,} — required copies + star loop. n >= 2 here: the QUANTIFIER
+        # arm of _build_fragment sends `{0,}` to _build_star and `{1,}` to
+        # _build_plus, so a required copy always exists to patch.
+        assert has_result, "{n,} reached _build_repetition with n == 0"
         var star = _build_star(nfa, ast, child_idx, greedy, flags)
-        if has_result:
-            var patch_frag = NFAFragment(res_start)
-            patch_frag.outs = res_outs.copy()
-            patch_frag.out_slots = res_out_slots.copy()
-            nfa.patch(patch_frag, star.start)
-            var new_frag = NFAFragment(res_start)
-            new_frag.outs = star.outs.copy()
-            new_frag.out_slots = star.out_slots.copy()
-            return new_frag^
-        return star^
+        var patch_frag = NFAFragment(res_start)
+        patch_frag.outs = res_outs.copy()
+        patch_frag.out_slots = res_out_slots.copy()
+        nfa.patch(patch_frag, star.start)
+        var new_frag = NFAFragment(res_start)
+        new_frag.outs = star.outs.copy()
+        new_frag.out_slots = star.out_slots.copy()
+        return new_frag^
     else:
         # {n,m} — required copies + (max-min) optional copies
         var optional_count = max_rep - min_rep
@@ -1503,16 +1505,12 @@ def _build_repetition(
                 res_out_slots = opt.out_slots.copy()
                 has_result = True
 
-        if has_result:
-            var frag = NFAFragment(res_start)
-            frag.outs = res_outs^
-            frag.out_slots = res_out_slots^
-            return frag^
-        # Shouldn't reach here, but just in case
-        var state_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
-        nfa.states.unsafe_get(state_idx).out1 = -1
-        var frag = NFAFragment(state_idx)
-        frag.add_out(state_idx, 1)
+        # At least one copy was built: `{0,0}` returned above, `{0,1}` is
+        # _build_question's, and the parser rejects max < min.
+        assert has_result, "{n,m} built no copies"
+        var frag = NFAFragment(res_start)
+        frag.outs = res_outs^
+        frag.out_slots = res_out_slots^
         return frag^
 
 

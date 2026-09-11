@@ -9,17 +9,21 @@ from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from emberregex.constants import CHAR_NEWLINE
 from emberregex.engine import _build_static_nfa
+from emberregex.ast import AnchorKind
+from emberregex.nfa import NFA, NFAStateKind
 from emberregex.nfa import NFA
 from emberregex.static_dfa import (
     EDFA_DEAD,
     EDFA_STATE_CAP,
     EagerDFA,
     WB_PENDING,
+    WB_RESOLVE,
     _MIN_CAP,
     _StateBits,
     _bs_eq,
     _byte_classes,
     _closure_pool,
+    _edfa_has_accel,
     _flat_closure,
     _flatten_nfa,
     _minimize,
@@ -27,7 +31,7 @@ from emberregex.static_dfa import (
     edfa_id_dtype,
 )
 from std.collections import InlineArray
-from std.sys import size_of
+from std.sys import simd_width_of, size_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -267,6 +271,14 @@ def test_accel_trailing_dotstar() raises:
     assert_equal(r.start, 1)
     assert_equal(r.end, 6)  # greedy .* stops at the newline
     assert_false(re.search("nothing here").matched)
+    # Full match with a whole-vector tail: the accelerated skip runs to
+    # the end of input and the walk ends there, matched. On a shuffle
+    # target this is the Sheng walker's skip.
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(re._strategy.use_sheng)
+    comptime W = simd_width_of[DType.uint8]()
+    assert_true(re.match("ac" + "z" * (4 * W)).matched)
+    assert_false(re.match("ac" + "z" * (4 * W) + "\n").matched)
 
 
 def test_accel_dotstar_with_newline_retry() raises:
@@ -669,6 +681,142 @@ def test_closure_pool_parity() raises:
     _assert_pool_parity["<.*?>"]()
     _assert_pool_parity["(?:a*)*b"]()
     _assert_pool_parity["(?u)[α-ω]+x"]()
+
+
+def test_accel_run_to_end_of_input_on_the_table_walk() raises:
+    # A trailing `.*` accelerated on the eager TABLE walk (the 71-byte
+    # literal arm puts the DFA past every shuffle tier; the alternation
+    # makes it a DFA shape at all): the skip runs to the end of a
+    # whole-vector tail and the walk ends there, matched. A literal
+    # SUFFIX would be prefiltered before any walk, which is why `.*x`
+    # cannot reach this.
+    comptime P = (
+        "(?:xqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+        "qqqqqqqqqqqqqqqq|z)a.*"
+    )
+    comptime S = Regex[P]
+    assert_true(S._strategy.use_eager_dfa)
+    assert_false(S._strategy.use_sheng)
+    assert_true(comptime (_edfa_has_accel(S._edfa)))
+    comptime W = simd_width_of[DType.uint8]()
+    var re = S()
+    var head = String("x") + String("q") * 70 + "a"
+    assert_true(re.match(head + String("z") * (4 * W)).matched)
+    assert_true(re.match(head).matched)
+    assert_true(re.match("za" + String("z") * (4 * W)).matched)
+    assert_false(re.match(head + String("z") * (4 * W) + "\n").matched)
+    assert_false(re.match(String("x") + String("q") * 69 + "a").matched)
+
+
+def _flat_views(
+    nfa: NFA,
+    mut kinds: List[Int],
+    mut out1s: List[Int],
+    mut out2s: List[Int],
+    mut anchors: List[Int],
+):
+    """Runtime: the flat NFA views `_flat_closure` walks."""
+    var class_of = List[Int](fill=-1, length=256)
+    var reps = _byte_classes(nfa, class_of)
+    var nclasses = len(reps)
+    var nl_class = class_of[Int(CHAR_NEWLINE)]
+    var cls_mask = List[SIMD[DType.uint64, 4]]()
+    var consuming_bits = _StateBits(0)
+    var match_bits = _StateBits(0)
+    var eol_bits = _StateBits(0)
+    var has_bol_ml = False
+    _flatten_nfa(
+        nfa,
+        class_of,
+        nclasses,
+        nl_class,
+        kinds,
+        out1s,
+        out2s,
+        anchors,
+        cls_mask,
+        consuming_bits,
+        match_bits,
+        eol_bits,
+        has_bol_ml,
+    )
+
+
+def _bs_has(b: _StateBits, i: Int) -> Bool:
+    return (b[i >> 6] >> UInt64(i & 63)) & 1 != 0
+
+
+def _wb_closure(
+    p: String, wb_mode: Int, prev_word: Bool, next_word: Bool
+) -> Tuple[Bool, Bool]:
+    """Runtime: the closure seeded at `p`'s first word anchor, as (the
+    anchor is a member, its continuation is a member)."""
+    var nfa = _build_static_nfa(p)
+    var kinds = List[Int]()
+    var out1s = List[Int]()
+    var out2s = List[Int]()
+    var anchors = List[Int]()
+    _flat_views(nfa, kinds, out1s, out2s, anchors)
+    var a = -1
+    for s in range(len(kinds)):
+        if kinds[s] == NFAStateKind.ANCHOR and (
+            anchors[s] == AnchorKind.WORD_BOUNDARY
+            or anchors[s] == AnchorKind.NOT_WORD_BOUNDARY
+        ):
+            a = s
+            break
+    var bits = _flat_closure(
+        kinds,
+        out1s,
+        out2s,
+        anchors,
+        a,
+        False,
+        False,
+        wb_mode,
+        prev_word,
+        next_word,
+    )
+    return (_bs_has(bits, a), _bs_has(bits, out1s[a]))
+
+
+def test_flat_closure_word_anchor_modes_at_runtime() raises:
+    # A word anchor is kept as a pending member, or resolved against the
+    # byte classes on both sides and walked past only when it holds
+    # (`\b`: classes differ; `\B`: same class).
+    var pending = _wb_closure("\\ba+\\b", WB_PENDING, False, False)
+    assert_true(pending[0])
+    assert_false(pending[1])
+    var holds = _wb_closure("\\ba+\\b", WB_RESOLVE, False, True)
+    assert_false(holds[0])
+    assert_true(holds[1])
+    var fails = _wb_closure("\\ba+\\b", WB_RESOLVE, True, True)
+    assert_false(fails[0])
+    assert_false(fails[1])
+    var nb_holds = _wb_closure("a\\Bb", WB_RESOLVE, True, True)
+    assert_true(nb_holds[1])
+    var nb_fails = _wb_closure("a\\Bb", WB_RESOLVE, True, False)
+    assert_false(nb_fails[1])
+
+
+def test_flat_closure_saves_and_out_of_range_seed_at_runtime() raises:
+    # A SAVE expands like an epsilon (the group's CHAR lands in the set);
+    # a seed outside the state range yields the empty set.
+    var nfa = _build_static_nfa("(a)b")
+    var kinds = List[Int]()
+    var out1s = List[Int]()
+    var out2s = List[Int]()
+    var anchors = List[Int]()
+    _flat_views(nfa, kinds, out1s, out2s, anchors)
+    var start = nfa.start
+    assert_equal(kinds[start], NFAStateKind.SAVE)
+    var bits = _flat_closure(kinds, out1s, out2s, anchors, start, True, True)
+    assert_true(_bs_has(bits, out1s[start]))
+    assert_equal(kinds[out1s[start]], NFAStateKind.CHAR)
+    var none = _flat_closure(
+        kinds, out1s, out2s, anchors, len(kinds), True, True
+    )
+    assert_true(_bs_eq(none, _StateBits(0)))
 
 
 def main() raises:

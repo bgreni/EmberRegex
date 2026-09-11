@@ -287,6 +287,9 @@ def _keep[
     min_length cannot be evaluated and the report is kept (a set using
     min_length always routes through the SOM path, so this never hides a
     filter that was asked for)."""
+    # Engine reports always carry a valid id (baked from the pattern
+    # index); this only keeps a hand-built list from indexing the table
+    # and `seen` out of range.
     if id < 0 or id >= num_patterns:
         return True
     var t = materialize[tbl]()

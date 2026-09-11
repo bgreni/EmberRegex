@@ -136,5 +136,26 @@ def test_parity_small_shapes() raises:
     check(["ab?", "c+d"])
 
 
+def test_parity_anchor_chains() raises:
+    # Zero-width chains: nested and doubled BOL/EOL anchors, anchors
+    # between consumers (the shapes that abandon the forward lane), a
+    # duplicated alternative, and a set whose `\n`-consuming member
+    # steps into a `(?m)^` context.
+    check(["a$(?:b?)?", "a$$"])
+    check(["(?m)a$(?:b?)?", "(?m)a$$"])
+    check(["(?m)a$^b", "(?m:a$)$"])
+    check(["^^a", "(?m)^^a", "(?:^|^)a"])
+    check(["ab|ab", "a^"])
+    check(["(?m)^ab", "[^a]+"])
+
+
+def test_parity_over_capacity_fallbacks() raises:
+    # Past EDFA_NFA_CAP states both public builders dispatch to the List
+    # form (and the 4201-state chain blows both state caps there); a
+    # reverse-only blowup declines identically on both forms.
+    check(["x{4200}"])
+    check(["[ab]{10}a[ab]*"])
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
