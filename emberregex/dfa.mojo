@@ -35,7 +35,7 @@ struct _DFAState(Copyable, Movable):
     """A single DFA state: a set of NFA states with a cached transition table.
     """
 
-    var transitions: InlineArray[
+    var transitions: Array[
         Int, 256
     ]  # 256 entries: byte -> DFA state idx (-1=uncomputed, -2=dead)
     var is_match: Bool
@@ -50,7 +50,7 @@ struct _DFAState(Copyable, Movable):
         eol_at_end: Bool = False,
         eol_at_newline: Bool = False,
     ):
-        self.transitions = InlineArray[Int, 256](fill=-1)
+        self.transitions = Array[Int, 256](fill=-1)
         self.is_match = is_match
         self.eol_at_end = eol_at_end
         self.eol_at_newline = eol_at_newline

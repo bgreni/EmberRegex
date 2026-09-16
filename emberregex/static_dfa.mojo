@@ -12,7 +12,7 @@ which keeps its own 4096-state cap and Pike VM fallback.
 """
 
 from std.bit import count_trailing_zeros, pop_count
-from std.collections import InlineArray
+from std.collections import Array
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
@@ -593,7 +593,7 @@ struct EagerDFA(Copyable, Movable):
     """Comptime-computed DFA: flat transition table + per-state flags.
 
     Only ever exists as a comptime value; the runtime engine reads the
-    materialized InlineArray forms (see edfa_table_arr / edfa_flags_arr).
+    materialized Array forms (see edfa_table_arr / edfa_flags_arr).
     """
 
     var valid: Bool
@@ -645,7 +645,7 @@ struct EagerDFA(Copyable, Movable):
 
     def __init__(out self):
         """Invalid placeholder with one dead state (keeps arrays non-empty
-        so downstream InlineArray sizes are never zero)."""
+        so downstream Array sizes are never zero)."""
         self.valid = False
         self.num_states = 1
         self.num_match_states = 0
@@ -1984,7 +1984,7 @@ def _edfa_finish(
 
 def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
     """Comptime: the flat table as `n` little-endian `dt` entries (see
-    static_bytes.mojo for why a string, not an InlineArray).
+    static_bytes.mojo for why a string, not an Array).
 
     `dt` comes from `edfa_id_dtype`, `n` from `edfa_table_len` (it may
     exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
@@ -1994,9 +1994,9 @@ def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
     return table_bytes[dt](d.table, n)
 
 
-def edfa_flags_arr[n: Int](d: EagerDFA) -> InlineArray[UInt8, n]:
+def edfa_flags_arr[n: Int](d: EagerDFA) -> Array[UInt8, n]:
     """Comptime conversion of per-state flags to a materializable array."""
-    var arr = InlineArray[UInt8, n](fill=0)
+    var arr = Array[UInt8, n](fill=0)
     for i in range(n):
         arr[i] = UInt8(d.flags[i])
     return arr^
@@ -2046,9 +2046,9 @@ def _accel_mask_word(d: EagerDFA, word: Int) -> UInt64:
     return m
 
 
-def _region_land_arr(d: EagerDFA) -> InlineArray[Int16, 256]:
+def _region_land_arr(d: EagerDFA) -> Array[Int16, 256]:
     """Comptime: `region_land` as a materializable array."""
-    var arr = InlineArray[Int16, 256](fill=-1)
+    var arr = Array[Int16, 256](fill=-1)
     for b in range(len(d.region_land)):
         arr[b] = Int16(d.region_land[b])
     return arr^
@@ -2391,7 +2391,7 @@ def _edfa_full_match_impl[
     //,
     d: EagerDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
     # `table` / `flags` are comptime arrays; `materialize` binds them to the
@@ -2431,7 +2431,7 @@ def edfa_full_match[
     //,
     d: EagerDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """Anchored full match (mirrors LazyDFA.full_match).
 
@@ -2457,7 +2457,7 @@ def _edfa_walk_impl[
     //,
     d: EagerDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
     accel: Bool,
     s_at0: Int,
     s_nl: Int,
@@ -2530,7 +2530,7 @@ def edfa_walk_from[
     //,
     d: EagerDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
     s_at0: Int,
     s_nl: Int,
     s_other: Int,
@@ -2584,7 +2584,7 @@ def edfa_match_at[
     //,
     d: EagerDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Anchored match at `start`; returns leftmost-longest end or -1
     (mirrors LazyDFA.match_at). `edfa_walk_from` in the DFA's own start

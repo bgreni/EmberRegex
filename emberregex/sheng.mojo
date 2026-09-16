@@ -36,7 +36,7 @@ unanchored `sheng_walk_from` pass, so there is no shuffle-engine
 search_forward here any more.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.sys import simd_width_of
 
 from .constants import CHAR_NEWLINE
@@ -71,8 +71,8 @@ comptime SHENG_STATE_CAP = WIDE_TABLE_CAP
 comptime _ShengState = SIMD[DType.uint8, SHUFFLE_INDEX_LANES]
 
 # Flat 256 x cap mask table. Scalar element type matters: comptime
-# InlineArray[Int32/UInt8, n] parameters lower to shared constant data in
-# the binary (like the eager DFA's table), whereas a comptime InlineArray
+# Array[Int32/UInt8, n] parameters lower to shared constant data in
+# the binary (like the eager DFA's table), whereas a comptime Array
 # of SIMD vectors materializes (a whole-table copy) at each runtime use
 # point — inside a walker that means per call, which made the first
 # version of this engine ~100x slower than the table walk. The natural
@@ -126,7 +126,7 @@ def sheng_masks_str[cap: Int](d: EagerDFA, enabled: Bool) -> String:
     # The masks are the table transposed (byte-major). Build them CHUNK
     # bytes at a time in one wide vector — lane inserts on a <= 1 KB
     # vector cost ~1-3 us in the comptime interpreter, where the
-    # cell-by-cell form paid a List read plus an InlineArray write
+    # cell-by-cell form paid a List read plus an Array write
     # (~100 us) per (byte, state): a 63-state table went ~1.6 s -> ~50 ms.
     comptime CHUNK = 16
     comptime WIDE = CHUNK * cap
@@ -218,7 +218,7 @@ def _sheng_scalar_full_match[
     d: EagerDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """The same anchored full match, walked one scalar load per byte.
 
@@ -272,7 +272,7 @@ def _sheng_full_match_impl[
     d: EagerDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
     accel: Bool,
 ](input: Span[Byte, origin]) -> Bool:
     comptime dead = d.num_states
@@ -332,7 +332,7 @@ def sheng_full_match[
     d: EagerDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin]) -> Bool:
     """Anchored full match (mirrors edfa_full_match).
 
@@ -367,7 +367,7 @@ def _sheng_walk_impl[
     d: EagerDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
     accel: Bool,
     s_at0: Int,
     s_nl: Int,
@@ -442,7 +442,7 @@ def sheng_walk_from[
     d: EagerDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
     s_at0: Int,
     s_nl: Int,
     s_other: Int,
@@ -485,7 +485,7 @@ def sheng_match_at[
     d: EagerDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Anchored match at `start` (mirrors edfa_match_at): `sheng_walk_from`
     in the DFA's own start states."""

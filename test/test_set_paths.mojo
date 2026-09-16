@@ -542,7 +542,7 @@ def test_merge_reports_collapses_shared_reports() raises:
 def test_combination_eval_rejects_malformed_programs() raises:
     # `combos_error` refuses these at build time; the evaluator itself
     # must still fail closed on an underflowing or leftover stack.
-    comptime R: InlineArray[Int32, 4] = [-1, -2, 0, 0]  # NOT, AND, 0, 0
+    comptime R: Array[Int32, 4] = [-1, -2, 0, 0]  # NOT, AND, 0, 0
     var seen: List[Bool] = [True, False]
     assert_false(_eval[rpn=R](0, 1, seen))  # NOT on an empty stack
     assert_false(_eval[rpn=R](1, 1, seen))  # AND on an empty stack

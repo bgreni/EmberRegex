@@ -51,7 +51,7 @@ Caps (all comptime, all "decline the lane and fall through"):
 - `AC_MAX` patterns, `AC_ENTRY_MAX` literal entries (alternation arms),
 - `AC_NODE_CAP` trie nodes, `AC_TABLE_CAP` table entries and
   `AC_POOL_CAP` report-pool entries — the last two are really
-  symbol-length bounds: both arrays travel as `InlineArray` comptime
+  symbol-length bounds: both arrays travel as `Array` comptime
   parameters and Mojo mangles parameter values into symbol names (see
   RoseView's note in set_rose.mojo). The pool needs its own cap because
   it is not bounded by the node count: suffix-chained literals (`a`,
@@ -60,7 +60,7 @@ Caps (all comptime, all "decline the lane and fall through"):
 - `AC_CLASS_MAX` byte classes, so the class map stays one byte wide.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 
 from .static_bytes import filled_string
 from .nfa import NFA
@@ -85,7 +85,7 @@ comptime AC_NODE_CAP = 32768
 
 comptime AC_TABLE_CAP = 1 << 17
 """Table entries (states x classes). A symbol-length bound, not a memory
-one: the table travels as an `InlineArray` comptime parameter and Mojo
+one: the table travels as an `Array` comptime parameter and Mojo
 mangles parameter values into symbol names (~4 chars per element), which
 the linker refuses past a few MB (set_rose.mojo's RoseView note has the
 measurement). 131072 is exactly the largest table proven to link today —
@@ -145,7 +145,7 @@ struct ACView(Copyable, Movable):
 struct ACSet(Copyable, Movable):
     """Comptime-computed Aho-Corasick automaton. Only ever exists as a
     comptime value; the runtime walker reads the materialized
-    InlineArray forms (ac_*_arr)."""
+    Array forms (ac_*_arr)."""
 
     var valid: Bool
     var num_states: Int
@@ -161,7 +161,7 @@ struct ACSet(Copyable, Movable):
     var accel_t1: List[Int]
 
     def __init__(out self):
-        """Invalid placeholder sized so every downstream InlineArray
+        """Invalid placeholder sized so every downstream Array
         stays nonzero-length."""
         self.valid = False
         self.num_states = 1
@@ -490,26 +490,26 @@ def ac_table_str[n: Int](d: ACSet) -> String:
     return out^
 
 
-def ac_cls_arr(d: ACSet) -> InlineArray[UInt8, 256]:
+def ac_cls_arr(d: ACSet) -> Array[UInt8, 256]:
     """Byte -> class map. Class 0 collects every byte no literal uses."""
-    var arr = InlineArray[UInt8, 256](fill=0)
+    var arr = Array[UInt8, 256](fill=0)
     for b in range(256):
         arr[b] = UInt8(d.class_map[b])
     return arr^
 
 
-def ac_rep_arr[n: Int](d: ACSet) -> InlineArray[Int32, n]:
+def ac_rep_arr[n: Int](d: ACSet) -> Array[Int32, n]:
     """Per-state report slice, interleaved as (offset, length) so the
     hot-path length test and the offset it needs share a cache line."""
-    var arr = InlineArray[Int32, n](fill=0)
+    var arr = Array[Int32, n](fill=0)
     for s in range(d.num_states):
         arr[2 * s] = Int32(d.rep_off[s])
         arr[2 * s + 1] = Int32(d.rep_len[s])
     return arr^
 
 
-def ac_pool_arr[n: Int](d: ACSet) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def ac_pool_arr[n: Int](d: ACSet) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     for i in range(n):
         arr[i] = Int32(d.pool[i])
     return arr^
@@ -520,7 +520,7 @@ def ac_pool_arr[n: Int](d: ACSet) -> InlineArray[Int32, n]:
 
 @always_inline
 def _ac_emit[
-    pn: Int, //, pool: InlineArray[Int32, pn]
+    pn: Int, //, pool: Array[Int32, pn]
 ](off: Int, count: Int, end: Int, mut out: List[SetMatch]):
     """Append this state's slice at `end` — already sorted and deduped."""
     var pl = materialize[pool]()
@@ -540,9 +540,9 @@ def ac_scan[
     //,
     v: ACView,
     table: StringLiteral,
-    cls: InlineArray[UInt8, 256],
-    rep: InlineArray[Int32, rn],
-    pool: InlineArray[Int32, pn],
+    cls: Array[UInt8, 256],
+    rep: Array[Int32, rn],
+    pool: Array[Int32, pn],
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan the whole input, reporting every (id, end) per the set
     contract. Non-mutating; one pass, one table load per byte.

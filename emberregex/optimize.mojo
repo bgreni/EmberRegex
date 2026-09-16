@@ -9,7 +9,7 @@ from .constants import CHAR_A_UPPER, CHAR_NEWLINE, CHAR_Z_UPPER
 from .nfa import NFA, NFAStateKind, split_cycle_flags
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
-from std.collections import InlineArray
+from std.collections import Array
 
 
 def extract_literal_prefix(nfa: NFA) -> List[UInt8]:
@@ -1051,18 +1051,18 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
     return res^
 
 
-def lit_bytes_arr[n: Int](l: List[UInt8]) -> InlineArray[UInt8, n]:
-    """Comptime: List -> InlineArray so literal bytes can ride as walker
+def lit_bytes_arr[n: Int](l: List[UInt8]) -> Array[UInt8, n]:
+    """Comptime: List -> Array so literal bytes can ride as walker
     comptime parameters (List-bearing values must not)."""
-    var a = InlineArray[UInt8, n](fill=0)
+    var a = Array[UInt8, n](fill=0)
     for i in range(min(n, len(l))):
         a[i] = l[i]
     return a^
 
 
-def lit_flags_arr[n: Int](l: List[Bool]) -> InlineArray[Bool, n]:
-    """Comptime: List -> InlineArray for the parallel caseless flags."""
-    var a = InlineArray[Bool, n](fill=False)
+def lit_flags_arr[n: Int](l: List[Bool]) -> Array[Bool, n]:
+    """Comptime: List -> Array for the parallel caseless flags."""
+    var a = Array[Bool, n](fill=False)
     for i in range(min(n, len(l))):
         a[i] = l[i]
     return a^

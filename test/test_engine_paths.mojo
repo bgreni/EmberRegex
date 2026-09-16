@@ -39,7 +39,7 @@ from emberregex.onepass import (
 )
 from emberregex.result import MatchResult
 from emberregex.static_bytes import static_bytes
-from std.collections import InlineArray
+from std.collections import Array
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -51,7 +51,7 @@ def _hbt[
 ](
     p: String,
     input: String,
-    mut slots: InlineArray[Int, n],
+    mut slots: Array[Int, n],
     start: Int = 0,
     anchored_end: Bool = False,
     end_at: Int = -1,
@@ -67,7 +67,7 @@ def test_heapbt_consuming_kinds() raises:
     # ANY refuses a newline, CHARSET tests membership, and an empty loop
     # iteration (`(?:a*)*` re-entering its SPLIT at the same position)
     # fails that path instead of looping.
-    var s0 = InlineArray[Int, 0](fill=-1)
+    var s0 = Array[Int, 0](fill=-1)
     assert_equal(_hbt[0]("a.c", "abc", s0), 3)
     assert_equal(_hbt[0]("a.c", "a\nc", s0), -1)
     assert_equal(_hbt[0]("a[b-d]x", "acx", s0), 3)
@@ -79,7 +79,7 @@ def test_heapbt_consuming_kinds() raises:
 def test_heapbt_anchored_end_and_word_anchors() raises:
     # With `anchored_end`, MATCH accepts only at `end_at`: `a` (end 1) and
     # `aaa` (end 3) fail that path and `aa` wins.
-    var s0 = InlineArray[Int, 0](fill=-1)
+    var s0 = Array[Int, 0](fill=-1)
     assert_equal(_hbt[0]("a|aa|aaa", "aaa", s0, anchored_end=True, end_at=2), 2)
     assert_equal(_hbt[0]("a|aa", "aaa", s0, anchored_end=True, end_at=3), -1)
     # `\B` holds between two word bytes and fails at a word/space edge.
@@ -91,7 +91,7 @@ def test_heapbt_anchored_end_and_word_anchors() raises:
 def test_heapbt_lookaround() raises:
     # Positive/negative lookahead and lookbehind on the heap walk, including
     # a lookbehind that cannot fit before its position.
-    var s0 = InlineArray[Int, 0](fill=-1)
+    var s0 = Array[Int, 0](fill=-1)
     assert_equal(_hbt[0]("a(?=b)b", "ab", s0), 2)
     assert_equal(_hbt[0]("a(?=b)b", "ac", s0), -1)
     assert_equal(_hbt[0]("a(?!c)b", "ab", s0), 2)
@@ -108,14 +108,14 @@ def test_heapbt_kept_lookaround_captures_are_snapshotted() raises:
     # back before the next alternative runs. Without the restore group 1
     # would leak (0, 1) into the `a(c)` arm's answer.
     # Python: re.match(r'(?:(?=(a))ab|a(c))', 'ac').groups() -> (None, 'c')
-    var s = InlineArray[Int, 4](fill=-1)
+    var s = Array[Int, 4](fill=-1)
     assert_equal(_hbt[4]("(?:(?=(a))ab|a(c))", "ac", s), 2)
     assert_equal(s[0], -1)
     assert_equal(s[1], -1)
     assert_equal(s[2], 1)
     assert_equal(s[3], 2)
     # And the kept writes are visible when the continuation succeeds.
-    var t = InlineArray[Int, 4](fill=-1)
+    var t = Array[Int, 4](fill=-1)
     assert_equal(_hbt[4]("(?:(?=(a))ab|a(c))", "ab", t), 2)
     assert_equal(t[0], 0)
     assert_equal(t[1], 1)
@@ -125,12 +125,12 @@ def test_heapbt_kept_lookaround_captures_are_snapshotted() raises:
 def test_heapbt_backreferences() raises:
     # Caseless comparison, an unset group (Python: the backreference fails),
     # and a group outside the walk's slot range (the guard, not an abort).
-    var s2 = InlineArray[Int, 2](fill=-1)
+    var s2 = Array[Int, 2](fill=-1)
     assert_equal(_hbt[2]("(?i)(a)\\1", "aA", s2), 2)
     assert_equal(_hbt[2]("(?i)(a)\\1", "Ab", s2), -1)
     assert_equal(_hbt[2]("(?:(a)|x)\\1", "x", s2), -1)
     assert_equal(_hbt[2]("(?:(a)|x)\\1", "aa", s2), 2)
-    var s0 = InlineArray[Int, 0](fill=-1)
+    var s0 = Array[Int, 0](fill=-1)
     assert_equal(_hbt[0]("(a)\\1", "aa", s0), -1)
 
 
@@ -183,7 +183,7 @@ def _op_valid[p: StaticString]() -> Bool:
 
 def _op_find_end[
     p: StaticString, n: Int
-](input: String, start: Int, mut slots: InlineArray[Int, n]) -> Int:
+](input: String, start: Int, mut slots: Array[Int, n]) -> Int:
     comptime op = build_onepass(_build_static_nfa(p), True)
     comptime TN = onepass_table_len(op)
     comptime TBL = static_bytes[onepass_table_str[TN](op)]()
@@ -204,18 +204,18 @@ def test_onepass_find_end_multiline_contexts() raises:
     # non-newline after the loop refuses the match.
     comptime P = "(?m)^(?:(a)|b)+$"
     assert_true(_op_valid[P]())
-    var s = InlineArray[Int, 2](fill=-1)
+    var s = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[P, 2]("x\nab", 2, s), 4)
     assert_equal(s[0], 2)
     assert_equal(s[1], 3)
-    var s1 = InlineArray[Int, 2](fill=-1)
+    var s1 = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[P, 2]("xab", 1, s1), -1)
-    var s2 = InlineArray[Int, 2](fill=-1)
+    var s2 = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[P, 2]("ab\nq", 0, s2), 2)
-    var s3 = InlineArray[Int, 2](fill=-1)
+    var s3 = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[P, 2]("abx", 0, s3), -1)
     # End of input in a non-match state.
-    var s4 = InlineArray[Int, 2](fill=-1)
+    var s4 = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[P, 2]("", 0, s4), -1)
 
 
@@ -225,14 +225,14 @@ def test_onepass_find_end_word_conditions() raises:
     # word byte, so end of input refuses it.
     comptime WB = "\\b(?:(a)|b)+\\b"
     assert_true(_op_valid[WB]())
-    var s = InlineArray[Int, 2](fill=-1)
+    var s = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[WB, 2]("xab", 1, s), -1)
     assert_equal(_op_find_end[WB, 2](" ab", 1, s), 3)
     assert_equal(_op_find_end[WB, 2]("abc", 0, s), -1)
     assert_equal(_op_find_end[WB, 2]("ab ", 0, s), 2)
     comptime NB = "(?:(a)|b)+\\B"
     assert_true(_op_valid[NB]())
-    var t = InlineArray[Int, 2](fill=-1)
+    var t = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[NB, 2]("abc", 0, t), 2)
     # Python: re.match(r'(?:(a)|b)+\B', 'ab').span() == (0, 1) -- the
     # boundary between `a` and `b` is not a word boundary, so the earlier
@@ -240,7 +240,7 @@ def test_onepass_find_end_word_conditions() raises:
     assert_equal(_op_find_end[NB, 2]("ab", 0, t), 1)
     comptime EOL = "(?:(a)|b)+$"
     assert_true(_op_valid[EOL]())
-    var u = InlineArray[Int, 2](fill=-1)
+    var u = Array[Int, 2](fill=-1)
     assert_equal(_op_find_end[EOL, 2]("abx", 0, u), -1)
     assert_equal(_op_find_end[EOL, 2]("ab", 0, u), 2)
 

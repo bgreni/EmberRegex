@@ -134,7 +134,7 @@ from .onepass import (
     onepass_table_str,
     onepass_table_len,
 )
-from std.collections import InlineArray
+from std.collections import Array
 
 
 @always_inline
@@ -148,7 +148,7 @@ def _sbt_run[
 ](
     input: Span[Byte, origin],
     pos: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     mut memo: List[UInt64],
     end_at: Int = -1,
     stack_lo: Int = 0,
@@ -255,7 +255,7 @@ def _sbt_stack_continue[
     input: Span[Byte, origin],
     state_idx: Int,
     pos: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     anchored_end: Bool,
     end_at: Int,
 ) -> Int:
@@ -290,7 +290,7 @@ def _sbt_run_memo[
 ](
     input: Span[Byte, origin],
     pos: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     mut memo: List[UInt64],
     end_at: Int = -1,
     stack_lo: Int = 0,
@@ -346,7 +346,7 @@ def _sbt_run_memoized[
 ](
     input: Span[Byte, origin],
     pos: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     mut memo: List[UInt64],
     end_at: Int = -1,
     stack_lo: Int = 0,
@@ -859,7 +859,7 @@ def _lf_end_deterministic[fast: Bool = True](nfa: NFA) -> Bool:
         return _lf_end_deterministic_list(nfa)
 
 
-comptime ALL_NEG_ONES[Size: Int] = InlineArray[Int, Size](fill=-1)
+comptime ALL_NEG_ONES[Size: Int] = Array[Int, Size](fill=-1)
 
 # Steps the leftmost-first lane's speculative backtracker attempt may
 # spend at one candidate (see Regex._sbt_match_at). The shapes it is for
@@ -1677,7 +1677,7 @@ struct Regex[pattern: String](Copyable, Movable):
         self,
         input: Span[Byte, origin],
         start: Int,
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
     ) -> Int:
         """`_sbt_match_at` with a fresh LF_SBT_ATTEMPT_BUDGET."""
         var budget = LF_SBT_ATTEMPT_BUDGET
@@ -1690,7 +1690,7 @@ struct Regex[pattern: String](Copyable, Movable):
         self,
         input: Span[Byte, origin],
         start: Int,
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
         mut budget: Int,
     ) -> Int:
         """Speculative anchored attempt at `start` on the specialized
@@ -1785,7 +1785,7 @@ struct Regex[pattern: String](Copyable, Movable):
         input: Span[Byte, origin],
         pos: Int,
         mut walk: _LFWalk[Self._num_slots, Self._span_lane, wo],
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
         fill: Bool,
     ) -> Tuple[Int, Int]:
         """The leftmost-first match starting at or after `pos` as
@@ -1948,7 +1948,7 @@ struct Regex[pattern: String](Copyable, Movable):
         input: Span[Byte, origin],
         s0: Int,
         pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
         fill: Bool,
     ) -> Tuple[Int, Int]:
         """The unanchored scan from `s0` for the end, the reverse walk for
@@ -1978,7 +1978,7 @@ struct Regex[pattern: String](Copyable, Movable):
         input: Span[Byte, origin],
         start: Int,
         end: Int,
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
         pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
     ):
         """Capture slots of the leftmost-first match `[start, end)` —
@@ -2069,7 +2069,7 @@ struct Regex[pattern: String](Copyable, Movable):
         input: Span[Byte, origin],
         start: Int,
         end_pin: Int,
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
     ) -> Int:
         """The one-pass DFA over exactly `[start, end_pin)` (see
         `onepass_match`): `end_pin` with the slots written, else -1.
@@ -2090,7 +2090,7 @@ struct Regex[pattern: String](Copyable, Movable):
         input: Span[Byte, origin],
         start: Int,
         end: Int,
-        mut slots: InlineArray[Int, Self._num_slots],
+        mut slots: Array[Int, Self._num_slots],
         pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
     ):
         """Pike VM on the exact span `[start, end)`: anchored at `start`,
@@ -2162,7 +2162,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 matched=True,
                 start=0,
                 end=input_len,
-                slots=InlineArray[Int, Self._num_slots](fill=-1),
+                slots=Array[Int, Self._num_slots](fill=-1),
             )
         elif Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
@@ -2177,7 +2177,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         matched=True,
                         start=0,
                         end=Self._strategy.prefix_len,
-                        slots=InlineArray[Int, Self._num_slots](fill=-1),
+                        slots=Array[Int, Self._num_slots](fill=-1),
                     )
             return MatchResult[Self._num_slots].no_match()
         elif Self._strategy.use_dfa:
@@ -2187,7 +2187,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         matched=True,
                         start=0,
                         end=input.byte_length(),
-                        slots=InlineArray[Int, Self._num_slots](fill=-1),
+                        slots=Array[Int, Self._num_slots](fill=-1),
                     )
                 return MatchResult[Self._num_slots].no_match()
             except:
@@ -2287,7 +2287,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 matched=True,
                 start=pos,
                 end=pos + Self._strategy.prefix_len,
-                slots=InlineArray[Int, Self._num_slots](fill=-1),
+                slots=Array[Int, Self._num_slots](fill=-1),
             )
         elif Self._use_lf_lane:
             # The same two-line prologue opens every leftmost-first lane
@@ -2319,7 +2319,7 @@ struct Regex[pattern: String](Copyable, Movable):
                             matched=True,
                             start=0,
                             end=self._lf_end_at(input_bytes, 0, match_end),
-                            slots=InlineArray[Int, Self._num_slots](fill=-1),
+                            slots=Array[Int, Self._num_slots](fill=-1),
                         )
                     return MatchResult[Self._num_slots].no_match()
 
@@ -2336,7 +2336,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 end=self._lf_end_at(
                                     input_bytes, pos, match_end
                                 ),
-                                slots=InlineArray[Int, Self._num_slots](
+                                slots=Array[Int, Self._num_slots](
                                     fill=-1
                                 ),
                             )
@@ -2363,7 +2363,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                     end=self._lf_end_at(
                                         input_bytes, pos, match_end
                                     ),
-                                    slots=InlineArray[Int, Self._num_slots](
+                                    slots=Array[Int, Self._num_slots](
                                         fill=-1
                                     ),
                                 )
@@ -2379,7 +2379,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                     end=self._lf_end_at(
                                         input_bytes, range[0], range[1]
                                     ),
-                                    slots=InlineArray[Int, Self._num_slots](
+                                    slots=Array[Int, Self._num_slots](
                                         fill=-1
                                     ),
                                 )
@@ -2560,7 +2560,7 @@ struct Regex[pattern: String](Copyable, Movable):
             matched=True,
             start=start,
             end=end,
-            slots=InlineArray[Int, Self._num_slots](fill=-1),
+            slots=Array[Int, Self._num_slots](fill=-1),
         )
 
     def finditer(mut self, input: String) -> List[MatchResult[Self._num_slots]]:
@@ -3046,7 +3046,7 @@ struct Regex[pattern: String](Copyable, Movable):
         input: String,
         pos: Int,
         end: Int,
-        slots: InlineArray[Int, n],
+        slots: Array[Int, n],
     ):
         var input_bytes = input.as_bytes()
         comptime if Self._num_slots >= 2:
@@ -3251,7 +3251,7 @@ struct Regex[pattern: String](Copyable, Movable):
                         matched=True,
                         start=pos,
                         end=pos + Self._strategy.prefix_len,
-                        slots=InlineArray[Int, Self._num_slots](fill=-1),
+                        slots=Array[Int, Self._num_slots](fill=-1),
                     )
                     output += self._expand_replacement(
                         input_bytes, match_result, replacement
@@ -3384,7 +3384,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     matched=True,
                     start=start,
                     end=end,
-                    slots=InlineArray[Int, Self._num_slots](fill=-1),
+                    slots=Array[Int, Self._num_slots](fill=-1),
                 )
                 output += self._expand_replacement(
                     input_bytes, match_result, replacement

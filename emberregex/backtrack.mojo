@@ -37,7 +37,7 @@ time — the SIMD bitmap materializes cleanly from comptime to runtime, giving
 O(1) ASCII membership tests with zero runtime overhead.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.ffi import external_call
 from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
@@ -775,7 +775,7 @@ def sbt_stack_bounds() -> SbtStackBounds:
         # /proc/self/maps for the main thread, which is why the result
         # wants hoisting if it ever shows up in a profile (see
         # ARCHITECTURE.md).
-        var attr = InlineArray[UInt64, 16](fill=0)
+        var attr = Array[UInt64, 16](fill=0)
         var me = external_call["pthread_self", Int]()
         var rc = external_call["pthread_getattr_np", Int32](
             me, Pointer(to=attr)
@@ -1348,7 +1348,7 @@ def _sbt_try_match[
 ](
     input: Span[Byte, origin],
     pos: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     mut budget: Int,
     memo_addr: Int,
     stack_floor: Int = 0,

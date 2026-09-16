@@ -25,7 +25,7 @@ from .nfa import NFA, NFAState, NFAStateKind
 from .charset import CharSet
 from .ast import AnchorKind
 from .result import MatchResult
-from std.collections import InlineArray
+from std.collections import Array
 from std.memory import unsafe_memset
 
 
@@ -80,7 +80,7 @@ struct PikeVM[num_slots: Int](Copyable):
     """Parallel NFA simulation (Pike VM) with capture group support.
 
     Parameterised on `num_slots` (= 2 * group_count) so the returned
-    `MatchResult` carries an `InlineArray` whose length is fixed at compile
+    `MatchResult` carries an `Array` whose length is fixed at compile
     time. The NFA's runtime `group_count` must equal `num_slots // 2`.
     """
 
@@ -348,7 +348,7 @@ struct PikeVM[num_slots: Int](Copyable):
                 break
 
         if matched:
-            var result_slots = InlineArray[Int, Self.num_slots](fill=-1)
+            var result_slots = Array[Int, Self.num_slots](fill=-1)
             for s in range(Self.num_slots):
                 result_slots[s] = bufs.best_slots.unsafe_get(s)
             return MatchResult[Self.num_slots](
@@ -602,12 +602,12 @@ def heapbt_match[
     input: Span[Byte, origin],
     start_state: Int,
     start_pos: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     anchored_end: Bool = False,
     end_at: Int = -1,
 ) -> Int:
     """Leftmost-first backtracking over the runtime NFA with an explicit,
-    heap-allocated stack, on a `Regex` verb's `InlineArray` slots. See
+    heap-allocated stack, on a `Regex` verb's `Array` slots. See
     `_heapbt_core` for the walk; this is the entry `_sbt_run` continues
     a backreference pattern on when the specialized walk's stack guard
     trips. Returns the match end, or -1."""
@@ -638,7 +638,7 @@ def _heapbt_core[
     """Leftmost-first backtracking over the runtime NFA with an explicit,
     heap-allocated stack. Returns the match end, or -1. The slots live at
     `slots_addr` (`num_slots` Ints) — an address rather than a container
-    so the same walk serves a verb's `InlineArray` (`heapbt_match`) and a
+    so the same walk serves a verb's `Array` (`heapbt_match`) and a
     Pike thread's `List` row (`_bt_try_match`) without a copy.
 
     The walk is the one `_sbt_try_match` makes — `out1` before `out2`, a

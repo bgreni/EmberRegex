@@ -1,6 +1,6 @@
 """Match result type for regex operations."""
 
-from std.collections import InlineArray
+from std.collections import Array
 
 
 struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
@@ -8,7 +8,7 @@ struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
 
     `num_slots` is the comptime-known capture-slot count (2 * group_count) for
     the Regex that produced this result. Storing slots in an
-    `InlineArray` keeps `MatchResult` a value type with no per-match heap
+    `Array` keeps `MatchResult` a value type with no per-match heap
     allocation.
     """
 
@@ -17,7 +17,7 @@ struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
     var matched: Bool
     var start: Int
     var end: Int
-    var slots: InlineArray[Int, Self.num_slots]
+    var slots: Array[Int, Self.num_slots]
 
     @always_inline
     def __init__(
@@ -25,7 +25,7 @@ struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
         matched: Bool,
         start: Int,
         end: Int,
-        var slots: InlineArray[Int, Self.num_slots],
+        var slots: Array[Int, Self.num_slots],
     ):
         self.matched = matched
         self.start = start
@@ -39,7 +39,7 @@ struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
             matched=False,
             start=-1,
             end=-1,
-            slots=InlineArray[Int, Self.num_slots](fill=-1),
+            slots=Array[Int, Self.num_slots](fill=-1),
         )
 
     def __bool__(self) -> Bool:

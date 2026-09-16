@@ -39,7 +39,7 @@ unconditional emit.
 """
 
 from std.bit import count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
@@ -56,7 +56,7 @@ comptime _F_STRICT = 2  # crossed EOL (strict)
 struct BitNFA(Copyable, Movable):
     """Comptime-computed bit-parallel NFA. Only ever exists as a
     comptime value; the runtime walker reads the materialized
-    InlineArray forms (bitnfa_*_arr)."""
+    Array forms (bitnfa_*_arr)."""
 
     var valid: Bool
     var num_positions: Int
@@ -478,22 +478,22 @@ def build_bitnfa(nfa: NFA, enabled: Bool) -> BitNFA:
 # --- Comptime materialization helpers ---------------------------------------
 
 
-def bitnfa_u64_arr[n: Int](data: List[UInt64]) -> InlineArray[UInt64, n]:
-    var arr = InlineArray[UInt64, n](fill=0)
+def bitnfa_u64_arr[n: Int](data: List[UInt64]) -> Array[UInt64, n]:
+    var arr = Array[UInt64, n](fill=0)
     for i in range(n):
         arr[i] = data[i]
     return arr^
 
 
-def bitnfa_i32_arr[n: Int](data: List[Int]) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def bitnfa_i32_arr[n: Int](data: List[Int]) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     for i in range(n):
         arr[i] = Int32(data[i])
     return arr^
 
 
-def bitnfa_ex_idx_arr[n: Int](d: BitNFA) -> InlineArray[Int16, n]:
-    var arr = InlineArray[Int16, n](fill=-1)
+def bitnfa_ex_idx_arr[n: Int](d: BitNFA) -> Array[Int16, n]:
+    var arr = Array[Int16, n](fill=-1)
     for i in range(n):
         arr[i] = Int16(d.ex_index[i])
     return arr^
@@ -526,8 +526,8 @@ def _emit_bits[
     sn: Int,
     //,
     d: BitNFA,
-    pool: InlineArray[Int32, pln],
-    slices: InlineArray[Int32, sn],
+    pool: Array[Int32, pln],
+    slices: Array[Int32, sn],
     K: Int,
 ](
     acc: SIMD[DType.uint64, K],
@@ -601,11 +601,11 @@ def bitnfa_scan[
     sn: Int,
     //,
     d: BitNFA,
-    reach: InlineArray[UInt64, rn],
-    ex_data: InlineArray[UInt64, xn],
-    ex_idx: InlineArray[Int16, pn],
-    pool: InlineArray[Int32, pln],
-    slices: InlineArray[Int32, sn],
+    reach: Array[UInt64, rn],
+    ex_data: Array[UInt64, xn],
+    ex_idx: Array[Int16, pn],
+    pool: Array[Int32, pln],
+    slices: Array[Int32, sn],
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan the whole input, reporting every (id, end) per the set
     contract. Non-mutating; O(n * lanes) with exception work only when
@@ -738,8 +738,8 @@ def _flush_pending[
     sn: Int,
     //,
     d: BitNFA,
-    pool: InlineArray[Int32, pln],
-    slices: InlineArray[Int32, sn],
+    pool: Array[Int32, pln],
+    slices: Array[Int32, sn],
     K: Int,
 ](
     mut st: BitStreamState[K],
@@ -766,11 +766,11 @@ def bitnfa_stream_chunk[
     sn: Int,
     //,
     d: BitNFA,
-    reach: InlineArray[UInt64, rn],
-    ex_data: InlineArray[UInt64, xn],
-    ex_idx: InlineArray[Int16, pn],
-    pool: InlineArray[Int32, pln],
-    slices: InlineArray[Int32, sn],
+    reach: Array[UInt64, rn],
+    ex_data: Array[UInt64, xn],
+    ex_idx: Array[Int16, pn],
+    pool: Array[Int32, pln],
+    slices: Array[Int32, sn],
 ](
     mut st: BitStreamState[d.lanes],
     input: Span[Byte, origin],
@@ -868,8 +868,8 @@ def bitnfa_stream_close[
     sn: Int,
     //,
     d: BitNFA,
-    pool: InlineArray[Int32, pln],
-    slices: InlineArray[Int32, sn],
+    pool: Array[Int32, pln],
+    slices: Array[Int32, sn],
 ](mut st: BitStreamState[d.lanes], mut out: List[SetMatch]):
     """Resolve the held step against end-of-stream and finish."""
     comptime K = d.lanes

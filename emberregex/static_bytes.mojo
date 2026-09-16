@@ -1,6 +1,6 @@
 """Comptime tables carried as string literals.
 
-A comptime `InlineArray` that a runtime walker `materialize`s becomes a
+A comptime `Array` that a runtime walker `materialize`s becomes a
 global constant, but the LLVM translation builds that constant by folding
 one `insertvalue` per element — O(n^2): a 128-state transition table
 (32768 cells) costs ~6 s of compile time per walker family, and every

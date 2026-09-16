@@ -209,7 +209,7 @@ def test_onepass_walker_acceleration() raises:
     comptime ST = onepass_state_arr[NS](op)
     # 40-byte middle run so the 16-byte-vector acceleration fires.
     var s = String("a") + String("x") * 38 + ";b"
-    var slots = InlineArray[Int, 8](fill=-1)
+    var slots = Array[Int, 8](fill=-1)
     var e = onepass_match[
         op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
     ](s.as_bytes(), 0, s.byte_length(), slots)
@@ -220,7 +220,7 @@ def test_onepass_walker_acceleration() raises:
     assert_equal(slots[3], 39)
     assert_equal(slots[4], 40)  # (b)
     assert_equal(slots[5], 41)
-    var slots2 = InlineArray[Int, 8](fill=-1)
+    var slots2 = Array[Int, 8](fill=-1)
     var steps = 0
     var e2 = onepass_find_end[
         op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
@@ -229,7 +229,7 @@ def test_onepass_walker_acceleration() raises:
     assert_equal(slots2[3], 39)
     # A dead walk: no ';' → no match.
     var miss = String("a") + String("x") * 40
-    var slots3 = InlineArray[Int, 8](fill=-1)
+    var slots3 = Array[Int, 8](fill=-1)
     var e3 = onepass_match[
         op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
     ](miss.as_bytes(), 0, miss.byte_length(), slots3)

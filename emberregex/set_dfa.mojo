@@ -29,7 +29,7 @@ already disqualify via can_use_dfa), stay on the fallback ladder
 """
 
 from std.bit import count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
@@ -71,7 +71,7 @@ comptime MDFA_STATE_CAP = 512
 struct MultiDFA(Copyable, Movable):
     """Comptime-computed multi-accept DFA. Only ever exists as a
     comptime value; the runtime walker reads the materialized
-    InlineArray forms (mdfa_*_arr)."""
+    Array forms (mdfa_*_arr)."""
 
     var valid: Bool
     var num_states: Int
@@ -100,7 +100,7 @@ struct MultiDFA(Copyable, Movable):
 
     def __init__(out self):
         """Invalid placeholder with one state (keeps downstream
-        InlineArray sizes nonzero)."""
+        Array sizes nonzero)."""
         self.valid = False
         self.num_states = 1
         self.num_report_states = 0
@@ -723,17 +723,17 @@ def mdfa_table_str[n: Int](d: MultiDFA) -> String:
     return table_bytes[DType.int16](d.table, n)
 
 
-def mdfa_pool_arr[n: Int](d: MultiDFA) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def mdfa_pool_arr[n: Int](d: MultiDFA) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     for i in range(n):
         arr[i] = Int32(d.pool[i])
     return arr^
 
 
-def mdfa_slices_arr[n: Int](d: MultiDFA) -> InlineArray[Int32, n]:
+def mdfa_slices_arr[n: Int](d: MultiDFA) -> Array[Int32, n]:
     """Per-state slice metadata, interleaved as 6 Int32 per state:
     (norm_off, norm_len, nl_off, nl_len, end_off, end_len)."""
-    var arr = InlineArray[Int32, n](fill=0)
+    var arr = Array[Int32, n](fill=0)
     for s in range(d.num_states):
         arr[6 * s + 0] = Int32(d.norm_off[s])
         arr[6 * s + 1] = Int32(d.norm_len[s])
@@ -834,7 +834,7 @@ def _mdfa_has_accel(d: MultiDFA) -> Bool:
 
 @always_inline
 def _emit_merged[
-    pn: Int, //, pool: InlineArray[Int32, pn]
+    pn: Int, //, pool: Array[Int32, pn]
 ](
     a_off: Int,
     a_len: Int,
@@ -876,8 +876,8 @@ def _mdfa_scan_impl[
     //,
     d: MultiDFA,
     table: StringLiteral,
-    pool: InlineArray[Int32, pn],
-    slices: InlineArray[Int32, sn],
+    pool: Array[Int32, pn],
+    slices: Array[Int32, sn],
     accel: Bool,
 ](input: Span[Byte, origin], mut out: List[SetMatch]):
     # Comptime arrays bound to the binary's constant data (no copy).
@@ -929,8 +929,8 @@ def mdfa_scan[
     //,
     d: MultiDFA,
     table: StringLiteral,
-    pool: InlineArray[Int32, pn],
-    slices: InlineArray[Int32, sn],
+    pool: Array[Int32, pn],
+    slices: Array[Int32, sn],
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan the whole input, reporting every (id, end) per the set
     contract. Non-mutating; one pass, one table load per byte.

@@ -69,18 +69,16 @@ def bench_static_dfa_literal_match(mut b: Bench) raises:
     var input = "abcdefghij"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_dfa_literal_match"))
+    b.bench_function(go, BenchId("static_dfa_literal_match"))
 
 
 def bench_static_dfa_char_class(mut b: Bench) raises:
@@ -88,18 +86,16 @@ def bench_static_dfa_char_class(mut b: Bench) raises:
     var input = "abcdefghijklmnopqrstuvwxyz"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_dfa_char_class_26"))
+    b.bench_function(go, BenchId("static_dfa_char_class_26"))
 
 
 def bench_static_dfa_alternation(mut b: Bench) raises:
@@ -107,18 +103,16 @@ def bench_static_dfa_alternation(mut b: Bench) raises:
     var input = "horse"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_dfa_alternation_8"))
+    b.bench_function(go, BenchId("static_dfa_alternation_8"))
 
 
 def bench_static_dfa_quantifier(mut b: Bench) raises:
@@ -126,18 +120,16 @@ def bench_static_dfa_quantifier(mut b: Bench) raises:
     var input = "abcdefg1234"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_dfa_quantifier_bounded"))
+    b.bench_function(go, BenchId("static_dfa_quantifier_bounded"))
 
 
 # ---------------------------------------------------------------------------
@@ -150,18 +142,16 @@ def bench_static_capture_simple(mut b: Bench) raises:
     var input = "user@example.com"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_capture_email"))
+    b.bench_function(go, BenchId("static_capture_email"))
 
 
 def bench_static_nested_groups(mut b: Bench) raises:
@@ -169,18 +159,16 @@ def bench_static_nested_groups(mut b: Bench) raises:
     var input = "foo-bar-baz@host"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_nested_groups"))
+    b.bench_function(go, BenchId("static_nested_groups"))
 
 
 def bench_capture_search_miss_100KB(mut b: Bench) raises:
@@ -198,18 +186,16 @@ def bench_capture_search_miss_100KB(mut b: Bench) raises:
     var input = String("user@example.org x.com ") * (100 * 1024 // 23)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("capture_search_miss_100KB"))
+    b.bench_function(go, BenchId("capture_search_miss_100KB"))
 
 
 def capture_sparse_input() -> String:
@@ -226,18 +212,16 @@ def bench_capture_findall_sparse_64KB(mut b: Bench) raises:
     var input = capture_sparse_input()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("capture_findall_sparse_64KB"))
+    b.bench_function(go, BenchId("capture_findall_sparse_64KB"))
 
 
 def reverse_suffix_miss_input() -> String:
@@ -261,18 +245,16 @@ def bench_reverse_suffix_search_64KB(mut b: Bench) raises:
     var input = reverse_suffix_miss_input()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("reverse_suffix_search_64KB"))
+    b.bench_function(go, BenchId("reverse_suffix_search_64KB"))
 
 
 def reverse_inner_miss_input() -> String:
@@ -294,18 +276,16 @@ def bench_reverse_inner_search_64KB(mut b: Bench) raises:
     var input = reverse_inner_miss_input()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("reverse_inner_search_64KB"))
+    b.bench_function(go, BenchId("reverse_inner_search_64KB"))
 
 
 def bench_onepass_match_kv(mut b: Bench) raises:
@@ -323,18 +303,16 @@ def bench_onepass_match_kv(mut b: Bench) raises:
     var input = "host=db01&port=5432&user=admin&retry=55&"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("onepass_match_kv"))
+    b.bench_function(go, BenchId("onepass_match_kv"))
 
 
 def onepass_findall_input() -> String:
@@ -355,18 +333,16 @@ def bench_onepass_findall_2KB(mut b: Bench) raises:
     var input = onepass_findall_input()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("onepass_findall_2KB"))
+    b.bench_function(go, BenchId("onepass_findall_2KB"))
 
 
 def bench_static_greedy_vs_lazy(mut b: Bench) raises:
@@ -375,31 +351,27 @@ def bench_static_greedy_vs_lazy(mut b: Bench) raises:
     var input = "<a>hello</a>"
 
     @always_inline
-    @parameter
-    def go_greedy(mut bench: Bencher) raises:
+    def go_greedy(mut bench: Bencher) raises {mut re_greedy, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re_greedy, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re_greedy.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
     @always_inline
-    @parameter
-    def go_lazy(mut bench: Bencher) raises:
+    def go_lazy(mut bench: Bencher) raises {mut re_lazy, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re_lazy, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re_lazy.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go_greedy](BenchId("static_greedy_tag"))
-    b.bench_function[go_lazy](BenchId("static_lazy_tag"))
+    b.bench_function(go_greedy, BenchId("static_greedy_tag"))
+    b.bench_function(go_lazy, BenchId("static_lazy_tag"))
 
 
 # ---------------------------------------------------------------------------
@@ -412,18 +384,16 @@ def bench_static_backref(mut b: Bench) raises:
     var input = "hello hello"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_backref"))
+    b.bench_function(go, BenchId("static_backref"))
 
 
 def bench_static_html_tag(mut b: Bench) raises:
@@ -431,18 +401,16 @@ def bench_static_html_tag(mut b: Bench) raises:
     var input = "<div>content</div>"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_html_tag"))
+    b.bench_function(go, BenchId("static_html_tag"))
 
 
 # ---------------------------------------------------------------------------
@@ -455,18 +423,16 @@ def bench_static_search_short(mut b: Bench) raises:
     var input = "hello world"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_search_short_11B"))
+    b.bench_function(go, BenchId("static_search_short_11B"))
 
 
 def bench_static_search_medium(mut b: Bench) raises:
@@ -474,18 +440,16 @@ def bench_static_search_medium(mut b: Bench) raises:
     var input = "a" * 500 + "needle" + "b" * 500
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_search_medium_1KB"))
+    b.bench_function(go, BenchId("static_search_medium_1KB"))
 
 
 def bench_static_search_long(mut b: Bench) raises:
@@ -493,18 +457,16 @@ def bench_static_search_long(mut b: Bench) raises:
     var input = "a" * 10000 + "needle" + "b" * 10000
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_search_long_20KB"))
+    b.bench_function(go, BenchId("static_search_long_20KB"))
 
 
 def bench_static_search_no_match(mut b: Bench) raises:
@@ -512,18 +474,16 @@ def bench_static_search_no_match(mut b: Bench) raises:
     var input = "a" * 10000
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_search_miss_10KB"))
+    b.bench_function(go, BenchId("static_search_miss_10KB"))
 
 
 def bench_static_search_capture(mut b: Bench) raises:
@@ -531,18 +491,16 @@ def bench_static_search_capture(mut b: Bench) raises:
     var input = "x" * 200 + "2026-03-21" + "y" * 200
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_search_date_capture"))
+    b.bench_function(go, BenchId("static_search_date_capture"))
 
 
 # ---------------------------------------------------------------------------
@@ -555,18 +513,16 @@ def bench_static_findall(mut b: Bench) raises:
     var input = "abc 12 def 345 ghi 6789 jkl 0 mno 42 pqr 100"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_findall_numbers"))
+    b.bench_function(go, BenchId("static_findall_numbers"))
 
 
 def bench_static_replace(mut b: Bench) raises:
@@ -574,18 +530,16 @@ def bench_static_replace(mut b: Bench) raises:
     var input = "abc 12 def 345 ghi 6789 jkl 0 mno 42 pqr 100"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.replace(input, "NUM")
                 keep(r.byte_length())
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_replace_numbers"))
+    b.bench_function(go, BenchId("static_replace_numbers"))
 
 
 def bench_static_replace_backref(mut b: Bench) raises:
@@ -593,18 +547,16 @@ def bench_static_replace_backref(mut b: Bench) raises:
     var input = "a=1 b=2 c=3 d=4 e=5"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.replace(input, "\\2=\\1")
                 keep(r.byte_length())
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_replace_with_backref"))
+    b.bench_function(go, BenchId("static_replace_with_backref"))
 
 
 def bench_static_split(mut b: Bench) raises:
@@ -612,18 +564,16 @@ def bench_static_split(mut b: Bench) raises:
     var input = "one, two; three  four,five;six seven , eight"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.split(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_split_delimiters"))
+    b.bench_function(go, BenchId("static_split_delimiters"))
 
 
 # ---------------------------------------------------------------------------
@@ -637,31 +587,27 @@ def bench_static_ignorecase(mut b: Bench) raises:
     var input = "HeLLoWoRLdFoOBaR"
 
     @always_inline
-    @parameter
-    def go_plain(mut bench: Bencher) raises:
+    def go_plain(mut bench: Bencher) raises {mut re_plain, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re_plain, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re_plain.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
     @always_inline
-    @parameter
-    def go_icase(mut bench: Bencher) raises:
+    def go_icase(mut bench: Bencher) raises {mut re_icase, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re_icase, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re_icase.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go_plain](BenchId("static_explicit_case_range"))
-    b.bench_function[go_icase](BenchId("static_ignorecase"))
+    b.bench_function(go_plain, BenchId("static_explicit_case_range"))
+    b.bench_function(go_icase, BenchId("static_ignorecase"))
 
 
 # ---------------------------------------------------------------------------
@@ -674,18 +620,16 @@ def bench_static_lookahead(mut b: Bench) raises:
     var input = "user@host"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_lookahead_positive"))
+    b.bench_function(go, BenchId("static_lookahead_positive"))
 
 
 def bench_static_lookbehind(mut b: Bench) raises:
@@ -693,18 +637,16 @@ def bench_static_lookbehind(mut b: Bench) raises:
     var input = "user@host"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_lookbehind_positive"))
+    b.bench_function(go, BenchId("static_lookbehind_positive"))
 
 
 # ---------------------------------------------------------------------------
@@ -717,18 +659,16 @@ def bench_static_optional_8(mut b: Bench) raises:
     var input = "aaaaaaaa"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_pathological_optional_8"))
+    b.bench_function(go, BenchId("static_pathological_optional_8"))
 
 
 def bench_static_dotstar(mut b: Bench) raises:
@@ -736,18 +676,16 @@ def bench_static_dotstar(mut b: Bench) raises:
     var input = "a" * 1000 + "x"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_dotstar_1K"))
+    b.bench_function(go, BenchId("static_dotstar_1K"))
 
 
 def bench_static_dotstar_search(mut b: Bench) raises:
@@ -757,18 +695,16 @@ def bench_static_dotstar_search(mut b: Bench) raises:
     var input = "a" * 1000 + "x" + "bbb"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.end)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_dotstar_search_1K"))
+    b.bench_function(go, BenchId("static_dotstar_search_1K"))
 
 
 def bench_static_bol_alternation_miss(mut b: Bench) raises:
@@ -778,18 +714,16 @@ def bench_static_bol_alternation_miss(mut b: Bench) raises:
     var input = "x" * 10_000
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_bol_alternation_miss_10KB"))
+    b.bench_function(go, BenchId("static_bol_alternation_miss_10KB"))
 
 
 def bench_static_replace_alternation(mut b: Bench) raises:
@@ -798,18 +732,16 @@ def bench_static_replace_alternation(mut b: Bench) raises:
     var input = repeat_with_sep("a cat and a dog here", " ", 30)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.replace(input, "pet")
                 keep(r.byte_length())
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_replace_alternation"))
+    b.bench_function(go, BenchId("static_replace_alternation"))
 
 
 def bench_static_ignorecase_search(mut b: Bench) raises:
@@ -823,18 +755,16 @@ def bench_static_ignorecase_search(mut b: Bench) raises:
     input += "an ERRor appeared"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.start)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_ignorecase_search_2KB"))
+    b.bench_function(go, BenchId("static_ignorecase_search_2KB"))
 
 
 def bench_static_teddy_prefix_search(mut b: Bench) raises:
@@ -847,18 +777,16 @@ def bench_static_teddy_prefix_search(mut b: Bench) raises:
     input += "POST /submit"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.start)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_teddy_prefix_search_2KB"))
+    b.bench_function(go, BenchId("static_teddy_prefix_search_2KB"))
 
 
 def bench_static_url_search(mut b: Bench) raises:
@@ -874,18 +802,16 @@ def bench_static_url_search(mut b: Bench) raises:
     input += "see http://example.com now"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.start)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_url_search_2KB"))
+    b.bench_function(go, BenchId("static_url_search_2KB"))
 
 
 def bench_static_ignorecase_alternation(mut b: Bench) raises:
@@ -899,18 +825,16 @@ def bench_static_ignorecase_alternation(mut b: Bench) raises:
     input += "then a FATAL crash"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.start)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_ignorecase_alternation_2KB"))
+    b.bench_function(go, BenchId("static_ignorecase_alternation_2KB"))
 
 
 def bench_pathological_pike_search_miss(mut b: Bench) raises:
@@ -921,17 +845,15 @@ def bench_pathological_pike_search_miss(mut b: Bench) raises:
     var input = "a" * 600
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             var r = re.search(input)
             keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("pathological_pike_search_miss_600B"))
+    b.bench_function(go, BenchId("pathological_pike_search_miss_600B"))
 
 
 def bench_static_nested_quantifier(mut b: Bench) raises:
@@ -939,18 +861,16 @@ def bench_static_nested_quantifier(mut b: Bench) raises:
     var input = "abc123def456ghi789x"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_nested_quantifier"))
+    b.bench_function(go, BenchId("static_nested_quantifier"))
 
 
 def bench_lf_dfa_lazy_findall_64KB(mut b: Bench) raises:
@@ -961,18 +881,16 @@ def bench_lf_dfa_lazy_findall_64KB(mut b: Bench) raises:
     var input = repeat_with_sep("<tag>", " text ", 64 * 1024 // 14)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("lf_dfa_lazy_findall_64KB"))
+    b.bench_function(go, BenchId("lf_dfa_lazy_findall_64KB"))
 
 
 def lcg_prose(n: Int) -> String:
@@ -1013,18 +931,16 @@ def bench_word_boundary_findall_64KB(mut b: Bench) raises:
     var input = lcg_prose(64 * 1024)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("word_boundary_findall_64KB"))
+    b.bench_function(go, BenchId("word_boundary_findall_64KB"))
 
 
 def bench_match_single_byte_run_20KB(mut b: Bench) raises:
@@ -1035,18 +951,16 @@ def bench_match_single_byte_run_20KB(mut b: Bench) raises:
     var input = "a" * 20480 + "e"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.end)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("match_single_byte_run_20KB"))
+    b.bench_function(go, BenchId("match_single_byte_run_20KB"))
 
 
 def bench_lf_dfa_class_run_search_20KB(mut b: Bench) raises:
@@ -1057,18 +971,16 @@ def bench_lf_dfa_class_run_search_20KB(mut b: Bench) raises:
     var input = "a" * (20 * 1024) + "x"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.end)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("lf_dfa_class_run_search_20KB"))
+    b.bench_function(go, BenchId("lf_dfa_class_run_search_20KB"))
 
 
 # ---------------------------------------------------------------------------
@@ -1081,18 +993,16 @@ def bench_static_email(mut b: Bench) raises:
     var input = "john.doe+test@example.co.uk"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_realworld_email"))
+    b.bench_function(go, BenchId("static_realworld_email"))
 
 
 def bench_static_email_search_2KB(mut b: Bench) raises:
@@ -1105,18 +1015,16 @@ def bench_static_email_search_2KB(mut b: Bench) raises:
     var input = make_lines(80) + " contact us at first.last@example.com today"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_email_search_2KB"))
+    b.bench_function(go, BenchId("static_email_search_2KB"))
 
 
 def bench_static_email_search_long_tokens(mut b: Bench) raises:
@@ -1132,18 +1040,16 @@ def bench_static_email_search_long_tokens(mut b: Bench) raises:
     var input = String(" ").join(parts) + " user@example.com"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_email_search_long_tokens"))
+    b.bench_function(go, BenchId("static_email_search_long_tokens"))
 
 
 def bench_static_ip_address(mut b: Bench) raises:
@@ -1151,18 +1057,16 @@ def bench_static_ip_address(mut b: Bench) raises:
     var input = "192.168.1.100"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_realworld_ipv4"))
+    b.bench_function(go, BenchId("static_realworld_ipv4"))
 
 
 def bench_static_log_parse(mut b: Bench) raises:
@@ -1172,18 +1076,16 @@ def bench_static_log_parse(mut b: Bench) raises:
     var input = "2026-03-21 14:30:05 [ERROR] Connection timeout after 30s"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_realworld_log_parse"))
+    b.bench_function(go, BenchId("static_realworld_log_parse"))
 
 
 def bench_static_csv_field(mut b: Bench) raises:
@@ -1191,18 +1093,16 @@ def bench_static_csv_field(mut b: Bench) raises:
     var input = "field1,field2,field3,field4,field5,field6,field7,field8"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("static_realworld_csv_fields"))
+    b.bench_function(go, BenchId("static_realworld_csv_fields"))
 
 
 # ---------------------------------------------------------------------------
@@ -1215,18 +1115,16 @@ def bench_throughput_literal_100B(mut b: Bench) raises:
     var input = "a" * 94 + "needle"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("throughput_literal_100B"))
+    b.bench_function(go, BenchId("throughput_literal_100B"))
 
 
 def bench_throughput_literal_10KB(mut b: Bench) raises:
@@ -1234,18 +1132,16 @@ def bench_throughput_literal_10KB(mut b: Bench) raises:
     var input = "a" * 10000 + "needle"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("throughput_literal_10KB"))
+    b.bench_function(go, BenchId("throughput_literal_10KB"))
 
 
 def bench_throughput_literal_100KB(mut b: Bench) raises:
@@ -1253,18 +1149,16 @@ def bench_throughput_literal_100KB(mut b: Bench) raises:
     var input = "a" * 100000 + "needle"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("throughput_literal_100KB"))
+    b.bench_function(go, BenchId("throughput_literal_100KB"))
 
 
 def bench_throughput_literal_1MB(mut b: Bench) raises:
@@ -1272,18 +1166,16 @@ def bench_throughput_literal_1MB(mut b: Bench) raises:
     var input = "a" * 1000000 + "needle"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("throughput_literal_1MB"))
+    b.bench_function(go, BenchId("throughput_literal_1MB"))
 
 
 def bench_throughput_class_10KB(mut b: Bench) raises:
@@ -1291,18 +1183,16 @@ def bench_throughput_class_10KB(mut b: Bench) raises:
     var input = "a" * 9990 + "xyzxyzxyz"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("throughput_class_10KB"))
+    b.bench_function(go, BenchId("throughput_class_10KB"))
 
 
 def bench_throughput_nomatch_100KB(mut b: Bench) raises:
@@ -1310,18 +1200,16 @@ def bench_throughput_nomatch_100KB(mut b: Bench) raises:
     var input = "a" * 100000
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("throughput_nomatch_100KB"))
+    b.bench_function(go, BenchId("throughput_nomatch_100KB"))
 
 
 # ---------------------------------------------------------------------------
@@ -1334,18 +1222,16 @@ def bench_anchor_bol(mut b: Bench) raises:
     var input = "hello world"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("anchor_bol"))
+    b.bench_function(go, BenchId("anchor_bol"))
 
 
 def bench_anchor_eol(mut b: Bench) raises:
@@ -1353,18 +1239,16 @@ def bench_anchor_eol(mut b: Bench) raises:
     var input = "hello world"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("anchor_eol"))
+    b.bench_function(go, BenchId("anchor_eol"))
 
 
 def bench_anchor_word_boundary(mut b: Bench) raises:
@@ -1372,18 +1256,16 @@ def bench_anchor_word_boundary(mut b: Bench) raises:
     var input = "say hello world today"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("anchor_word_boundary"))
+    b.bench_function(go, BenchId("anchor_word_boundary"))
 
 
 def bench_anchor_word_boundary_miss(mut b: Bench) raises:
@@ -1391,18 +1273,16 @@ def bench_anchor_word_boundary_miss(mut b: Bench) raises:
     var input = "say hello world today"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("anchor_word_boundary_miss"))
+    b.bench_function(go, BenchId("anchor_word_boundary_miss"))
 
 
 def bench_anchor_bol_long_input(mut b: Bench) raises:
@@ -1410,18 +1290,16 @@ def bench_anchor_bol_long_input(mut b: Bench) raises:
     var input = "a" * 10000
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("anchor_bol_miss_10KB"))
+    b.bench_function(go, BenchId("anchor_bol_miss_10KB"))
 
 
 # ---------------------------------------------------------------------------
@@ -1434,18 +1312,16 @@ def bench_multiline_bol(mut b: Bench) raises:
     var input = make_lines(100)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("multiline_bol_findall_100_lines"))
+    b.bench_function(go, BenchId("multiline_bol_findall_100_lines"))
 
 
 def bench_multiline_eol(mut b: Bench) raises:
@@ -1453,18 +1329,16 @@ def bench_multiline_eol(mut b: Bench) raises:
     var input = make_lines(100)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("multiline_eol_findall_100_lines"))
+    b.bench_function(go, BenchId("multiline_eol_findall_100_lines"))
 
 
 def bench_dotall_match(mut b: Bench) raises:
@@ -1472,18 +1346,16 @@ def bench_dotall_match(mut b: Bench) raises:
     var input = "<body>\nline1\nline2\nline3\n</body>"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("dotall_multiline_body"))
+    b.bench_function(go, BenchId("dotall_multiline_body"))
 
 
 # ---------------------------------------------------------------------------
@@ -1496,18 +1368,16 @@ def bench_named_groups(mut b: Bench) raises:
     var input = "2026-03-21"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("named_group_date"))
+    b.bench_function(go, BenchId("named_group_date"))
 
 
 def bench_named_vs_unnamed(mut b: Bench) raises:
@@ -1516,31 +1386,27 @@ def bench_named_vs_unnamed(mut b: Bench) raises:
     var input = "user@example.com"
 
     @always_inline
-    @parameter
-    def go_named(mut bench: Bencher) raises:
+    def go_named(mut bench: Bencher) raises {mut re_named, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re_named, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re_named.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
     @always_inline
-    @parameter
-    def go_pos(mut bench: Bencher) raises:
+    def go_pos(mut bench: Bencher) raises {mut re_pos, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re_pos, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re_pos.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go_named](BenchId("named_group_email"))
-    b.bench_function[go_pos](BenchId("positional_group_email"))
+    b.bench_function(go_named, BenchId("named_group_email"))
+    b.bench_function(go_pos, BenchId("positional_group_email"))
 
 
 # ---------------------------------------------------------------------------
@@ -1553,18 +1419,16 @@ def bench_neg_lookahead(mut b: Bench) raises:
     var input = "hello world"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("neg_lookahead"))
+    b.bench_function(go, BenchId("neg_lookahead"))
 
 
 def bench_neg_lookbehind(mut b: Bench) raises:
@@ -1572,18 +1436,16 @@ def bench_neg_lookbehind(mut b: Bench) raises:
     var input = "hello world"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("neg_lookbehind"))
+    b.bench_function(go, BenchId("neg_lookbehind"))
 
 
 def bench_password_lookahead(mut b: Bench) raises:
@@ -1591,18 +1453,16 @@ def bench_password_lookahead(mut b: Bench) raises:
     var input = "MyP4ssw0rd"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("password_validation_lookahead"))
+    b.bench_function(go, BenchId("password_validation_lookahead"))
 
 
 # ---------------------------------------------------------------------------
@@ -1615,18 +1475,16 @@ def bench_alternation_4(mut b: Bench) raises:
     var input = "delta"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("alternation_4"))
+    b.bench_function(go, BenchId("alternation_4"))
 
 
 def bench_alternation_4_search_2KB(mut b: Bench) raises:
@@ -1636,18 +1494,16 @@ def bench_alternation_4_search_2KB(mut b: Bench) raises:
     var input = make_lines(80) + " delta"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("alternation_4_search_2KB"))
+    b.bench_function(go, BenchId("alternation_4_search_2KB"))
 
 
 def bench_alternation_16(mut b: Bench) raises:
@@ -1658,18 +1514,16 @@ def bench_alternation_16(mut b: Bench) raises:
     var input = "pi"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("alternation_16"))
+    b.bench_function(go, BenchId("alternation_16"))
 
 
 # 32-arm alternation with a class arm so Teddy can't claim it: 44 DFA
@@ -1686,18 +1540,16 @@ def bench_sheng64_alt_32_search_2KB(mut b: Bench) raises:
     var input = make_lines(80) + " tap"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("sheng64_alt_32_search_2KB"))
+    b.bench_function(go, BenchId("sheng64_alt_32_search_2KB"))
 
 
 def bench_alternation_miss(mut b: Bench) raises:
@@ -1708,18 +1560,16 @@ def bench_alternation_miss(mut b: Bench) raises:
     var input = "sigma"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("alternation_16_miss"))
+    b.bench_function(go, BenchId("alternation_16_miss"))
 
 
 # ---------------------------------------------------------------------------
@@ -1732,18 +1582,16 @@ def bench_findall_few(mut b: Bench) raises:
     var input = "a1b2c3"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("findall_3_matches"))
+    b.bench_function(go, BenchId("findall_3_matches"))
 
 
 def bench_findall_many(mut b: Bench) raises:
@@ -1751,18 +1599,16 @@ def bench_findall_many(mut b: Bench) raises:
     var input = repeat_with_sep("42", " word ", 100)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("findall_100_matches"))
+    b.bench_function(go, BenchId("findall_100_matches"))
 
 
 def bench_findall_dense(mut b: Bench) raises:
@@ -1770,18 +1616,16 @@ def bench_findall_dense(mut b: Bench) raises:
     var input = "a" * 500
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("findall_500_dot_matches"))
+    b.bench_function(go, BenchId("findall_500_dot_matches"))
 
 
 # ---------------------------------------------------------------------------
@@ -1794,18 +1638,16 @@ def bench_replace_many(mut b: Bench) raises:
     var input = repeat_with_sep("42", " text ", 50)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.replace(input, "NUM")
                 keep(r.byte_length())
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("replace_50_matches"))
+    b.bench_function(go, BenchId("replace_50_matches"))
 
 
 def bench_replace_named_backref(mut b: Bench) raises:
@@ -1814,18 +1656,16 @@ def bench_replace_named_backref(mut b: Bench) raises:
     var input = "John Doe"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.replace(input, "\\2, \\1")
                 keep(r.byte_length())
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("replace_named_backref"))
+    b.bench_function(go, BenchId("replace_named_backref"))
 
 
 # ---------------------------------------------------------------------------
@@ -1838,18 +1678,16 @@ def bench_split_many(mut b: Bench) raises:
     var input = repeat_with_sep("word", ",", 100)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.split(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("split_100_parts"))
+    b.bench_function(go, BenchId("split_100_parts"))
 
 
 # ---------------------------------------------------------------------------
@@ -1862,18 +1700,16 @@ def bench_pathological_optional_16(mut b: Bench) raises:
     var input = "aaaaaaaaaaaaaaaa"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("pathological_optional_16"))
+    b.bench_function(go, BenchId("pathological_optional_16"))
 
 
 def bench_pathological_dotstar_anchored(mut b: Bench) raises:
@@ -1881,18 +1717,16 @@ def bench_pathological_dotstar_anchored(mut b: Bench) raises:
     var input = "a" * 5000 + "x"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("pathological_dotstar_anchored_5K"))
+    b.bench_function(go, BenchId("pathological_dotstar_anchored_5K"))
 
 
 def bench_pathological_dotstar_miss(mut b: Bench) raises:
@@ -1900,18 +1734,16 @@ def bench_pathological_dotstar_miss(mut b: Bench) raises:
     var input = "a" * 5000
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("pathological_dotstar_miss_5K"))
+    b.bench_function(go, BenchId("pathological_dotstar_miss_5K"))
 
 
 def bench_pathological_backref_repeated(mut b: Bench) raises:
@@ -1919,18 +1751,16 @@ def bench_pathological_backref_repeated(mut b: Bench) raises:
     var input = "hello hello hello"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("pathological_triple_backref"))
+    b.bench_function(go, BenchId("pathological_triple_backref"))
 
 
 def bench_pathological_nested_quantifier_miss(mut b: Bench) raises:
@@ -1947,18 +1777,16 @@ def bench_pathological_nested_quantifier_miss(mut b: Bench) raises:
     var input = String("a1") * 800 + "ax"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("pathological_nested_quantifier_miss"))
+    b.bench_function(go, BenchId("pathological_nested_quantifier_miss"))
 
 
 def bench_memo_ambiguous_plus_miss(mut b: Bench) raises:
@@ -1982,18 +1810,16 @@ def bench_memo_ambiguous_plus_miss(mut b: Bench) raises:
     var input = String("a") * 1500 + "c"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("memo_ambiguous_plus_miss_1500"))
+    b.bench_function(go, BenchId("memo_ambiguous_plus_miss_1500"))
 
 
 def bench_memo_ambiguous_plus_in_span(mut b: Bench) raises:
@@ -2008,18 +1834,16 @@ def bench_memo_ambiguous_plus_in_span(mut b: Bench) raises:
     var input = String("a") * 1500 + "b"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("memo_ambiguous_plus_in_span_1500"))
+    b.bench_function(go, BenchId("memo_ambiguous_plus_in_span_1500"))
 
 
 # ---------------------------------------------------------------------------
@@ -2032,18 +1856,16 @@ def bench_url_parse(mut b: Bench) raises:
     var input = "https://www.example.com/path/to/page?q=1&r=2"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_url_parse"))
+    b.bench_function(go, BenchId("realworld_url_parse"))
 
 
 def bench_phone_number(mut b: Bench) raises:
@@ -2051,18 +1873,16 @@ def bench_phone_number(mut b: Bench) raises:
     var input = "(555) 123-4567"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_phone"))
+    b.bench_function(go, BenchId("realworld_phone"))
 
 
 def bench_hex_color(mut b: Bench) raises:
@@ -2070,18 +1890,16 @@ def bench_hex_color(mut b: Bench) raises:
     var input = "#1a2B3c"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_hex_color"))
+    b.bench_function(go, BenchId("realworld_hex_color"))
 
 
 def bench_semver(mut b: Bench) raises:
@@ -2089,18 +1907,16 @@ def bench_semver(mut b: Bench) raises:
     var input = "12.34.56-beta.1"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_semver"))
+    b.bench_function(go, BenchId("realworld_semver"))
 
 
 def bench_counted_repeat_search_2KB(mut b: Bench) raises:
@@ -2128,18 +1944,16 @@ def bench_counted_repeat_search_2KB(mut b: Bench) raises:
     var input = make_counted_haystack(90)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("counted_repeat_search_2KB"))
+    b.bench_function(go, BenchId("counted_repeat_search_2KB"))
 
 
 def make_giveback_haystack(n: Int) -> String:
@@ -2169,18 +1983,16 @@ def bench_counted_repeat_giveback_2KB(mut b: Bench) raises:
     var input = make_giveback_haystack(90)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("counted_repeat_giveback_2KB"))
+    b.bench_function(go, BenchId("counted_repeat_giveback_2KB"))
 
 
 def bench_key_value_pairs(mut b: Bench) raises:
@@ -2188,18 +2000,16 @@ def bench_key_value_pairs(mut b: Bench) raises:
     var input = "host=localhost port=5432 db=mydb user=admin timeout=30"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_key_value_findall"))
+    b.bench_function(go, BenchId("realworld_key_value_findall"))
 
 
 def bench_html_tag_extraction(mut b: Bench) raises:
@@ -2210,18 +2020,16 @@ def bench_html_tag_extraction(mut b: Bench) raises:
     )
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.findall(input)
                 keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_html_tag_findall"))
+    b.bench_function(go, BenchId("realworld_html_tag_findall"))
 
 
 def bench_whitespace_normalize(mut b: Bench) raises:
@@ -2229,18 +2037,16 @@ def bench_whitespace_normalize(mut b: Bench) raises:
     var input = "hello   world\t\tfoo  bar\n\nbaz   qux"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.replace(input, " ")
                 keep(r.byte_length())
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_ws_normalize"))
+    b.bench_function(go, BenchId("realworld_ws_normalize"))
 
 
 def bench_log_search_in_bulk(mut b: Bench) raises:
@@ -2256,18 +2062,16 @@ def bench_log_search_in_bulk(mut b: Bench) raises:
     var re = Regex["\\[ERROR\\].*"]()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input, mut re}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input, mut re}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("realworld_log_search_1000_lines"))
+    b.bench_function(go, BenchId("realworld_log_search_1000_lines"))
 
 
 # ---------------------------------------------------------------------------
@@ -2280,18 +2084,16 @@ def bench_inline_ignorecase(mut b: Bench) raises:
     var input = "HeLLo WoRLd"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("inline_ignorecase"))
+    b.bench_function(go, BenchId("inline_ignorecase"))
 
 
 def bench_inline_multiline(mut b: Bench) raises:
@@ -2299,18 +2101,16 @@ def bench_inline_multiline(mut b: Bench) raises:
     var input = "info: ok\nwarn: hmm\nerror: bad\ninfo: ok"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("inline_multiline_search"))
+    b.bench_function(go, BenchId("inline_multiline_search"))
 
 
 # ---------------------------------------------------------------------------
@@ -2323,18 +2123,16 @@ def bench_engine_dfa_simple(mut b: Bench) raises:
     var input = "abc123def"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("engine_dfa_no_capture"))
+    b.bench_function(go, BenchId("engine_dfa_no_capture"))
 
 
 def bench_engine_pike_same(mut b: Bench) raises:
@@ -2342,18 +2140,16 @@ def bench_engine_pike_same(mut b: Bench) raises:
     var input = "abc123def"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("engine_pike_with_capture"))
+    b.bench_function(go, BenchId("engine_pike_with_capture"))
 
 
 def bench_engine_backtrack_same(mut b: Bench) raises:
@@ -2361,18 +2157,16 @@ def bench_engine_backtrack_same(mut b: Bench) raises:
     var input = "abc123abc"
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("engine_backtrack_with_backref"))
+    b.bench_function(go, BenchId("engine_backtrack_with_backref"))
 
 
 # ---------------------------------------------------------------------------
@@ -2389,18 +2183,16 @@ def bench_static_simd_literal_match(mut b: Bench) raises:
     var input = String(SIMD_LIT)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm input}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.match(input)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("simd_literal_match"))
+    b.bench_function(go, BenchId("simd_literal_match"))
 
 
 def bench_static_simd_literal_search(mut b: Bench) raises:
@@ -2410,18 +2202,16 @@ def bench_static_simd_literal_search(mut b: Bench) raises:
     var haystack = make_lines(100) + "\n" + String(SIMD_LIT)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {mut re, imm haystack}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {mut re, imm haystack}:
             for _ in range(ITERS_PER_CALL):
                 var r = re.search(haystack)
                 keep(r.matched)
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("simd_literal_search"))
+    b.bench_function(go, BenchId("simd_literal_search"))
 
 
 # ---------------------------------------------------------------------------

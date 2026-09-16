@@ -30,7 +30,7 @@ from emberregex.static_dfa import (
     build_eager_dfa,
     edfa_id_dtype,
 )
-from std.collections import InlineArray
+from std.collections import Array
 from std.sys import simd_width_of, size_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 

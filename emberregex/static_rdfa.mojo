@@ -44,7 +44,7 @@ would be an accept point the skip cannot see).
 """
 
 from std.bit import count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
@@ -104,7 +104,7 @@ comptime RDFA_STATE_CAP = _MIN_CAP
 
 struct RDFA(Copyable, Movable):
     """Comptime-computed reverse DFA. Only ever exists as a comptime
-    value; the walker reads the materialized InlineArray forms."""
+    value; the walker reads the materialized Array forms."""
 
     var valid: Bool
     var num_states: Int
@@ -752,8 +752,8 @@ def rdfa_table_str[n: Int, dt: DType](d: RDFA) -> String:
     return table_bytes[dt](d.table, n)
 
 
-def rdfa_flags_arr[n: Int](d: RDFA) -> InlineArray[UInt8, n]:
-    var arr = InlineArray[UInt8, n](fill=0)
+def rdfa_flags_arr[n: Int](d: RDFA) -> Array[UInt8, n]:
+    var arr = Array[UInt8, n](fill=0)
     for i in range(n):
         arr[i] = UInt8(d.flags[i])
     return arr^
@@ -849,7 +849,7 @@ def rdfa_find_start[
     //,
     d: RDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], end: Int, floor: Int) -> Int:
     """Leftmost (smallest) position >= `floor` from which a match ends
     exactly at `end`, or -1 if none (which the forward scan rules out).

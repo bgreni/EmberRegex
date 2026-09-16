@@ -165,7 +165,7 @@ match, never one per candidate. Every materialized table holds its state
 ids in the narrowest integer type that fits them (`edfa_id_dtype`:
 `Int8`, `Int16` or `Int32` — the table is the walk's hot data) and is
 travels as a comptime string literal (`static_bytes.mojo`): a materialized
-`InlineArray` global costs O(n²) in the MLIR→LLVM translation (one folded
+`Array` global costs O(n²) in the MLIR→LLVM translation (one folded
 `insertvalue` per cell, ~6 s per 128-state table), while a `!kgen.string`
 lowers to one static `c"..."` global that the walkers read through a
 bitcast pointer — the same load, no per-call copy. `EDFA_TABLE_MIN_BYTES`
@@ -561,9 +561,9 @@ Three constraints shape the code more than anything else:
   carrying a baked database as a comptime parameter, that the inliner does
   *not* fold, emits a symbol containing the whole database — and the linker
   refuses names past a few MB. Every `List` field costs a fixed ~1 MB
-  regardless of length; the same data as `InlineArray` costs ~4 chars per
+  regardless of length; the same data as `Array` costs ~4 chars per
   element. Hence `RoseView` and `ReverseView`: POD scalars in the parameter,
-  bulk data in separate `InlineArray`s.
+  bulk data in separate `Array`s.
 - **Baked lanes hold zero per-instance state**, so `scan` needs no `mut self`
   and no scratch object. Keeping the bit-parallel NFA as the always-builds
   fallback is partly what lets the API stay non-mutating and thread-safe.

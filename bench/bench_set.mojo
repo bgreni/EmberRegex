@@ -211,17 +211,15 @@ def bench_set_teddy8_sparse(mut b: Bench) raises:
     var input = make_sparse_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_teddy8_sparse_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_teddy8_sparse_16k"), _throughput(input))
 
 
 def bench_set_teddy8_dense(mut b: Bench) raises:
@@ -229,17 +227,15 @@ def bench_set_teddy8_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_teddy8_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_teddy8_dense_16k"), _throughput(input))
 
 
 def bench_set_teddy64_sparse(mut b: Bench) raises:
@@ -247,17 +243,15 @@ def bench_set_teddy64_sparse(mut b: Bench) raises:
     var input = make_sparse_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_teddy64_sparse_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_teddy64_sparse_16k"), _throughput(input))
 
 
 def bench_set_teddy64_dense(mut b: Bench) raises:
@@ -265,17 +259,15 @@ def bench_set_teddy64_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_teddy64_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_teddy64_dense_16k"), _throughput(input))
 
 
 # ---------------------------------------------------------------------------
@@ -290,17 +282,15 @@ def bench_set_ac_256_sparse_64k(mut b: Bench) raises:
     var input = make_ac_sparse_haystack(HAYSTACK_LEN_64K)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_ac_256_sparse_64k"), _throughput(input))
+    b.bench_function(go, BenchId("set_ac_256_sparse_64k"), _throughput(input))
 
 
 def bench_set_ac_256_dense(mut b: Bench) raises:
@@ -310,17 +300,15 @@ def bench_set_ac_256_dense(mut b: Bench) raises:
     var input = make_ac_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_ac_256_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_ac_256_dense_16k"), _throughput(input))
 
 
 # ---------------------------------------------------------------------------
@@ -335,34 +323,30 @@ def bench_set_rose_log_sparse_64k(mut b: Bench) raises:
     var input = make_sparse_haystack(HAYSTACK_LEN_64K)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_rose_log_sparse_64k"), _throughput(input))
+    b.bench_function(go, BenchId("set_rose_log_sparse_64k"), _throughput(input))
 
 
 def bench_set_mdfa_log_sparse_64k(mut b: Bench) raises:
     var input = make_sparse_haystack(HAYSTACK_LEN_64K)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = mdfa_direct_scan[LOG_PATS](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_mdfa_log_sparse_64k"), _throughput(input))
+    b.bench_function(go, BenchId("set_mdfa_log_sparse_64k"), _throughput(input))
 
 
 def bench_set_rose_full_sparse_64k(mut b: Bench) raises:
@@ -372,18 +356,16 @@ def bench_set_rose_full_sparse_64k(mut b: Bench) raises:
     var input = make_sparse_haystack(HAYSTACK_LEN_64K)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](
-        BenchId("set_rose_full_sparse_64k"), _throughput(input)
+    b.bench_function(
+        go, BenchId("set_rose_full_sparse_64k"), _throughput(input)
     )
 
 
@@ -391,18 +373,16 @@ def bench_set_mdfa_full_sparse_64k(mut b: Bench) raises:
     var input = make_sparse_haystack(HAYSTACK_LEN_64K)
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = mdfa_direct_scan[ROSE_FULL_PATS](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](
-        BenchId("set_mdfa_full_sparse_64k"), _throughput(input)
+    b.bench_function(
+        go, BenchId("set_mdfa_full_sparse_64k"), _throughput(input)
     )
 
 
@@ -411,34 +391,30 @@ def bench_set_rose_full_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_rose_full_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_rose_full_dense_16k"), _throughput(input))
 
 
 def bench_set_mdfa_full_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = mdfa_direct_scan[ROSE_FULL_PATS](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_mdfa_full_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_mdfa_full_dense_16k"), _throughput(input))
 
 
 def bench_set_rose_log_sparse(mut b: Bench) raises:
@@ -446,34 +422,30 @@ def bench_set_rose_log_sparse(mut b: Bench) raises:
     var input = make_sparse_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_rose_log_sparse_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_rose_log_sparse_16k"), _throughput(input))
 
 
 def bench_set_mdfa_log_sparse(mut b: Bench) raises:
     var input = make_sparse_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = mdfa_direct_scan[LOG_PATS](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_mdfa_log_sparse_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_mdfa_log_sparse_16k"), _throughput(input))
 
 
 def bench_set_rose_log_dense(mut b: Bench) raises:
@@ -483,34 +455,30 @@ def bench_set_rose_log_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_rose_log_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_rose_log_dense_16k"), _throughput(input))
 
 
 def bench_set_mdfa_log_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = mdfa_direct_scan[LOG_PATS](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_mdfa_log_dense_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_mdfa_log_dense_16k"), _throughput(input))
 
 
 def bench_set_rose_anchors_dense(mut b: Bench) raises:
@@ -520,18 +488,16 @@ def bench_set_rose_anchors_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](
-        BenchId("set_rose_anchors_dense_16k"), _throughput(input)
+    b.bench_function(
+        go, BenchId("set_rose_anchors_dense_16k"), _throughput(input)
     )
 
 
@@ -539,18 +505,16 @@ def bench_set_mdfa_anchors_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = mdfa_direct_scan[ANCHOR_PATS](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](
-        BenchId("set_mdfa_anchors_dense_16k"), _throughput(input)
+    b.bench_function(
+        go, BenchId("set_mdfa_anchors_dense_16k"), _throughput(input)
     )
 
 
@@ -568,18 +532,16 @@ def bench_set_bitnfa_blowup_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](
-        BenchId("set_bitnfa_blowup_dense_16k"), _throughput(input)
+    b.bench_function(
+        go, BenchId("set_bitnfa_blowup_dense_16k"), _throughput(input)
     )
 
 
@@ -596,11 +558,9 @@ def bench_set_bitnfa_log_dense(mut b: Bench) raises:
     var input = make_dense_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm input}:
             var r = bitnfa_scan[
                 d=BN,
                 reach=REACH,
@@ -611,10 +571,10 @@ def bench_set_bitnfa_log_dense(mut b: Bench) raises:
             ](input.as_bytes())
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](
-        BenchId("set_bitnfa_log_dense_16k"), _throughput(input)
+    b.bench_function(
+        go, BenchId("set_bitnfa_log_dense_16k"), _throughput(input)
     )
 
 
@@ -628,17 +588,15 @@ def bench_set_pike_wb_sparse(mut b: Bench) raises:
     var input = make_sparse_haystack()
 
     @always_inline
-    @parameter
-    def go(mut bench: Bencher) raises:
+    def go(mut bench: Bencher) raises {imm db, imm input}:
         @always_inline
-        @parameter
-        def call() raises:
+        def call() raises {imm db, imm input}:
             var r = db.scan(input)
             keep(len(r))
 
-        bench.iter[call]()
+        bench.iter(call)
 
-    b.bench_function[go](BenchId("set_pike_wb_sparse_16k"), _throughput(input))
+    b.bench_function(go, BenchId("set_pike_wb_sparse_16k"), _throughput(input))
 
 
 def main() raises:

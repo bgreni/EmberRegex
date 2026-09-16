@@ -66,7 +66,7 @@ MATCH) with the end position. A loop's later iteration overwrites, which
 is Python's last-iteration capture semantics; a group the path never
 passes keeps the caller's -1.
 
-Tables (POD + InlineArray rule: the struct crosses into the walkers as a
+Tables (POD + Array rule: the struct crosses into the walkers as a
 comptime parameter, the bulk as separate arrays padded to at least
 EDFA_TABLE_MIN_BYTES so they lower to shared constant data):
 `onepass_table_arr` — `num_states x nclasses` Int32 cells, -1 dead, else
@@ -82,7 +82,7 @@ not a table step per byte.
 """
 
 from std.bit import count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
@@ -712,9 +712,9 @@ def onepass_table_str[n: Int](op: OnePass) -> String:
 comptime ONEPASS_CLASS_LEN = EDFA_TABLE_MIN_BYTES
 
 
-def onepass_class_arr(op: OnePass) -> InlineArray[UInt8, ONEPASS_CLASS_LEN]:
+def onepass_class_arr(op: OnePass) -> Array[UInt8, ONEPASS_CLASS_LEN]:
     """Comptime: byte -> class, padded (see ONEPASS_CLASS_LEN)."""
-    var arr = InlineArray[UInt8, ONEPASS_CLASS_LEN](fill=0)
+    var arr = Array[UInt8, ONEPASS_CLASS_LEN](fill=0)
     for b in range(256):
         arr[b] = UInt8(op.class_of[b])
     return arr^
@@ -728,9 +728,9 @@ def onepass_eps_len(op: OnePass) -> Int:
     return n if n > min_n else min_n
 
 
-def onepass_eps_arr[n: Int](op: OnePass) -> InlineArray[UInt64, n]:
+def onepass_eps_arr[n: Int](op: OnePass) -> Array[UInt64, n]:
     """Comptime: slot bitset per slot-set id."""
-    var arr = InlineArray[UInt64, n](fill=0)
+    var arr = Array[UInt64, n](fill=0)
     var m = len(op.eps_sets)
     if n < m:
         m = n
@@ -747,10 +747,10 @@ def onepass_state_len(op: OnePass) -> Int:
     return n if n > min_n else min_n
 
 
-def onepass_state_arr[n: Int](op: OnePass) -> InlineArray[Int32, n]:
+def onepass_state_arr[n: Int](op: OnePass) -> Array[Int32, n]:
     """Comptime: per state, the match flags (low byte) and the match
     slot-set id (from bit _OP_STATE_EPS_SHIFT)."""
-    var arr = InlineArray[Int32, n](fill=0)
+    var arr = Array[Int32, n](fill=0)
     var m = op.num_states
     if n < m:
         m = n
@@ -765,7 +765,7 @@ def onepass_state_arr[n: Int](op: OnePass) -> InlineArray[Int32, n]:
 
 
 @always_inline
-def _op_apply(mask: UInt64, pos: Int, mut slots: InlineArray[Int, _]):
+def _op_apply(mask: UInt64, pos: Int, mut slots: Array[Int, _]):
     """Write `pos` into every slot of `mask` (its `_OP_MW_BIT` ignored)."""
     var m = mask & _OP_SLOT_MASK
     while m != 0:
@@ -838,16 +838,16 @@ def _onepass_match_impl[
     //,
     op: OnePass,
     table: StringLiteral,
-    classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
-    eps: InlineArray[UInt64, ne],
-    states: InlineArray[Int32, ns],
+    classes: Array[UInt8, ONEPASS_CLASS_LEN],
+    eps: Array[UInt64, ne],
+    states: Array[Int32, ns],
     num_slots: Int,
     accel: Bool,
 ](
     input: Span[Byte, origin],
     start: Int,
     end_pin: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
 ) -> Int:
     var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
     var cls = materialize[classes]()
@@ -893,15 +893,15 @@ def onepass_match[
     //,
     op: OnePass,
     table: StringLiteral,
-    classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
-    eps: InlineArray[UInt64, ne],
-    states: InlineArray[Int32, ns],
+    classes: Array[UInt8, ONEPASS_CLASS_LEN],
+    eps: Array[UInt64, ne],
+    states: Array[Int32, ns],
     num_slots: Int,
 ](
     input: Span[Byte, origin],
     start: Int,
     end_pin: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
 ) -> Int:
     """Anchored walk over exactly `[start, end_pin)`, writing the capture
     slots as it goes: `end_pin` when the walk survives and ends in a
@@ -950,15 +950,15 @@ def _onepass_find_end_impl[
     //,
     op: OnePass,
     table: StringLiteral,
-    classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
-    eps: InlineArray[UInt64, ne],
-    states: InlineArray[Int32, ns],
+    classes: Array[UInt8, ONEPASS_CLASS_LEN],
+    eps: Array[UInt64, ne],
+    states: Array[Int32, ns],
     num_slots: Int,
     accel: Bool,
 ](
     input: Span[Byte, origin],
     start: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     mut steps: Int,
 ) -> Int:
     var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
@@ -1034,14 +1034,14 @@ def onepass_find_end[
     //,
     op: OnePass,
     table: StringLiteral,
-    classes: InlineArray[UInt8, ONEPASS_CLASS_LEN],
-    eps: InlineArray[UInt64, ne],
-    states: InlineArray[Int32, ns],
+    classes: Array[UInt8, ONEPASS_CLASS_LEN],
+    eps: Array[UInt64, ne],
+    states: Array[Int32, ns],
     num_slots: Int,
 ](
     input: Span[Byte, origin],
     start: Int,
-    mut slots: InlineArray[Int, num_slots],
+    mut slots: Array[Int, num_slots],
     mut steps: Int,
 ) -> Int:
     """Anchored LEFTMOST-FIRST walk from `start` (regex-automata's

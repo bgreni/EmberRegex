@@ -43,7 +43,7 @@ length, which is why SOM is a separate entry point rather than something
 """
 
 from std.bit import count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
@@ -79,7 +79,7 @@ comptime RDFA_STATE_CAP = 512
 
 struct ReverseDFA(Copyable, Movable):
     """Comptime-computed reverse automaton. Only ever exists as a comptime
-    value; the walker reads the materialized InlineArray forms."""
+    value; the walker reads the materialized Array forms."""
 
     var valid: Bool
     var num_states: Int
@@ -870,17 +870,17 @@ def rdfa_table_str[n: Int](d: ReverseDFA) -> String:
     return table_bytes[DType.int32](d.table, n)
 
 
-def rdfa_pool_arr[n: Int](d: ReverseDFA) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def rdfa_pool_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     for i in range(n):
         arr[i] = Int32(d.pool[i])
     return arr^
 
 
-def rdfa_slices_arr[n: Int](d: ReverseDFA) -> InlineArray[Int32, n]:
+def rdfa_slices_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:
     """Per-state slice metadata, 6 Int32 per state:
     (norm_off, norm_len, bol0_off, bol0_len, bolnl_off, bolnl_len)."""
-    var arr = InlineArray[Int32, n](fill=0)
+    var arr = Array[Int32, n](fill=0)
     for s in range(d.num_states):
         arr[6 * s + 0] = Int32(d.norm_off[s])
         arr[6 * s + 1] = Int32(d.norm_len[s])
@@ -903,7 +903,7 @@ def rdfa_view(d: ReverseDFA) -> ReverseView:
 
 
 struct ReverseView(Copyable, Movable):
-    """POD scalars for the walker; tables arrive as InlineArrays."""
+    """POD scalars for the walker; tables arrive as Arrays."""
 
     var num_states: Int
     var seed_at_end: Int
@@ -981,7 +981,7 @@ def leftmost_nonoverlapping(
 
 @always_inline
 def _record[
-    pn: Int, //, pool: InlineArray[Int32, pn]
+    pn: Int, //, pool: Array[Int32, pn]
 ](off: Int, n: Int, pos: Int, mut starts: List[Int]):
     """Positions arrive in decreasing order, so every write is an
     improvement — the last one per id is the leftmost start."""
@@ -999,8 +999,8 @@ def reverse_som[
     //,
     d: ReverseView,
     table: StringLiteral,
-    pool: InlineArray[Int32, pn],
-    slices: InlineArray[Int32, sn],
+    pool: Array[Int32, pn],
+    slices: Array[Int32, sn],
 ](
     input: Span[Byte, origin],
     end: Int,

@@ -22,7 +22,7 @@ Combinations pair naturally with `SetFlags.QUIET`: mark the contributing
 patterns quiet so only the combination itself is reported.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import min
 
 from .set_pike import SetMatch
@@ -171,7 +171,7 @@ def combos_error(combos: List[String], num_patterns: Int) -> String:
 
 
 def _eval[
-    n: Int, //, rpn: InlineArray[Int32, n]
+    n: Int, //, rpn: Array[Int32, n]
 ](off: Int, count: Int, seen: List[Bool]) -> Bool:
     """Evaluate one RPN program against the per-id "seen so far" flags."""
     var prog = materialize[rpn]()
@@ -196,15 +196,15 @@ def _eval[
     return stack[0]
 
 
-def combos_rpn_arr[n: Int](pool: List[Int]) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def combos_rpn_arr[n: Int](pool: List[Int]) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     for i in range(min(n, len(pool))):
         arr[i] = Int32(pool[i])
     return arr^
 
 
 def evaluate_combinations[
-    n: Int, //, rpn: InlineArray[Int32, n], num_combos: Int, num_patterns: Int
+    n: Int, //, rpn: Array[Int32, n], num_combos: Int, num_patterns: Int
 ](reports: List[SetMatch]) -> List[SetMatch]:
     """Emit `(combo_index, end)` where each combination first becomes
     true.

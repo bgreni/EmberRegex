@@ -31,7 +31,7 @@ superset's leftmost start. That bounds the attempts to the width of the
 superset match rather than to the input.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 
 from .ast import AST, ASTNode, ASTNodeKind
 from .backtrack import (
@@ -198,7 +198,7 @@ def confirm_span[
     comptime unbudgeted = _nfa_has_backref(nfa)
     var lo = leftmost if leftmost >= 0 else 0
     for s in range(lo, end + 1):
-        var slots = InlineArray[Int, NS](fill=-1)
+        var slots = Array[Int, NS](fill=-1)
         var budget: Int
         comptime if unbudgeted:
             budget = Int.MAX
@@ -249,7 +249,7 @@ def _confirm_stack_continue[
 ](
     input: Span[Byte, origin],
     start: Int,
-    mut slots: InlineArray[Int, NS],
+    mut slots: Array[Int, NS],
     end: Int,
 ) -> Int:
     """Finish one backreference confirm attempt on the heap-stack

@@ -18,7 +18,7 @@ from emberregex.backtrack import (
     sbt_memo_rows_of,
 )
 from emberregex.engine import _sbt_run
-from std.collections import InlineArray
+from std.collections import Array
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -28,7 +28,7 @@ def _sbt_end[p: String](input: String, pos: Int = 0) raises -> Int:
     Pike VM. Tests call this instead of `search` precisely so the fallback
     is visible instead of being papered over."""
     comptime R = Regex[p]
-    var slots = InlineArray[Int, R._num_slots](fill=-1)
+    var slots = Array[Int, R._num_slots](fill=-1)
     var memo = List[UInt64]()
     return _sbt_run[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
@@ -211,23 +211,33 @@ def test_aborted_attempt_leaves_no_poisoned_bits() raises:
     # the same length on purpose, so the stale-size check in `_sbt_run`
     # cannot be what saves the second one — without the discard this
     # returns -1 on an input that plainly matches.
+    #
+    # The memo keeps the work linear, so what the attempt runs out of is
+    # stack, and the bytes a frame costs are the compiler's: Mojo 1.0.0
+    # conceded at 2200 a's under -D ASSERT=all, 1.1.0rc0 not before 14000.
+    # Find a conceding length by doubling instead of pinning one.
     comptime P = "(a|aa)+b"
     comptime R = Regex[P]
     var memo = List[UInt64]()
-    var aborts = String("a") * 2200 + "c"
-    var matches = String("aab") + String("a") * 2198
-    assert_equal(aborts.byte_length(), matches.byte_length())
-    var slots = InlineArray[Int, R._num_slots](fill=-1)
+    var n = 2200
     var raised = False
-    try:
-        _ = _sbt_run[
-            pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
-        ](aborts.as_bytes(), 0, slots, memo)
-    except:
-        raised = True
-    assert_true(raised, "2200 a's must exhaust the backtracker")
+    while not raised:
+        assert_true(n <= 1 << 20, "no input length exhausts the backtracker")
+        memo = List[UInt64]()
+        var aborts = String("a") * n + "c"
+        var slots = Array[Int, R._num_slots](fill=-1)
+        try:
+            _ = _sbt_run[
+                pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
+            ](aborts.as_bytes(), 0, slots, memo)
+        except:
+            raised = True
+        if not raised:
+            n *= 2
     assert_equal(len(memo), 0, "an aborted attempt's bits are discarded")
-    var slots2 = InlineArray[Int, R._num_slots](fill=-1)
+    var matches = String("aab") + String("a") * (n - 2)
+    assert_equal(matches.byte_length(), n + 1)
+    var slots2 = Array[Int, R._num_slots](fill=-1)
     var end = _sbt_run[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](matches.as_bytes(), 0, slots2, memo)
@@ -344,14 +354,14 @@ def test_memo_reused_for_same_length_dropped_for_another() raises:
     comptime R = Regex[P]
     var memo = List[UInt64]()
     var text = String("a") * 300 + "c" + "aab"
-    var slots = InlineArray[Int, R._num_slots](fill=-1)
+    var slots = Array[Int, R._num_slots](fill=-1)
     var end0 = _sbt_run[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](text.as_bytes(), 0, slots, memo)
     assert_equal(end0, -1)
     var words = len(memo)
     assert_true(words > 0, "the exhausted attempt built the memo")
-    var slots2 = InlineArray[Int, R._num_slots](fill=-1)
+    var slots2 = Array[Int, R._num_slots](fill=-1)
     var end1 = _sbt_run[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](text.as_bytes(), 301, slots2, memo)
@@ -362,7 +372,7 @@ def test_memo_reused_for_same_length_dropped_for_another() raises:
     # A different length: stale buffer dropped; the fresh attempt fits
     # the budget, so no memo is rebuilt.
     var other = String("aab")
-    var slots3 = InlineArray[Int, R._num_slots](fill=-1)
+    var slots3 = Array[Int, R._num_slots](fill=-1)
     var end2 = _sbt_run[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
     ](other.as_bytes(), 0, slots3, memo)

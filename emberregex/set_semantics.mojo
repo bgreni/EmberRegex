@@ -23,7 +23,7 @@ at all: they change the AUTOMATON at build time (set_approx.mojo), so
 they cost nothing per byte.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import max
 
 from .ast import AnchorKind
@@ -252,14 +252,14 @@ def sem_table_len(num_patterns: Int) -> Int:
 
 def sem_table_arr[
     n: Int
-](flags: List[Int], ext: List[Int], num_patterns: Int) -> InlineArray[Int32, n]:
+](flags: List[Int], ext: List[Int], num_patterns: Int) -> Array[Int32, n]:
     """Comptime: flatten the per-pattern flags and extended parameters
     into one indexable table.
 
     The runtime filter indexes this by report id, which a comptime
     `List` parameter cannot serve — a materialized array can.
     """
-    var arr = InlineArray[Int32, n](fill=-1)
+    var arr = Array[Int32, n](fill=-1)
     for i in range(num_patterns):
         var b = SEM_STRIDE * i
         if b + SEM_MIN_LEN >= n:
@@ -273,7 +273,7 @@ def sem_table_arr[
 
 @always_inline
 def _keep[
-    n: Int, //, tbl: InlineArray[Int32, n]
+    n: Int, //, tbl: Array[Int32, n]
 ](
     id: Int,
     start: Int,
@@ -314,7 +314,7 @@ def _keep[
 
 
 def apply_semantics[
-    n: Int, //, tbl: InlineArray[Int32, n], num_patterns: Int
+    n: Int, //, tbl: Array[Int32, n], num_patterns: Int
 ](var reports: List[SetMatch]) -> List[SetMatch]:
     """Apply QUIET, SINGLEMATCH, min_offset and max_offset. Order is
     preserved, so the result is still (end, id) ordered."""
@@ -327,7 +327,7 @@ def apply_semantics[
 
 
 def apply_semantics_spans[
-    n: Int, //, tbl: InlineArray[Int32, n], num_patterns: Int
+    n: Int, //, tbl: Array[Int32, n], num_patterns: Int
 ](var spans: List[SetSpan]) -> List[SetSpan]:
     """Same filter over a SOM stream, plus `min_length`."""
     var out = List[SetSpan](capacity=len(spans))

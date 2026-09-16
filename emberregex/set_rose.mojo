@@ -71,7 +71,7 @@ accept state that also carries an EOL slice) and collapse in the final
 sort+dedup.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import min
 from std.sys import simd_width_of
 
@@ -146,7 +146,7 @@ comptime ROSE_LOOK_MAX_POP = 128
 comptime _LOOK_STRIDE = 9
 
 # Total states across ALL confirm DFAs. The concatenated table travels to
-# the walkers as a comptime InlineArray parameter, and Mojo spells such
+# the walkers as a comptime Array parameter, and Mojo spells such
 # parameters into the mangled symbol name at roughly 3 chars per entry —
 # 256 columns per state, so ~768 bytes of symbol per confirm state. The
 # linker rejects names past a few MB (measured: 3.5 MB already fails), so
@@ -158,7 +158,7 @@ comptime ROSE_CONF_STATE_CAP = 512
 
 struct RoseSet(Copyable, Movable):
     """Comptime-computed decomposition. Only ever exists as a comptime
-    value; the runtime walker reads the materialized InlineArray forms
+    value; the runtime walker reads the materialized Array forms
     (rose_table_arr / rose_flags_arr).
 
     `lit` is entry-indexed and holds exactly what the phase-1 Teddy
@@ -200,7 +200,7 @@ struct RoseSet(Copyable, Movable):
 
     def __init__(out self):
         """Invalid placeholder with one dead confirm state (keeps
-        downstream InlineArray sizes nonzero)."""
+        downstream Array sizes nonzero)."""
         self.valid = False
         self.lit = LiteralSet()
         self.offsets = List[Int]()
@@ -254,9 +254,9 @@ struct RoseView(Copyable, Movable):
       - flattening the nesting but keeping Lists -> 3.5 MB, still over:
         EVERY List field costs a fixed ~1 MB of memref hex regardless of
         how few elements it holds;
-      - the same data as `InlineArray` costs ~4 chars per element.
+      - the same data as `Array` costs ~4 chars per element.
 
-    So the per-entry pools travel as InlineArray parameters
+    So the per-entry pools travel as Array parameters
     (rose_meta_arr / rose_lits_arr) and this struct carries only scalars.
     The other lanes never hit this because their scan functions stay
     small enough to inline, at which point no symbol spells the values
@@ -344,8 +344,8 @@ def rose_lits_len(r: RoseSet) -> Int:
     return max(1, n)
 
 
-def rose_meta_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def rose_meta_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     var meta = _rose_meta(r)
     for i in range(min(n, len(meta))):
         arr[i] = Int32(meta[i])
@@ -356,10 +356,10 @@ def rose_bcls_len(r: RoseSet) -> Int:
     return max(1, 8 * len(r.back_classes))
 
 
-def rose_bcls_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
+def rose_bcls_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
     """Comptime: the byte bitmaps a variable-offset factor extends
     backward over, 8 words per entry (0 for fixed-offset entries)."""
-    var arr = InlineArray[Int32, n](fill=0)
+    var arr = Array[Int32, n](fill=0)
     for i in range(len(r.back_classes)):
         if len(r.back_classes[i]) != 8:
             continue
@@ -376,11 +376,11 @@ def rose_look_len(r: RoseSet) -> Int:
     return max(1, n)
 
 
-def rose_look_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
+def rose_look_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
     """Comptime: the concatenated lookaround records, _LOOK_STRIDE ints
     each (offset from the factor start, then 8 bitmap words). Entry i's
     slice starts at record _M_LOOKB and runs for _M_LOOKN records."""
-    var arr = InlineArray[Int32, n](fill=0)
+    var arr = Array[Int32, n](fill=0)
     var w = 0
     for i in range(len(r.looks)):
         for j in range(len(r.looks[i])):
@@ -390,8 +390,8 @@ def rose_look_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
     return arr^
 
 
-def rose_lits_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
-    var arr = InlineArray[Int32, n](fill=0)
+def rose_lits_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
+    var arr = Array[Int32, n](fill=0)
     var lits = _rose_lits(r)
     for i in range(min(n, len(lits))):
         arr[i] = Int32(lits[i])
@@ -400,7 +400,7 @@ def rose_lits_arr[n: Int](r: RoseSet) -> InlineArray[Int32, n]:
 
 def _entry_bytes[
     mn: Int, ln: Int
-](meta: InlineArray[Int32, mn], lits: InlineArray[Int32, ln], i: Int) -> List[
+](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[
     Int
 ]:
     """Comptime: entry i's factor bytes."""
@@ -414,7 +414,7 @@ def _entry_bytes[
 
 def _entry_caseless[
     mn: Int, ln: Int
-](meta: InlineArray[Int32, mn], lits: InlineArray[Int32, ln], i: Int) -> List[
+](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[
     Bool
 ]:
     """Comptime: entry i's per-byte caseless flags."""
@@ -428,7 +428,7 @@ def _entry_caseless[
 
 def _bucket_entries[
     mn: Int
-](meta: InlineArray[Int32, mn], n_entries: Int, b: Int) -> List[Int]:
+](meta: Array[Int32, mn], n_entries: Int, b: Int) -> List[Int]:
     """Comptime: entry indices assigned to candidate-mask bit b."""
     var out = List[Int]()
     for i in range(n_entries):
@@ -440,8 +440,8 @@ def _bucket_entries[
 def _rose_pos_masks[
     mn: Int, ln: Int
 ](
-    meta: InlineArray[Int32, mn],
-    lits: InlineArray[Int32, ln],
+    meta: Array[Int32, mn],
+    lits: Array[Int32, ln],
     n_entries: Int,
     j: Int,
 ) -> Tuple[_NibbleTable, _NibbleTable]:
@@ -1247,8 +1247,8 @@ def rose_table_str[n: Int](r: RoseSet) -> String:
     return table_bytes[DType.int32](r.conf_table, n)
 
 
-def rose_flags_arr[n: Int](r: RoseSet) -> InlineArray[UInt8, n]:
-    var arr = InlineArray[UInt8, n](fill=0)
+def rose_flags_arr[n: Int](r: RoseSet) -> Array[UInt8, n]:
+    var arr = Array[UInt8, n](fill=0)
     for i in range(n):
         arr[i] = UInt8(r.conf_flags[i])
     return arr^
@@ -1323,7 +1323,7 @@ def merge_reports(var a: List[SetMatch], b: List[SetMatch]) -> List[SetMatch]:
 
 @always_inline
 def _in_class[
-    bn: Int, //, words: InlineArray[Int32, bn], base: Int
+    bn: Int, //, words: Array[Int32, bn], base: Int
 ](b: Byte) -> Bool:
     """Is `b` in the 8-word byte set starting at `base`?"""
     var cls = materialize[words]()
@@ -1336,7 +1336,7 @@ def _look_ok[
     origin: Origin,
     kn: Int,
     //,
-    look: InlineArray[Int32, kn],
+    look: Array[Int32, kn],
     base: Int,
     n: Int,
 ](input: Span[Byte, origin], at: Int) -> Bool:
@@ -1394,10 +1394,10 @@ def _rose_walk[
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: InlineArray[UInt8, fn_],
-    meta: InlineArray[Int32, mn],
-    lits: InlineArray[Int32, ln],
-    bcls: InlineArray[Int32, bn],
+    flags: Array[UInt8, fn_],
+    meta: Array[Int32, mn],
+    lits: Array[Int32, ln],
+    bcls: Array[Int32, bn],
     pid: Int,
 ](
     input: Span[Byte, origin],
@@ -1451,10 +1451,10 @@ def _rose_confirm[
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: InlineArray[UInt8, fn_],
-    meta: InlineArray[Int32, mn],
-    lits: InlineArray[Int32, ln],
-    bcls: InlineArray[Int32, bn],
+    flags: Array[UInt8, fn_],
+    meta: Array[Int32, mn],
+    lits: Array[Int32, ln],
+    bcls: Array[Int32, bn],
     entry: Int,
     pid: Int,
 ](input: Span[Byte, origin], start: Int, mut out: List[SetMatch]):
@@ -1492,11 +1492,11 @@ def _rose_verify_at[
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: InlineArray[UInt8, fn_],
-    meta: InlineArray[Int32, mn],
-    lits: InlineArray[Int32, ln],
-    bcls: InlineArray[Int32, bn],
-    look: InlineArray[Int32, kn],
+    flags: Array[UInt8, fn_],
+    meta: Array[Int32, mn],
+    lits: Array[Int32, ln],
+    bcls: Array[Int32, bn],
+    look: Array[Int32, kn],
 ](
     input: Span[Byte, origin],
     at: Int,
@@ -1610,11 +1610,11 @@ def rose_scan[
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: InlineArray[UInt8, fn_],
-    meta: InlineArray[Int32, mn],
-    lits: InlineArray[Int32, ln],
-    bcls: InlineArray[Int32, bn],
-    look: InlineArray[Int32, kn],
+    flags: Array[UInt8, fn_],
+    meta: Array[Int32, mn],
+    lits: Array[Int32, ln],
+    bcls: Array[Int32, bn],
+    look: Array[Int32, kn],
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan for the factor-group patterns: Teddy front end, per-candidate
     confirmation. Returns contract-ordered, deduped reports.

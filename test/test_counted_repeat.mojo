@@ -30,7 +30,7 @@ from emberregex import Regex
 from emberregex.backtrack import sbt_counted_shapes
 from emberregex.engine import _sbt_run
 from emberregex.nfa import NFA
-from std.collections import InlineArray
+from std.collections import Array
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -421,7 +421,7 @@ def _sbt_end[p: String](input: String, pos: Int = 0) raises -> Int:
     test calls this rather than `search` precisely so the fallback is
     visible instead of being papered over."""
     comptime R = Regex[p]
-    var slots = InlineArray[Int, R._num_slots](fill=-1)
+    var slots = Array[Int, R._num_slots](fill=-1)
     var memo = List[UInt64]()
     return _sbt_run[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots

@@ -27,7 +27,7 @@ from emberregex.backtrack import (
     sbt_stack_low,
 )
 from emberregex.engine import _sbt_run
-from std.collections import InlineArray
+from std.collections import Array
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -92,7 +92,7 @@ def test_guard_trips_and_is_not_luck() raises:
     var text = String("ab") * 800
 
     # (1) floor 0 disables the guard (every real address is above it).
-    var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+    var slots = materialize[Array[Int, R._num_slots](fill=-1)]()
     var budget = SBT_BUDGET
     var got = _sbt_try_match[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
@@ -102,7 +102,7 @@ def test_guard_trips_and_is_not_luck() raises:
     assert_true(budget > SBT_BUDGET // 2)
 
     # (2) same walk, 64KB of stack to run in.
-    var slots2 = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+    var slots2 = materialize[Array[Int, R._num_slots](fill=-1)]()
     var budget2 = SBT_BUDGET
     var floor = sbt_stack_here() - 65536
     var got2 = _sbt_try_match[
@@ -121,7 +121,7 @@ def test_guard_does_not_fire_when_it_should_not() raises:
     comptime P = "((?:ab)+)c"
     comptime R = Regex[P]
     var text = String("ab") * 50 + "c"
-    var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+    var slots = materialize[Array[Int, R._num_slots](fill=-1)]()
     var budget = SBT_BUDGET
     var got = _sbt_try_match[
         pattern=R.pattern, state_idx=R._start, num_slots=R._num_slots
@@ -165,17 +165,17 @@ def test_floor_is_clamped_to_the_real_thread_stack() raises:
 @no_inline
 def _burn_then_walk[
     p: String
-](levels: Int, text: String, mut sink: InlineArray[Int, 4]) -> Int:
+](levels: Int, text: String, mut sink: Array[Int, 4]) -> Int:
     """Consume 64 KiB of stack per level, then run the backtracker.
 
     `@no_inline` and the `sink` writes are what stop the optimizer from
     turning this back into a loop with no frames.
     """
-    var pad = InlineArray[Int, 8192](fill=levels)
+    var pad = Array[Int, 8192](fill=levels)
     if levels == 0:
         sink[0] = Int(pad[levels & 8191])
         comptime R = Regex[p]
-        var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+        var slots = materialize[Array[Int, R._num_slots](fill=-1)]()
         var memo = List[UInt64]()
         try:
             return _sbt_run[
@@ -199,7 +199,7 @@ def test_deep_caller_does_not_overflow() raises:
     return, so 70 is chosen to be past the old cliff and comfortably
     inside the new bound.
     """
-    var sink = InlineArray[Int, 4](fill=0)
+    var sink = Array[Int, 4](fill=0)
     var text = String("a") * 200_000
     var got = _burn_then_walk["((?:a|a{2,})+)b"](70, text, sink)
     # Either answer is fine; not crashing is the assertion.
@@ -237,7 +237,7 @@ def _check[p: String](text: String) raises:
     # raised for both the work bound and the stack bound); it may not
     # crash, and it may not return a wrong answer.
     var want_end = want.end if (want.matched and want.start == 0) else -1
-    var slots = materialize[InlineArray[Int, R._num_slots](fill=-1)]()
+    var slots = materialize[Array[Int, R._num_slots](fill=-1)]()
     var memo = List[UInt64]()
     try:
         var end = _sbt_run[

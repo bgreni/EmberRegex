@@ -45,7 +45,7 @@ Continuation closures are memoized per target state in one flat pool.
 """
 
 from std.bit import count_leading_zeros, count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
@@ -1138,7 +1138,7 @@ def lfdfa_find_end[
     //,
     lf: LFDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Unanchored scan from `start`: the END of the leftmost-first match
     beginning at or after `start` (Python `re.search` semantics), or -1.
@@ -1162,7 +1162,7 @@ def lfdfa_match_at[
     //,
     lf: LFDFA,
     table: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], pos: Int) -> Int:
     """Anchored at `pos`: the leftmost-first END of a match starting
     exactly there, or -1. Needs a DFA built with `anchored=True`."""
@@ -1186,7 +1186,7 @@ def sheng_lfdfa_find_end[
     lf: LFDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
     """`lfdfa_find_end` on the shuffle engine."""
     return sheng_walk_from[
@@ -1209,7 +1209,7 @@ def sheng_lfdfa_match_at[
     lf: LFDFA,
     cap: Int,
     masks: StringLiteral,
-    flags: InlineArray[UInt8, ns],
+    flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], pos: Int) -> Int:
     """`lfdfa_match_at` on the shuffle engine."""
     comptime assert lf.has_anchored, "lfdfa_match_at needs anchored starts"

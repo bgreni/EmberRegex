@@ -20,7 +20,7 @@ bitmask into a lane index.
 """
 
 from std.bit import count_leading_zeros, count_trailing_zeros
-from std.collections import InlineArray
+from std.collections import Array
 from std.memory import bitcast, pack_bits
 from std.sys import simd_width_of
 from std.sys.info import CompilationTarget
@@ -142,8 +142,8 @@ def _lit_verify_rest[
     origin: Origin,
     n: Int,
     //,
-    lit: InlineArray[UInt8, n],
-    cl: InlineArray[Bool, n],
+    lit: Array[UInt8, n],
+    cl: Array[Bool, n],
     off_a: Int,
     off_b: Int,
 ](input: Span[Byte, origin], pos: Int) -> Bool:
@@ -168,8 +168,8 @@ def _lit_first_verified_lane[
     n: Int,
     W: Int,
     //,
-    lit: InlineArray[UInt8, n],
-    cl: InlineArray[Bool, n],
+    lit: Array[UInt8, n],
+    cl: Array[Bool, n],
     off_a: Int,
     off_b: Int,
 ](input: Span[Byte, origin], base: Int, m: SIMD[DType.bool, W]) -> Int:
@@ -190,8 +190,8 @@ def simd_find_literal_rare[
     origin: Origin,
     n: Int,
     //,
-    lit: InlineArray[UInt8, n],
-    cl: InlineArray[Bool, n],
+    lit: Array[UInt8, n],
+    cl: Array[Bool, n],
     off_a: Int,
     off_b: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
