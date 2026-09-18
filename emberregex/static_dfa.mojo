@@ -20,7 +20,7 @@ from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import PROBE_RANKS
 from .static_bytes import table_bytes
-from .dfa import _epsilon_closure, _check_eol_match, _reaches_match
+from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
 from .simd_kernels import (
@@ -795,64 +795,6 @@ def _classic_flags(
     return fl
 
 
-def _state_flags(nfa: NFA, states: List[Int], has_match: Bool) -> Int:
-    var f = 0
-    if has_match:
-        f |= Int(EDFA_MATCH)
-    if _check_eol_match(nfa, states, at_end=True):
-        f |= Int(EDFA_EOL_AT_END)
-    if _check_eol_match(nfa, states, at_end=False):
-        f |= Int(EDFA_EOL_AT_NEWLINE)
-    return f
-
-
-def _find_or_add(
-    nfa: NFA,
-    var closed: List[Int],
-    has_match: Bool,
-    mut sets: List[List[Int]],
-    mut flags: List[Int],
-) -> Int:
-    """Return the DFA state index for a closed NFA state set, adding it if new.
-
-    Linear scan with direct sorted-list comparison instead of a Dict: state
-    counts are capped small and this only runs in the comptime interpreter,
-    where string key construction costs more than int compares.
-    """
-    for k in range(len(sets)):
-        if sets[k] == closed:
-            return k
-    flags.append(_state_flags(nfa, closed, has_match))
-    sets.append(closed^)
-    return len(sets) - 1
-
-
-def _add_start(
-    nfa: NFA,
-    at_start: Bool,
-    after_newline: Bool,
-    mut sets: List[List[Int]],
-    mut flags: List[Int],
-) -> Int:
-    var seeds: List[Int] = [nfa.start]
-    var closed = List[Int]()
-    var m = _epsilon_closure(nfa, seeds^, closed, at_start, after_newline)
-    return _find_or_add(nfa, closed^, m, sets, flags)
-
-
-def _accepts(nfa: NFA, state: Int, byte: Int) -> Bool:
-    """Does consuming NFA state `state` accept `byte`?"""
-    var kind = nfa.states[state].kind
-    if kind == NFAStateKind.CHAR:
-        return UInt32(byte) == nfa.states[state].char_value
-    if kind == NFAStateKind.ANY:
-        return byte != Int(CHAR_NEWLINE)
-    if kind == NFAStateKind.CHARSET:
-        var cs = nfa.states[state].charset_index
-        return nfa.charsets[cs].contains(UInt32(byte))
-    return False
-
-
 def _mk_iota256_i64() -> SIMD[DType.int64, 256]:
     var v = SIMD[DType.int64, 256](0)
     for i in range(256):
@@ -1382,7 +1324,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     SIMD bitsets, per-state metadata is read out of the NFA exactly once,
     and continuation closures are memoized by target state — the inner
     loops touch only bitsets, SIMD lanes, and flat Lists. The naive form
-    (per-(state, byte) `_accepts` calls, List[Int] state sets) cost tens of
+    (per-(state, byte) accept tests, List[Int] state sets) cost tens of
     seconds to minutes per big Unicode class pattern.
 
     `minimize` is a test hook: it defaults on, and turning it off yields

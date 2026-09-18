@@ -78,8 +78,11 @@ from .constants import (
 from .ast import AST, ASTNode, ASTNodeKind, AnchorKind
 from .charset import CharSet, CharRange
 from .utf8 import negate_ranges, unicode_property
-from .errors import RegexError
 from .flags import RegexFlags
+
+
+def _regex_error(message: String, position: Int) -> Error:
+    return Error(String("RegexError at position ", position, ": ", message))
 
 
 struct Parser[origin: Origin](Movable):
@@ -113,7 +116,7 @@ struct Parser[origin: Origin](Movable):
             # ')' no '(' opened (`_parse_concat` breaks on it, and at the
             # top level there is no group to close). '|' is always eaten.
             assert self._peek() == CHAR_RPAREN, "parse stopped early"
-            raise Error(String(RegexError("Unmatched ')'", self.pos)))
+            raise _regex_error("Unmatched ')'", self.pos)
         # Build bitmaps for all charsets
         for i in range(len(self.ast.charsets)):
             self.ast.charsets[i].build_bitmap()
@@ -144,13 +147,9 @@ struct Parser[origin: Origin](Movable):
 
     def _expect(mut self, ch: Byte) raises:
         if self._at_end() or self._peek() != ch:
-            raise Error(
-                String(
-                    RegexError(
-                        "Expected '" + chr(Int(ch)) + "'",
-                        self.pos,
-                    )
-                )
+            raise _regex_error(
+                "Expected '" + chr(Int(ch)) + "'",
+                self.pos,
             )
         self.pos += 1
 
@@ -312,17 +311,13 @@ struct Parser[origin: Origin](Movable):
                     return (False, 0, 0)
                 self.pos += 1  # consume '}'
                 if max_val < min_val:
-                    raise Error(
-                        String(
-                            RegexError(
-                                "Invalid repetition: min ("
-                                + String(min_val)
-                                + ") > max ("
-                                + String(max_val)
-                                + ")",
-                                save_pos,
-                            )
-                        )
+                    raise _regex_error(
+                        "Invalid repetition: min ("
+                        + String(min_val)
+                        + ") > max ("
+                        + String(max_val)
+                        + ")",
+                        save_pos,
                     )
                 return (True, min_val, max_val)
             else:
@@ -359,7 +354,7 @@ struct Parser[origin: Origin](Movable):
         var value: UInt32 = 0
         for _ in range(count):
             if self._at_end():
-                raise Error(String(RegexError("Expected hex digit", self.pos)))
+                raise _regex_error("Expected hex digit", self.pos)
             var ch = self._advance()
             if ch >= CHAR_ZERO and ch <= CHAR_NINE:
                 value = value * 16 + UInt32(ch - CHAR_ZERO)
@@ -368,13 +363,9 @@ struct Parser[origin: Origin](Movable):
             elif ch >= CHAR_A_UPPER and ch <= CHAR_F_UPPER:
                 value = value * 16 + UInt32(ch - CHAR_A_UPPER + 10)
             else:
-                raise Error(
-                    String(
-                        RegexError(
-                            "Invalid hex digit '" + chr(Int(ch)) + "'",
-                            self.pos - 1,
-                        )
-                    )
+                raise _regex_error(
+                    "Invalid hex digit '" + chr(Int(ch)) + "'",
+                    self.pos - 1,
                 )
         return value
 
@@ -393,43 +384,29 @@ struct Parser[origin: Origin](Movable):
             elif ch >= CHAR_A_UPPER and ch <= CHAR_F_UPPER:
                 value = value * 16 + UInt32(ch - CHAR_A_UPPER + 10)
             else:
-                raise Error(
-                    String(
-                        RegexError(
-                            "Invalid hex digit in \\x{...}", self.pos - 1
-                        )
-                    )
+                raise _regex_error(
+                    "Invalid hex digit in \\x{...}", self.pos - 1
                 )
             ndig += 1
             if ndig > 6:
-                raise Error(
-                    String(RegexError("\\x{...} escape too long", self.pos))
-                )
+                raise _regex_error("\\x{...} escape too long", self.pos)
         if ndig == 0:
-            raise Error(String(RegexError("Empty \\x{...} escape", self.pos)))
+            raise _regex_error("Empty \\x{...} escape", self.pos)
         self._expect(CHAR_RBRACE)
         if value > 0x10FFFF:
-            raise Error(
-                String(
-                    RegexError("\\x{...} value above U+10FFFF", self.pos - 1)
-                )
-            )
+            raise _regex_error("\\x{...} value above U+10FFFF", self.pos - 1)
         return value
 
     def _check_needs_unicode(mut self, cp: UInt32, at: Int) raises:
         """Codepoints above U+00FF only have a byte-level meaning in
         UTF-8 mode — shared gate for \\u, \\U and \\x{...}."""
         if cp > 255 and not self.inline_flags.unicode():
-            raise Error(
-                String(
-                    RegexError(
-                        (
-                            "Unicode code point > U+00FF needs UTF-8 mode"
-                            " — prefix the pattern with (?u) or (*UTF8)"
-                        ),
-                        at,
-                    )
-                )
+            raise _regex_error(
+                (
+                    "Unicode code point > U+00FF needs UTF-8 mode"
+                    " — prefix the pattern with (?u) or (*UTF8)"
+                ),
+                at,
             )
 
     def _skip_verbose(mut self):
@@ -484,13 +461,9 @@ struct Parser[origin: Origin](Movable):
             self.pos += 1
             return self.ast.add_node(ASTNode.anchor(AnchorKind.EOL))
         elif ch == CHAR_STAR or ch == CHAR_PLUS or ch == CHAR_QUESTION:
-            raise Error(
-                String(
-                    RegexError(
-                        "Quantifier without preceding element",
-                        self.pos,
-                    )
-                )
+            raise _regex_error(
+                "Quantifier without preceding element",
+                self.pos,
             )
         else:
             self.pos += 1
@@ -544,26 +517,18 @@ struct Parser[origin: Origin](Movable):
                 )
                 self.pos = close + 1
             elif name == "UCP":
-                raise Error(
-                    String(
-                        RegexError(
-                            (
-                                "(*UCP) is not supported: UTF-8 mode does"
-                                " not give \\d \\w \\s \\b their Unicode"
-                                " meanings (PCRE's UCP contract); use"
-                                " (*UTF8) or (?u) for codepoint classes"
-                                " and \\p{...} for Unicode shorthands"
-                            ),
-                            self.pos,
-                        )
-                    )
+                raise _regex_error(
+                    (
+                        "(*UCP) is not supported: UTF-8 mode does"
+                        " not give \\d \\w \\s \\b their Unicode"
+                        " meanings (PCRE's UCP contract); use"
+                        " (*UTF8) or (?u) for codepoint classes"
+                        " and \\p{...} for Unicode shorthands"
+                    ),
+                    self.pos,
                 )
             else:
-                raise Error(
-                    String(
-                        RegexError("Unknown verb '(*" + name + ")'", self.pos)
-                    )
-                )
+                raise _regex_error("Unknown verb '(*" + name + ")'", self.pos)
 
     def _parse_group(mut self) raises -> Int:
         """Parse a group: (regex), (?:regex), (?=), (?!), (?<=), (?<!), (?P<name>).
@@ -578,12 +543,8 @@ struct Parser[origin: Origin](Movable):
         if not self._at_end() and self._peek() == CHAR_QUESTION:
             self.pos += 1  # consume '?'
             if self._at_end():
-                raise Error(
-                    String(
-                        RegexError(
-                            "Unexpected end of pattern after '(?'", self.pos
-                        )
-                    )
+                raise _regex_error(
+                    "Unexpected end of pattern after '(?'", self.pos
                 )
             var modifier = self._peek()
             if modifier == CHAR_HASH:
@@ -614,11 +575,7 @@ struct Parser[origin: Origin](Movable):
             elif modifier == CHAR_LESS_THAN:
                 self.pos += 1  # consume '<'
                 if self._at_end():
-                    raise Error(
-                        String(
-                            RegexError("Unexpected end after '(?<'", self.pos)
-                        )
-                    )
+                    raise _regex_error("Unexpected end after '(?<'", self.pos)
                 var next_ch = self._peek()
                 if next_ch == CHAR_EQUALS:
                     self.pos += 1  # consume '='
@@ -631,15 +588,11 @@ struct Parser[origin: Origin](Movable):
                     self._expect(CHAR_RPAREN)
                     return self.ast.add_node(ASTNode.lookbehind(inner, True))
                 else:
-                    raise Error(
-                        String(
-                            RegexError(
-                                "Unknown lookbehind modifier '(?<"
-                                + chr(Int(next_ch))
-                                + "'",
-                                self.pos - 2,
-                            )
-                        )
+                    raise _regex_error(
+                        "Unknown lookbehind modifier '(?<"
+                        + chr(Int(next_ch))
+                        + "'",
+                        self.pos - 2,
                     )
             elif modifier == CHAR_P_UPPER:
                 self.pos += 1  # consume 'P'
@@ -658,17 +611,13 @@ struct Parser[origin: Origin](Movable):
                     # no engine (Python/JS reject; PCRE/Perl/Ruby/Rust
                     # apply rightward only). Use (?flags:...) to scope.
                     if was_content_seen:
-                        raise Error(
-                            String(
-                                RegexError(
-                                    (
-                                        "global flags not at the start of"
-                                        " the pattern — use (?flags:...)"
-                                        " to scope flags to part of it"
-                                    ),
-                                    self.pos,
-                                )
-                            )
+                        raise _regex_error(
+                            (
+                                "global flags not at the start of"
+                                " the pattern — use (?flags:...)"
+                                " to scope flags to part of it"
+                            ),
+                            self.pos,
                         )
                     self.content_seen = was_content_seen
                     self.pos += 1  # consume ')'
@@ -693,24 +642,14 @@ struct Parser[origin: Origin](Movable):
                         ASTNode.scoped_flags(inner, add_flags, remove_flags)
                     )
                 else:
-                    raise Error(
-                        String(
-                            RegexError(
-                                "Expected ')' or ':' after inline flags",
-                                self.pos,
-                            )
-                        )
+                    raise _regex_error(
+                        "Expected ')' or ':' after inline flags",
+                        self.pos,
                     )
             else:
-                raise Error(
-                    String(
-                        RegexError(
-                            "Unknown group modifier '(?"
-                            + chr(Int(modifier))
-                            + "'",
-                            self.pos - 1,
-                        )
-                    )
+                raise _regex_error(
+                    "Unknown group modifier '(?" + chr(Int(modifier)) + "'",
+                    self.pos - 1,
                 )
         else:
             # Capturing group
@@ -784,30 +723,22 @@ struct Parser[origin: Origin](Movable):
                 or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
                 or ch == CHAR_UNDERSCORE
             ):
-                raise Error(
-                    String(
-                        RegexError(
-                            "Invalid group name: '" + chr(Int(ch)) + "'",
-                            self.pos,
-                        )
-                    )
+                raise _regex_error(
+                    "Invalid group name: '" + chr(Int(ch)) + "'",
+                    self.pos,
                 )
             self.pos += 1
         if self.pos == start:
-            raise Error(String(RegexError("Empty group name", self.pos)))
+            raise _regex_error("Empty group name", self.pos)
         return String(unsafe_from_utf8=self.pattern[start : self.pos])
 
     def _parse_escape(mut self) raises -> Int:
         """Parse a backslash escape sequence."""
         self.pos += 1  # consume '\\'
         if self._at_end():
-            raise Error(
-                String(
-                    RegexError(
-                        "Trailing backslash",
-                        self.pos - 1,
-                    )
-                )
+            raise _regex_error(
+                "Trailing backslash",
+                self.pos - 1,
             )
 
         var ch = self._advance()
@@ -894,13 +825,9 @@ struct Parser[origin: Origin](Movable):
                 if d2 <= 7 and d3 <= 7:
                     var val = d1 * 64 + d2 * 8 + d3
                     if val > 255:
-                        raise Error(
-                            String(
-                                RegexError(
-                                    "Octal escape outside 0-\\377",
-                                    self.pos - 2,
-                                )
-                            )
+                        raise _regex_error(
+                            "Octal escape outside 0-\\377",
+                            self.pos - 2,
                         )
                     self.pos += 2
                     return self.ast.add_node(ASTNode.literal(UInt32(val)))
@@ -912,15 +839,11 @@ struct Parser[origin: Origin](Movable):
                 self.pos += 1
                 group_index = d1 * 10 + d2
             if group_index > self.ast.group_count:
-                raise Error(
-                    String(
-                        RegexError(
-                            "Invalid backreference \\"
-                            + String(group_index)
-                            + ": group does not exist",
-                            self.pos - 2,
-                        )
-                    )
+                raise _regex_error(
+                    "Invalid backreference \\"
+                    + String(group_index)
+                    + ": group does not exist",
+                    self.pos - 2,
                 )
             return self.ast.add_node(ASTNode.backreference(group_index))
 
@@ -931,15 +854,11 @@ struct Parser[origin: Origin](Movable):
                 var n = self._parse_int()
                 self._expect(CHAR_GREATER_THAN)
                 if n < 1 or n > self.ast.group_count:
-                    raise Error(
-                        String(
-                            RegexError(
-                                "Invalid backreference \\g<"
-                                + String(n)
-                                + ">: group does not exist",
-                                self.pos - 1,
-                            )
-                        )
+                    raise _regex_error(
+                        "Invalid backreference \\g<"
+                        + String(n)
+                        + ">: group does not exist",
+                        self.pos - 1,
                     )
                 return self.ast.add_node(ASTNode.backreference(n))
             var name = self._parse_group_name()
@@ -949,13 +868,9 @@ struct Parser[origin: Origin](Movable):
                 return self.ast.add_node(
                     ASTNode.backreference(maybe_idx.value())
                 )
-            raise Error(
-                String(
-                    RegexError(
-                        "Unknown group name '" + name + "' in \\g<>",
-                        self.pos - name.byte_length() - 2,
-                    )
-                )
+            raise _regex_error(
+                "Unknown group name '" + name + "' in \\g<>",
+                self.pos - name.byte_length() - 2,
             )
 
         # Hex escapes: \xHH, or PCRE's \x{...}
@@ -972,31 +887,23 @@ struct Parser[origin: Origin](Movable):
         if ch == CHAR_U_LOWER:
             var cp = self._parse_hex_digits(4)
             if cp > 255 and not self.inline_flags.unicode():
-                raise Error(
-                    String(
-                        RegexError(
-                            (
-                                "Unicode code point > U+00FF needs UTF-8 mode"
-                                " — prefix the pattern with (?u) or (*UTF8)"
-                            ),
-                            self.pos - 5,
-                        )
-                    )
+                raise _regex_error(
+                    (
+                        "Unicode code point > U+00FF needs UTF-8 mode"
+                        " — prefix the pattern with (?u) or (*UTF8)"
+                    ),
+                    self.pos - 5,
                 )
             return self.ast.add_node(ASTNode.literal(cp))
         if ch == CHAR_U_UPPER:
             var cp = self._parse_hex_digits(8)
             if cp > 255 and not self.inline_flags.unicode():
-                raise Error(
-                    String(
-                        RegexError(
-                            (
-                                "Unicode code point > U+00FF needs UTF-8 mode"
-                                " — prefix the pattern with (?u) or (*UTF8)"
-                            ),
-                            self.pos - 9,
-                        )
-                    )
+                raise _regex_error(
+                    (
+                        "Unicode code point > U+00FF needs UTF-8 mode"
+                        " — prefix the pattern with (?u) or (*UTF8)"
+                    ),
+                    self.pos - 9,
                 )
             return self.ast.add_node(ASTNode.literal(cp))
 
@@ -1005,11 +912,7 @@ struct Parser[origin: Origin](Movable):
         # punctuation: \c{ is ';', \c; is '{').
         if ch == CHAR_C_LOWER:
             if self._at_end():
-                raise Error(
-                    String(
-                        RegexError("Expected character after \\c", self.pos - 1)
-                    )
-                )
+                raise _regex_error("Expected character after \\c", self.pos - 1)
             var ctrl = Int(self._advance())
             if ctrl >= 97 and ctrl <= 122:
                 ctrl -= 32
@@ -1028,13 +931,9 @@ struct Parser[origin: Origin](Movable):
             var known = True
             var pranges = unicode_property(pname, known)
             if not known:
-                raise Error(
-                    String(
-                        RegexError(
-                            "Unknown Unicode property '\\p{" + pname + "}'",
-                            self.pos,
-                        )
-                    )
+                raise _regex_error(
+                    "Unknown Unicode property '\\p{" + pname + "}'",
+                    self.pos,
                 )
             if negated_prop:
                 pranges = negate_ranges(pranges)
@@ -1113,13 +1012,9 @@ struct Parser[origin: Origin](Movable):
         ):
             return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
-        raise Error(
-            String(
-                RegexError(
-                    "Invalid escape sequence '\\" + chr(Int(ch)) + "'",
-                    self.pos - 2,
-                )
-            )
+        raise _regex_error(
+            "Invalid escape sequence '\\" + chr(Int(ch)) + "'",
+            self.pos - 2,
         )
 
     def _parse_cc_codepoint(mut self) raises -> UInt32:
@@ -1159,12 +1054,8 @@ struct Parser[origin: Origin](Movable):
 
         # It is an escape
         if self._at_end():
-            raise Error(
-                String(
-                    RegexError(
-                        "Trailing backslash in character class", self.pos - 1
-                    )
-                )
+            raise _regex_error(
+                "Trailing backslash in character class", self.pos - 1
             )
         var esc = self._advance()
         if esc == CHAR_t:
@@ -1198,13 +1089,9 @@ struct Parser[origin: Origin](Movable):
                 ocp = (ocp << 3) | UInt32(self._advance() - CHAR_ZERO)
                 ndig += 1
             if ocp > 255:
-                raise Error(
-                    String(
-                        RegexError(
-                            "Octal escape outside 0-\\377 in character class",
-                            self.pos - 1,
-                        )
-                    )
+                raise _regex_error(
+                    "Octal escape outside 0-\\377 in character class",
+                    self.pos - 1,
                 )
             return ocp
         elif esc == CHAR_X_LOWER:
@@ -1217,41 +1104,29 @@ struct Parser[origin: Origin](Movable):
         elif esc == CHAR_U_LOWER:
             var cp = self._parse_hex_digits(4)
             if cp > 255 and not self.inline_flags.unicode():
-                raise Error(
-                    String(
-                        RegexError(
-                            (
-                                "Unicode code point > U+00FF needs UTF-8 mode"
-                                " — prefix the pattern with (?u) or (*UTF8)"
-                            ),
-                            self.pos - 5,
-                        )
-                    )
+                raise _regex_error(
+                    (
+                        "Unicode code point > U+00FF needs UTF-8 mode"
+                        " — prefix the pattern with (?u) or (*UTF8)"
+                    ),
+                    self.pos - 5,
                 )
             return cp
         elif esc == CHAR_U_UPPER:
             var cp = self._parse_hex_digits(8)
             if cp > 255 and not self.inline_flags.unicode():
-                raise Error(
-                    String(
-                        RegexError(
-                            (
-                                "Unicode code point > U+00FF needs UTF-8 mode"
-                                " — prefix the pattern with (?u) or (*UTF8)"
-                            ),
-                            self.pos - 9,
-                        )
-                    )
+                raise _regex_error(
+                    (
+                        "Unicode code point > U+00FF needs UTF-8 mode"
+                        " — prefix the pattern with (?u) or (*UTF8)"
+                    ),
+                    self.pos - 9,
                 )
             return cp
         elif esc == CHAR_C_LOWER:
             # Same PCRE/Perl formula as the atom path: uppercase, XOR 0x40.
             if self._at_end():
-                raise Error(
-                    String(
-                        RegexError("Expected character after \\c", self.pos - 1)
-                    )
-                )
+                raise _regex_error("Expected character after \\c", self.pos - 1)
             var ctrl = Int(self._advance())
             if ctrl >= 97 and ctrl <= 122:
                 ctrl -= 32
@@ -1265,15 +1140,11 @@ struct Parser[origin: Origin](Movable):
             or (esc >= CHAR_A_UPPER and esc <= CHAR_Z_UPPER)
             or (esc >= CHAR_ZERO and esc <= CHAR_NINE)
         ):
-            raise Error(
-                String(
-                    RegexError(
-                        "Invalid escape sequence '\\"
-                        + chr(Int(esc))
-                        + "' in character class",
-                        self.pos - 2,
-                    )
-                )
+            raise _regex_error(
+                "Invalid escape sequence '\\"
+                + chr(Int(esc))
+                + "' in character class",
+                self.pos - 2,
             )
         return UInt32(esc)
 
@@ -1365,12 +1236,8 @@ struct Parser[origin: Origin](Movable):
             # so build it standalone and add the inverted byte set.
             var tmp = CharSet()
             if not Self._posix_class(name, tmp):
-                raise Error(
-                    String(
-                        RegexError(
-                            "Unknown POSIX class '[:" + name + ":]'", start
-                        )
-                    )
+                raise _regex_error(
+                    "Unknown POSIX class '[:" + name + ":]'", start
                 )
             tmp.build_bitmap()
             for b in range(256):
@@ -1378,11 +1245,7 @@ struct Parser[origin: Origin](Movable):
                     cs.add_range(UInt32(b), UInt32(b))
             return True
         if not Self._posix_class(name, cs):
-            raise Error(
-                String(
-                    RegexError("Unknown POSIX class '[:" + name + ":]'", start)
-                )
-            )
+            raise _regex_error("Unknown POSIX class '[:" + name + ":]'", start)
         return True
 
     def _parse_char_class(mut self) raises -> Int:
@@ -1511,32 +1374,22 @@ struct Parser[origin: Origin](Movable):
                         or esc == CHAR_V_LOWER
                         or esc == CHAR_V_UPPER
                     ):
-                        raise Error(
-                            String(
-                                RegexError(
-                                    (
-                                        "Bad character range: shorthand class"
-                                        " cannot be a range endpoint"
-                                    ),
-                                    self.pos,
-                                )
-                            )
+                        raise _regex_error(
+                            (
+                                "Bad character range: shorthand class"
+                                " cannot be a range endpoint"
+                            ),
+                            self.pos,
                         )
                 var hi = self._parse_cc_codepoint()
                 if hi < lo:
-                    raise Error(
-                        String(
-                            RegexError("Invalid character range", self.pos - 2)
-                        )
-                    )
+                    raise _regex_error("Invalid character range", self.pos - 2)
                 cs.add_range(lo, hi)
             else:
                 cs.add_range(lo, lo)
 
         if self._at_end():
-            raise Error(
-                String(RegexError("Unterminated character class", self.pos))
-            )
+            raise _regex_error("Unterminated character class", self.pos)
         self.pos += 1  # consume ']'
 
         if negated:

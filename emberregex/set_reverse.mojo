@@ -49,7 +49,7 @@ from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind
 from .set_dfa import (
-    _SET_INDEX_MASK,
+    _bs_find_or_add,
     _find_or_add_set,
     _pool_slice,
     _sorted_dedup,
@@ -61,8 +61,6 @@ from .static_dfa import (
     EDFA_NFA_CAP,
     _StateBits,
     _bs_any,
-    _bs_eq,
-    _bs_hash,
     _bs_set,
     _byte_classes,
     _flatten_nfa,
@@ -189,17 +187,7 @@ def _rev_closure(
                     # BOL kinds: keep them so the slices can find them,
                     # but the pop above stops the walk there.
                     stack.append(p)
-    _sort_ints(out)
-
-
-def _sort_ints(mut arr: List[Int]):
-    for i in range(1, len(arr)):
-        var key = arr[i]
-        var j = i - 1
-        while j >= 0 and arr[j] > key:
-            arr[j + 1] = arr[j]
-            j -= 1
-        arr[j + 1] = key
+    sort(out)
 
 
 def _start_ids(nfa: NFA, states: List[Int]) -> List[Int]:
@@ -554,7 +542,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         True,
         WB_DROP,
     )
-    var s_end = _rbs_find_or_add(c_end, sets_bits, hashes, index)
+    var s_end = _bs_find_or_add(c_end, sets_bits, hashes, index)
     var c_nl = _rev_flat_closure(
         kinds,
         anchors,
@@ -566,7 +554,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         True,
         WB_DROP,
     )
-    var s_nl = _rbs_find_or_add(c_nl, sets_bits, hashes, index)
+    var s_nl = _bs_find_or_add(c_nl, sets_bits, hashes, index)
     var c_other = _rev_flat_closure(
         kinds,
         anchors,
@@ -578,7 +566,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         False,
         WB_DROP,
     )
-    var s_other = _rbs_find_or_add(c_other, sets_bits, hashes, index)
+    var s_other = _bs_find_or_add(c_other, sets_bits, hashes, index)
 
     # Per-seed reverse closures, memoized lazily (closure distributes
     # over union). Two variants: mid-line and just-after-'\n'.
@@ -672,13 +660,13 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
                         closed = closed | gval_n.unsafe_get(slot)
                     else:
                         closed = closed | gval_o.unsafe_get(slot)
-            var tid = _rbs_find_or_add(closed, sets_bits, hashes, index)
+            var tid = _bs_find_or_add(closed, sets_bits, hashes, index)
             for b in range(Int(rep_lo[ci]), Int(rep_hi[ci]) + 1):
                 row[b] = Int32(tid)
         rows.append(row)
         cur += 1
 
-    # Materialize member lists (ascending, matching _sort_ints order) and
+    # Materialize member lists (ascending, matching the sorted order) and
     # the flat table in discovery order.
     var n_sets = len(sets_bits)
     var sets = List[List[Int]]()
@@ -699,29 +687,6 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
         )
 
     return _rdfa_finish(nfa, preds, sets, table^, s_end, s_nl, s_other, result^)
-
-
-def _rbs_find_or_add(
-    closed: _StateBits,
-    mut sets_bits: List[_StateBits],
-    mut hashes: List[UInt64],
-    mut index: List[Int],
-) -> Int:
-    """Intern a reverse bitset state set; insertion order — and therefore
-    state numbering — matches `_rev_find_or_add` exactly."""
-    var h = _bs_hash(closed)
-    var slot = Int(h & UInt64(_SET_INDEX_MASK))
-    while True:
-        var packed = index[slot]
-        if packed == 0:
-            hashes.append(h)
-            sets_bits.append(closed)
-            index[slot] = len(sets_bits)  # store id + 1
-            return len(sets_bits) - 1
-        var k = packed - 1
-        if hashes[k] == h and _bs_eq(sets_bits.unsafe_get(k), closed):
-            return k
-        slot = (slot + 1) & _SET_INDEX_MASK
 
 
 def _build_reverse_dfa_list(nfa: NFA) -> ReverseDFA:

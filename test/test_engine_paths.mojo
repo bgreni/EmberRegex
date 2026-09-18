@@ -1,13 +1,10 @@
 """Engine paths the lane tests leave dark.
 
-Three kinds of test live here, grouped by cost:
+Two kinds of test live here, grouped by cost:
 
 - Runtime-built NFAs driven straight into an engine (`heapbt_match`, the
   Pike VM, the leftmost-first end analyses): no comptime instantiation,
   no lane pin needed — the engine is named, not selected.
-- One-pass tables built for tiny anchor shapes and walked directly with
-  `onepass_find_end`, whose start-context and end-condition branches no
-  engine verb reaches (nothing calls it today).
 - A handful of `Regex[...]` verbs whose shape steers a lane into a branch
   no other file's patterns take: the budget raise and every `_pike_*`
   fallback of the backtracker lane, the multiline BOL skip and empty-match
@@ -26,19 +23,7 @@ from emberregex.engine import (
 )
 from emberregex.executor import PikeVM, _VMBuffers, heapbt_match
 from emberregex.nfa import split_cycle_flags
-from emberregex.onepass import (
-    build_onepass,
-    onepass_class_arr,
-    onepass_eps_arr,
-    onepass_eps_len,
-    onepass_find_end,
-    onepass_state_arr,
-    onepass_state_len,
-    onepass_table_len,
-    onepass_table_str,
-)
 from emberregex.result import MatchResult
-from emberregex.static_bytes import static_bytes
 from std.collections import Array
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -171,78 +156,6 @@ def test_pike_ignores_saves_beyond_its_slots() raises:
     assert_true(m.matched)
     assert_equal(m.start, 1)
     assert_equal(m.end, 3)
-
-
-# --- One-pass walker: start context and end conditions ----------------------
-
-
-def _op_valid[p: StaticString]() -> Bool:
-    comptime op = build_onepass(_build_static_nfa(p), True)
-    return op.valid
-
-
-def _op_find_end[
-    p: StaticString, n: Int
-](input: String, start: Int, mut slots: Array[Int, n]) -> Int:
-    comptime op = build_onepass(_build_static_nfa(p), True)
-    comptime TN = onepass_table_len(op)
-    comptime TBL = static_bytes[onepass_table_str[TN](op)]()
-    comptime CLS = onepass_class_arr(op)
-    comptime NE = onepass_eps_len(op)
-    comptime EPS = onepass_eps_arr[NE](op)
-    comptime NS = onepass_state_len(op)
-    comptime ST = onepass_state_arr[NS](op)
-    var steps = 0
-    return onepass_find_end[
-        op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=n
-    ](input.as_bytes(), start, slots, steps)
-
-
-def test_onepass_find_end_multiline_contexts() raises:
-    # `(?m)^` picks the after-newline start state; `$` before a newline
-    # records the match and the dead byte after it returns that end; a
-    # non-newline after the loop refuses the match.
-    comptime P = "(?m)^(?:(a)|b)+$"
-    assert_true(_op_valid[P]())
-    var s = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[P, 2]("x\nab", 2, s), 4)
-    assert_equal(s[0], 2)
-    assert_equal(s[1], 3)
-    var s1 = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[P, 2]("xab", 1, s1), -1)
-    var s2 = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[P, 2]("ab\nq", 0, s2), 2)
-    var s3 = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[P, 2]("abx", 0, s3), -1)
-    # End of input in a non-match state.
-    var s4 = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[P, 2]("", 0, s4), -1)
-
-
-def test_onepass_find_end_word_conditions() raises:
-    # A leading `\b` picks the after-word start state (no match after a
-    # word byte); a trailing `\b` needs a non-word next byte; `\B` needs a
-    # word byte, so end of input refuses it.
-    comptime WB = "\\b(?:(a)|b)+\\b"
-    assert_true(_op_valid[WB]())
-    var s = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[WB, 2]("xab", 1, s), -1)
-    assert_equal(_op_find_end[WB, 2](" ab", 1, s), 3)
-    assert_equal(_op_find_end[WB, 2]("abc", 0, s), -1)
-    assert_equal(_op_find_end[WB, 2]("ab ", 0, s), 2)
-    comptime NB = "(?:(a)|b)+\\B"
-    assert_true(_op_valid[NB]())
-    var t = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[NB, 2]("abc", 0, t), 2)
-    # Python: re.match(r'(?:(a)|b)+\B', 'ab').span() == (0, 1) -- the
-    # boundary between `a` and `b` is not a word boundary, so the earlier
-    # end is kept when end of input refuses the later one.
-    assert_equal(_op_find_end[NB, 2]("ab", 0, t), 1)
-    comptime EOL = "(?:(a)|b)+$"
-    assert_true(_op_valid[EOL]())
-    var u = Array[Int, 2](fill=-1)
-    assert_equal(_op_find_end[EOL, 2]("abx", 0, u), -1)
-    assert_equal(_op_find_end[EOL, 2]("ab", 0, u), 2)
 
 
 # --- Leftmost-first end analyses, reference (List) forms at runtime ---------

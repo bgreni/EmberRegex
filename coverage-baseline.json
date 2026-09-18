@@ -1,6 +1,6 @@
 {
-  "hit": 7447,
-  "total": 7522,
-  "percent": 99.0,
+  "hit": 7217,
+  "total": 7289,
+  "percent": 99.01,
   "note": "Line coverage of emberregex/ over the suite, as run_coverage.py measures it. CI fails a PR whose ratio falls below this. Raise it (or, with a reviewed reason in the PR, lower it) by running `pixi run coverage --update-baseline`."
 }

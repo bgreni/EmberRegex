@@ -207,20 +207,6 @@ def main():
     # \s in Unicode mode: Z plus the ASCII controls that are whitespace.
     emit_list("UC_Space", union(cats["Z"], [(0x9, 0xD), (0x85, 0x85)]))
 
-    names = (
-        [m for m, _ in MAJOR] + CATEGORIES + ["Alnum", "Word", "Space"]
-    )
-    print("# Every table name this module defines, for the lookup in utf8.mojo.")
-    print("comptime UNICODE_CATEGORY_NAMES: List[String] = [")
-    for n in names:
-        print(f'    "{n}",')
-    print("]")
-    print()
-    print("comptime UNICODE_SCRIPT_NAMES: List[String] = [")
-    for n in sorted(scripts):
-        print(f'    "{n}",')
-    print("]")
-
 
 if __name__ == "__main__":
     main()

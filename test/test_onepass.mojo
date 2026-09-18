@@ -31,7 +31,6 @@ from emberregex.onepass import (
     onepass_class_arr,
     onepass_eps_arr,
     onepass_eps_len,
-    onepass_find_end,
     onepass_match,
     onepass_state_arr,
     onepass_state_len,
@@ -220,13 +219,6 @@ def test_onepass_walker_acceleration() raises:
     assert_equal(slots[3], 39)
     assert_equal(slots[4], 40)  # (b)
     assert_equal(slots[5], 41)
-    var slots2 = Array[Int, 8](fill=-1)
-    var steps = 0
-    var e2 = onepass_find_end[
-        op=op, table=TBL, classes=CLS, eps=EPS, states=ST, num_slots=8
-    ](s.as_bytes(), 0, slots2, steps)
-    assert_equal(e2, s.byte_length())
-    assert_equal(slots2[3], 39)
     # A dead walk: no ';' → no match.
     var miss = String("a") + String("x") * 40
     var slots3 = Array[Int, 8](fill=-1)

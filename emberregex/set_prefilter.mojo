@@ -131,20 +131,6 @@ def prefilter_ast(mut ast: AST, mut needs_confirm: Bool) -> Bool:
     return True
 
 
-def ast_needs_prefilter(ast: AST) -> Bool:
-    """Comptime: does this pattern contain anything needing the
-    widen-and-confirm path?"""
-    for i in range(len(ast.nodes)):
-        var k = ast.nodes[i].kind
-        if (
-            k == ASTNodeKind.LOOKAHEAD
-            or k == ASTNodeKind.LOOKBEHIND
-            or k == ASTNodeKind.BACKREFERENCE
-        ):
-            return True
-    return False
-
-
 # --- Confirmation -----------------------------------------------------------
 
 

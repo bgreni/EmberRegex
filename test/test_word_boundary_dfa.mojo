@@ -208,7 +208,7 @@ def _prev_states_entered_on_word_bytes(lf: LFDFA) -> Bool:
 
 def _lf_prev_invariant[p: StaticString]() -> Bool:
     comptime nfa = Regex[p].nfa
-    comptime lf = build_lf_dfa(nfa, True, False, False)
+    comptime lf = build_lf_dfa(nfa, True, minimize=False)
     comptime ok = _prev_states_entered_on_word_bytes(lf)
     return ok
 

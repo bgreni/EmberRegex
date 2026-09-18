@@ -31,6 +31,15 @@ struct NFAStateKind:
     comptime BACKREF = 9  # Backreference to captured group
 
 
+def is_consuming_kind(kind: Int) -> Bool:
+    """Does a state of this kind consume an input byte?"""
+    return (
+        kind == NFAStateKind.CHAR
+        or kind == NFAStateKind.CHARSET
+        or kind == NFAStateKind.ANY
+    )
+
+
 struct NFAState(Copyable, Movable):
     """A single state in the NFA."""
 
@@ -269,12 +278,12 @@ def build_nfa(var ast: AST, flags: RegexFlags = RegexFlags()) raises -> NFA:
 
 def _split_cycle_flags_list(nfa: NFA) -> List[Bool]:
     """Comptime: per-state flag, True when the state lies on a directed
-    cycle of the graph `forms_cycle` walks (SPLIT -> out1+out2, MATCH ->
+    cycle of the graph (SPLIT -> out1+out2, MATCH ->
     nothing, everything else -> out1).
 
     One iterative Tarjan SCC pass: a state is on a cycle exactly when its
-    SCC has more than one member, or it points at itself. Callers that
-    used to ask `forms_cycle` per SPLIT made engine selection quadratic —
+    SCC has more than one member, or it points at itself. A whole-graph
+    walk per SPLIT made engine selection quadratic —
     `(?u)\\p{L}+` has ~800 cyclic SPLITs over ~2100 states, and the
     per-split whole-graph walks cost minutes in the comptime interpreter.
     Identical comptime calls are memoized, so several callers asking for
@@ -484,7 +493,7 @@ def _nfa_has_backref(nfa: NFA) -> Bool:
 
 def split_cycle_flags[fast: Bool = True](nfa: NFA) -> List[Bool]:
     """Comptime: per-state flag, True when the state lies on a directed
-    cycle of the graph `forms_cycle` walks (SPLIT -> out1+out2, MATCH ->
+    cycle of the graph (SPLIT -> out1+out2, MATCH ->
     nothing, everything else -> out1). One Tarjan SCC pass; see
     `_split_cycle_flags_list` for the semantics and `_split_cycle_flags_simd`
     for why the arrays are SIMD lanes (a 2082-state property NFA: ~4 s
@@ -511,36 +520,6 @@ def split_cycle_flags[fast: Bool = True](nfa: NFA) -> List[Bool]:
         return _split_cycle_flags_simd[4096](nfa)
     else:
         return _split_cycle_flags_list(nfa)
-
-
-def forms_cycle(nfa: NFA, split_idx: Int) -> Bool:
-    """Return True if either arm of split_idx eventually loops back to it.
-
-    This detects SPLIT states that are part of quantifier loops (*, +,
-    {n,}). Greedy loops carry the body in out1, lazy loops in out2, so
-    both arms are seeded.
-    """
-    var num_states = len(nfa.states)
-    var visited = List[Bool](length=num_states, fill=False)
-    var stack = List[Int]()
-    stack.append(nfa.states[split_idx].out1)
-    stack.append(nfa.states[split_idx].out2)
-    while len(stack) > 0:
-        var idx = stack.pop()
-        if idx < 0 or idx >= num_states or visited[idx]:
-            continue
-        if idx == split_idx:
-            return True
-        visited[idx] = True
-        var kind = nfa.states[idx].kind
-        if kind == NFAStateKind.SPLIT:
-            stack.append(nfa.states[idx].out1)
-            stack.append(nfa.states[idx].out2)
-        elif kind == NFAStateKind.MATCH:
-            pass  # dead end
-        else:  # CHAR, CHARSET, ANY, SAVE, ANCHOR, etc.
-            stack.append(nfa.states[idx].out1)
-    return False
 
 
 def _detect_start_anchor(mut nfa: NFA):

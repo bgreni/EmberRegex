@@ -112,19 +112,11 @@ struct LFDFA(Copyable, Movable):
 
     `d` is the table in EagerDFA form — the same walkers, acceleration
     data, flag bytes and Sheng masks apply — with its `start_*` fields
-    holding the UNANCHORED start states (restart bit set). The anchored
-    starts are kept separately and only built on request
-    (`build_lf_dfa(..., anchored=True)`): they roughly double the state
-    count, and the search-family verbs never need them.
+    holding the UNANCHORED start states (restart bit set).
     """
 
     var valid: Bool
     var d: EagerDFA
-    var has_anchored: Bool
-    var astart_at_0: Int
-    var astart_after_nl: Int
-    var astart_other: Int
-    var astart_other_word: Int  # mid-line after a word byte
     # Debug/test view: the ids (in `d`'s numbering) of the states whose
     # look-behind class is "word". Exact only when built with
     # `minimize=False` (minimization may merge such a state with an
@@ -134,11 +126,6 @@ struct LFDFA(Copyable, Movable):
     def __init__(out self):
         self.valid = False
         self.d = EagerDFA()
-        self.has_anchored = False
-        self.astart_at_0 = 0
-        self.astart_after_nl = 0
-        self.astart_other = 0
-        self.astart_other_word = 0
         self.prev_ids = List[Int]()
 
 
@@ -270,7 +257,6 @@ def _lf_memo_closure(
 def build_lf_dfa(
     nfa: NFA,
     enabled: Bool,
-    anchored: Bool = False,
     minimize: Bool = True,
 ) -> LFDFA:
     """Leftmost-first subset construction — runs at compile time.
@@ -280,8 +266,7 @@ def build_lf_dfa(
     the lane capacity, or when the state count exceeds EDFA_STATE_CAP
     (callers then use the lazy DFA, or the backtracker for lazy patterns).
 
-    Start contexts: the three unanchored ones (restart bit set) always;
-    the three anchored ones (restart clear) when `anchored` is set. The
+    Start contexts: the three unanchored ones (restart bit set). The
     restart bit is only ever set when some context's start closure is
     non-empty — for a `^`-anchored pattern nothing can start mid-input,
     so its unanchored states are its anchored states.
@@ -471,15 +456,12 @@ def build_lf_dfa(
     var st_selfloop = List[Bool]()
     var st_genuine = List[Bool]()
 
-    # --- Start states: (other, after-nl, at-0[, other-after-word])
-    # unanchored, then the same anchored.
+    # --- Start states: (other, after-nl, at-0[, other-after-word]),
+    # unanchored.
     var starts = List[Int]()
     var nctx = 4 if has_wb else 3
-    var nstart_ctx = 2 * nctx if anchored else nctx
-    for k in range(nstart_ctx):
-        var ctxk = k % nctx
+    for ctxk in range(nctx):
         var ctx = ctxk if ctxk < 3 else 0
-        var with_restart = k < nctx and has_restart
         var off = len(pool)
         var cnt = _lf_closure(
             kinds,
@@ -530,7 +512,7 @@ def build_lf_dfa(
                         eol_nl_ok,
                     )
             acc_fl = _wb_normalize(acc_fl)
-        var new_restart = with_restart and not trunc
+        var new_restart = has_restart and not trunc
         acc[_LF_TAIL_LANE] = 0
         acc[_LF_RESTART_LANE] = 1 if new_restart else 0
         acc[_LF_PREV_LANE] = 1 if prev else 0
@@ -1102,23 +1084,10 @@ def build_lf_dfa(
     var pstarts = _edfa_finish(
         result.d, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize, nctx
     )
-    for k in range(nstart_ctx, len(pstarts)):
+    for k in range(nctx, len(pstarts)):
         result.prev_ids.append(pstarts[k])
     if has_wb:
         result.d.start_other_word = pstarts[3]
-    if anchored:
-        result.has_anchored = True
-        result.astart_other = pstarts[nctx]
-        result.astart_after_nl = pstarts[nctx + 1]
-        result.astart_at_0 = pstarts[nctx + 2]
-        result.astart_other_word = pstarts[
-            nctx + 3
-        ] if has_wb else result.astart_other
-    else:
-        result.astart_other = result.d.start_other
-        result.astart_after_nl = result.d.start_after_nl
-        result.astart_at_0 = result.d.start_at_0
-        result.astart_other_word = result.d.start_other_word
     result.valid = True
     return result^
 
@@ -1156,29 +1125,6 @@ def lfdfa_find_end[
 
 
 @always_inline
-def lfdfa_match_at[
-    origin: Origin,
-    ns: Int,
-    //,
-    lf: LFDFA,
-    table: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], pos: Int) -> Int:
-    """Anchored at `pos`: the leftmost-first END of a match starting
-    exactly there, or -1. Needs a DFA built with `anchored=True`."""
-    comptime assert lf.has_anchored, "lfdfa_match_at needs anchored starts"
-    return edfa_walk_from[
-        d=lf.d,
-        table=table,
-        flags=flags,
-        s_at0=lf.astart_at_0,
-        s_nl=lf.astart_after_nl,
-        s_other=lf.astart_other,
-        s_other_w=lf.astart_other_word,
-    ](input, pos)
-
-
-@always_inline
 def sheng_lfdfa_find_end[
     origin: Origin,
     ns: Int,
@@ -1199,27 +1145,3 @@ def sheng_lfdfa_find_end[
         s_other=lf.d.start_other,
         s_other_w=lf.d.start_other_word,
     ](input, start)
-
-
-@always_inline
-def sheng_lfdfa_match_at[
-    origin: Origin,
-    ns: Int,
-    //,
-    lf: LFDFA,
-    cap: Int,
-    masks: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], pos: Int) -> Int:
-    """`lfdfa_match_at` on the shuffle engine."""
-    comptime assert lf.has_anchored, "lfdfa_match_at needs anchored starts"
-    return sheng_walk_from[
-        d=lf.d,
-        cap=cap,
-        masks=masks,
-        flags=flags,
-        s_at0=lf.astart_at_0,
-        s_nl=lf.astart_after_nl,
-        s_other=lf.astart_other,
-        s_other_w=lf.astart_other_word,
-    ](input, pos)

@@ -48,9 +48,7 @@ Two things differ from regex-automata by design:
   `[start, end_pin)` and require a match state there. With a unique path
   per input, that path's slot writes ARE Python's assignment (the first
   path in priority order that reaches MATCH at the pinned end is the only
-  one). The transition still records whether MATCH preceded its consuming
-  member in priority order (`match_wins`), so a leftmost-first walker can
-  be built on the same tables.
+  one).
 - Anchors resolve at build time where the context allows (BOL kinds
   against the state's context; `\\b` / `\\B` against the look-behind class
   and the class of the byte being consumed — `_byte_classes` cuts the
@@ -118,11 +116,8 @@ from .simd_kernels import (
 # state count is bounded by the NFA; the cap keeps the table (and the
 # comptime work) of big Unicode tries off this lane.
 comptime ONEPASS_STATE_CAP = 128
-# Slot sets are the low 63 bits of a 64-bit word; bit 63 of a slot-set
-# word is `match_wins` (see `_OP_MW_BIT`).
+# Slot sets are the low 63 bits of a 64-bit word.
 comptime ONEPASS_MAX_SLOTS = 63
-comptime _OP_MW_BIT: UInt64 = UInt64(1) << 63
-comptime _OP_SLOT_MASK: UInt64 = ~_OP_MW_BIT
 
 # Per-state match flags (OnePass.match_flags / onepass_state_arr).
 comptime OP_MATCH: UInt8 = 1  # MATCH is in the state's closure
@@ -167,8 +162,7 @@ struct OnePass(Copyable, Movable):
     var class_of: List[Int]  # 256 entries: byte -> class
     var trans_next: List[Int]  # num_states * nclasses; -1 = dead
     var trans_eps: List[Int]  # slot-set id per cell (meaningful when live)
-    # Slot-set id -> slot bitset (bits 0..62) with `_OP_MW_BIT` set when
-    # MATCH preceded the consuming member in priority order; id 0 = empty.
+    # Slot-set id -> slot bitset (bits 0..62); id 0 = empty.
     var eps_sets: List[UInt64]
     var match_eps: List[Int]  # per state: slot-set id on the path to MATCH
     var match_flags: List[Int]  # per state: OP_* bits
@@ -282,16 +276,15 @@ def _op_norm_ctx(
     return ctx
 
 
-def _op_intern_eps(mut eps_sets: List[UInt64], sl: UInt64, mw: Bool) -> Int:
-    """Id of the (slot set, match-preceded) word, appending a new one
-    when unseen; -1 past _OP_MAX_EPS ids."""
-    var word = sl | (_OP_MW_BIT if mw else UInt64(0))
+def _op_intern_eps(mut eps_sets: List[UInt64], sl: UInt64) -> Int:
+    """Id of the slot-set word, appending a new one when unseen; -1 past
+    _OP_MAX_EPS ids."""
     for i in range(len(eps_sets)):
-        if eps_sets[i] == word:
+        if eps_sets[i] == sl:
             return i
     if len(eps_sets) >= _OP_MAX_EPS:
         return -1
-    eps_sets.append(word)
+    eps_sets.append(sl)
     return len(eps_sets) - 1
 
 
@@ -460,7 +453,6 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
             match_flags.append(0)
         var ctx = st_ctx[d]
         var seen = _StateBits(0)
-        var matched = False
         stk_s.clear()
         stk_sl.clear()
         stk_need.clear()
@@ -542,12 +534,11 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
             elif kind == NFAStateKind.MATCH:
                 # First visit only (`seen`): the highest-priority path to
                 # MATCH from this state.
-                var eid = _op_intern_eps(eps_sets, sl, False)
+                var eid = _op_intern_eps(eps_sets, sl)
                 if eid < 0:
                     return result^
                 match_eps[d] = eid
                 match_flags[d] = Int(OP_MATCH) | need
-                matched = True
             elif (
                 kind == NFAStateKind.CHAR
                 or kind == NFAStateKind.CHARSET
@@ -564,7 +555,7 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
                     cm = cm & ~word_mask
                 if cm.reduce_or() == 0:
                     continue
-                var eid = _op_intern_eps(eps_sets, sl, matched)
+                var eid = _op_intern_eps(eps_sets, sl)
                 if eid < 0:
                     return result^
                 var target = out1s[s]
@@ -766,8 +757,8 @@ def onepass_state_arr[n: Int](op: OnePass) -> Array[Int32, n]:
 
 @always_inline
 def _op_apply(mask: UInt64, pos: Int, mut slots: Array[Int, _]):
-    """Write `pos` into every slot of `mask` (its `_OP_MW_BIT` ignored)."""
-    var m = mask & _OP_SLOT_MASK
+    """Write `pos` into every slot of `mask`."""
+    var m = mask
     while m != 0:
         var k = Int(count_trailing_zeros(m))
         slots[k] = pos
@@ -940,147 +931,3 @@ def onepass_match[
         num_slots=num_slots,
         accel=False,
     ](input, start, end_pin, slots)
-
-
-@always_inline
-def _onepass_find_end_impl[
-    origin: Origin,
-    ne: Int,
-    ns: Int,
-    //,
-    op: OnePass,
-    table: StringLiteral,
-    classes: Array[UInt8, ONEPASS_CLASS_LEN],
-    eps: Array[UInt64, ne],
-    states: Array[Int32, ns],
-    num_slots: Int,
-    accel: Bool,
-](
-    input: Span[Byte, origin],
-    start: Int,
-    mut slots: Array[Int, num_slots],
-    mut steps: Int,
-) -> Int:
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
-    var cls = materialize[classes]()
-    var ep = materialize[eps]()
-    var st = materialize[states]()
-    var input_len = len(input)
-    var sid = _op_start_state[op](input, start)
-    var row = sid * op.nclasses
-    var pos = start
-    var best = -1
-    # The entry slots until a match is recorded: a -1 return hands them
-    # back untouched (the lane tries the next candidate with them, as
-    # the backtracker's restoring SAVEs do).
-    var best_slots = slots.copy()
-    while pos < input_len:
-        var info = Int(st.unsafe_get(sid))
-        comptime if accel:
-            # Skipped positions need no match bookkeeping: an accelerated
-            # state's loop writes no slot and its match-ness (if any) is
-            # unconditional — see the acceleration scan in
-            # `build_onepass` — so the exit position, reached in the same
-            # state, records the later (overriding) end below.
-            var unused = -1
-            var p2 = _edfa_accel_skip[d=op.accel](input, sid, pos, unused)
-            if p2 > pos:
-                steps += p2 - pos
-                pos = p2
-                if pos >= input_len:
-                    break
-        var v = Int(
-            tbl[
-                unsafe_offset=row
-                + Int(cls.unsafe_get(Int(input.unsafe_get(pos))))
-            ]
-        )
-        if info & Int(OP_MATCH) != 0 and _op_match_ok[op](
-            input, pos, info & 0xFF
-        ):
-            best = pos
-            best_slots = slots.copy()
-            _op_apply(
-                ep.unsafe_get(info >> _OP_STATE_EPS_SHIFT), pos, best_slots
-            )
-            # MATCH outranks the thread that would consume this byte:
-            # leftmost-first stops here.
-            if v < 0 or (ep.unsafe_get(v >> _OP_EPS_SHIFT) & _OP_MW_BIT) != 0:
-                slots = best_slots.copy()
-                return best
-        if v < 0:
-            slots = best_slots.copy()
-            return best
-        var e = v >> _OP_EPS_SHIFT
-        if e != 0:
-            _op_apply(ep.unsafe_get(e), pos, slots)
-        row = v & _OP_ROW_MASK
-        sid = (v >> _OP_SID_SHIFT) & _OP_SID_MASK
-        pos += 1
-        steps += 1
-    var info = Int(st.unsafe_get(sid))
-    if _op_match_ok[op](input, input_len, info & 0xFF):
-        _op_apply(ep.unsafe_get(info >> _OP_STATE_EPS_SHIFT), input_len, slots)
-        return input_len
-    slots = best_slots.copy()
-    return best
-
-
-@always_inline
-def onepass_find_end[
-    origin: Origin,
-    ne: Int,
-    ns: Int,
-    //,
-    op: OnePass,
-    table: StringLiteral,
-    classes: Array[UInt8, ONEPASS_CLASS_LEN],
-    eps: Array[UInt64, ne],
-    states: Array[Int32, ns],
-    num_slots: Int,
-](
-    input: Span[Byte, origin],
-    start: Int,
-    mut slots: Array[Int, num_slots],
-    mut steps: Int,
-) -> Int:
-    """Anchored LEFTMOST-FIRST walk from `start` (regex-automata's
-    one-pass search): Python's end of the match starting at `start`
-    with its slots written into `slots`, or -1 when nothing matches
-    there — exact, never a budget exhaustion. `steps` is advanced by the
-    bytes walked (the capture lane's per-call attempt allowance).
-
-    A match state records its end (and a snapshot of the slots with the
-    match writes applied) and the walk goes on while the consuming
-    thread outranks MATCH; a transition whose slot-set word carries
-    `_OP_MW_BIT` — MATCH came first in priority order — ends it. After a
-    recorded match only higher-priority threads survive (one-pass: one
-    thread), so a later match overrides and a dead walk returns the
-    recorded one.
-
-    No engine code path calls this today: the capture lane's anchored
-    attempt measured faster on the budgeted backtracker (the per-match
-    slot snapshots here cost on short dense inputs), so this walker is
-    provided and tested for a future caller.
-    """
-    comptime if _edfa_has_accel(op.accel):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _onepass_find_end_impl[
-                op=op,
-                table=table,
-                classes=classes,
-                eps=eps,
-                states=states,
-                num_slots=num_slots,
-                accel=True,
-            ](input, start, slots, steps)
-    return _onepass_find_end_impl[
-        op=op,
-        table=table,
-        classes=classes,
-        eps=eps,
-        states=states,
-        num_slots=num_slots,
-        accel=False,
-    ](input, start, slots, steps)

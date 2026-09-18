@@ -525,7 +525,7 @@ def _epsilon_closure(
             # CHAR, CHARSET, ANY — consuming states
             out.append(s)
 
-    _sort_ints(out)
+    sort(out)
     return has_match
 
 
@@ -604,14 +604,3 @@ def _state_key(states: List[Int]) -> String:
             result += ","
         result += String(states.unsafe_get(i))
     return result^
-
-
-def _sort_ints(mut arr: List[Int]):
-    """Insertion sort for small arrays (DFA state sets are typically small)."""
-    for i in range(1, len(arr)):
-        var key = arr.unsafe_get(i)
-        var j = i - 1
-        while j >= 0 and arr.unsafe_get(j) > key:
-            arr.unsafe_set(j + 1, arr.unsafe_get(j))
-            j -= 1
-        arr.unsafe_set(j + 1, key)

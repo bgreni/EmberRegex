@@ -10,9 +10,11 @@ Run with:  python3 bench/bench_compare_pcre2.py
 
 import os
 import subprocess
-import shutil
 import sys
 import argparse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench_compare import run_mojo_static_benchmarks, _ratio_str as ratio_str
 
 try:
     from reportlab.lib import colors
@@ -30,9 +32,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 BAR_COLS = 16   # width of the speedup bar
-
-# Mojo: each call() runs ITERS_PER_CALL ops; the markdown table shows ms/call.
-MOJO_ITERS_PER_CALL = 100
 
 # ---------------------------------------------------------------------------
 # Paths (repo-relative, resolved from this file's location)
@@ -118,45 +117,6 @@ def run_pcre2_benchmarks() -> dict[str, float]:
     return timings
 
 
-def run_mojo_static_benchmarks() -> dict[str, float]:
-    """Run bench_static via pixi and parse its markdown table output."""
-    pixi_cmd = shutil.which("pixi")
-    if pixi_cmd is None:
-        print("  [warning] pixi not found in PATH — skipping Regex benchmarks.")
-        return {}
-
-    result = subprocess.run(
-        [pixi_cmd, "run", "bench"],
-        capture_output=True, text=True,
-        cwd=REPO_ROOT,
-    )
-    output = result.stdout + result.stderr
-
-    timings: dict[str, float] = {}
-    in_table = False
-    for line in output.splitlines():
-        line = line.strip()
-        if "met (ms)" in line or line.startswith("| ----"):
-            in_table = True
-            continue
-        if not in_table:
-            continue
-        if not line.startswith("|"):
-            break
-        parts = [p.strip() for p in line.split("|") if p.strip()]
-        if len(parts) < 2:
-            continue
-        name = parts[0]
-        try:
-            met_ms = float(parts[1])
-        except ValueError:
-            continue
-        # met (ms) is min time per call() — each call() runs MOJO_ITERS_PER_CALL ops
-        timings[name] = met_ms * 1000.0 / MOJO_ITERS_PER_CALL
-
-    return timings
-
-
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
@@ -169,10 +129,6 @@ def speedup_bar(ratio: float) -> str:
     return f"{color}{bar}\033[0m"
 
 
-def ratio_str(ratio: float) -> str:
-    tag = f"{ratio:.1f}x"
-    color = "\033[32m" if ratio >= 1.0 else "\033[31m"
-    return f"{color}{tag:>6}\033[0m"
 
 
 def print_comparison(

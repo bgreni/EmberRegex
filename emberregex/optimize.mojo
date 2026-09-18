@@ -688,8 +688,7 @@ def _inner_set(mut bits: SIMD[DType.uint8, _INNER_BITS], s: Int):
 def _arm_reaches(nfa: NFA, arm: Int, target: Int) -> Bool:
     """Comptime: does the subgraph entered at `arm` reach `target`
     (following out1/out2; MATCH is a dead end)? Distinguishes a
-    quantifier SPLIT's looping arm from its exit arm — seeded per arm,
-    unlike forms_cycle, which seeds both."""
+    quantifier SPLIT's looping arm from its exit arm — seeded per arm."""
     var n = len(nfa.states)
     var visited = SIMD[DType.uint8, _INNER_BITS](0)
     var stack = List[Int]()

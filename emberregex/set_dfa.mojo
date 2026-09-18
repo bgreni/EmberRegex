@@ -56,6 +56,7 @@ from .static_dfa import (
     _bs_eq,
     _bs_hash,
     _byte_classes,
+    _find_exit2,
     _flat_closure,
     _flatten_nfa,
     WB_DROP,
@@ -125,13 +126,7 @@ struct MultiDFA(Copyable, Movable):
 
 
 def _sorted_dedup(var ids: List[Int]) -> List[Int]:
-    for i in range(1, len(ids)):
-        var key = ids[i]
-        var j = i - 1
-        while j >= 0 and ids[j] > key:
-            ids[j + 1] = ids[j]
-            j -= 1
-        ids[j + 1] = key
+    sort(ids)
     var out = List[Int]()
     for i in range(len(ids)):
         if len(out) == 0 or out[len(out) - 1] != ids[i]:
@@ -760,29 +755,6 @@ def _maccel_mask_word(d: MultiDFA, word: Int) -> UInt64:
 
 
 @always_inline
-def _mdfa_find_exit2[
-    origin: Origin, //, e1: UInt8, e2: UInt8
-](input: Span[Byte, origin], start: Int) -> Int:
-    """First position >= start whose byte is e1 or e2, else len(input)."""
-    comptime W = simd_width_of[DType.uint8]()
-    var ptr = Pointer(input.unsafe_ptr())
-    var input_len = len(input)
-    var pos = start
-    while pos + W <= input_len:
-        var block = ptr.unsafe_offset(pos).unsafe_load[width=W]()
-        var bits = lane_bits(block.eq(e1) | block.eq(e2))
-        if bits != 0:
-            return pos + first_lane_index(bits)
-        pos += W
-    while pos < input_len:
-        var b = input.unsafe_get(pos)
-        if b == e1 or b == e2:
-            return pos
-        pos += 1
-    return input_len
-
-
-@always_inline
 def _mdfa_accel_skip[
     origin: Origin, //, d: MultiDFA
 ](input: Span[Byte, origin], cur: Int, pos: Int) -> Int:
@@ -812,7 +784,7 @@ def _mdfa_accel_skip[
             d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
         )
         if cur == a_state:
-            p = _mdfa_find_exit2[e1=a_e1, e2=a_e2](input, p)
+            p = _find_exit2[e1=a_e1, e2=a_e2](input, p)
     comptime for ai in range(len(d.accel_nib_states)):
         comptime a_state = d.accel_nib_states[ai]
         comptime a_kind = d.accel_nib_kind[ai]

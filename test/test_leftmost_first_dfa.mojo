@@ -26,7 +26,6 @@ from emberregex.static_lfdfa import (
     LF_LIST_CAP,
     build_lf_dfa,
     lfdfa_find_end,
-    lfdfa_match_at,
 )
 from std.benchmark import keep
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
@@ -671,44 +670,6 @@ def test_high_bytes_in_scan() raises:
     assert_true(r.matched)
     assert_equal(r.start, 80)
     assert_equal(r.end, 83)
-
-
-# --- The anchored walker (opt-in starts) -----------------------------------
-
-
-def test_anchored_lf_dfa_match_at() raises:
-    comptime P = "a*(?:ab)*|b[cd]"
-    comptime lf = build_lf_dfa(Regex[P].nfa, True, anchored=True)
-    assert_true(lf.valid)
-    assert_true(lf.has_anchored)
-    comptime tn = lf.d.num_states * 256
-    comptime dt = edfa_id_dtype(lf.d.num_states)
-    comptime table = static_bytes[edfa_table_str[tn, dt](lf.d)]()
-    comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
-    var input = String("xaab")
-    var bytes = input.as_bytes()
-    # Anchored at 1: leftmost-first end of the match starting there.
-    assert_equal(lfdfa_match_at[lf=lf, table=table, flags=flags](bytes, 1), 3)
-    # Anchored at 0: `a*` matches empty at 0 (the first arm wins).
-    assert_equal(lfdfa_match_at[lf=lf, table=table, flags=flags](bytes, 0), 0)
-    # Unanchored from 0 on an input where only a later start matches.
-    var input2 = String("xxbd")
-    var bytes2 = input2.as_bytes()
-    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 0)
-    comptime Q = "b[cd]"
-    comptime lfq = build_lf_dfa(Regex[Q].nfa, True, anchored=True)
-    comptime tq = static_bytes[
-        edfa_table_str[lfq.d.num_states * 256, edfa_id_dtype(lfq.d.num_states)](
-            lfq.d
-        )
-    ]()
-    comptime fq = edfa_flags_arr[lfq.d.num_states](lfq.d)
-    assert_equal(lfdfa_find_end[lf=lfq, table=tq, flags=fq](bytes2, 0), 4)
-    assert_equal(lfdfa_match_at[lf=lfq, table=tq, flags=fq](bytes2, 0), -1)
-    assert_equal(lfdfa_match_at[lf=lfq, table=tq, flags=fq](bytes2, 2), 4)
-    # The default build carries no anchored starts.
-    comptime lfu = build_lf_dfa(Regex[Q].nfa, True)
-    assert_false(lfu.has_anchored)
 
 
 # 62 single-byte arms: every unanchored state carries 62 consuming

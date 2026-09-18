@@ -49,13 +49,6 @@ struct CharSet(Copyable):
         self.bitmap_valid = False
 
     @staticmethod
-    def from_char(ch: UInt32) -> CharSet:
-        """Create a charset containing a single character."""
-        var cs = CharSet()
-        cs.add_range(ch, ch)
-        return cs^
-
-    @staticmethod
     def from_range(lo: UInt32, hi: UInt32) -> CharSet:
         """Create a charset from a single range."""
         var cs = CharSet()

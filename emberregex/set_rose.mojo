@@ -77,7 +77,7 @@ from std.sys import simd_width_of
 
 from .charset import BITMAP_WIDTH
 from .constants import CHAR_NEWLINE
-from .nfa import NFA, NFAStateKind, build_nfa
+from .nfa import NFA, NFAStateKind, build_nfa, is_consuming_kind
 from .optimize import _charset_filter_byte, _probe_rank_table
 from .parser import parse
 from .set_literal import (
@@ -400,9 +400,7 @@ def rose_lits_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
 
 def _entry_bytes[
     mn: Int, ln: Int
-](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[
-    Int
-]:
+](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[Int]:
     """Comptime: entry i's factor bytes."""
     var off = Int(meta[_M_STRIDE * i + _M_BYTE_OFF])
     var n = Int(meta[_M_STRIDE * i + _M_LEN])
@@ -414,9 +412,7 @@ def _entry_bytes[
 
 def _entry_caseless[
     mn: Int, ln: Int
-](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[
-    Bool
-]:
+](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[Bool]:
     """Comptime: entry i's per-byte caseless flags."""
     var off = Int(meta[_M_STRIDE * i + _M_BYTE_OFF])
     var n = Int(meta[_M_STRIDE * i + _M_LEN])
@@ -552,8 +548,7 @@ def _class_words(nfa: NFA, state: Int) -> List[Int]:
     """Comptime: 8 x 32-bit words naming the bytes a consuming state
     accepts, or an empty list when the state is not a one-byte consumer.
 
-    This is exactly what static_dfa's `_accepts` tests, which is what the
-    confirm DFA was built from. CHARSET reads the parsed 256-bit bitmap
+    This is exactly the byte set the confirm DFA was built from. CHARSET reads the parsed 256-bit bitmap
     straight off the CharSet — comptime SIMD lane reads are
     interpreter-native (~1us) and a 256-step `contains` loop is not
     (35-70us per List step) — and complements it when negated, which is
@@ -755,7 +750,7 @@ def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     var loop_state = -1
     var exit_state = -1
     var kind = nfa.states[head].kind
-    if _is_consuming_kind(kind):
+    if is_consuming_kind(kind):
         # `X+`: X -> SPLIT(back to X, exit)
         var sp = nfa.states[head].out1
         if sp < 0 or sp >= n or nfa.states[sp].kind != NFAStateKind.SPLIT:
@@ -772,12 +767,12 @@ def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
         # `X*`: SPLIT(X, exit) with X -> back to the SPLIT
         var a = nfa.states[head].out1
         var b = nfa.states[head].out2
-        if a >= 0 and a < n and _is_consuming_kind(nfa.states[a].kind):
+        if a >= 0 and a < n and is_consuming_kind(nfa.states[a].kind):
             if nfa.states[a].out1 == head:
                 loop_state = a
                 exit_state = b
         if loop_state < 0 and b >= 0 and b < n:
-            if _is_consuming_kind(nfa.states[b].kind):
+            if is_consuming_kind(nfa.states[b].kind):
                 if nfa.states[b].out1 == head:
                     loop_state = b
                     exit_state = a
@@ -808,14 +803,6 @@ def _var_offset_run(nfa: NFA, head: Int, ranks: List[Int]) -> _Run:
     # fixed position.
     result.look = lit.look.copy()
     return result^
-
-
-def _is_consuming_kind(kind: Int) -> Bool:
-    return (
-        kind == NFAStateKind.CHAR
-        or kind == NFAStateKind.CHARSET
-        or kind == NFAStateKind.ANY
-    )
 
 
 def _extract_factors(nfa: NFA, ranks: List[Int]) -> _Factors:
@@ -1322,9 +1309,7 @@ def merge_reports(var a: List[SetMatch], b: List[SetMatch]) -> List[SetMatch]:
 
 
 @always_inline
-def _in_class[
-    bn: Int, //, words: Array[Int32, bn], base: Int
-](b: Byte) -> Bool:
+def _in_class[bn: Int, //, words: Array[Int32, bn], base: Int](b: Byte) -> Bool:
     """Is `b` in the 8-word byte set starting at `base`?"""
     var cls = materialize[words]()
     var w = Int(cls.unsafe_get(base + (Int(b) >> 5)))

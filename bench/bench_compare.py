@@ -7,6 +7,7 @@ Run with:  python3 bench/bench_compare.py
            pixi run compare
 """
 
+import os
 import re
 import sys
 import timeit
@@ -53,6 +54,7 @@ def _run_mojo_task(task: str) -> dict[str, float]:
     result = subprocess.run(
         [pixi_cmd, "run", task],
         capture_output=True, text=True,
+        cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
     )
     output = result.stdout + result.stderr
 

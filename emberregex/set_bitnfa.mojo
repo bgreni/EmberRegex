@@ -44,6 +44,7 @@ from std.collections import Array
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
 from .nfa import NFA, NFAStateKind
+from .set_dfa import _pool_slice, _sorted_dedup
 from .set_pike import SetMatch
 
 comptime BITNFA_POS_CAP = 512
@@ -219,11 +220,6 @@ def _mask_from(positions: List[Int], lanes: Int) -> List[UInt64]:
     return m^
 
 
-def _mask_or(mut acc: List[UInt64], m: List[UInt64]):
-    for i in range(len(acc)):
-        acc[i] |= m[i]
-
-
 def _mask_any(m: List[UInt64]) -> Bool:
     for i in range(len(m)):
         if m[i] != 0:
@@ -236,40 +232,6 @@ def _mask_eq(a: List[UInt64], b: List[UInt64]) -> Bool:
         if a[i] != b[i]:
             return False
     return True
-
-
-def _sorted_dedup_ids(var ids: List[Int]) -> List[Int]:
-    for i in range(1, len(ids)):
-        var key = ids[i]
-        var j = i - 1
-        while j >= 0 and ids[j] > key:
-            ids[j + 1] = ids[j]
-            j -= 1
-        ids[j + 1] = key
-    var out = List[Int]()
-    for i in range(len(ids)):
-        if len(out) == 0 or out[len(out) - 1] != ids[i]:
-            out.append(ids[i])
-    return out^
-
-
-def _bit_pool_slice(mut pool: List[Int], ids: List[Int]) -> Tuple[Int, Int]:
-    var n = len(ids)
-    if n == 0:
-        return (0, 0)
-    var limit = len(pool) - n
-    for off in range(limit + 1):
-        var same = True
-        for i in range(n):
-            if pool[off + i] != ids[i]:
-                same = False
-                break
-        if same:
-            return (off, n)
-    var off = len(pool)
-    for i in range(n):
-        pool.append(ids[i])
-    return (off, n)
 
 
 def build_bitnfa(nfa: NFA, enabled: Bool) -> BitNFA:
@@ -384,28 +346,28 @@ def build_bitnfa(nfa: NFA, enabled: Bool) -> BitNFA:
 
         # Accept slices.
         var base = p * 12
-        var norm_o = _sorted_dedup_ids(wo.norm_ids.copy())
-        var norm_n = _sorted_dedup_ids(wn.norm_ids.copy())
-        var nl_o = _sorted_dedup_ids(wo.nl_ids.copy())
-        var nl_n = _sorted_dedup_ids(wn.nl_ids.copy())
-        var end_o = _sorted_dedup_ids(wo.end_ids.copy())
-        var end_n = _sorted_dedup_ids(wn.end_ids.copy())
-        var sl = _bit_pool_slice(pool, norm_o)
+        var norm_o = _sorted_dedup(wo.norm_ids.copy())
+        var norm_n = _sorted_dedup(wn.norm_ids.copy())
+        var nl_o = _sorted_dedup(wo.nl_ids.copy())
+        var nl_n = _sorted_dedup(wn.nl_ids.copy())
+        var end_o = _sorted_dedup(wo.end_ids.copy())
+        var end_n = _sorted_dedup(wn.end_ids.copy())
+        var sl = _pool_slice(pool, norm_o)
         slices[base] = sl[0]
         slices[base + 1] = sl[1]
-        sl = _bit_pool_slice(pool, norm_n)
+        sl = _pool_slice(pool, norm_n)
         slices[base + 2] = sl[0]
         slices[base + 3] = sl[1]
-        sl = _bit_pool_slice(pool, nl_o)
+        sl = _pool_slice(pool, nl_o)
         slices[base + 4] = sl[0]
         slices[base + 5] = sl[1]
-        sl = _bit_pool_slice(pool, nl_n)
+        sl = _pool_slice(pool, nl_n)
         slices[base + 6] = sl[0]
         slices[base + 7] = sl[1]
-        sl = _bit_pool_slice(pool, end_o)
+        sl = _pool_slice(pool, end_o)
         slices[base + 8] = sl[0]
         slices[base + 9] = sl[1]
-        sl = _bit_pool_slice(pool, end_n)
+        sl = _pool_slice(pool, end_n)
         slices[base + 10] = sl[0]
         slices[base + 11] = sl[1]
         if len(nl_o) > 0 or len(nl_n) > 0:

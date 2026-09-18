@@ -37,7 +37,7 @@ and a hard cap (`APPROX_MAX_STATES`) because the state count grows like
 """
 
 from .charset import CharSet
-from .nfa import NFA, NFAState, NFAStateKind
+from .nfa import NFA, NFAState, NFAStateKind, is_consuming_kind
 
 # The layered construction multiplies states by roughly 4*(k+1). Past this
 # the automaton stops being worth building — Hyperscan documents the same
@@ -53,14 +53,6 @@ def _all_bytes_charset(mut nfa: NFA) -> Int:
     var idx = len(nfa.charsets)
     nfa.charsets.append(cs^)
     return idx
-
-
-def _is_consuming(kind: Int) -> Bool:
-    return (
-        kind == NFAStateKind.CHAR
-        or kind == NFAStateKind.CHARSET
-        or kind == NFAStateKind.ANY
-    )
 
 
 def approx_supported(base: NFA) -> Bool:
@@ -143,7 +135,7 @@ def approx_nfa(base: NFA, k: Int, hamming: Bool) -> NFA:
     for layer in range(k - 1, -1, -1):
         for s in range(n):
             ref st = base.states[s]
-            var consuming = _is_consuming(st.kind)
+            var consuming = is_consuming_kind(st.kind)
             # MATCH gets an insertion edge too, or a spare byte AFTER the
             # pattern has nowhere to go and `hello`@1 would miss `hellol`.
             # Epsilon states need none: their position is the position of

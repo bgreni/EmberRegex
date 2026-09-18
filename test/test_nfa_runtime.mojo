@@ -4,7 +4,7 @@
 code the `Regex[...]` field block runs in the comptime interpreter — so
 these tests pin the EXACT Thompson lowering of each AST shape (state
 kinds, out1/out2 wiring, SPLIT greediness, SAVE slots, capability flags)
-and the analyses over it (`split_cycle_flags`, `forms_cycle`,
+and the analyses over it (`split_cycle_flags`,
 `_nfa_has_backref`, `_detect_start_anchor`) without adding a single
 comptime `Regex[...]` instantiation to the suite. Runtime callers pass
 `fast=False`: the SIMD-lane analyses are interpreter-only.
@@ -21,7 +21,6 @@ from emberregex.nfa import (
     NFAStateKind,
     _nfa_has_backref,
     build_nfa,
-    forms_cycle,
     split_cycle_flags,
 )
 from emberregex.parser import parse
@@ -133,8 +132,6 @@ def test_multiway_alternation_is_right_to_left_split_chain() raises:
     var cyc = split_cycle_flags[fast=False](nfa)
     for i in range(6):
         assert_false(cyc[i])
-    assert_false(forms_cycle(nfa, 4))
-    assert_false(forms_cycle(nfa, 2))
 
 
 # --- Leading anchors ---------------------------------------------------------
@@ -199,7 +196,6 @@ def test_lazy_star_and_question_prefer_skip_arm() raises:
     assert_true(cyc[0])
     assert_true(cyc[1])
     assert_false(cyc[2])
-    assert_true(forms_cycle(star, 1))
 
     # `{0,}` is routed to the star builder, not the counted one.
     var greedy = _nfa("a{0,}")
@@ -220,7 +216,6 @@ def test_lazy_star_and_question_prefer_skip_arm() raises:
     var qcyc = split_cycle_flags[fast=False](q)
     assert_false(qcyc[0])
     assert_false(qcyc[1])
-    assert_false(forms_cycle(q, 1))
 
 
 def test_plus_loops_body_back_to_split() raises:
@@ -240,7 +235,6 @@ def test_plus_loops_body_back_to_split() raises:
     assert_true(cyc[1])
     assert_true(cyc[2])
     assert_false(cyc[3])
-    assert_true(forms_cycle(plus, 2))
 
     # Lazy: the exit edge is out1, the loop edge out2.
     var lazy = _nfa("a+?")
@@ -250,7 +244,7 @@ def test_plus_loops_body_back_to_split() raises:
     _assert_state(lazy, 1, NFAStateKind.SPLIT, 2, 0)
     assert_false(lazy.states[1].greedy)
     assert_true(lazy.has_lazy)
-    assert_true(forms_cycle(lazy, 1))
+    assert_true(split_cycle_flags[fast=False](lazy)[1])
 
 
 def test_counted_repetition_lowering() raises:
@@ -277,7 +271,6 @@ def test_counted_repetition_lowering() raises:
     assert_true(cyc[2])
     assert_true(cyc[3])
     assert_false(cyc[4])
-    assert_true(forms_cycle(open_, 3))
 
     # {1,3}: one required copy, then a ladder of two `?` copies — each
     # optional SPLIT's skip edge is patched forward, never back.
@@ -290,8 +283,9 @@ def test_counted_repetition_lowering() raises:
     _assert_state(ladder, 4, NFAStateKind.SPLIT, 3, 5)
     _assert_state(ladder, 3, NFAStateKind.CHAR, 5, -1)
     assert_equal(ladder.states[5].kind, NFAStateKind.MATCH)
-    assert_false(forms_cycle(ladder, 2))
-    assert_false(forms_cycle(ladder, 4))
+    var lcyc = split_cycle_flags[fast=False](ladder)
+    assert_false(lcyc[2])
+    assert_false(lcyc[4])
 
     # {0,2}: no required copy, so the first optional copy IS the start.
     var opt = _nfa("a{0,2}")
@@ -685,7 +679,6 @@ def test_split_cycle_flags_self_edge_singletons() raises:
     var c1 = split_cycle_flags[fast=False](loop1)
     assert_true(c1[0])
     assert_false(c1[1])
-    assert_true(forms_cycle(loop1, 0))
 
     var loop2 = NFA()
     _ = loop2.add_state(NFAState.split_state(1, 0))
@@ -693,7 +686,6 @@ def test_split_cycle_flags_self_edge_singletons() raises:
     var c2 = split_cycle_flags[fast=False](loop2)
     assert_true(c2[0])
     assert_false(c2[1])
-    assert_true(forms_cycle(loop2, 0))
 
     # A dangling arm (-1) is not an edge.
     var dangling = NFA()
@@ -702,7 +694,6 @@ def test_split_cycle_flags_self_edge_singletons() raises:
     var c3 = split_cycle_flags[fast=False](dangling)
     assert_false(c3[0])
     assert_false(c3[1])
-    assert_false(forms_cycle(dangling, 0))
 
 
 def main() raises:
