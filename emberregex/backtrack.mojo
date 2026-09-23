@@ -192,6 +192,7 @@ comptime SBT_GIVEBACK_POSSESSIVE = 2
 body consumed can ever start it: the loop never gives anything back."""
 
 
+@fieldwise_init
 struct SbtLoopFilter(Copyable, Movable):
     """Comptime analysis of one simple loop: how far its giveback can be
     skipped, and the byte sets the walkers test against."""
@@ -202,16 +203,6 @@ struct SbtLoopFilter(Copyable, Movable):
     var stop_bits: SIMD[DType.uint8, BITMAP_WIDTH]
     """`exit_bits | ~body`: bytes at which a lazy loop must stop scanning —
     either the exit could start there or the body can no longer consume."""
-
-    def __init__(
-        out self,
-        mode: Int,
-        exit_bits: SIMD[DType.uint8, BITMAP_WIDTH],
-        stop_bits: SIMD[DType.uint8, BITMAP_WIDTH],
-    ):
-        self.mode = mode
-        self.exit_bits = exit_bits
-        self.stop_bits = stop_bits
 
 
 def _sbt_loop_filter(nfa: NFA, body_idx: Int, exit_idx: Int) -> SbtLoopFilter:
@@ -269,6 +260,7 @@ def sbt_loop_modes(nfa: NFA) -> List[Int]:
     return modes^
 
 
+@fieldwise_init
 struct SbtCounted(Copyable, Movable):
     """Comptime description of a counted repetition (`x{n,m}`) whose body is
     a single consuming state, rooted at one NFA state.
@@ -287,22 +279,6 @@ struct SbtCounted(Copyable, Movable):
     var body: Int
     var exit: Int
     var greedy: Bool
-
-    def __init__(
-        out self,
-        ok: Bool,
-        lo: Int,
-        hi: Int,
-        body: Int,
-        exit: Int,
-        greedy: Bool,
-    ):
-        self.ok = ok
-        self.lo = lo
-        self.hi = hi
-        self.body = body
-        self.exit = exit
-        self.greedy = greedy
 
 
 def _sbt_is_body_state(nfa: NFA, idx: Int) -> Bool:
@@ -724,16 +700,13 @@ comptime SBT_STACK_BUDGET = 4 * 1024 * 1024
 comptime SBT_STACK_RESERVE = 512 * 1024
 
 
+@fieldwise_init
 struct SbtStackBounds(Copyable, Movable):
     """This thread's stack, low and high address. `low == 0` means the
     platform could not be asked."""
 
     var low: Int
     var high: Int
-
-    def __init__(out self, low: Int, high: Int):
-        self.low = low
-        self.high = high
 
 
 @no_inline
@@ -879,6 +852,7 @@ def sbt_stack_floor[
         return 0
 
 
+@fieldwise_init
 struct SbtDepthPlan(Copyable, Movable):
     """Where the walker has to watch the stack, decided at compile time."""
 
@@ -891,10 +865,6 @@ struct SbtDepthPlan(Copyable, Movable):
     check may live in that one branch. When False the walker checks on
     entry to EVERY state instead: correct, and measurably slower, which
     is why it is computed rather than assumed."""
-
-    def __init__(out self, needs_guard: Bool, splits_are_fvs: Bool):
-        self.needs_guard = needs_guard
-        self.splits_are_fvs = splits_are_fvs
 
 
 def _sbt_depth_plan_list(nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
