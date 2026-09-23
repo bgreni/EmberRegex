@@ -28,13 +28,10 @@ test suite (`-D ASSERT=all`).
 
 import argparse
 import os
-import shutil
-import subprocess
 import sys
 import tempfile
-import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from timed_build import compile_once
 
 # Each stage is a program body; {P} is replaced with the pattern literal.
 # Ordered so adjacent diffs isolate one stage of the pipeline.
@@ -109,26 +106,11 @@ def mojo_literal(pattern: str) -> str:
     return '"' + pattern.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def compile_once(body: str, cache_dir: str, work: str) -> float:
-    src = os.path.join(work, "probe.mojo")
-    out = os.path.join(work, "probe.bin")
-    with open(src, "w") as f:
-        f.write(body)
-    shutil.rmtree(cache_dir, ignore_errors=True)
-    os.makedirs(cache_dir)
-    env = dict(os.environ, MODULAR_CACHE_DIR=cache_dir)
-    t0 = time.time()
-    r = subprocess.run(
-        ["mojo", "build", "-D", "ASSERT=all", "-I", ".", src, "-o", out],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    dt = time.time() - t0
+def compile_stage(body: str, cache_dir: str, work: str) -> float:
+    dt, r = compile_once(body, work, flags=("-D", "ASSERT=all", "-I", "."), cache=cache_dir)
     if r.returncode != 0:
         sys.stderr.write(r.stderr[-1500:] + "\n")
-        raise SystemExit(f"stage failed to compile (see stderr above)")
+        raise SystemExit("stage failed to compile (see stderr above)")
     return dt
 
 
@@ -145,7 +127,7 @@ def main() -> None:
         for name, tmpl in STAGES:
             body = tmpl.replace("{P}", lit)
             best = min(
-                compile_once(body, cache, work) for _ in range(args.repeat)
+                compile_stage(body, cache, work) for _ in range(args.repeat)
             )
             times[name] = best
             print(f"  {name:8s} {best:7.1f}s", flush=True)

@@ -12,10 +12,10 @@ Usage: python3 tools/compile_dashboard.py [N ...]   # default ladder
 """
 
 import os
-import subprocess
 import sys
 import tempfile
-import time
+
+from timed_build import compile_once
 
 # Default ladder stops at 32: the N=64 mixed rung measured past 27
 # minutes (2026-07-23, table in MULTIPATTERN_PLAN.md) and the decision
@@ -55,25 +55,16 @@ TIMEOUT_S = 900
 
 
 def measure(n: int, workdir: str) -> tuple[float, int] | None:
-    src = os.path.join(workdir, f"set_{n}.mojo")
-    out = os.path.join(workdir, f"set_{n}")
-    with open(src, "w") as f:
-        f.write(gen_source(n))
-    t0 = time.monotonic()
-    try:
-        ret = subprocess.run(
-            ["pixi", "run", "mojo", "build", "-I", ".", src, "-o", out],
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
+    elapsed, ret = compile_once(
+        gen_source(n), workdir, f"set_{n}", flags=("-I", "."),
+        timeout=TIMEOUT_S, mojo=("pixi", "run", "mojo"),
+    )
+    if elapsed is None:
         return None
-    elapsed = time.monotonic() - t0
     if ret.returncode:
         print(ret.stderr, file=sys.stderr)
         raise SystemExit(f"compile failed for N={n}")
-    return elapsed, os.path.getsize(out)
+    return elapsed, os.path.getsize(os.path.join(workdir, f"set_{n}"))
 
 
 if __name__ == "__main__":

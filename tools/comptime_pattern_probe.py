@@ -21,13 +21,11 @@ import argparse
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
-import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from timed_build import ROOT, compile_once
+
 LIT = re.compile(r'Regex\["((?:[^"\\]|\\.)*)"\]')
 TEMPLATE = """from emberregex import Regex
 
@@ -35,25 +33,6 @@ def main() raises:
     var re = Regex["{P}"]()
     print("b", re.match("x").matched, re.search("x").matched)
 """
-
-
-def compile_once(body, include, cache, work):
-    src = os.path.join(work, "probe.mojo")
-    out = os.path.join(work, "probe.bin")
-    with open(src, "w") as f:
-        f.write(body)
-    shutil.rmtree(cache, ignore_errors=True)
-    os.makedirs(cache)
-    env = dict(os.environ, MODULAR_CACHE_DIR=cache)
-    t0 = time.time()
-    r = subprocess.run(
-        ["mojo", "build", "-D", "ASSERT=all", "-I", include, src, "-o", out],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    return time.time() - t0, r.returncode, r.stderr[-400:]
 
 
 def main():
@@ -74,13 +53,15 @@ def main():
                     pats.append(m.group(1))
             rows = []
             for p in pats:
-                dt, rc, err = compile_once(
-                    TEMPLATE.replace("{P}", p), args.include, cache, work
+                dt, r = compile_once(
+                    TEMPLATE.replace("{P}", p), work,
+                    flags=("-D", "ASSERT=all", "-I", args.include), cache=cache,
                 )
+                rc = r.returncode
                 rows.append({"pattern": p, "seconds": round(dt, 1), "rc": rc})
                 print(f"{dt:7.1f}s rc={rc}  {p}", flush=True)
                 if rc:
-                    sys.stderr.write(err + "\n")
+                    sys.stderr.write(r.stderr[-400:] + "\n")
             rows.sort(key=lambda r: -r["seconds"])
             all_rows[f] = rows
             print(f"== {f}: {len(rows)} patterns, sum {sum(r['seconds'] for r in rows):.1f}s ==")
