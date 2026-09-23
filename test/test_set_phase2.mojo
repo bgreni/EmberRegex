@@ -42,10 +42,10 @@ def _mdfa_scan[
 
 def _accelerates(d: MultiDFA, state: Int) -> Bool:
     """Comptime: is `state` one of the SIMD-scanned self-loop states?"""
-    for s in d.accel_states:
+    for s in d.accel.states:
         if s == state:
             return True
-    for s in d.accel_nib_states:
+    for s in d.accel.nib_states:
         if s == state:
             return True
     return False

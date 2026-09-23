@@ -52,15 +52,11 @@ from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .set_reverse import _reverse_edges, _rev_flat_closure
 from .simd_kernels import (
-    ACCEL_SHUFTI,
-    ACCEL_TRUFFLE,
-    HAS_FAST_BYTE_SHUFFLE,
+    AccelSet,
     _class_contains,
-    build_shufti_masks,
-    build_truffle_masks,
+    accel_exits,
     nibble_table_from,
     rfind_in_class,
-    shufti_encodable,
 )
 from .simd_scan import lane_bits, last_lane_index
 from .static_bytes import table_bytes
@@ -120,13 +116,7 @@ struct RDFA(Copyable, Movable):
     # or on a nibble-encodable set — the same two flavours as EagerDFA,
     # scanning backward. Every reverse self-loop is a genuine one (there
     # is no restart here), so none is vetoed.
-    var accel_states: List[Int]
-    var accel_exit1: List[Int]
-    var accel_exit2: List[Int]  # or -1
-    var accel_nib_states: List[Int]
-    var accel_nib_kind: List[Int]
-    var accel_nib_t0: List[Int]
-    var accel_nib_t1: List[Int]
+    var accel: AccelSet
 
     def __init__(out self):
         self.valid = False
@@ -140,13 +130,7 @@ struct RDFA(Copyable, Movable):
         self.any_bol0 = False
         self.any_bolnl = False
         self.any_wb = False
-        self.accel_states = List[Int]()
-        self.accel_exit1 = List[Int]()
-        self.accel_exit2 = List[Int]()
-        self.accel_nib_states = List[Int]()
-        self.accel_nib_kind = List[Int]()
-        self.accel_nib_t0 = List[Int]()
-        self.accel_nib_t1 = List[Int]()
+        self.accel = AccelSet()
 
 
 def _rev_bol_reaches_start(
@@ -705,33 +689,11 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             != 0
         ):
             continue
-        var row = rows.unsafe_get(si)
-        var exit_count = 0
-        for byte in range(256):
-            if Int(row[byte]) != si:
-                exit_count += 1
-        if exit_count == 0 or exit_count == 256:
-            continue  # never exits / never self-loops: nothing to skip
-        var exits = List[Int]()
-        for byte in range(256):
-            if Int(row[byte]) != si:
-                exits.append(byte)
-        if len(exits) <= 2:
-            result.accel_states.append(si)
-            result.accel_exit1.append(exits[0])
-            result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
-            var t0 = List[Int]()
-            var t1 = List[Int]()
-            if shufti_encodable(exits):
-                build_shufti_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_SHUFTI)
-            else:
-                build_truffle_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_TRUFFLE)
-            result.accel_nib_states.append(si)
-            result.accel_nib_t0.extend(t0^)
-            result.accel_nib_t1.extend(t1^)
+        var exits = accel_exits(
+            rows.unsafe_get(si).ne(SIMD[DType.int32, 256](Int32(si)))
+        )
+        if len(exits) > 0:
+            result.accel.add(si, exits)
     result.valid = True
     result.num_states = nfinal
     result.table = table^
@@ -781,21 +743,6 @@ def _rfind_exit2[
     return floor
 
 
-def _rdfa_accel_mask_word(d: RDFA, word: Int) -> UInt64:
-    var m = UInt64(0)
-    for s in d.accel_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    for s in d.accel_nib_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    return m
-
-
-def _rdfa_has_accel(d: RDFA) -> Bool:
-    return len(d.accel_states) > 0 or len(d.accel_nib_states) > 0
-
-
 @always_inline
 def _rdfa_accel_skip[
     origin: Origin, //, d: RDFA
@@ -806,8 +753,8 @@ def _rdfa_accel_skip[
     comptime W = simd_width_of[DType.uint8]()
     if pos - floor < W:
         return pos
-    comptime m0 = _rdfa_accel_mask_word(d, 0)
-    comptime m1 = _rdfa_accel_mask_word(d, 1)
+    comptime m0 = d.accel.mask_word(0)
+    comptime m1 = d.accel.mask_word(1)
     comptime if d.num_states <= 64:
         if (m0 >> UInt64(cur)) & 1 == 0:
             return pos
@@ -816,19 +763,19 @@ def _rdfa_accel_skip[
         if (m >> UInt64(cur & 63)) & 1 == 0:
             return pos
     var p = pos
-    comptime for ai in range(len(d.accel_states)):
-        comptime a_state = d.accel_states[ai]
-        comptime a_e1 = UInt8(d.accel_exit1[ai])
+    comptime for ai in range(len(d.accel.states)):
+        comptime a_state = d.accel.states[ai]
+        comptime a_e1 = UInt8(d.accel.exit1[ai])
         comptime a_e2 = UInt8(
-            d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
+            d.accel.exit2[ai] if d.accel.exit2[ai] >= 0 else d.accel.exit1[ai]
         )
         if cur == a_state:
             p = _rfind_exit2[e1=a_e1, e2=a_e2](input, p, floor)
-    comptime for ai in range(len(d.accel_nib_states)):
-        comptime a_state = d.accel_nib_states[ai]
-        comptime a_kind = d.accel_nib_kind[ai]
-        comptime a_t0 = nibble_table_from(d.accel_nib_t0, ai)
-        comptime a_t1 = nibble_table_from(d.accel_nib_t1, ai)
+    comptime for ai in range(len(d.accel.nib_states)):
+        comptime a_state = d.accel.nib_states[ai]
+        comptime a_kind = d.accel.nib_kind[ai]
+        comptime a_t0 = nibble_table_from(d.accel.nib_t0, ai)
+        comptime a_t1 = nibble_table_from(d.accel.nib_t1, ai)
         if cur == a_state:
             # Scalar peek at the byte about to be consumed: only
             # vectorize when it actually self-loops.
@@ -878,7 +825,7 @@ def rdfa_find_start[
     var best = -1
     while True:
         var f = flg.unsafe_get(cur)
-        comptime if _rdfa_has_accel(d):
+        comptime if d.accel.any():
             pos = _rdfa_accel_skip[d=d](input, cur, pos, floor)
         if (f & RDFA_NORM) != 0:
             best = pos

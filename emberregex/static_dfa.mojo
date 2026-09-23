@@ -24,19 +24,13 @@ from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
 from .simd_kernels import (
-    ACCEL_SHUFTI,
-    ACCEL_TRUFFLE,
-    HAS_FAST_BYTE_SHUFFLE,
+    AccelSet,
     _ShuffleIndex,
     _class_contains,
     _sheng_step,
-    build_class_masks,
-    build_shufti_masks,
-    build_truffle_masks,
+    accel_exits,
     find_in_class,
     nibble_table_from,
-    shufti_encodable,
-    stops_from_bitmap,
 )
 
 # Per-state flag bits (see EagerDFA.flags)
@@ -611,18 +605,8 @@ struct EagerDFA(Copyable, Movable):
     var any_eol_nl: Bool  # some state carries EDFA_EOL_AT_NEWLINE
     var any_eol_end: Bool  # some state carries EDFA_EOL_AT_END
     var any_wb: Bool  # some state carries EDFA_MATCH_IF_WORD / _NONWORD
-    # Accelerated states: self-loop on all but <= 2 bytes. The walkers
-    # SIMD-scan to the next exit byte instead of stepping the table.
-    var accel_states: List[Int]
-    var accel_exit1: List[Int]  # first exit byte per accelerated state
-    var accel_exit2: List[Int]  # second exit byte, or -1 if only one
-    # Nibble-accelerated states: self-loop on all but an arbitrary exit-byte
-    # set, encoded as shufti or truffle masks (see simd_kernels.mojo). Only
-    # populated when the target has a native byte shuffle.
-    var accel_nib_states: List[Int]
-    var accel_nib_kind: List[Int]  # ACCEL_SHUFTI or ACCEL_TRUFFLE
-    var accel_nib_t0: List[Int]  # NIBBLE_TABLE_SIZE entries per state
-    var accel_nib_t1: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+    # Accelerated states (see AccelSet).
+    var accel: AccelSet
     # Region acceleration: a small set of flag-free states whose rows
     # agree on every byte outside an exit set and land inside the set —
     # the look-behind-split restart states of a word-anchor pattern
@@ -631,11 +615,7 @@ struct EagerDFA(Copyable, Movable):
     # The walkers SIMD-scan to the next exit byte as for a single state
     # and land in the member the last skipped byte selects.
     var region_states: List[Int]
-    var region_exit1: Int  # -1 when the exit set is nibble-encoded
-    var region_exit2: Int  # or -1
-    var region_nib_kind: Int
-    var region_nib_t0: List[Int]
-    var region_nib_t1: List[Int]
+    var region_exits: AccelSet  # the region's exit set, as one entry
     var region_land: List[Int]  # 256 entries: member landed in per byte
 
     def __init__(out self):
@@ -654,19 +634,9 @@ struct EagerDFA(Copyable, Movable):
         self.any_eol_nl = False
         self.any_eol_end = False
         self.any_wb = False
-        self.accel_states = List[Int]()
-        self.accel_exit1 = List[Int]()
-        self.accel_exit2 = List[Int]()
-        self.accel_nib_states = List[Int]()
-        self.accel_nib_kind = List[Int]()
-        self.accel_nib_t0 = List[Int]()
-        self.accel_nib_t1 = List[Int]()
+        self.accel = AccelSet()
         self.region_states = List[Int]()
-        self.region_exit1 = -1
-        self.region_exit2 = -1
-        self.region_nib_kind = 0
-        self.region_nib_t0 = List[Int]()
-        self.region_nib_t1 = List[Int]()
+        self.region_exits = AccelSet()
         self.region_land = List[Int]()
 
 
@@ -1803,31 +1773,16 @@ def _edfa_finish(
         # bytes 80 -> 22 us, 4 exits 80 -> 45 us, 8 exits 79 -> 89 us
         # (slower), 26 exits (`\b[a-z]+ing\b`) 101 -> 128 us (slower).
         if len(exits) > 0 and len(exits) <= _REGION_MAX_EXITS:
-            var encodable = len(exits) <= 2 or HAS_FAST_BYTE_SHUFFLE
-            if encodable:
+            var region_exits = AccelSet()
+            region_exits.add(members[0], exits)
+            if region_exits.any():  # encodable on this target
                 result.region_states = members.copy()
                 result.region_land = land^
-                if len(exits) <= 2:
-                    result.region_exit1 = exits[0]
-                    result.region_exit2 = exits[1] if len(exits) == 2 else -1
-                else:
-                    var t0 = List[Int]()
-                    var t1 = List[Int]()
-                    if shufti_encodable(exits):
-                        build_shufti_masks(exits, t0, t1)
-                        result.region_nib_kind = ACCEL_SHUFTI
-                    else:
-                        build_truffle_masks(exits, t0, t1)
-                        result.region_nib_kind = ACCEL_TRUFFLE
-                    result.region_nib_t0 = t0^
-                    result.region_nib_t1 = t1^
+                result.region_exits = region_exits^
 
-    # Acceleration: a state that self-loops on all but an exit-byte set gets
-    # a SIMD scan to its next exit byte instead of a per-byte table walk.
-    # <= 2 exit bytes (e.g. the `.*` state of `.*x`) use direct compares;
-    # larger sets (e.g. the `\w+` self-loop) are nibble-encoded as shufti
-    # masks when exact, truffle otherwise — only on targets with a native
-    # byte shuffle. EOL_AT_NEWLINE-flagged states are excluded: skipping
+    # Acceleration (see AccelSet): a state that self-loops on all but an
+    # exit-byte set gets a SIMD scan to its next exit byte instead of a
+    # per-byte table walk. EOL_AT_NEWLINE-flagged states are excluded: skipping
     # bytes would skip their per-'\n' last_match updates when '\n'
     # self-loops. So are states the producer vetoed (EDFA_NO_ACCEL) and
     # states whose match-ness depends on the next byte's word class
@@ -1844,13 +1799,6 @@ def _edfa_finish(
             != 0
         ):
             continue
-        var row = new_rows.unsafe_get(s)
-        var exit_count = 0
-        for byte in range(256):
-            if Int(row[byte]) != s:
-                exit_count += 1
-        if exit_count == 0 or exit_count == 256:
-            continue  # never exits / never self-loops: nothing to skip
         # A region member takes the region skip instead: its own loop
         # set is a byte class (word bytes, say) whose runs are a few
         # bytes long in prose, while the region's exit set is sparse —
@@ -1862,26 +1810,11 @@ def _edfa_finish(
                 is_member = True
         if is_member:
             continue
-        var exits = List[Int]()
-        for byte in range(256):
-            if Int(row[byte]) != s:
-                exits.append(byte)
-        if len(exits) <= 2:
-            result.accel_states.append(s)
-            result.accel_exit1.append(exits[0])
-            result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
-            var t0 = List[Int]()
-            var t1 = List[Int]()
-            if shufti_encodable(exits):
-                build_shufti_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_SHUFTI)
-            else:
-                build_truffle_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_TRUFFLE)
-            result.accel_nib_states.append(s)
-            result.accel_nib_t0.extend(t0^)
-            result.accel_nib_t1.extend(t1^)
+        var exits = accel_exits(
+            new_rows.unsafe_get(s).ne(SIMD[DType.int32, 256](Int32(s)))
+        )
+        if len(exits) > 0:
+            result.accel.add(s, exits)
     # The veto has done its job; the walkers' flag bytes never carry it.
     for s in range(nsets):
         new_flags[s] &= ~Int(EDFA_NO_ACCEL)
@@ -1971,18 +1904,6 @@ def _find_exit2[
     return input_len
 
 
-def _accel_mask_word(d: EagerDFA, word: Int) -> UInt64:
-    """Comptime: bitmask of accelerated state ids in [word*64, (word+1)*64)."""
-    var m = UInt64(0)
-    for s in d.accel_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    for s in d.accel_nib_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    return m
-
-
 def _region_land_arr(d: EagerDFA) -> Array[Int16, 256]:
     """Comptime: `region_land` as a materializable array."""
     var arr = Array[Int16, 256](fill=-1)
@@ -2011,8 +1932,8 @@ def _edfa_accel_skip[
     comptime W = simd_width_of[DType.uint8]()
     if pos + W > len(input):
         return pos
-    comptime m0 = _accel_mask_word(d, 0)
-    comptime m1 = _accel_mask_word(d, 1)
+    comptime m0 = d.accel.mask_word(0)
+    comptime m1 = d.accel.mask_word(1)
     comptime if d.num_states <= 64:
         if (m0 >> UInt64(cur)) & 1 == 0:
             return pos
@@ -2022,21 +1943,21 @@ def _edfa_accel_skip[
             return pos
 
     var p = pos
-    comptime for ai in range(len(d.accel_states)):
-        comptime a_state = d.accel_states[ai]
-        comptime a_e1 = UInt8(d.accel_exit1[ai])
+    comptime for ai in range(len(d.accel.states)):
+        comptime a_state = d.accel.states[ai]
+        comptime a_e1 = UInt8(d.accel.exit1[ai])
         comptime a_e2 = UInt8(
-            d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
+            d.accel.exit2[ai] if d.accel.exit2[ai] >= 0 else d.accel.exit1[ai]
         )
         if cur == a_state:
             p = _find_exit2[e1=a_e1, e2=a_e2](input, p)
             comptime if a_state < d.num_match_states:
                 last_match = p
-    comptime for ai in range(len(d.accel_nib_states)):
-        comptime a_state = d.accel_nib_states[ai]
-        comptime a_kind = d.accel_nib_kind[ai]
-        comptime a_t0 = nibble_table_from(d.accel_nib_t0, ai)
-        comptime a_t1 = nibble_table_from(d.accel_nib_t1, ai)
+    comptime for ai in range(len(d.accel.nib_states)):
+        comptime a_state = d.accel.nib_states[ai]
+        comptime a_kind = d.accel.nib_kind[ai]
+        comptime a_t0 = nibble_table_from(d.accel.nib_t0, ai)
+        comptime a_t1 = nibble_table_from(d.accel.nib_t1, ai)
         if cur == a_state:
             # Scalar peek: only vectorize when the current byte actually
             # self-loops; instant exits go back to the table walk.
@@ -2072,10 +1993,11 @@ def _edfa_region_skip[
                 in_region = True
         if in_region and p < len(input):
             var p2 = p
-            comptime if d.region_exit1 >= 0:
-                comptime r_e1 = UInt8(d.region_exit1)
+            comptime if len(d.region_exits.states) > 0:
+                comptime r_e1 = UInt8(d.region_exits.exit1[0])
                 comptime r_e2 = UInt8(
-                    d.region_exit2 if d.region_exit2 >= 0 else d.region_exit1
+                    d.region_exits.exit2[0] if d.region_exits.exit2[0]
+                    >= 0 else d.region_exits.exit1[0]
                 )
                 # Scalar peek: a region is re-entered right after landing
                 # on an exit byte (a false candidate), where a vector
@@ -2084,9 +2006,9 @@ def _edfa_region_skip[
                 if b0 != r_e1 and b0 != r_e2:
                     p2 = _find_exit2[e1=r_e1, e2=r_e2](input, p + 1)
             else:
-                comptime r_kind = d.region_nib_kind
-                comptime r_t0 = nibble_table_from(d.region_nib_t0, 0)
-                comptime r_t1 = nibble_table_from(d.region_nib_t1, 0)
+                comptime r_kind = d.region_exits.nib_kind[0]
+                comptime r_t0 = nibble_table_from(d.region_exits.nib_t0, 0)
+                comptime r_t1 = nibble_table_from(d.region_exits.nib_t1, 0)
                 if not _class_contains[kind=r_kind, t0=r_t0, t1=r_t1](
                     input.unsafe_get(p)
                 ):
@@ -2110,15 +2032,11 @@ def _edfa_has_region(d: EagerDFA) -> Bool:
 
 def _edfa_has_accel(d: EagerDFA) -> Bool:
     """Comptime: does any state carry acceleration data?"""
-    return (
-        len(d.accel_states) > 0
-        or len(d.accel_nib_states) > 0
-        or len(d.region_states) >= 2
-    )
+    return d.accel.any() or len(d.region_states) >= 2
 
 
 def _start_run_skip_idx(d: EagerDFA) -> Int:
-    """Comptime: index into accel_nib_* of a self-looping nib-accel state
+    """Comptime: index into accel.nib_* of a self-looping nib-accel state
     `S1` such that the mid-line start state (`start_other`, `S0`)
     transitions to `S1` on *every* byte that `S1` self-loops on — else -1.
 
@@ -2145,8 +2063,8 @@ def _start_run_skip_idx(d: EagerDFA) -> Int:
         .unsafe_bitcast[Int64]()
         .unsafe_load[width=256]()
     )
-    for i in range(len(d.accel_nib_states)):
-        var s1 = d.accel_nib_states[i]
+    for i in range(len(d.accel.nib_states)):
+        var s1 = d.accel.nib_states[i]
         var row1 = (
             Pointer(to=d.table[s1 * 256])
             .unsafe_bitcast[Int64]()
@@ -2172,7 +2090,7 @@ def _start_run_skip_idx(d: EagerDFA) -> Int:
 
 
 def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
-    """Comptime: (accel_nib index of S1, pivot byte P) enabling the
+    """Comptime: (accel.nib_* index of S1, pivot byte P) enabling the
     pivot-anchored search prefilter, or (-1, -1).
 
     Qualifying shape — the `[class]+ P …` family (e.g. an email regex's
@@ -2193,7 +2111,7 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
     var rs = _start_run_skip_idx(d)
     if rs < 0:
         return (-1, -1)
-    var s1 = d.accel_nib_states[rs]
+    var s1 = d.accel.nib_states[rs]
     var n = d.num_states
     # Rows as 256-lane vectors throughout: the cell-by-cell form read the
     # whole table several times over at ~50 us per List element.
@@ -2294,7 +2212,7 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
     var chain = List[Int]()
     if pv[0] < 0:
         return chain^
-    var s1 = d.accel_nib_states[pv[0]]
+    var s1 = d.accel.nib_states[pv[0]]
     var cur = d.table[s1 * 256 + pv[1]]
     var cap = 4
     while cap > 0 and cur >= 0:
@@ -2573,9 +2491,9 @@ def pivot_first_candidate[
     """
     comptime pv = _pivot_prefilter(d)
     comptime assert pv[0] >= 0
-    comptime pk = d.accel_nib_kind[pv[0]]
-    comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
-    comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
+    comptime pk = d.accel.nib_kind[pv[0]]
+    comptime pt0 = nibble_table_from(d.accel.nib_t0, pv[0])
+    comptime pt1 = nibble_table_from(d.accel.nib_t1, pv[0])
     comptime pivot_byte = UInt8(pv[1])
     comptime fchain = _pivot_forced_chain(d, pv)
     var input_len = len(input)

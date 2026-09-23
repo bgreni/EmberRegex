@@ -119,7 +119,7 @@ current per-file durations.
   test can drift onto a different engine and keep passing — it just quietly
   stops testing what its filename claims. Pin with `_strategy.use_*`,
   `_use_lf_dfa`, `_use_onepass`, `_use_dfa_span`, `_SHENG_CAP`,
-  `accel_nib_states`, or the engine's own runtime state (`clear_count`).
+  `accel.nib_states`, or the engine's own runtime state (`clear_count`).
 - **Pin exclusively, never with a disjunction.**
   `assert_true(use_teddy or use_eager_dfa)` passes on either arm and therefore
   cannot catch a lane change. Use `comptime if HAS_FAST_BYTE_SHUFFLE:` with the

@@ -212,26 +212,100 @@ def stops_from_bitmap(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> List[Int]:
     return stops^
 
 
+def build_nib_masks(
+    stop_bytes: List[Int], mut t0: List[Int], mut t1: List[Int]
+) -> Int:
+    """Comptime: encode a byte set as nibble masks — shufti when exact,
+    truffle otherwise — and return the kind (ACCEL_SHUFTI/_TRUFFLE)."""
+    if shufti_encodable(stop_bytes):
+        build_shufti_masks(stop_bytes, t0, t1)
+        return ACCEL_SHUFTI
+    build_truffle_masks(stop_bytes, t0, t1)
+    return ACCEL_TRUFFLE
+
+
 def build_class_masks(
     stop_bytes: List[Int],
 ) -> Tuple[Int, _NibbleTable, _NibbleTable]:
-    """Comptime: encode a byte set as (kind, t0, t1) for find_in_class —
-    shufti when exact, truffle otherwise."""
+    """Comptime: encode a byte set as (kind, t0, t1) for find_in_class."""
     var t0 = List[Int]()
     var t1 = List[Int]()
-    if shufti_encodable(stop_bytes):
-        build_shufti_masks(stop_bytes, t0, t1)
-        return (
-            ACCEL_SHUFTI,
-            nibble_table_from(t0, 0),
-            nibble_table_from(t1, 0),
-        )
-    build_truffle_masks(stop_bytes, t0, t1)
-    return (
-        ACCEL_TRUFFLE,
-        nibble_table_from(t0, 0),
-        nibble_table_from(t1, 0),
-    )
+    var kind = build_nib_masks(stop_bytes, t0, t1)
+    return (kind, nibble_table_from(t0, 0), nibble_table_from(t1, 0))
+
+
+def accel_exits(exit_lanes: SIMD[DType.bool, 256]) -> List[Int]:
+    """Comptime: the exit bytes (set lanes) of a state that self-loops on
+    the other bytes, or empty when it never exits or never self-loops —
+    nothing to skip either way."""
+    var n = 0
+    for b in range(256):
+        if exit_lanes[b]:
+            n += 1
+    var exits = List[Int]()
+    if n == 0 or n == 256:
+        return exits^
+    for b in range(256):
+        if exit_lanes[b]:
+            exits.append(b)
+    return exits^
+
+
+struct AccelSet(Copyable, Movable):
+    """Comptime acceleration data of a table: states that self-loop on all
+    but an exit-byte set, which the walkers SIMD-scan to the next exit
+    byte instead of stepping the table. <= 2 exit bytes (e.g. the `.*`
+    state of `.*x`) use direct compares; larger sets (e.g. the `\\w+`
+    self-loop) are nibble-encoded (`build_nib_masks`), only on targets
+    with a native byte shuffle."""
+
+    var states: List[Int]
+    var exit1: List[Int]  # first exit byte per state
+    var exit2: List[Int]  # second exit byte, or -1 if only one
+    var nib_states: List[Int]
+    var nib_kind: List[Int]  # ACCEL_SHUFTI or ACCEL_TRUFFLE
+    var nib_t0: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+    var nib_t1: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+
+    def __init__(out self):
+        self.states = List[Int]()
+        self.exit1 = List[Int]()
+        self.exit2 = List[Int]()
+        self.nib_states = List[Int]()
+        self.nib_kind = List[Int]()
+        self.nib_t0 = List[Int]()
+        self.nib_t1 = List[Int]()
+
+    def add(mut self, s: Int, exits: List[Int]):
+        """Comptime: accelerate state `s` over its non-empty exit set
+        (`accel_exits`); a no-op for > 2 exits off shuffle targets."""
+        if len(exits) <= 2:
+            self.states.append(s)
+            self.exit1.append(exits[0])
+            self.exit2.append(exits[1] if len(exits) == 2 else -1)
+        elif HAS_FAST_BYTE_SHUFFLE:
+            var t0 = List[Int]()
+            var t1 = List[Int]()
+            self.nib_kind.append(build_nib_masks(exits, t0, t1))
+            self.nib_states.append(s)
+            self.nib_t0.extend(t0^)
+            self.nib_t1.extend(t1^)
+
+    def mask_word(self, word: Int) -> UInt64:
+        """Comptime: bitmask of accelerated state ids in
+        [word*64, (word+1)*64)."""
+        var m = UInt64(0)
+        for s in self.states:
+            if s >> 6 == word:
+                m |= UInt64(1) << UInt64(s & 63)
+        for s in self.nib_states:
+            if s >> 6 == word:
+                m |= UInt64(1) << UInt64(s & 63)
+        return m
+
+    def any(self) -> Bool:
+        """Comptime: does any state carry acceleration data?"""
+        return len(self.states) > 0 or len(self.nib_states) > 0
 
 
 # --- Scanners ---------------------------------------------------------------

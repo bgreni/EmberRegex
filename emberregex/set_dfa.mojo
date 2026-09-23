@@ -38,15 +38,11 @@ from .dfa import _epsilon_closure
 from .nfa import NFA, NFAStateKind
 from .set_pike import SetMatch
 from .simd_kernels import (
-    ACCEL_SHUFTI,
-    ACCEL_TRUFFLE,
-    HAS_FAST_BYTE_SHUFFLE,
+    AccelSet,
     _class_contains,
-    build_shufti_masks,
-    build_truffle_masks,
+    accel_exits,
     find_in_class,
     nibble_table_from,
-    shufti_encodable,
 )
 from .simd_scan import first_lane_index, lane_bits
 from .static_bytes import table_bytes
@@ -89,15 +85,7 @@ struct MultiDFA(Copyable, Movable):
     var end_len: List[Int]
     var any_nl: Bool
     var any_end: Bool
-    # Accelerated states: self-loop on all but <= 2 bytes.
-    var accel_states: List[Int]
-    var accel_exit1: List[Int]
-    var accel_exit2: List[Int]
-    # Nibble-accelerated states (arbitrary exit sets, shuffle targets).
-    var accel_nib_states: List[Int]
-    var accel_nib_kind: List[Int]
-    var accel_nib_t0: List[Int]
-    var accel_nib_t1: List[Int]
+    var accel: AccelSet
 
     def __init__(out self):
         """Invalid placeholder with one state (keeps downstream
@@ -116,13 +104,7 @@ struct MultiDFA(Copyable, Movable):
         self.end_len = List[Int](fill=0, length=1)
         self.any_nl = False
         self.any_end = False
-        self.accel_states = List[Int]()
-        self.accel_exit1 = List[Int]()
-        self.accel_exit2 = List[Int]()
-        self.accel_nib_states = List[Int]()
-        self.accel_nib_kind = List[Int]()
-        self.accel_nib_t0 = List[Int]()
-        self.accel_nib_t1 = List[Int]()
+        self.accel = AccelSet()
 
 
 def _sorted_dedup(var ids: List[Int]) -> List[Int]:
@@ -582,33 +564,11 @@ def _mdfa_finish(
     for s in range(n):
         if s < num_report:
             continue
-        var row = new_rows.unsafe_get(s)
-        var exit_count = 0
-        for byte in range(256):
-            if Int(row[byte]) != s:
-                exit_count += 1
-        if exit_count == 0 or exit_count == 256:
-            continue
-        var exits = List[Int]()
-        for byte in range(256):
-            if Int(row[byte]) != s:
-                exits.append(byte)
-        if len(exits) <= 2:
-            result.accel_states.append(s)
-            result.accel_exit1.append(exits[0])
-            result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
-            var t0 = List[Int]()
-            var t1 = List[Int]()
-            if shufti_encodable(exits):
-                build_shufti_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_SHUFTI)
-            else:
-                build_truffle_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_TRUFFLE)
-            result.accel_nib_states.append(s)
-            result.accel_nib_t0.extend(t0^)
-            result.accel_nib_t1.extend(t1^)
+        var exits = accel_exits(
+            new_rows.unsafe_get(s).ne(SIMD[DType.int32, 256](Int32(s)))
+        )
+        if len(exits) > 0:
+            result.accel.add(s, exits)
 
     # One 256-lane vector store per row (see static_dfa `_edfa_finish`).
     var new_table = List[Int](fill=-1, length=n * 256)
@@ -742,18 +702,6 @@ def mdfa_slices_arr[n: Int](d: MultiDFA) -> Array[Int32, n]:
 # --- Runtime walker ----------------------------------------------------------
 
 
-def _maccel_mask_word(d: MultiDFA, word: Int) -> UInt64:
-    """Comptime: bitmask of accelerated state ids in [word*64, ...)."""
-    var m = UInt64(0)
-    for s in d.accel_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    for s in d.accel_nib_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    return m
-
-
 @always_inline
 def _mdfa_accel_skip[
     origin: Origin, //, d: MultiDFA
@@ -769,7 +717,7 @@ def _mdfa_accel_skip[
     comptime NW = (d.num_states + 63) >> 6
     var in_accel = False
     comptime for w in range(NW):
-        comptime mw = _maccel_mask_word(d, w)
+        comptime mw = d.accel.mask_word(w)
         comptime if mw != 0:
             if (cur >> 6) == w:
                 in_accel = ((mw >> UInt64(cur & 63)) & 1) != 0
@@ -777,19 +725,19 @@ def _mdfa_accel_skip[
         return pos
 
     var p = pos
-    comptime for ai in range(len(d.accel_states)):
-        comptime a_state = d.accel_states[ai]
-        comptime a_e1 = UInt8(d.accel_exit1[ai])
+    comptime for ai in range(len(d.accel.states)):
+        comptime a_state = d.accel.states[ai]
+        comptime a_e1 = UInt8(d.accel.exit1[ai])
         comptime a_e2 = UInt8(
-            d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
+            d.accel.exit2[ai] if d.accel.exit2[ai] >= 0 else d.accel.exit1[ai]
         )
         if cur == a_state:
             p = _find_exit2[e1=a_e1, e2=a_e2](input, p)
-    comptime for ai in range(len(d.accel_nib_states)):
-        comptime a_state = d.accel_nib_states[ai]
-        comptime a_kind = d.accel_nib_kind[ai]
-        comptime a_t0 = nibble_table_from(d.accel_nib_t0, ai)
-        comptime a_t1 = nibble_table_from(d.accel_nib_t1, ai)
+    comptime for ai in range(len(d.accel.nib_states)):
+        comptime a_state = d.accel.nib_states[ai]
+        comptime a_kind = d.accel.nib_kind[ai]
+        comptime a_t0 = nibble_table_from(d.accel.nib_t0, ai)
+        comptime a_t1 = nibble_table_from(d.accel.nib_t1, ai)
         if cur == a_state:
             # Scalar peek: only vectorize when the current byte actually
             # self-loops; instant exits go back to the table walk.
@@ -798,10 +746,6 @@ def _mdfa_accel_skip[
             ):
                 p = find_in_class[kind=a_kind, t0=a_t0, t1=a_t1](input, p + 1)
     return p
-
-
-def _mdfa_has_accel(d: MultiDFA) -> Bool:
-    return len(d.accel_states) > 0 or len(d.accel_nib_states) > 0
 
 
 @always_inline
@@ -915,7 +859,7 @@ def mdfa_scan[
     is emitted; the callers (`_scan_ladder`, the bench's phase-2 helper)
     each have exactly one call."""
     var out = List[SetMatch]()
-    comptime if _mdfa_has_accel(d):
+    comptime if d.accel.any():
         comptime W = simd_width_of[DType.uint8]()
         if len(input) >= W:
             _mdfa_scan_impl[

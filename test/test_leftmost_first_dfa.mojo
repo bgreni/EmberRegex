@@ -136,8 +136,8 @@ def test_spurious_self_loops_are_not_accelerated() raises:
         "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap|[0-9]{3}"
     ]
     assert_true(A._use_lf_dfa)
-    comptime a_accel = len(A._lfdfa.d.accel_states) + len(
-        A._lfdfa.d.accel_nib_states
+    comptime a_accel = len(A._lfdfa.d.accel.states) + len(
+        A._lfdfa.d.accel.nib_states
     )
     assert_equal(a_accel, 1)
     # A genuine single-byte loop (the `a+` run) IS accelerated, on both
@@ -145,11 +145,11 @@ def test_spurious_self_loops_are_not_accelerated() raises:
     # 20 KB run measured 16x slower when a loop-set threshold dropped it.
     comptime B = Regex["a+e|x"]
     assert_true(B._use_lf_dfa)
-    comptime b_lf_accel = len(B._lfdfa.d.accel_states) + len(
-        B._lfdfa.d.accel_nib_states
+    comptime b_lf_accel = len(B._lfdfa.d.accel.states) + len(
+        B._lfdfa.d.accel.nib_states
     )
-    comptime b_classic_accel = len(B._edfa.accel_states) + len(
-        B._edfa.accel_nib_states
+    comptime b_classic_accel = len(B._edfa.accel.states) + len(
+        B._edfa.accel.nib_states
     )
     assert_true(b_lf_accel >= 1)
     assert_true(b_classic_accel >= 1)
@@ -565,7 +565,7 @@ def test_reverse_acceleration_bounds() raises:
     # longer than a SIMD chunk so the vector path is the one exercised.
     comptime S = Regex["b|.*x"]
     assert_true(S._use_lf_dfa)
-    comptime any_rev_accel = len(S._rdfa.accel_states) > 0
+    comptime any_rev_accel = len(S._rdfa.accel.states) > 0
     assert_true(any_rev_accel)
     var re = S()
     var run = "b" + "a" * 40 + "x"
