@@ -453,7 +453,7 @@ struct RegexSet[
 
     # --- Semantic surface (phase 7) ----------------------------------------
     comptime _has_sem = has_semantics(Self.flags, Self.ext, Self.num_patterns)
-    comptime _sem_needs_som = needs_som(Self.flags, Self.ext, Self.num_patterns)
+    comptime _sem_needs_som = needs_som(Self.ext, Self.num_patterns)
     comptime _SEM = sem_table_arr[sem_table_len(Self.num_patterns)](
         Self.flags, Self.ext, Self.num_patterns
     )

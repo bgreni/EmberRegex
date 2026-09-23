@@ -87,7 +87,7 @@ def any_ext(ext: List[Int], field: Int, num_patterns: Int) -> Bool:
     return False
 
 
-def needs_som(flags: List[Int], ext: List[Int], num_patterns: Int) -> Bool:
+def needs_som(ext: List[Int], num_patterns: Int) -> Bool:
     """Comptime: does the semantic surface force start-of-match?
 
     Only `min_length` does — it constrains the match WIDTH, which the
@@ -101,12 +101,11 @@ def has_semantics(flags: List[Int], ext: List[Int], num_patterns: Int) -> Bool:
     pass is compiled out."""
     if any_flag(flags, SetFlags.SINGLEMATCH | SetFlags.QUIET):
         return True
-    for i in range(num_patterns):
-        # Only the first three are report-stream filters; the distances
-        # are applied to the automaton itself at build time.
-        for f in range(3):
-            if ext_of(ext, i, f) >= 0:
-                return True
+    # Only the first three are report-stream filters; the distances are
+    # applied to the automaton itself at build time.
+    for f in range(3):
+        if any_ext(ext, f, num_patterns):
+            return True
     return False
 
 
@@ -262,8 +261,6 @@ def sem_table_arr[
     var arr = Array[Int32, n](fill=-1)
     for i in range(num_patterns):
         var b = SEM_STRIDE * i
-        if b + SEM_MIN_LEN >= n:
-            break
         arr[b + SEM_FLAG] = Int32(flag_of(flags, i))
         arr[b + SEM_MIN_OFF] = Int32(ext_of(ext, i, EXT_MIN_OFFSET))
         arr[b + SEM_MAX_OFF] = Int32(ext_of(ext, i, EXT_MAX_OFFSET))
