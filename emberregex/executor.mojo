@@ -117,14 +117,12 @@ struct PikeVM[num_slots: Int](Copyable):
         input: Span[Byte, origin],
         start_pos: Int,
         mut bufs: _VMBuffers,
-        max_pos: Int = -1,
         full: Bool = False,
         unanchored: Bool = False,
         end_at: Int = -1,
     ) -> MatchResult[Self.num_slots]:
         """Core NFA simulation using pre-allocated buffers.
 
-        If max_pos >= 0, limits processing to positions < max_pos.
         If full is True, MATCH only accepts at end of input (fullmatch);
         otherwise the VM implements leftmost-first (Python re) semantics.
         If unanchored is True, a fresh start-state thread is injected at
@@ -134,16 +132,14 @@ struct PikeVM[num_slots: Int](Copyable):
         If end_at >= 0, MATCH accepts only at exactly that position (the
         first thread in priority order there wins, as in fullmatch) and
         the simulation stops there — but anchors and word boundaries
-        still see the REAL input: `max_pos` would truncate `input_len`,
-        so `$` would hold at the pin and `\b` would see no byte after
-        it, which is wrong for the DFA-span capture lane (engine.mojo
-        `_span_fill_slots`), whose span ends mid-input.
+        still see the REAL input: truncating it at the pin would make `$`
+        hold there and leave `\b` no byte after it, which is wrong for
+        the DFA-span capture lane (engine.mojo `_span_fill_slots`), whose
+        span ends mid-input.
         """
         var input_len = len(input)
-        if max_pos >= 0 and max_pos < input_len:
-            input_len = max_pos
         # Where the simulation stops and fullmatch-style acceptance
-        # applies: the end pin, else the (possibly truncated) input end.
+        # applies: the end pin, else the input end.
         var stop = input_len
         var pinned = full
         if end_at >= 0 and end_at <= input_len:
@@ -178,34 +174,15 @@ struct PikeVM[num_slots: Int](Copyable):
 
         var pos = start_pos
         while True:
-            # Check for match states
-            if pinned:
-                # Fullmatch / end pin: MATCH only accepts at `stop`; the
-                # first (highest-priority) thread that reached it wins.
-                if pos >= stop:
-                    for i in range(len(bufs.current_states)):
-                        if (
-                            self.nfa.states.unsafe_get(
-                                bufs.current_states.unsafe_get(i)
-                            ).kind
-                            == NFAStateKind.MATCH
-                        ):
-                            matched = True
-                            best_match_end = pos
-                            for s in range(Self._stride):
-                                bufs.best_slots.unsafe_set(
-                                    s,
-                                    bufs.current_slot_data.unsafe_get(
-                                        i * Self._stride + s
-                                    ),
-                                )
-                            break
-            else:
-                # Leftmost-first (Python re semantics): the first thread in
-                # priority order to reach MATCH beats every lower-priority
-                # thread, so record it and cut those threads. Surviving
-                # higher-priority threads may still override with a match
-                # they reach later (e.g. the greedy arm of `a*`).
+            # Check for match states. Fullmatch / end pin: MATCH only
+            # accepts at `stop`, where the first (highest-priority) thread
+            # that reached it wins. Otherwise leftmost-first (Python re
+            # semantics): the first thread in priority order to reach
+            # MATCH beats every lower-priority thread, so record it and cut
+            # those threads. Surviving higher-priority threads may still
+            # override with a match they reach later (e.g. the greedy arm
+            # of `a*`).
+            if not pinned or pos >= stop:
                 for i in range(len(bufs.current_states)):
                     if (
                         self.nfa.states.unsafe_get(
@@ -222,8 +199,9 @@ struct PikeVM[num_slots: Int](Copyable):
                                     i * Self._stride + s
                                 ),
                             )
-                        bufs.current_states.resize(i, 0)
-                        bufs.current_slot_data.resize(i * Self._stride, 0)
+                        if not pinned:
+                            bufs.current_states.resize(i, 0)
+                            bufs.current_slot_data.resize(i * Self._stride, 0)
                         break
 
             if pos >= stop:
@@ -247,46 +225,27 @@ struct PikeVM[num_slots: Int](Copyable):
                         s, bufs.current_slot_data.unsafe_get(base + s)
                     )
 
+                var ok = False
                 if kind == NFAStateKind.CHAR:
-                    if ch == state.char_value:
-                        self._add_state(
-                            bufs.next_states,
-                            bufs.next_slot_data,
-                            bufs.gen,
-                            next_gen,
-                            out1,
-                            bufs.temp_slots,
-                            input,
-                            input_len,
-                            pos + 1,
-                        )
+                    ok = ch == state.char_value
                 elif kind == NFAStateKind.ANY:
-                    if ch != UInt32(CHAR_NEWLINE):
-                        self._add_state(
-                            bufs.next_states,
-                            bufs.next_slot_data,
-                            bufs.gen,
-                            next_gen,
-                            out1,
-                            bufs.temp_slots,
-                            input,
-                            input_len,
-                            pos + 1,
-                        )
+                    ok = ch != UInt32(CHAR_NEWLINE)
                 elif kind == NFAStateKind.CHARSET:
-                    var cs_idx = state.charset_index
-                    if self.nfa.charsets.unsafe_get(cs_idx).contains(ch):
-                        self._add_state(
-                            bufs.next_states,
-                            bufs.next_slot_data,
-                            bufs.gen,
-                            next_gen,
-                            out1,
-                            bufs.temp_slots,
-                            input,
-                            input_len,
-                            pos + 1,
-                        )
+                    ok = self.nfa.charsets.unsafe_get(
+                        state.charset_index
+                    ).contains(ch)
+                if ok:
+                    self._add_state(
+                        bufs.next_states,
+                        bufs.next_slot_data,
+                        bufs.gen,
+                        next_gen,
+                        out1,
+                        bufs.temp_slots,
+                        input,
+                        input_len,
+                        pos + 1,
+                    )
 
             # Unanchored: seed a fresh lowest-priority thread at the next
             # position while no match is recorded (earlier-start threads
