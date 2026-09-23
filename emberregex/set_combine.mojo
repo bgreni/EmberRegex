@@ -196,13 +196,6 @@ def _eval[
     return stack[0]
 
 
-def combos_rpn_arr[n: Int](pool: List[Int]) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(min(n, len(pool))):
-        arr[i] = Int32(pool[i])
-    return arr^
-
-
 def evaluate_combinations[
     n: Int, //, rpn: Array[Int32, n], num_combos: Int, num_patterns: Int
 ](reports: List[SetMatch]) -> List[SetMatch]:

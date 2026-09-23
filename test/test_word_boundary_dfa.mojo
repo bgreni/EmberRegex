@@ -13,25 +13,21 @@ shapes engine selection leaves on the backtracker.
 """
 
 from emberregex import Regex
-from emberregex.static_bytes import static_bytes
+from emberregex.static_bytes import int_arr, static_bytes, table_bytes
 from emberregex.static_dfa import (
     EDFA_MATCH_IF_NONWORD,
     EDFA_MATCH_IF_WORD,
     EagerDFA,
     _edfa_has_region,
     build_eager_dfa,
-    edfa_flags_arr,
     edfa_full_match,
     edfa_id_dtype,
     edfa_match_at,
-    edfa_table_str,
 )
 from emberregex.static_lfdfa import build_lf_dfa
 from emberregex.static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
-    rdfa_flags_arr,
-    rdfa_table_str,
 )
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -203,20 +199,20 @@ def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     comptime assert ed.valid
     comptime ETN = ed.num_states * 256
     comptime EDT = edfa_id_dtype(ed.num_states)
-    comptime etbl = static_bytes[edfa_table_str[ETN, EDT](ed)]()
-    comptime efl = edfa_flags_arr[ed.num_states](ed)
+    comptime etbl = static_bytes[table_bytes[EDT](ed.table, ETN)]()
+    comptime efl = int_arr[DType.uint8, ed.num_states](ed.flags, 0)
     comptime lf = build_lf_dfa(nfa, True)
     comptime assert lf.valid
     comptime LTN = lf.num_states * 256
     comptime LDT = edfa_id_dtype(lf.num_states)
-    comptime ltbl = static_bytes[edfa_table_str[LTN, LDT](lf)]()
-    comptime lfl = edfa_flags_arr[lf.num_states](lf)
+    comptime ltbl = static_bytes[table_bytes[LDT](lf.table, LTN)]()
+    comptime lfl = int_arr[DType.uint8, lf.num_states](lf.flags, 0)
     comptime rd = build_reverse_dfa(nfa, True)
     comptime assert rd.valid
     comptime RTN = rd.num_states * 256
     comptime RDT = edfa_id_dtype(rd.num_states)
-    comptime rtbl = static_bytes[rdfa_table_str[RTN, RDT](rd)]()
-    comptime rfl = rdfa_flags_arr[rd.num_states](rd)
+    comptime rtbl = static_bytes[table_bytes[RDT](rd.table, RTN)]()
+    comptime rfl = int_arr[DType.uint8, rd.num_states](rd.flags, 0)
 
     var re = Regex[p]()
     var bytes = input.as_bytes()

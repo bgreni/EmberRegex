@@ -13,10 +13,9 @@ instead, which would silently stop exercising this engine.
 """
 
 from emberregex import SetMatch, RegexSet
-from emberregex.static_bytes import static_bytes
+from emberregex.static_bytes import int_arr, static_bytes
 from emberregex.set_dfa import (
     build_multi_dfa,
-    mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
     mdfa_table_str,
@@ -35,7 +34,7 @@ def _mdfa_scan[
     comptime S = RegexSet[patterns]
     comptime MD = build_multi_dfa(S.nfa, S.nfa.can_use_dfa)
     comptime T = static_bytes[mdfa_table_str[MD.num_states * 256](MD)]()
-    comptime P = mdfa_pool_arr[len(MD.pool)](MD)
+    comptime P = int_arr[DType.int32, len(MD.pool)](MD.pool, 0)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
 

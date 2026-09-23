@@ -7,7 +7,6 @@ regression can't hide behind the identical-semantics lazy path.
 
 from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
-from emberregex.constants import CHAR_NEWLINE
 from emberregex.engine import _build_static_nfa
 from emberregex.ast import AnchorKind
 from emberregex.nfa import NFA, NFAStateKind
@@ -16,16 +15,15 @@ from emberregex.static_dfa import (
     EDFA_DEAD,
     EDFA_STATE_CAP,
     EagerDFA,
+    _FlatNFA,
     WB_PENDING,
     WB_RESOLVE,
     _MIN_CAP,
     _StateBits,
     _bs_eq,
-    _byte_classes,
     _closure_pool,
     _edfa_has_accel,
     _flat_closure,
-    _flatten_nfa,
     _minimize,
     build_eager_dfa,
     edfa_id_dtype,
@@ -617,34 +615,11 @@ def test_differential_table_walk_big_merge() raises:
 def _pool_parity_impl(nfa: NFA) -> Bool:
     """Comptime: `_closure_pool` agrees with a per-target `_flat_closure`
     DFS for EVERY state, in both `after_newline` variants."""
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    var flat = _FlatNFA(nfa)
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
     var n = len(kinds)
     var pool_o = _closure_pool(kinds, out1s, out2s, anchors, False)
     var pool_n = _closure_pool(kinds, out1s, out2s, anchors, True)
@@ -708,40 +683,6 @@ def test_accel_run_to_end_of_input_on_the_table_walk() raises:
     assert_false(re.match(String("x") + String("q") * 69 + "a").matched)
 
 
-def _flat_views(
-    nfa: NFA,
-    mut kinds: List[Int],
-    mut out1s: List[Int],
-    mut out2s: List[Int],
-    mut anchors: List[Int],
-):
-    """Runtime: the flat NFA views `_flat_closure` walks."""
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
-
-
 def _bs_has(b: _StateBits, i: Int) -> Bool:
     return (b[i >> 6] >> UInt64(i & 63)) & 1 != 0
 
@@ -752,11 +693,11 @@ def _wb_closure(
     """Runtime: the closure seeded at `p`'s first word anchor, as (the
     anchor is a member, its continuation is a member)."""
     var nfa = _build_static_nfa(p)
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    _flat_views(nfa, kinds, out1s, out2s, anchors)
+    var flat = _FlatNFA(nfa)
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
     var a = -1
     for s in range(len(kinds)):
         if kinds[s] == NFAStateKind.ANCHOR and (
@@ -803,11 +744,11 @@ def test_flat_closure_saves_and_out_of_range_seed_at_runtime() raises:
     # A SAVE expands like an epsilon (the group's CHAR lands in the set);
     # a seed outside the state range yields the empty set.
     var nfa = _build_static_nfa("(a)b")
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    _flat_views(nfa, kinds, out1s, out2s, anchors)
+    var flat = _FlatNFA(nfa)
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
     var start = nfa.start
     assert_equal(kinds[start], NFAStateKind.SAVE)
     var bits = _flat_closure(kinds, out1s, out2s, anchors, start, True, True)

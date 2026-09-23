@@ -59,7 +59,6 @@ from .simd_kernels import (
     rfind_in_class,
 )
 from .simd_scan import lane_bits, last_lane_index
-from .static_bytes import table_bytes
 from .static_dfa import (
     edfa_id_dtype,
     EDFA_DEAD,
@@ -71,9 +70,9 @@ from .static_dfa import (
     _bs_eq,
     _bs_hash,
     _bs_set,
-    _byte_classes,
-    _flatten_nfa,
-    _is_word_byte,
+    _FlatNFA,
+    _class_ranges,
+    _word_classes,
     _minimize,
     _nfa_has_word_anchor,
     _wb_holds,
@@ -99,8 +98,8 @@ comptime RDFA_STATE_CAP = _MIN_CAP
 
 struct RDFA(Copyable, Movable):
     """Comptime-computed reverse DFA. Only ever exists as a comptime
-    value; the walker reads the materialized forms (rdfa_table_str /
-    rdfa_flags_arr)."""
+    value; the walker reads the materialized forms (`table_bytes` /
+    `int_arr` of its table and flags)."""
 
     var valid: Bool
     var num_states: Int
@@ -272,42 +271,17 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
         return result^
     var preds = _reverse_edges(nfa)
 
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref eol_bits = flat.eol_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     var pred_data = List[Int]()
     var pred_off = List[Int]()
@@ -411,12 +385,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var gval_n = List[_StateBits]()
     var one_seed = List[Int](fill=0, length=1)
     var need_nl_variant = has_bol_ml or _bs_any(eol_bits)
-    var word_cls = SIMD[DType.uint64, 4](0)
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)
 
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0
@@ -704,21 +673,6 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     result.seed_at_end = starts[2]
     result.seed_other_word = starts[3] if has_wb else starts[0]
     return result^
-
-
-def rdfa_table_str[n: Int, dt: DType](d: RDFA) -> String:
-    """Comptime: the flat table as `n` little-endian `dt` entries (narrow id
-    type from `edfa_id_dtype`, `n` from `edfa_table_len`; EDFA_DEAD
-    survives). See static_bytes.mojo for why a string."""
-    assert n == 0 or n >= len(d.table), "table string shorter than the table"
-    return table_bytes[dt](d.table, n)
-
-
-def rdfa_flags_arr[n: Int](d: RDFA) -> Array[UInt8, n]:
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(d.flags[i])
-    return arr^
 
 
 @always_inline

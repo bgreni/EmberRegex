@@ -162,7 +162,7 @@ loops at 35-70 us per element op, spread over every lane. Rules:
   Int64]().unsafe_load[width=256]()` / `.unsafe_store(vec)` (a `List[Int]`
   holds 64-bit lanes). `List(fill=, length=)` + vector stores replaced 256
   appends per state and the per-cell `Array` copies
-  (`_edfa_finish`, `edfa_table_str`, `sheng_masks_str`, the set lanes).
+  (`_edfa_finish`, `table_bytes`, `sheng_masks_str`, the set lanes).
 - **A materialized table is a string literal, never an `Array`.**
   A comptime `Array` a walker `materialize`s becomes a global whose
   LLVM initializer is folded one `insertvalue` per element — O(n²): a

@@ -45,10 +45,9 @@ Continuation closures are memoized per target state in one flat pool.
 """
 
 from std.bit import count_leading_zeros, count_trailing_zeros
+from std.math import iota
 
 from .ast import AnchorKind
-from .constants import CHAR_NEWLINE
-from .dfa import _reaches_match
 from .nfa import NFA, NFAStateKind
 from .static_dfa import (
     EDFA_EOL_AT_END,
@@ -62,16 +61,17 @@ from .static_dfa import (
     _StateBits,
     _WB_PREV_SALT,
     _bs_set,
-    _is_word_byte,
+    _FlatNFA,
+    _class_ranges,
+    _eol_ok_bits,
     _lane_word,
-    _byte_classes,
     _edfa_finish,
-    _flatten_nfa,
     _nfa_has_word_anchor,
     _wb_anchor_flags,
     _wb_holds,
     _wb_normalize,
     _word_anchor_bits,
+    _word_classes,
     WB_PENDING,
     WB_RESOLVE,
 )
@@ -190,14 +190,7 @@ comptime _LF_TAIL_SALT_O: UInt64 = 0x165667B19E3779F9
 comptime _LF_TAIL_SALT_N: UInt64 = 0x27D4EB2F165667C5
 
 
-def _mk_iota64() -> SIMD[DType.uint64, 64]:
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(i)
-    return v
-
-
-comptime _IOTA64 = _mk_iota64()
+comptime _IOTA64 = iota[DType.uint64, 64]()
 
 
 def _lf_memo_closure(
@@ -269,58 +262,28 @@ def build_lf_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
         return result^
 
     # --- Byte classes + flat NFA views (shared with build_eager_dfa). ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    var nwords = (nclasses + 63) >> 6
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref consuming_bits = flat.consuming_bits
+    ref match_bits = flat.match_bits
+    ref eol_bits = flat.eol_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-    var nwords = (nclasses + 63) >> 6
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
-
-    # Pending-EOL resolution, per anchor state: does its continuation
-    # reach MATCH at end of input / at a '\n'? (The continuation never
-    # consumes on this lane — see _eol_ml_continuation_consumes.)
+    # Pending-EOL resolution (the continuation never consumes on this
+    # lane — see _eol_ml_continuation_consumes).
     var eol_end_ok = _StateBits(0)
     var eol_nl_ok = _StateBits(0)
-    for s in range(n):
-        if (eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
-            continue
-        if _reaches_match(nfa, out1s[s], True):
-            _bs_set(eol_end_ok, s)
-        if anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
-            nfa, out1s[s], False
-        ):
-            _bs_set(eol_nl_ok, s)
+    _eol_ok_bits(nfa, flat, eol_end_ok, eol_nl_ok)
 
     # --- Ordered closures, memoized per (target, context) as chunks. ---
     var pool = List[Int]()
@@ -341,12 +304,7 @@ def build_lf_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
     # EOL_MULTILINE resolving at '\n').
     var has_wb = _nfa_has_word_anchor(nfa)
     var wb_bits = _word_anchor_bits(kinds, anchors)
-    var word_cls = SIMD[DType.uint64, 4](0)  # classes of word bytes
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)  # classes of word bytes
 
     # The restart closures (mid-line / after '\n') as lane vectors, with
     # their flag bytes, whether they end in MATCH, and their pending word
@@ -496,26 +454,17 @@ def build_lf_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
             acc_h ^= _WB_PREV_SALT
         var found = -1
         var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
-        for j in range(4):
-            if found >= 0:
-                break
-            var word: UInt64
-            if j == 0:
-                word = _lane_word(eqm.slice[64, offset=0]())
-            elif j == 1:
-                word = _lane_word(eqm.slice[64, offset=64]())
-            elif j == 2:
-                word = _lane_word(eqm.slice[64, offset=128]())
-            else:
-                word = _lane_word(eqm.slice[64, offset=192]())
-            while word != 0:
-                var cand = 64 * j + Int(count_trailing_zeros(word))
-                word &= word - 1
-                if cand >= len(st_list):
-                    break
-                if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
-                    found = cand
-                    break
+        comptime for j in range(4):
+            if found < 0:
+                var word = _lane_word(eqm.slice[64, offset=64 * j]())
+                while word != 0:
+                    var cand = 64 * j + Int(count_trailing_zeros(word))
+                    word &= word - 1
+                    if cand >= len(st_list):
+                        break
+                    if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
+                        found = cand
+                        break
         if found < 0:
             found = len(st_list)
             hashv[found] = acc_h
@@ -999,26 +948,19 @@ def build_lf_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
                     acc_h ^= _WB_PREV_SALT
                 var found = -1
                 var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
-                for j in range(4):
-                    if found >= 0:
-                        break
-                    var word: UInt64
-                    if j == 0:
-                        word = _lane_word(eqm.slice[64, offset=0]())
-                    elif j == 1:
-                        word = _lane_word(eqm.slice[64, offset=64]())
-                    elif j == 2:
-                        word = _lane_word(eqm.slice[64, offset=128]())
-                    else:
-                        word = _lane_word(eqm.slice[64, offset=192]())
-                    while word != 0:
-                        var cand = 64 * j + Int(count_trailing_zeros(word))
-                        word &= word - 1
-                        if cand >= len(st_list):
-                            break
-                        if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
-                            found = cand
-                            break
+                comptime for j in range(4):
+                    if found < 0:
+                        var word = _lane_word(eqm.slice[64, offset=64 * j]())
+                        while word != 0:
+                            var cand = 64 * j + Int(count_trailing_zeros(word))
+                            word &= word - 1
+                            if cand >= len(st_list):
+                                break
+                            if (
+                                (st_list.unsafe_get(cand) ^ acc).reduce_or()
+                            ) == 0:
+                                found = cand
+                                break
                 if found < 0:
                     if len(st_list) >= EDFA_STATE_CAP + 1:
                         return result^  # state blowup: stay invalid

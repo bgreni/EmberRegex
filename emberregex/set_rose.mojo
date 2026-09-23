@@ -257,7 +257,7 @@ struct RoseView(Copyable, Movable):
       - the same data as `Array` costs ~4 chars per element.
 
     So the per-entry pools travel as Array parameters
-    (rose_meta_arr / rose_lits_arr) and this struct carries only scalars.
+    (`_rose_meta` / `_rose_lits`) and this struct carries only scalars.
     The other lanes never hit this because their scan functions stay
     small enough to inline, at which point no symbol spells the values
     at all.
@@ -344,14 +344,6 @@ def rose_lits_len(r: RoseSet) -> Int:
     return max(1, n)
 
 
-def rose_meta_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    var meta = _rose_meta(r)
-    for i in range(min(n, len(meta))):
-        arr[i] = Int32(meta[i])
-    return arr^
-
-
 def rose_bcls_len(r: RoseSet) -> Int:
     return max(1, 8 * len(r.back_classes))
 
@@ -387,14 +379,6 @@ def rose_look_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
             if w < n:
                 arr[w] = Int32(r.looks[i][j])
             w += 1
-    return arr^
-
-
-def rose_lits_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    var lits = _rose_lits(r)
-    for i in range(min(n, len(lits))):
-        arr[i] = Int32(lits[i])
     return arr^
 
 

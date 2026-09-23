@@ -13,13 +13,14 @@ which keeps its own 4096-state cap and Pike VM fallback.
 
 from std.bit import count_trailing_zeros, pop_count
 from std.collections import Array
+from std.math import iota
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import PROBE_RANKS
-from .static_bytes import table_bytes
+from .static_bytes import int_arr
 from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
@@ -201,16 +202,9 @@ def _bs_eq(a: _StateBits, b: _StateBits) -> Bool:
     return (a ^ b).reduce_or() == 0
 
 
-def _mk_bs_salt() -> SIMD[DType.uint64, 64]:
-    """Distinct odd multiplier per lane so identical words in different
-    lanes hash differently."""
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
-    return v
-
-
-comptime _BS_SALT = _mk_bs_salt()
+# Distinct odd multiplier per lane so identical words in different lanes
+# hash differently.
+comptime _BS_SALT = (2 * iota[DType.uint64, 64]() + 1) * 0x9E3779B97F4A7C15
 
 
 @always_inline
@@ -540,49 +534,12 @@ def _wb_normalize(fl: Int) -> Int:
     return fl
 
 
-def _wb_cont_reaches_bol(nfa: NFA) -> Bool:
-    """Comptime: does some word anchor's epsilon continuation reach a BOL
-    kind (`\\b^`, `(?m)\\b^x`)? The DFA lanes expand a word anchor's
-    continuation when the anchor resolves, without the position context
-    a BOL kind needs, so such patterns stay off them (the mirror of
-    `_eol_continuation_crosses_anchor`). The walk follows every anchor
-    conservatively."""
-    var num_states = len(nfa.states)
-    for i in range(num_states):
-        if nfa.states[i].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[i].anchor_type
-        if (
-            at != AnchorKind.WORD_BOUNDARY
-            and at != AnchorKind.NOT_WORD_BOUNDARY
-        ):
-            continue
-        var visited = List[Bool](length=num_states, fill=False)
-        var stack: List[Int] = [nfa.states[i].out1]
-        while len(stack) > 0:
-            var s = stack.pop()
-            if s < 0 or s >= num_states or visited[s]:
-                continue
-            visited[s] = True
-            var kind = nfa.states[s].kind
-            if kind == NFAStateKind.SPLIT:
-                stack.append(nfa.states[s].out1)
-                stack.append(nfa.states[s].out2)
-            elif kind == NFAStateKind.SAVE:
-                stack.append(nfa.states[s].out1)
-            elif kind == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[s].anchor_type
-                if at2 == AnchorKind.BOL or at2 == AnchorKind.BOL_MULTILINE:
-                    return True
-                stack.append(nfa.states[s].out1)
-    return False
-
-
 struct EagerDFA(Copyable, Movable):
     """Comptime-computed DFA: flat transition table + per-state flags.
 
     Only ever exists as a comptime value; the runtime engine reads the
-    materialized forms (see edfa_table_str / edfa_flags_arr).
+    materialized forms (the table as a string literal, the flags as an
+    Array — `Regex._EDFA_TABLE` / `_EDFA_FLAGS`).
     """
 
     var valid: Bool
@@ -640,66 +597,20 @@ struct EagerDFA(Copyable, Movable):
         self.region_land = List[Int]()
 
 
-def _eol_ml_continuation_consumes(nfa: NFA) -> Bool:
-    """Comptime: does any EOL_MULTILINE anchor's continuation consume?
-
-    The DFA lanes keep EOL anchors unresolved in state sets and resolve
-    them via per-state flags, so a continuation that must consume more
-    input (e.g. `(?m)a$\\nb`) is unreachable there — the DFA silently
-    under-reports. Such patterns must stay off the DFA lanes. Strict EOL
-    needs no such guard: it holds only at end of input, where a
-    consuming continuation is provably dead. The walk follows any
-    anchor conservatively (assume it could hold).
-    """
+def _anchor_cont_hits[
+    seed_mask: Int, hit_anchor_mask: Int, hit_consuming: Bool
+](nfa: NFA) -> Bool:
+    """Comptime: does the epsilon continuation (`out1`) of some anchor whose
+    kind is in `seed_mask` reach an anchor whose kind is in
+    `hit_anchor_mask`, or, with `hit_consuming`, a consuming state (CHAR,
+    CHARSET, ANY, BACKREF)? Masks are `1 << AnchorKind`. The walk follows
+    SPLIT, SAVE and every other anchor (conservatively assuming it holds);
+    anything else ends it."""
     var num_states = len(nfa.states)
     for i in range(num_states):
         if nfa.states[i].kind != NFAStateKind.ANCHOR:
             continue
-        if nfa.states[i].anchor_type != AnchorKind.EOL_MULTILINE:
-            continue
-        var visited = List[Bool](length=num_states, fill=False)
-        var stack: List[Int] = [nfa.states[i].out1]
-        while len(stack) > 0:
-            var s = stack.pop()
-            if s < 0 or s >= num_states or visited[s]:
-                continue
-            visited[s] = True
-            var kind = nfa.states[s].kind
-            if (
-                kind == NFAStateKind.CHAR
-                or kind == NFAStateKind.CHARSET
-                or kind == NFAStateKind.ANY
-                or kind == NFAStateKind.BACKREF
-            ):
-                return True
-            if kind == NFAStateKind.SPLIT:
-                stack.append(nfa.states[s].out1)
-                stack.append(nfa.states[s].out2)
-            elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
-                stack.append(nfa.states[s].out1)
-    return False
-
-
-def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
-    """Comptime: does any EOL anchor's continuation reach an anchor whose
-    truth is NOT implied by the EOL that precedes it?
-
-    The DFA lanes resolve EOL anchors with per-state flag bytes, which
-    carry one bit of context ("we are at a '\\n'" / "we are at the end").
-    A nested EOL anchor is fine — `_reaches_match` follows the kinds that
-    hold in the same context, which is what makes `ab$$` work. A BOL kind
-    or a word boundary is not: whether it holds depends on the *preceding*
-    byte, which the flag cannot express, so the walk would have to guess.
-    Such patterns stay off these lanes rather than guess (the same
-    treatment `_eol_ml_continuation_consumes` gives consuming
-    continuations).
-    """
-    var num_states = len(nfa.states)
-    for i in range(num_states):
-        if nfa.states[i].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[i].anchor_type
-        if at != AnchorKind.EOL and at != AnchorKind.EOL_MULTILINE:
+        if (seed_mask >> nfa.states[i].anchor_type) & 1 == 0:
             continue
         var visited = List[Bool](length=num_states, fill=False)
         var stack: List[Int] = [nfa.states[i].out1]
@@ -715,14 +626,51 @@ def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
             elif kind == NFAStateKind.SAVE:
                 stack.append(nfa.states[s].out1)
             elif kind == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[s].anchor_type
-                if at2 == AnchorKind.EOL or at2 == AnchorKind.EOL_MULTILINE:
-                    stack.append(nfa.states[s].out1)
-                else:
+                if (hit_anchor_mask >> nfa.states[s].anchor_type) & 1 != 0:
                     return True
-            # consuming states end the walk; the consuming case has its
-            # own guard (_eol_ml_continuation_consumes)
+                stack.append(nfa.states[s].out1)
+            elif hit_consuming and (
+                kind == NFAStateKind.CHAR
+                or kind == NFAStateKind.CHARSET
+                or kind == NFAStateKind.ANY
+                or kind == NFAStateKind.BACKREF
+            ):
+                return True
     return False
+
+
+comptime _EOL_KINDS = (1 << AnchorKind.EOL) | (1 << AnchorKind.EOL_MULTILINE)
+
+comptime _wb_cont_reaches_bol = _anchor_cont_hits[
+    (1 << AnchorKind.WORD_BOUNDARY) | (1 << AnchorKind.NOT_WORD_BOUNDARY),
+    (1 << AnchorKind.BOL) | (1 << AnchorKind.BOL_MULTILINE),
+    False,
+]
+"""Does some word anchor's continuation reach a BOL kind (`\\b^`,
+`(?m)\\b^x`)? The DFA lanes expand a word anchor's continuation when the
+anchor resolves, without the position context a BOL kind needs, so such
+patterns stay off them."""
+
+comptime _eol_ml_continuation_consumes = _anchor_cont_hits[
+    1 << AnchorKind.EOL_MULTILINE, 0, True
+]
+"""Does any EOL_MULTILINE anchor's continuation consume? The DFA lanes keep
+EOL anchors unresolved in state sets and resolve them via per-state flags,
+so a continuation that must consume more input (`(?m)a$\\nb`) is
+unreachable there and the DFA would silently under-report. Strict EOL
+needs no such guard: it holds only at end of input, where a consuming
+continuation is provably dead."""
+
+comptime _eol_continuation_crosses_anchor = _anchor_cont_hits[
+    _EOL_KINDS, ~_EOL_KINDS, False
+]
+"""Does any EOL anchor's continuation reach an anchor whose truth is NOT
+implied by the EOL before it? The flag bytes carry one bit of context ("at
+a '\\n'" / "at the end"): a nested EOL is fine (`_reaches_match` follows
+it, which is what makes `ab$$` work), but a BOL kind or word boundary
+depends on the PRECEDING byte, so such patterns stay off these lanes
+rather than guess. (Consuming continuations are
+`_eol_ml_continuation_consumes`'s.)"""
 
 
 # Folded into a state's hash when its look-behind class is "word".
@@ -760,14 +708,7 @@ def _classic_flags(
     return fl
 
 
-def _mk_iota256_i64() -> SIMD[DType.int64, 256]:
-    var v = SIMD[DType.int64, 256](0)
-    for i in range(256):
-        v[i] = Int64(i)
-    return v
-
-
-comptime _IOTA256_I64 = _mk_iota256_i64()
+comptime _IOTA256_I64 = iota[DType.int64, 256]()
 
 
 def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
@@ -849,81 +790,163 @@ def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
     return reps^
 
 
-def _flatten_nfa(
-    nfa: NFA,
-    class_of: List[Int],
-    nclasses: Int,
-    nl_class: Int,
-    mut kinds: List[Int],
-    mut out1s: List[Int],
-    mut out2s: List[Int],
-    mut anchors: List[Int],
-    mut cls_mask: List[SIMD[DType.uint64, 4]],
-    mut consuming_bits: _StateBits,
-    mut match_bits: _StateBits,
-    mut eol_bits: _StateBits,
-    mut has_bol_ml: Bool,
-):
-    """One flat pass over the NFA, shared by the bitset determinizers.
+struct _FlatNFA:
+    """Byte classes plus one flat pass over the NFA — the setup every bitset
+    determinizer shares. Built ONCE per build, in place (`var flat =
+    _FlatNFA(nfa)`); callers bind the fields they need to locals with `ref`
+    and pass those, never the struct, into the hot loops, which then never
+    carry an aggregate across a call boundary."""
 
-    Fills flat views for the closure walks, membership bitsets, and each
-    state's accepted-class mask (classes are byte intervals wholly inside
-    or outside every accept set, so a class bitmask per state captures
-    acceptance exactly). Called ONCE per build: the point of the flat
-    views is that the hot loops never pass the NFA aggregate across a
-    call boundary again.
-    """
-    var n = len(nfa.states)
-    for i in range(n):
-        var kind = nfa.states[i].kind
-        kinds.append(kind)
-        out1s.append(nfa.states[i].out1)
-        out2s.append(nfa.states[i].out2)
-        var at = nfa.states[i].anchor_type
-        anchors.append(at)
-        var cm = SIMD[DType.uint64, 4](0)
-        if kind == NFAStateKind.CHAR:
-            var c = Int(nfa.states[i].char_value)
-            if c < 256:
-                var ci = class_of[c]
-                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.ANY:
-            for ci in range(nclasses):
-                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
-                UInt64(1) << UInt64(nl_class & 63)
-            )
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.CHARSET:
-            var cs = nfa.states[i].charset_index
-            for r in range(len(nfa.charsets[cs].ranges)):
-                var lo = Int(nfa.charsets[cs].ranges[r].lo)
-                var hi = Int(nfa.charsets[cs].ranges[r].hi)
-                if lo > hi or lo > 255:
-                    continue
-                if hi > 255:
-                    hi = 255
-                # _byte_classes marked lo and hi+1, so the classes of lo
-                # and hi bound exactly the classes inside [lo, hi].
-                for ci in range(class_of[lo], class_of[hi] + 1):
+    var class_of: List[Int]  # 256 entries: byte -> class (_byte_classes)
+    var reps: List[Int]  # first byte of each class; classes are intervals
+    var nclasses: Int
+    var nl_class: Int  # the class of '\n'
+    # Flat views for the closure walks.
+    var kinds: List[Int]
+    var out1s: List[Int]
+    var out2s: List[Int]
+    var anchors: List[Int]
+    # Each state's accepted-class mask (classes are byte intervals wholly
+    # inside or outside every accept set, so a class bitmask per state
+    # captures acceptance exactly).
+    var cls_mask: List[SIMD[DType.uint64, 4]]
+    var consuming_bits: _StateBits
+    var match_bits: _StateBits
+    var eol_bits: _StateBits  # EOL / EOL_MULTILINE anchors
+    var has_bol_ml: Bool
+
+    def __init__(out self, nfa: NFA):
+        self.class_of = List[Int](fill=-1, length=256)
+        self.reps = _byte_classes(nfa, self.class_of)
+        var nclasses = len(self.reps)
+        var nl_class = self.class_of[Int(CHAR_NEWLINE)]
+        self.nclasses = nclasses
+        self.nl_class = nl_class
+        self.kinds = List[Int]()
+        self.out1s = List[Int]()
+        self.out2s = List[Int]()
+        self.anchors = List[Int]()
+        self.cls_mask = List[SIMD[DType.uint64, 4]]()
+        self.consuming_bits = _StateBits(0)
+        self.match_bits = _StateBits(0)
+        self.eol_bits = _StateBits(0)
+        self.has_bol_ml = False
+        var n = len(nfa.states)
+        for i in range(n):
+            var kind = nfa.states[i].kind
+            self.kinds.append(kind)
+            self.out1s.append(nfa.states[i].out1)
+            self.out2s.append(nfa.states[i].out2)
+            var at = nfa.states[i].anchor_type
+            self.anchors.append(at)
+            var cm = SIMD[DType.uint64, 4](0)
+            if kind == NFAStateKind.CHAR:
+                var c = Int(nfa.states[i].char_value)
+                if c < 256:
+                    var ci = self.class_of[c]
                     cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            if nfa.charsets[cs].negated:
-                # Classes are pure w.r.t. this charset, so negation is
-                # exact at class granularity.
-                for w in range(4):
-                    cm[w] = ~cm[w]
-                for ci in range(nclasses, 256):
-                    cm[ci >> 6] = cm[ci >> 6] & ~(UInt64(1) << UInt64(ci & 63))
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.MATCH:
-            _bs_set(match_bits, i)
-        elif kind == NFAStateKind.ANCHOR:
-            if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
-                _bs_set(eol_bits, i)
-            elif at == AnchorKind.BOL_MULTILINE:
-                has_bol_ml = True
-        cls_mask.append(cm)
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.ANY:
+                for ci in range(nclasses):
+                    cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+                cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
+                    UInt64(1) << UInt64(nl_class & 63)
+                )
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.CHARSET:
+                var cs = nfa.states[i].charset_index
+                for r in range(len(nfa.charsets[cs].ranges)):
+                    var lo = Int(nfa.charsets[cs].ranges[r].lo)
+                    var hi = Int(nfa.charsets[cs].ranges[r].hi)
+                    if lo > hi or lo > 255:
+                        continue
+                    if hi > 255:
+                        hi = 255
+                    # _byte_classes marked lo and hi+1, so the classes of
+                    # lo and hi bound exactly the classes inside [lo, hi].
+                    for ci in range(self.class_of[lo], self.class_of[hi] + 1):
+                        cm[ci >> 6] = cm[ci >> 6] | (
+                            UInt64(1) << UInt64(ci & 63)
+                        )
+                if nfa.charsets[cs].negated:
+                    # Classes are pure w.r.t. this charset, so negation is
+                    # exact at class granularity.
+                    for w in range(4):
+                        cm[w] = ~cm[w]
+                    for ci in range(nclasses, 256):
+                        cm[ci >> 6] = cm[ci >> 6] & ~(
+                            UInt64(1) << UInt64(ci & 63)
+                        )
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.MATCH:
+                _bs_set(self.match_bits, i)
+            elif kind == NFAStateKind.ANCHOR:
+                if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
+                    _bs_set(self.eol_bits, i)
+                elif at == AnchorKind.BOL_MULTILINE:
+                    self.has_bol_ml = True
+            self.cls_mask.append(cm)
+
+
+def _class_ranges(
+    reps: List[Int],
+    mut rep_lo: SIMD[DType.int32, 256],
+    mut rep_hi: SIMD[DType.int32, 256],
+):
+    """Comptime: class c is the byte interval [rep_lo[c], rep_hi[c]], from
+    the first bytes `reps` (`_byte_classes`)."""
+    var nclasses = len(reps)
+    for ci in range(nclasses):
+        rep_lo[ci] = Int32(reps[ci])
+        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
+            255
+        )
+
+
+def _word_classes(
+    rep_lo: SIMD[DType.int32, 256], nclasses: Int
+) -> SIMD[DType.uint64, 4]:
+    """Comptime: the classes of word bytes, as a class bitmask (classes are
+    pure w.r.t. the word set when the NFA has a word anchor)."""
+    var word_cls = SIMD[DType.uint64, 4](0)
+    for ci in range(nclasses):
+        if _is_word_byte(Int(rep_lo[ci])):
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (
+                UInt64(1) << UInt64(ci & 63)
+            )
+    return word_cls
+
+
+def _eol_ok_bits(
+    nfa: NFA,
+    f: _FlatNFA,
+    mut eol_end_ok: _StateBits,
+    mut eol_nl_ok: _StateBits,
+):
+    """Comptime: pending-EOL resolution per anchor state, as bitsets — does
+    its continuation reach MATCH at end of input (`eol_end_ok`) / at a
+    '\\n' (`eol_nl_ok`)? The question `_check_eol_match` asks per member,
+    precomputed so a state's flags are bitset ANDs."""
+    for s in range(len(f.kinds)):
+        if (f.eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
+            continue
+        if _reaches_match(nfa, f.out1s[s], True):
+            _bs_set(eol_end_ok, s)
+        if f.anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
+            nfa, f.out1s[s], False
+        ):
+            _bs_set(eol_nl_ok, s)
+
+
+def _bs_members(bits: _StateBits) -> List[Int]:
+    """Comptime: the members of a bitset, ascending."""
+    var members = List[Int]()
+    for l in range(64):
+        var w = bits[l]
+        while w != 0:
+            members.append(64 * l + Int(count_trailing_zeros(w)))
+            w &= w - 1
+    return members^
 
 
 # --- Hopcroft minimization -------------------------------------------------
@@ -951,35 +974,12 @@ comptime _MIN_CAP = 128
 comptime _COL_CHUNK = 8
 
 
-def _mk_bit64() -> SIMD[DType.uint64, 64]:
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(1) << UInt64(i)
-    return v
-
-
-comptime _BIT64 = _mk_bit64()
-
-
-def _mk_iota256() -> SIMD[DType.int32, 256]:
-    var v = SIMD[DType.int32, 256](0)
-    for i in range(256):
-        v[i] = Int32(i)
-    return v
-
-
-comptime _IOTA256 = _mk_iota256()
-
-
-def _mk_col_salt() -> SIMD[DType.uint64, _MIN_CAP]:
-    """Distinct odd multiplier per state lane, as in _mk_bs_salt."""
-    var v = SIMD[DType.uint64, _MIN_CAP](0)
-    for i in range(_MIN_CAP):
-        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
-    return v
-
-
-comptime _COL_SALT = _mk_col_salt()
+comptime _BIT64 = SIMD[DType.uint64, 64](1) << iota[DType.uint64, 64]()
+comptime _IOTA256 = iota[DType.int32, 256]()
+# Distinct odd multiplier per state lane, as in _BS_SALT.
+comptime _COL_SALT = (
+    2 * iota[DType.uint64, _MIN_CAP]() + 1
+) * 0x9E3779B97F4A7C15
 
 
 @always_inline
@@ -1303,44 +1303,21 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     if n > EDFA_NFA_CAP:
         return result^  # cannot bitset; would blow EDFA_STATE_CAP anyway
 
-    # --- Byte classes: intervals with a representative first byte. ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    # --- Byte classes + one flat pass over the NFA (see _FlatNFA). ---
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref consuming_bits = flat.consuming_bits
+    ref match_bits = flat.match_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    # --- One flat pass over the NFA (see _flatten_nfa). ---
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     # --- Continuation closures, memoized by target state. ---
     # closure(union of targets) == union of closures, so per-member work in
@@ -1377,21 +1354,9 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     var lazy_members = 0
     var pool_threshold = 2 * n
 
-    # Pending-EOL resolution per anchor state, as bitsets: does the
-    # continuation reach MATCH at end of input / at a '\n'? (Same
-    # question `_check_eol_match` asks per member; precomputed so the
-    # per-state flag computation is two bitset ANDs.)
     var eol_end_ok = _StateBits(0)
     var eol_nl_ok = _StateBits(0)
-    for s in range(n):
-        if (eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
-            continue
-        if _reaches_match(nfa, out1s[s], True):
-            _bs_set(eol_end_ok, s)
-        if anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
-            nfa, out1s[s], False
-        ):
-            _bs_set(eol_nl_ok, s)
+    _eol_ok_bits(nfa, flat, eol_end_ok, eol_nl_ok)
 
     # --- Word boundaries: look-behind class per state. ---
     # A DFA state is (set, prev_word): the set keeps word anchors as
@@ -1403,12 +1368,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     # feed the word / non-word byte classes of the transitions.
     var has_wb = _nfa_has_word_anchor(nfa)
     var wb_bits = _word_anchor_bits(kinds, anchors)
-    var word_cls = SIMD[DType.uint64, 4](0)  # classes of word bytes
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)
 
     # --- State-set bookkeeping: bitsets, hashes in SIMD lanes, flags. ---
     var sets_bits = List[_StateBits]()
@@ -1680,9 +1640,9 @@ def _edfa_finish(
     `starts` holds any number of start ids in the caller's order, the
     first three being (other, after-'\\n', at-0) for the `start_*`
     fields; the permuted ids come back in the same order so a producer
-    with extra start contexts (the leftmost-first DFA's anchored starts)
-    can record them. The first `nregion` of them are the candidates for
-    region acceleration (the unanchored start contexts). Marks `result`
+    with extra ids to track can record them. The first `nregion` of them
+    are the candidates for region acceleration (the unanchored start
+    contexts). Marks `result`
     valid.
     """
     # Merge states no input can tell apart. Before the permutation and
@@ -1852,26 +1812,6 @@ def _edfa_finish(
     return pstarts^
 
 
-def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
-    """Comptime: the flat table as `n` little-endian `dt` entries (see
-    static_bytes.mojo for why a string, not an Array).
-
-    `dt` comes from `edfa_id_dtype`, `n` from `edfa_table_len` (it may
-    exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
-    survives the narrowing, so the walkers keep their sign-bit dead test.
-    """
-    assert n == 0 or n >= len(d.table), "table string shorter than the table"
-    return table_bytes[dt](d.table, n)
-
-
-def edfa_flags_arr[n: Int](d: EagerDFA) -> Array[UInt8, n]:
-    """Comptime conversion of per-state flags to a materializable array."""
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(d.flags[i])
-    return arr^
-
-
 # --- Runtime table walkers -------------------------------------------------
 #
 # The DFA metadata `d` and the table/flags arrive as comptime parameters, so
@@ -1904,12 +1844,7 @@ def _find_exit2[
     return input_len
 
 
-def _region_land_arr(d: EagerDFA) -> Array[Int16, 256]:
-    """Comptime: `region_land` as a materializable array."""
-    var arr = Array[Int16, 256](fill=-1)
-    for b in range(len(d.region_land)):
-        arr[b] = Int16(d.region_land[b])
-    return arr^
+
 
 
 @always_inline
@@ -2018,7 +1953,7 @@ def _edfa_region_skip[
             if p2 > p:
                 # Every skipped byte's target is the same from any
                 # member: the state is whatever the last one selected.
-                comptime land = _region_land_arr(d)
+                comptime land = int_arr[DType.int16, 256](d.region_land, -1)
                 var lnd = materialize[land]()
                 cur = Int(lnd.unsafe_get(Int(input.unsafe_get(p2 - 1))))
                 p = p2
@@ -2257,7 +2192,7 @@ def _edfa_full_match_impl[
     cap: Int,
 ](input: Span[Byte, origin]) -> Bool:
     """Anchored full match. `cap == 0` steps the eager table (`table` from
-    `edfa_table_str`); a Sheng tier `cap` steps by one shuffle over the
+    `table_bytes`); a Sheng tier `cap` steps by one shuffle over the
     mask table `table` (`sheng_masks_str`, sheng.mojo), dead state
     `d.num_states`."""
     # `table` / `flags` are comptime constants; `materialize` binds them to

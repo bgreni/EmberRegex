@@ -44,8 +44,6 @@ from .optimize import (
     extract_required_byte,
     extract_match_sandwich,
     is_pure_literal,
-    lit_bytes_arr,
-    lit_flags_arr,
     select_probe_offsets,
 )
 from .teddy import (
@@ -82,9 +80,7 @@ from .static_dfa import (
     _wb_cont_reaches_bol,
     _pivot_prefilter,
     build_eager_dfa,
-    edfa_table_str,
     edfa_table_len,
-    edfa_flags_arr,
     edfa_id_dtype,
     edfa_full_match,
     edfa_match_at,
@@ -94,10 +90,8 @@ from .static_lfdfa import build_lf_dfa
 from .static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
-    rdfa_flags_arr,
-    rdfa_table_str,
 )
-from .static_bytes import static_bytes
+from .static_bytes import int_arr, list_arr, static_bytes, table_bytes
 from .sheng import (
     sheng_cap_for,
     sheng_full_match,
@@ -114,10 +108,9 @@ from .simd_kernels import (
 )
 from .executor import PikeVM, _VMBuffers, heapbt_match
 from .onepass import (
+    ONEPASS_CLASS_LEN,
     build_onepass,
     onepass_shape,
-    onepass_class_arr,
-    onepass_eps_arr,
     onepass_eps_len,
     onepass_match,
     onepass_state_arr,
@@ -1386,10 +1379,12 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     # of a per-call stack copy (see edfa_table_len).
     comptime _EDFA_TN = edfa_table_len(Self._edfa.num_states)
     comptime _EDFA_DT = edfa_id_dtype(Self._edfa.num_states)
-    comptime _EDFA_TABLE_S = edfa_table_str[Self._EDFA_TN, Self._EDFA_DT](
-        Self._edfa
+    comptime _EDFA_TABLE_S = table_bytes[Self._EDFA_DT](
+        Self._edfa.table, Self._EDFA_TN
     )
-    comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
+    comptime _EDFA_FLAGS = int_arr[DType.uint8, Self._edfa.num_states](
+        Self._edfa.flags, 0
+    )
     comptime _EDFA_TABLE = static_bytes[Self._EDFA_TABLE_S]()
     # Narrowest tbl tier that holds this DFA: a 6-state DFA keeps 16-lane
     # masks even where 64 lanes are available (see sheng.mojo).
@@ -1401,10 +1396,12 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     comptime _SHENG_MASKS = static_bytes[Self._SHENG_MASKS_S]()
     comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.num_states)
     comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.num_states)
-    comptime _LFDFA_TABLE_S = edfa_table_str[Self._LFDFA_TN, Self._LFDFA_DT](
-        Self._lfdfa
+    comptime _LFDFA_TABLE_S = table_bytes[Self._LFDFA_DT](
+        Self._lfdfa.table, Self._LFDFA_TN
     )
-    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.num_states](Self._lfdfa)
+    comptime _LFDFA_FLAGS = int_arr[DType.uint8, Self._lfdfa.num_states](
+        Self._lfdfa.flags, 0
+    )
     comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa, Self._use_lf_sheng)
     comptime _LF_SHENG_MASKS_S = sheng_masks_str[Self._LF_SHENG_CAP](
         Self._lfdfa, Self._use_lf_sheng
@@ -1413,10 +1410,12 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     comptime _LF_SHENG_MASKS = static_bytes[Self._LF_SHENG_MASKS_S]()
     comptime _RDFA_TN = edfa_table_len(Self._rdfa.num_states)
     comptime _RDFA_DT = edfa_id_dtype(Self._rdfa.num_states)
-    comptime _RDFA_TABLE_S = rdfa_table_str[Self._RDFA_TN, Self._RDFA_DT](
-        Self._rdfa
+    comptime _RDFA_TABLE_S = table_bytes[Self._RDFA_DT](
+        Self._rdfa.table, Self._RDFA_TN
     )
-    comptime _RDFA_FLAGS = rdfa_flags_arr[Self._rdfa.num_states](Self._rdfa)
+    comptime _RDFA_FLAGS = int_arr[DType.uint8, Self._rdfa.num_states](
+        Self._rdfa.flags, 0
+    )
     comptime _RDFA_TABLE = static_bytes[Self._RDFA_TABLE_S]()
     # Pivot-anchored prefilter shape (the `[class]+ P …` family), read off
     # the classic table; the leftmost-first scan starts at its candidate.
@@ -1436,11 +1435,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     # _find_prefix_candidate's delegation to simd_find_literal_rare
     # (List-bearing values must not ride as comptime parameters).
     # Referenced only when fprefix_len >= 2.
-    comptime _FPRE_LIT = lit_bytes_arr[Self._strategy.fprefix_len](
-        Self._fpre.bytes
+    comptime _FPRE_LIT = list_arr[UInt8, Self._strategy.fprefix_len](
+        Self._fpre.bytes, 0
     )
-    comptime _FPRE_CL = lit_flags_arr[Self._strategy.fprefix_len](
-        Self._fpre.caseless
+    comptime _FPRE_CL = list_arr[Bool, Self._strategy.fprefix_len](
+        Self._fpre.caseless, False
     )
     # Reverse-suffix / reverse-inner required literal (Rust regex's
     # ReverseSuffix/ReverseInner, effects (a)+(b) — see _lf_next_match's
@@ -1464,8 +1463,10 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     # where _use_rev_literal holds, so the invalid case (length 0) never
     # elaborates.
     comptime _IL_N = len(Self._inner_lit.bytes)
-    comptime _IL_LIT = lit_bytes_arr[Self._IL_N](Self._inner_lit.bytes)
-    comptime _IL_CL = lit_flags_arr[Self._IL_N](Self._inner_lit.caseless)
+    comptime _IL_LIT = list_arr[UInt8, Self._IL_N](Self._inner_lit.bytes, 0)
+    comptime _IL_CL = list_arr[Bool, Self._IL_N](
+        Self._inner_lit.caseless, False
+    )
     comptime _IL_PROBES = select_probe_offsets(
         Self._inner_lit.bytes, Self._inner_lit.caseless
     )
@@ -1542,9 +1543,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     comptime _OP_TN = onepass_table_len(Self._onepass)
     comptime _OP_TABLE_S = onepass_table_str[Self._OP_TN](Self._onepass)
     comptime _OP_TABLE = static_bytes[Self._OP_TABLE_S]()
-    comptime _OP_CLASSES = onepass_class_arr(Self._onepass)
+    comptime _OP_CLASSES = int_arr[DType.uint8, ONEPASS_CLASS_LEN](
+        Self._onepass.class_of, 0
+    )
     comptime _OP_NE = onepass_eps_len(Self._onepass)
-    comptime _OP_EPS = onepass_eps_arr[Self._OP_NE](Self._onepass)
+    comptime _OP_EPS = list_arr[UInt64, Self._OP_NE](Self._onepass.eps_sets, 0)
     comptime _OP_NS = onepass_state_len(Self._onepass)
     comptime _OP_STATES = onepass_state_arr[Self._OP_NS](Self._onepass)
 

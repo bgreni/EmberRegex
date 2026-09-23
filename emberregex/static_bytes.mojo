@@ -12,7 +12,7 @@ bytes at comptime (`table_bytes`), turned into a `StringLiteral` once per
 `Regex` (`static_bytes`), and read through `unsafe_ptr()` in the walkers.
 """
 
-from std.collections import List
+from std.collections import Array, List
 from std.collections.string.string_span import _get_kgen_string
 from std.sys import size_of
 
@@ -68,3 +68,26 @@ def static_bytes[
 ]:
     """Comptime: the bytes of `s` as a string literal (static data)."""
     return {}
+
+
+def list_arr[
+    T: Copyable & Deinitable, n: Int
+](l: List[T], fill: T) -> Array[T, n]:
+    """Comptime: the first `n` entries of `l` as an Array, `fill` past its
+    end — the form small tables take to ride as walker comptime parameters
+    (List-bearing values must not). Call at decl level (`comptime x =
+    list_arr[...](...)`) so the copy is memoized."""
+    var a = Array[T, n](fill=fill)
+    for i in range(min(n, len(l))):
+        a[i] = l[i].copy()
+    return a^
+
+
+def int_arr[
+    dt: DType, n: Int
+](l: List[Int], fill: Scalar[dt]) -> Array[Scalar[dt], n]:
+    """Comptime: `list_arr` narrowing each entry to `dt`."""
+    var a = Array[Scalar[dt], n](fill=fill)
+    for i in range(min(n, len(l))):
+        a[i] = Scalar[dt](l[i])
+    return a^
