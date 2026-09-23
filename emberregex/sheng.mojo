@@ -39,7 +39,7 @@ search_forward here any more.
 from std.collections import Array
 from std.sys import simd_width_of
 
-from .constants import CHAR_NEWLINE
+from .constants import CHAR_NEWLINE, is_word_byte
 from .static_bytes import filled_string
 from .static_dfa import (
     EDFA_EOL_AT_END,
@@ -50,12 +50,11 @@ from .static_dfa import (
     _edfa_has_accel,
     _edfa_has_region,
     _edfa_region_skip,
-    edfa_is_word,
 )
 from .simd_kernels import (
+    HAS_WIDE_BYTE_SHUFFLE,
     NIBBLE_TABLE_SIZE,
-    SHUFFLE_INDEX_LANES,
-    WIDE_TABLE_CAP,
+    _ShuffleIndex,
     nibble_lookup,
     table_lookup_32,
     table_lookup_64,
@@ -63,12 +62,7 @@ from .simd_kernels import (
 
 # Widest tbl tier this target can do in one instruction (see module
 # docstring) — an algorithmic constant, NOT a platform vector width.
-comptime SHENG_STATE_CAP = WIDE_TABLE_CAP
-
-# The state vector broadcasts one state id across the shuffle's index
-# register; only lane 0 is ever read back. Its width is the tbl result
-# width and is independent of the mask width.
-comptime _ShengState = SIMD[DType.uint8, SHUFFLE_INDEX_LANES]
+comptime SHENG_STATE_CAP = 64 if HAS_WIDE_BYTE_SHUFFLE else NIBBLE_TABLE_SIZE
 
 # Flat 256 x cap mask table. Scalar element type matters: comptime
 # Array[Int32/UInt8, n] parameters lower to shared constant data in
@@ -150,8 +144,10 @@ def sheng_masks_str[cap: Int](d: EagerDFA, enabled: Bool) -> String:
 @always_inline
 def _sheng_step[
     cap: Int
-](masks: StringLiteral, b: Byte, state_vec: _ShengState) -> _ShengState:
-    """One transition: shuffle the byte's mask by the state vector.
+](masks: StringLiteral, b: Byte, state_vec: _ShuffleIndex) -> _ShuffleIndex:
+    """One transition: shuffle the byte's mask by the state vector (the
+    state id broadcast across the index register; only lane 0 is ever
+    read back, and its width is independent of the mask width).
 
     Each branch loads and shuffles at the literal tier width `cap`: only the tier this DFA needs is emitted,
     and the NEON-only tiers are never elaborated where cap is always
@@ -279,7 +275,7 @@ def _sheng_full_match_impl[
     # `masks` / `flags` are comptime arrays; `materialize` binds them to the
     # constant data emitted in the binary (no copy) so the walk can index them.
     var flg = materialize[flags]()
-    var cur_vec = _ShengState(UInt8(d.start_at_0))
+    var cur_vec = _ShuffleIndex(UInt8(d.start_at_0))
     var cur = d.start_at_0
     var pos = 0
     var input_len = len(input)
@@ -291,7 +287,7 @@ def _sheng_full_match_impl[
                 var before = cur
                 skipped = _edfa_region_skip[d=d](input, cur, skipped)
                 if cur != before:
-                    cur_vec = _ShengState(UInt8(cur))
+                    cur_vec = _ShuffleIndex(UInt8(cur))
             pos = skipped
             if pos >= input_len:
                 break
@@ -383,12 +379,12 @@ def _sheng_walk_impl[
         cur = s_nl
     else:
         comptime if s_other_w != s_other:
-            cur = s_other_w if edfa_is_word(
+            cur = s_other_w if is_word_byte(
                 input.unsafe_get(start - 1)
             ) else s_other
         else:
             cur = s_other
-    var cur_vec = _ShengState(UInt8(cur))
+    var cur_vec = _ShuffleIndex(UInt8(cur))
 
     var last_match = -1
     if cur < d.num_match_states:
@@ -403,7 +399,7 @@ def _sheng_walk_impl[
                 var before = cur
                 skipped = _edfa_region_skip[d=d](input, cur, skipped)
                 if cur != before:
-                    cur_vec = _ShengState(UInt8(cur))
+                    cur_vec = _ShuffleIndex(UInt8(cur))
             pos = skipped
             if pos >= input_len:
                 break
@@ -417,7 +413,7 @@ def _sheng_walk_impl[
         comptime if d.any_wb:
             if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
                 var f = flg.unsafe_get(cur)
-                if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
+                if ((f & EDFA_MATCH_IF_WORD) != 0) == is_word_byte(b):
                     last_match = pos
         cur_vec = _sheng_step[cap](masks, b, cur_vec)
         cur = Int(cur_vec[0])

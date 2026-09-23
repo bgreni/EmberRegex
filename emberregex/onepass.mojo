@@ -85,7 +85,7 @@ from std.sys import simd_width_of
 
 from .ast import AnchorKind
 from .backtrack import _sbt_is_simple_body
-from .constants import CHAR_NEWLINE
+from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind, split_cycle_flags
 from .static_bytes import filled_string
 from .static_dfa import (
@@ -101,7 +101,6 @@ from .static_dfa import (
     _is_word_byte,
     _nfa_has_word_anchor,
     _wb_holds,
-    edfa_is_word,
 )
 from .simd_kernels import (
     ACCEL_SHUFTI,
@@ -783,7 +782,7 @@ def _op_start_state[op: OnePass](input: Span[Byte, _], start: Int) -> Int:
             if b == CHAR_NEWLINE:
                 return op.start_nl
         comptime if op.start_word != op.start_other:
-            if edfa_is_word(b):
+            if is_word_byte(b):
                 return op.start_word
         return op.start_other
 
@@ -809,13 +808,13 @@ def _op_match_ok[
             ):
                 return False
             if flags & Int(OP_NEED_WORD) != 0 and (
-                at_eof or not edfa_is_word(input.unsafe_get(end_pin))
+                at_eof or not is_word_byte(input.unsafe_get(end_pin))
             ):
                 return False
             if (
                 flags & Int(OP_NEED_NONWORD) != 0
                 and not at_eof
-                and edfa_is_word(input.unsafe_get(end_pin))
+                and is_word_byte(input.unsafe_get(end_pin))
             ):
                 return False
     return True

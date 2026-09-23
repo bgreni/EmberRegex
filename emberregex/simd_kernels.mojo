@@ -51,10 +51,6 @@ comptime HAS_FAST_BYTE_SHUFFLE = (
 # executes once per input byte.
 comptime HAS_WIDE_BYTE_SHUFFLE = CompilationTarget.has_neon()
 
-# Widest single-instruction table lookup on this target. This is the
-# ceiling on Sheng's state count, not a vector width.
-comptime WIDE_TABLE_CAP = 64 if HAS_WIDE_BYTE_SHUFFLE else NIBBLE_TABLE_SIZE
-
 # One tbl/pshufb produces 16 result bytes, so the index vector is one
 # 128-bit register no matter how wide the table is.
 comptime SHUFFLE_INDEX_LANES = 16

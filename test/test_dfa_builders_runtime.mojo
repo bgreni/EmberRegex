@@ -19,7 +19,7 @@ answer). Nothing here selects a lane, so no lane pin applies.
 
 from emberregex.nfa import build_nfa, NFA
 from emberregex.parser import parse
-from emberregex.constants import CHAR_NEWLINE
+from emberregex.constants import CHAR_NEWLINE, is_word_byte
 from emberregex.simd_kernels import (
     ACCEL_SHUFTI,
     ACCEL_TRUFFLE,
@@ -30,7 +30,6 @@ from emberregex.static_dfa import (
     _minimize,
     EDFA_DEAD,
     EDFA_NFA_CAP,
-    edfa_is_word,
 )
 from emberregex.static_rdfa import (
     build_reverse_dfa,
@@ -78,7 +77,7 @@ def _find_start(d: RDFA, text: String, end: Int, floor: Int = 0) -> Int:
         cur = d.seed_at_end
     elif input[end] == CHAR_NEWLINE:
         cur = d.seed_at_nl
-    elif edfa_is_word(input[end]):
+    elif is_word_byte(input[end]):
         cur = d.seed_other_word
     else:
         cur = d.seed_other
@@ -96,7 +95,7 @@ def _find_start(d: RDFA, text: String, end: Int, floor: Int = 0) -> Int:
         if (f & RDFA_BOLNL) != 0 and b == CHAR_NEWLINE:
             best = pos
         if (f & (RDFA_WB_LEFT_WORD | RDFA_WB_LEFT_NONWORD)) != 0:
-            if ((f & RDFA_WB_LEFT_WORD) != 0) == edfa_is_word(b):
+            if ((f & RDFA_WB_LEFT_WORD) != 0) == is_word_byte(b):
                 best = pos
         if pos <= floor:
             return best

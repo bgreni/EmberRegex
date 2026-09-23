@@ -48,7 +48,7 @@ from std.collections import Array
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
-from .constants import CHAR_NEWLINE
+from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .set_reverse import _reverse_edges, _rev_flat_closure
 from .simd_kernels import (
@@ -84,7 +84,6 @@ from .static_dfa import (
     _word_anchor_bits,
     WB_PENDING,
     WB_RESOLVE,
-    edfa_is_word,
 )
 
 # Per-state accept bits.
@@ -870,7 +869,7 @@ def rdfa_find_start[
         cur = d.seed_at_nl
     else:
         comptime if d.seed_other_word != d.seed_other:
-            cur = d.seed_other_word if edfa_is_word(
+            cur = d.seed_other_word if is_word_byte(
                 input.unsafe_get(end)
             ) else d.seed_other
         else:
@@ -897,7 +896,7 @@ def rdfa_find_start[
                 best = pos
         comptime if d.any_wb:
             if (f & (RDFA_WB_LEFT_WORD | RDFA_WB_LEFT_NONWORD)) != 0:
-                if ((f & RDFA_WB_LEFT_WORD) != 0) == edfa_is_word(b):
+                if ((f & RDFA_WB_LEFT_WORD) != 0) == is_word_byte(b):
                     best = pos
         if pos <= floor:
             return best

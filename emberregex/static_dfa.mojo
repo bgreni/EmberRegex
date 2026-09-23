@@ -159,13 +159,6 @@ def _is_word_byte(b: Int) -> Bool:
     return b >= 0 and b < 256 and is_word_byte(Byte(b))
 
 
-@always_inline
-def edfa_is_word(b: Byte) -> Bool:
-    """Runtime twin of `_is_word_byte`: the shared `constants.is_word_byte`
-    every engine's `\\b` check uses."""
-    return is_word_byte(b)
-
-
 def _wb_holds(anchor_kind: Int, prev_word: Bool, next_word: Bool) -> Bool:
     """Comptime: does a word-boundary anchor of `anchor_kind` hold between
     a byte of class `prev_word` and one of class `next_word`? Out of
@@ -2416,7 +2409,7 @@ def _edfa_walk_impl[
         cur = s_nl
     else:
         comptime if s_other_w != s_other:
-            cur = s_other_w if edfa_is_word(
+            cur = s_other_w if is_word_byte(
                 input.unsafe_get(start - 1)
             ) else s_other
         else:
@@ -2448,7 +2441,7 @@ def _edfa_walk_impl[
             # Such states occupy one id range (see num_cond_states).
             if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
                 var f = flg.unsafe_get(cur)
-                if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
+                if ((f & EDFA_MATCH_IF_WORD) != 0) == is_word_byte(b):
                     last_match = pos
         var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
         if nxt < 0:
