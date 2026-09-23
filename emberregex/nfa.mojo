@@ -600,10 +600,7 @@ def _utf8_class_fragment(mut nfa: NFA, ranges: List[Int]) raises -> NFAFragment:
         frag.add_out(st, 1)
         return frag^
 
-    var all_idx = List[Int]()
-    for i in range(tbl.count):
-        all_idx.append(i)
-    return _utf8_trie_fragment(nfa, tbl.words, all_idx, 0)
+    return _utf8_trie_fragment(nfa, tbl.words, tbl.count)
 
 
 # Field width of the packed trie records and bucket descriptors built by
@@ -621,10 +618,10 @@ comptime _TRIE_ID_LIMIT = 1 << _TRIE_FIELD_BITS
 def _utf8_trie_fragment(
     mut nfa: NFA,
     seq_words: List[Int],
-    idxs: List[Int],
-    pos: Int,
+    count: Int,
 ) raises -> NFAFragment:
-    """Prefix-factored alternation over byte-range sequences.
+    """Prefix-factored alternation over the `count` byte-range sequences
+    packed in `seq_words`.
 
     Emitting one independent chain per sequence is correct but ruinous
     for the big Unicode classes: `\\p{L}` is 805 sequences, so the naive
@@ -650,7 +647,7 @@ def _utf8_trie_fragment(
     bucket the same thing (a first-seen scan plus a stable counting sort
     backs the fast path up, so unsorted inputs still factor correctly).
     """
-    if len(idxs) >= _TRIE_ID_LIMIT:
+    if count >= _TRIE_ID_LIMIT:
         raise Error("utf8 trie: too many sequences")
 
     # Local state records, one packed Int each; local ids materialize at
@@ -665,11 +662,14 @@ def _utf8_trie_fragment(
 
     # Worklist of subtrees: member indices, byte position, and the local
     # charset state whose out1 the subtree start patches (-1 = root).
+    var all_idx = List[Int]()
+    for i in range(count):
+        all_idx.append(i)
     var task_idxs = List[List[Int]]()
     var task_pos = List[Int]()
     var task_patch = List[Int]()
-    task_idxs.append(idxs.copy())
-    task_pos.append(pos)
+    task_idxs.append(all_idx^)
+    task_pos.append(0)
     task_patch.append(-1)
 
     var t = 0
