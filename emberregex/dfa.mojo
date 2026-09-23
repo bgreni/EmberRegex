@@ -262,6 +262,14 @@ struct LazyDFA(Copyable, Movable):
         comptime tables overflowed.
         """
         self._ensure_init(nfa)
+        return self._longest_end(nfa, input, start)
+
+    @always_inline
+    def _longest_end[
+        origin: Origin, //
+    ](mut self, nfa: NFA, input: Span[Byte, origin], start: Int) raises -> Int:
+        """`match_at`'s walk, without the init check: inlined into it and
+        into `search_forward`'s per-start loop."""
         var input_len = len(input)
 
         # Select initial state based on position context
@@ -332,40 +340,7 @@ struct LazyDFA(Copyable, Movable):
                         break
                     pos += 1
 
-            if pos > input_len:
-                break
-
-            # Select initial state based on position context
-            var current: Int
-            if pos == 0:
-                current = self._init_start
-            elif pos > 0 and input.unsafe_get(pos - 1) == CHAR_NEWLINE:
-                current = self._init_after_nl
-            else:
-                current = self._init_other
-
-            var last_match = -1
-            if self.states.unsafe_get(current).is_match:
-                last_match = pos
-
-            self._begin_run(pos)
-            var p = pos
-            while p < input_len:
-                var byte = input.unsafe_get(p)
-                if byte == CHAR_NEWLINE:
-                    if self.states.unsafe_get(current).eol_at_newline:
-                        last_match = p
-                current = self._step(nfa, current, byte, p)
-                if current < 0:
-                    break
-                p += 1
-                if self.states.unsafe_get(current).is_match:
-                    last_match = p
-            self._end_run(p)
-
-            if current >= 0 and self.states.unsafe_get(current).eol_at_end:
-                last_match = p
-
+            var last_match = self._longest_end(nfa, input, pos)
             if last_match >= 0:
                 return (pos, last_match)
 
