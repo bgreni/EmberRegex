@@ -1322,16 +1322,10 @@ def _look_ok[
 def _rose_walk[
     origin: Origin,
     fn_: Int,
-    mn: Int,
-    ln: Int,
-    bn: Int,
     //,
     r: RoseView,
     table: StringLiteral,
     flags: Array[UInt8, fn_],
-    meta: Array[Int32, mn],
-    lits: Array[Int32, ln],
-    bcls: Array[Int32, bn],
     pid: Int,
 ](
     input: Span[Byte, origin],
@@ -1380,15 +1374,11 @@ def _rose_confirm[
     origin: Origin,
     fn_: Int,
     mn: Int,
-    ln: Int,
-    bn: Int,
     //,
     r: RoseView,
     table: StringLiteral,
     flags: Array[UInt8, fn_],
     meta: Array[Int32, mn],
-    lits: Array[Int32, ln],
-    bcls: Array[Int32, bn],
     entry: Int,
     pid: Int,
 ](input: Span[Byte, origin], start: Int, mut out: List[SetMatch]):
@@ -1404,15 +1394,7 @@ def _rose_confirm[
         cur = s_nl
     else:
         cur = s_other
-    _rose_walk[
-        r=r,
-        table=table,
-        flags=flags,
-        meta=meta,
-        lits=lits,
-        bcls=bcls,
-        pid=pid,
-    ](input, start, cur, out)
+    _rose_walk[r=r, table=table, flags=flags, pid=pid](input, start, cur, out)
 
 
 @always_inline
@@ -1476,8 +1458,6 @@ def _rose_verify_at[
                                 table=table,
                                 flags=flags,
                                 meta=meta,
-                                lits=lits,
-                                bcls=bcls,
                                 entry=i,
                                 pid=pid,
                             ](input, s0, out)
@@ -1500,13 +1480,7 @@ def _rose_verify_at[
                                 cur = k2
                             if cur >= 0:
                                 _rose_walk[
-                                    r=r,
-                                    table=table,
-                                    flags=flags,
-                                    meta=meta,
-                                    lits=lits,
-                                    bcls=bcls,
-                                    pid=pid,
+                                    r=r, table=table, flags=flags, pid=pid
                                 ](input, at + L, cur, out)
                     elif not skip:
                         if (
@@ -1521,8 +1495,6 @@ def _rose_verify_at[
                                 table=table,
                                 flags=flags,
                                 meta=meta,
-                                lits=lits,
-                                bcls=bcls,
                                 entry=i,
                                 pid=pid,
                             ](input, at - off, out)
