@@ -10,6 +10,9 @@ from std.math import max, min
 from .constants import (
     CHAR_A_LOWER,
     CHAR_A_UPPER,
+    CHAR_LPAREN,
+    CHAR_RPAREN,
+    CHAR_STAR,
     CHAR_Z_LOWER,
     CHAR_Z_UPPER,
     ascii_to_lower,
@@ -1464,7 +1467,43 @@ def _add_case_folding(mut cs: CharSet):
     cs.ranges.extend(new_ranges^)
 
 
-def _build_static_nfa(pattern: String) -> NFA:
+def apply_flags(pattern: String, flag_bits: Int) -> String:
+    """`pattern` with `flags` spelled as one leading inline group
+    (`(?imsxu)`), placed after any leading `(*UTF8)` verbs — the parser
+    only accepts those first (see `Parser._consume_verbs`)."""
+    var flags = RegexFlags(flag_bits)
+    var letters = String()
+    if flags.ignorecase():
+        letters += "i"
+    if flags.multiline():
+        letters += "m"
+    if flags.dotall():
+        letters += "s"
+    if flags.verbose():
+        letters += "x"
+    if flags.unicode():
+        letters += "u"
+    var b = pattern.as_bytes()
+    var pos = 0
+    while (
+        pos + 2 < len(b) and b[pos] == CHAR_LPAREN and b[pos + 1] == CHAR_STAR
+    ):
+        var close = pos + 2
+        while close < len(b) and b[close] != CHAR_RPAREN:
+            close += 1
+        if close >= len(b):
+            break
+        pos = close + 1
+    return (
+        String(unsafe_from_utf8=b[:pos])
+        + "(?"
+        + letters
+        + ")"
+        + String(unsafe_from_utf8=b[pos:])
+    )
+
+
+def _build_static_nfa(pattern: String, flags: Int = 0) -> NFA:
     """Parse and build NFA — called at compile time.
 
     Aborts on invalid pattern (produces compile error at comptime).
@@ -1477,7 +1516,7 @@ def _build_static_nfa(pattern: String) -> NFA:
     states, and a linker failure past a few hundred).
     """
     try:
-        var ast = parse(pattern)
+        var ast = parse(pattern if flags == 0 else apply_flags(pattern, flags))
         var merged_flags = ast.flags
         return build_nfa(ast^, merged_flags)
     except e:

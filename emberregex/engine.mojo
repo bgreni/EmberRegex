@@ -15,15 +15,13 @@ backtrack.mojo for what that does and does not flatten.
 
 from .constants import (
     CHAR_BACKSLASH,
-    CHAR_LPAREN,
     CHAR_NEWLINE,
     CHAR_NINE,
     CHAR_ONE,
-    CHAR_RPAREN,
-    CHAR_STAR,
     CHAR_ZERO,
 )
 from .nfa import (
+    apply_flags,
     _build_static_nfa,
     _nfa_has_backref,
     split_cycle_flags,
@@ -1155,41 +1153,6 @@ struct _LFWalk[num_slots: Int, span: Bool, origin: MutOrigin](
         self.pike = pike
 
 
-def _apply_flags(pattern: String, flags: RegexFlags) -> String:
-    """`pattern` with `flags` spelled as one leading inline group
-    (`(?imsxu)`), placed after any leading `(*UTF8)` verbs — the parser
-    only accepts those first (see `Parser._consume_verbs`)."""
-    var letters = String()
-    if flags.ignorecase():
-        letters += "i"
-    if flags.multiline():
-        letters += "m"
-    if flags.dotall():
-        letters += "s"
-    if flags.verbose():
-        letters += "x"
-    if flags.unicode():
-        letters += "u"
-    var b = pattern.as_bytes()
-    var pos = 0
-    while (
-        pos + 2 < len(b) and b[pos] == CHAR_LPAREN and b[pos + 1] == CHAR_STAR
-    ):
-        var close = pos + 2
-        while close < len(b) and b[close] != CHAR_RPAREN:
-            close += 1
-        if close >= len(b):
-            break
-        pos = close + 1
-    return (
-        String(unsafe_from_utf8=b[:pos])
-        + "(?"
-        + letters
-        + ")"
-        + String(unsafe_from_utf8=b[pos:])
-    )
-
-
 struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     Copyable, Movable
 ):
@@ -1206,15 +1169,18 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     recurse — see backtrack.mojo.
     """
 
-    # The pattern every lane compiles: exactly `pattern` for the default
-    # flags, so those instantiations share the memoized NFA and the
-    # backtracker's symbol names with the flag-free spelling. The ternary
-    # is load-bearing: a String RETURNED by a comptime call is a different
-    # interpreter value (and symbol mangling) even when equal.
-    comptime _pat = Self.pattern if Self.flags.value == 0 else _apply_flags(
-        Self.pattern, Self.flags
+    # The pattern the backtracker re-derives its NFA from: exactly
+    # `pattern` for the default flags, so its per-state symbols and NFA
+    # memo entry are the flag-free ones. The ternary is load-bearing: a
+    # String RETURNED by a comptime call is a different interpreter value
+    # (and symbol mangling) even when equal. `nfa` takes the flags as an
+    # operand instead of going through `_pat`: every lane method's type
+    # mentions `nfa` (via `_num_slots`), and routing it through the
+    # ternary cost ~20% of compile time on bench.mojo.
+    comptime _pat = Self.pattern if Self.flags.value == 0 else apply_flags(
+        Self.pattern, Self.flags.value
     )
-    comptime nfa = _build_static_nfa(Self._pat)
+    comptime nfa = _build_static_nfa(Self.pattern, Self.flags.value)
     # One Tarjan pass and one depth plan per pattern: the selection
     # predicates below used to each call `split_cycle_flags(Self.nfa)`
     # inside their own bodies, and calls made inside interpreted bodies
