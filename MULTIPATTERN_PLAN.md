@@ -37,7 +37,8 @@ list at the end is deliberate and specific, not a summary of intent.
   slots give leftmost SOM for free from the generation counter.
   `scan_spans` filters the stream to per-id leftmost non-overlapping
   spans. Verified by differentials between the two independent
-  implementations plus `tools/set_oracle.py::sweep_som`.
+  implementations plus `tools/set_oracle.py::sweep_som` (since replaced
+  by the context-preserving `sweep_ctx_som`).
   **Not done: SOM horizon modes (5.3)** — they are an offset-WIDTH
   tradeoff in stream state, and our offsets are plain `Int`, so there is
   nothing to trade until stream-state size is itself a problem.

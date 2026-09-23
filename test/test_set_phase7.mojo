@@ -156,7 +156,7 @@ def test_keyword_parameter_construction() raises:
 # --- Exact backreferences and lookaround (the Hyperscan differentiator) -----
 #
 # Expectations come from tools/set_oracle.py::sweep_ctx, the
-# CONTEXT-PRESERVING all-ends sweep. The plain `sweep` is unsound here for
+# CONTEXT-PRESERVING all-ends sweep. A region-bounded sweep is unsound for
 # the same reason a first cut of the engine was wrong: bounding the region
 # hides the right-hand text a lookahead asserts about.
 
