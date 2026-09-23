@@ -586,13 +586,7 @@ def _emit_bits[
                     for i in range(n):
                         ids.append(Int(pl.unsafe_get(off + i)))
     # Sort ascending and collapse duplicates.
-    for i in range(1, len(ids)):
-        var key = ids[i]
-        var j = i - 1
-        while j >= 0 and ids[j] > key:
-            ids[j + 1] = ids[j]
-            j -= 1
-        ids[j + 1] = key
+    sort(ids)
     for i in range(len(ids)):
         if i > 0 and ids[i] == ids[i - 1]:
             continue
