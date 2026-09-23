@@ -11,18 +11,12 @@ with restore-on-return to eliminate slot copying.
 """
 
 from .constants import (
-    CHAR_A_LOWER,
     CHAR_A_UPPER,
     CHAR_NEWLINE,
-    CHAR_NINE,
-    CHAR_UNDERSCORE,
-    CHAR_ZERO,
-    CHAR_Z_LOWER,
     CHAR_Z_UPPER,
     is_word_byte,
 )
-from .nfa import NFA, NFAState, NFAStateKind
-from .charset import CharSet
+from .nfa import NFA, NFAStateKind
 from .ast import AnchorKind
 from .result import MatchResult
 from std.collections import Array

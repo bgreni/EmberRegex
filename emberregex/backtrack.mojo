@@ -43,13 +43,8 @@ from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 
 from .constants import (
-    CHAR_A_LOWER,
     CHAR_A_UPPER,
     CHAR_NEWLINE,
-    CHAR_NINE,
-    CHAR_UNDERSCORE,
-    CHAR_ZERO,
-    CHAR_Z_LOWER,
     CHAR_Z_UPPER,
     is_word_byte,
 )
@@ -57,7 +52,6 @@ from .nfa import (
     _build_static_nfa,
     split_cycle_flags,
     NFA,
-    NFAState,
     NFAStateKind,
 )
 from .charset import BITMAP_WIDTH
