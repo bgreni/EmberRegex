@@ -539,7 +539,7 @@ def test_bench_match_single_byte_run() raises:
     # stays accelerated (a single-byte self-loop is a genuine run).
     comptime S = Regex["a+e|x"]
     assert_true(S._strategy.use_eager_dfa)
-    comptime n_accel = len(S._edfa.accel_states) + len(S._edfa.accel_nib_states)
+    comptime n_accel = len(S._edfa.accel.states) + len(S._edfa.accel.nib_states)
     assert_true(n_accel >= 1)
     var re = S()
     var input = "a" * 20480 + "e"

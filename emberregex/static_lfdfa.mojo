@@ -45,7 +45,6 @@ Continuation closures are memoized per target state in one flat pool.
 """
 
 from std.bit import count_leading_zeros, count_trailing_zeros
-from std.collections import Array
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
@@ -75,9 +74,7 @@ from .static_dfa import (
     _word_anchor_bits,
     WB_PENDING,
     WB_RESOLVE,
-    edfa_walk_from,
 )
-from .sheng import sheng_walk_from
 
 # Lanes of a state's ordered-list vector. The last three lanes are the
 # tail-kind, restart and look-behind markers, so a state holds at most
@@ -105,28 +102,6 @@ comptime _LFClo = SIMD[DType.int16, _LF_CLO_W]
 # 64-bit lane never overflows. Below this the word doubles as the exact
 # per-member acceptance bitstring.
 comptime _LF_SIG_BITS = 56
-
-
-struct LFDFA(Copyable, Movable):
-    """Comptime-computed leftmost-first DFA.
-
-    `d` is the table in EagerDFA form — the same walkers, acceleration
-    data, flag bytes and Sheng masks apply — with its `start_*` fields
-    holding the UNANCHORED start states (restart bit set).
-    """
-
-    var valid: Bool
-    var d: EagerDFA
-    # Debug/test view: the ids (in `d`'s numbering) of the states whose
-    # look-behind class is "word". Exact only when built with
-    # `minimize=False` (minimization may merge such a state with an
-    # equivalent one entered on other bytes).
-    var prev_ids: List[Int]
-
-    def __init__(out self):
-        self.valid = False
-        self.d = EagerDFA()
-        self.prev_ids = List[Int]()
 
 
 def _lf_closure(
@@ -254,12 +229,13 @@ def _lf_memo_closure(
     return len(clo_vec) - 1
 
 
-def build_lf_dfa(
-    nfa: NFA,
-    enabled: Bool,
-    minimize: Bool = True,
-) -> LFDFA:
+def build_lf_dfa(nfa: NFA, enabled: Bool) -> EagerDFA:
     """Leftmost-first subset construction — runs at compile time.
+
+    The table comes back in EagerDFA form — the same walkers,
+    acceleration data, flag bytes and Sheng masks apply — with its
+    `start_*` fields holding the UNANCHORED start states (restart bit
+    set).
 
     Returns an invalid placeholder when `enabled` is False, when the NFA
     cannot be bitset-indexed, when some state's ordered list would exceed
@@ -284,10 +260,8 @@ def build_lf_dfa(
     closure, and while a state has at most _LF_SIG_BITS consuming
     members, "does member k accept class c" is a bit of the class's
     signature word rather than a List read.
-
-    `minimize` is a test hook, as in `build_eager_dfa`.
     """
-    var result = LFDFA()
+    var result = EagerDFA()
     if not enabled:
         return result^
     var n = len(nfa.states)
@@ -1075,73 +1049,9 @@ def build_lf_dfa(
         if st_selfloop[s] and not st_genuine[s]:
             flags[s] |= Int(EDFA_NO_ACCEL)
 
-    # The look-behind-"word" states ride along in `starts` so the finish
-    # (minimization remap + match permutation) renumbers them too.
-    for s in range(len(st_list)):
-        if Int(st_list[s][_LF_PREV_LANE]) != 0:
-            starts.append(s)
-
     var pstarts = _edfa_finish(
-        result.d, rows, flags, starts, rep_lo, rep_hi, nclasses, minimize, nctx
+        result, rows, flags, starts, rep_lo, rep_hi, nclasses, True, nctx
     )
-    for k in range(nctx, len(pstarts)):
-        result.prev_ids.append(pstarts[k])
     if has_wb:
-        result.d.start_other_word = pstarts[3]
-    result.valid = True
+        result.start_other_word = pstarts[3]
     return result^
-
-
-# --- Runtime walkers ---------------------------------------------------------
-#
-# Both are the eager table walk (`edfa_walk_from`) in different start
-# states — the leftmost-first bookkeeping is entirely in the table. The
-# Sheng variants are the shuffle walk over masks built from the same
-# table (`sheng_masks_arr(lf.d, ...)`).
-
-
-@always_inline
-def lfdfa_find_end[
-    origin: Origin,
-    ns: Int,
-    //,
-    lf: LFDFA,
-    table: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], start: Int) -> Int:
-    """Unanchored scan from `start`: the END of the leftmost-first match
-    beginning at or after `start` (Python `re.search` semantics), or -1.
-    The start context (position 0 / after '\\n' / mid-line) is read from
-    `input[start - 1]`."""
-    return edfa_walk_from[
-        d=lf.d,
-        table=table,
-        flags=flags,
-        s_at0=lf.d.start_at_0,
-        s_nl=lf.d.start_after_nl,
-        s_other=lf.d.start_other,
-        s_other_w=lf.d.start_other_word,
-    ](input, start)
-
-
-@always_inline
-def sheng_lfdfa_find_end[
-    origin: Origin,
-    ns: Int,
-    //,
-    lf: LFDFA,
-    cap: Int,
-    masks: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], start: Int) -> Int:
-    """`lfdfa_find_end` on the shuffle engine."""
-    return sheng_walk_from[
-        d=lf.d,
-        cap=cap,
-        masks=masks,
-        flags=flags,
-        s_at0=lf.d.start_at_0,
-        s_nl=lf.d.start_after_nl,
-        s_other=lf.d.start_other,
-        s_other_w=lf.d.start_other_word,
-    ](input, start)

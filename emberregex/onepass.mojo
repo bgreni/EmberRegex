@@ -67,7 +67,8 @@ passes keeps the caller's -1.
 Tables (POD + Array rule: the struct crosses into the walkers as a
 comptime parameter, the bulk as separate arrays padded to at least
 EDFA_TABLE_MIN_BYTES so they lower to shared constant data):
-`onepass_table_arr` — `num_states x nclasses` Int32 cells, -1 dead, else
+`onepass_table_str` — `num_states x nclasses` Int32 cells (a string
+literal, see static_bytes.mojo), -1 dead, else
 the premultiplied next row, the next state id and the slot-set id packed
 (`_OP_*` shifts); `onepass_class_arr` — byte to class; `onepass_eps_arr` —
 slot bitsets by id (id 0 is the empty set); `onepass_state_arr` — per
@@ -85,7 +86,7 @@ from std.sys import simd_width_of
 
 from .ast import AnchorKind
 from .backtrack import _sbt_is_simple_body
-from .constants import CHAR_NEWLINE
+from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind, split_cycle_flags
 from .static_bytes import filled_string
 from .static_dfa import (
@@ -101,16 +102,8 @@ from .static_dfa import (
     _is_word_byte,
     _nfa_has_word_anchor,
     _wb_holds,
-    edfa_is_word,
 )
-from .simd_kernels import (
-    ACCEL_SHUFTI,
-    ACCEL_TRUFFLE,
-    HAS_FAST_BYTE_SHUFFLE,
-    build_shufti_masks,
-    build_truffle_masks,
-    shufti_encodable,
-)
+from .simd_kernels import accel_exits
 
 # Caps. A DFA state is one NFA transition target in one context, so the
 # state count is bounded by the NFA; the cap keeps the table (and the
@@ -171,7 +164,7 @@ struct OnePass(Copyable, Movable):
     var start_other: Int
     var start_word: Int
     var any_need: Bool  # some match state carries an OP_NEED_* bit
-    # Acceleration view: only `accel_*`, `num_states` and
+    # Acceleration view: only `accel`, `num_states` and
     # `num_match_states` (0: no match bookkeeping) are filled in, for
     # `_edfa_accel_skip`.
     var accel: EagerDFA
@@ -614,31 +607,9 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
             var cell = s * nclasses + c
             if trans_next[cell] == s and trans_eps[cell] == 0:
                 loopb |= classv.eq(SIMD[DType.int64, 256](c))
-        var exits = List[Int]()
-        var loops = 0
-        for b in range(256):
-            if loopb[b]:
-                loops += 1
-            else:
-                exits.append(b)
-        if loops == 0 or len(exits) == 0:
-            continue
-        if len(exits) <= 2:
-            accel.accel_states.append(s)
-            accel.accel_exit1.append(exits[0])
-            accel.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
-            var t0 = List[Int]()
-            var t1 = List[Int]()
-            if shufti_encodable(exits):
-                build_shufti_masks(exits, t0, t1)
-                accel.accel_nib_kind.append(ACCEL_SHUFTI)
-            else:
-                build_truffle_masks(exits, t0, t1)
-                accel.accel_nib_kind.append(ACCEL_TRUFFLE)
-            accel.accel_nib_states.append(s)
-            accel.accel_nib_t0.extend(t0^)
-            accel.accel_nib_t1.extend(t1^)
+        var exits = accel_exits(~loopb)
+        if len(exits) > 0:
+            accel.accel.add(s, exits)
 
     var any_need = False
     for s in range(num_states):
@@ -783,7 +754,7 @@ def _op_start_state[op: OnePass](input: Span[Byte, _], start: Int) -> Int:
             if b == CHAR_NEWLINE:
                 return op.start_nl
         comptime if op.start_word != op.start_other:
-            if edfa_is_word(b):
+            if is_word_byte(b):
                 return op.start_word
         return op.start_other
 
@@ -809,13 +780,13 @@ def _op_match_ok[
             ):
                 return False
             if flags & Int(OP_NEED_WORD) != 0 and (
-                at_eof or not edfa_is_word(input.unsafe_get(end_pin))
+                at_eof or not is_word_byte(input.unsafe_get(end_pin))
             ):
                 return False
             if (
                 flags & Int(OP_NEED_NONWORD) != 0
                 and not at_eof
-                and edfa_is_word(input.unsafe_get(end_pin))
+                and is_word_byte(input.unsafe_get(end_pin))
             ):
                 return False
     return True

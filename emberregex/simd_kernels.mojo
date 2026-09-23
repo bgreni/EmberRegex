@@ -51,10 +51,6 @@ comptime HAS_FAST_BYTE_SHUFFLE = (
 # executes once per input byte.
 comptime HAS_WIDE_BYTE_SHUFFLE = CompilationTarget.has_neon()
 
-# Widest single-instruction table lookup on this target. This is the
-# ceiling on Sheng's state count, not a vector width.
-comptime WIDE_TABLE_CAP = 64 if HAS_WIDE_BYTE_SHUFFLE else NIBBLE_TABLE_SIZE
-
 # One tbl/pshufb produces 16 result bytes, so the index vector is one
 # 128-bit register no matter how wide the table is.
 comptime SHUFFLE_INDEX_LANES = 16
@@ -125,6 +121,31 @@ def table_lookup_64(
     )
 
 
+@always_inline
+def _sheng_step[
+    cap: Int
+](masks: StringLiteral, b: Byte, state_vec: _ShuffleIndex) -> _ShuffleIndex:
+    """One Sheng transition (sheng.mojo): shuffle byte `b`'s `cap`-byte
+    mask by the state vector (the state id broadcast across the index
+    register; only lane 0 is ever read back, and its width is
+    independent of the mask width).
+
+    Each branch loads and shuffles at the literal tier width `cap`: only
+    the tier this DFA needs is emitted, and the NEON-only tiers are never
+    elaborated where cap is always NIBBLE_TABLE_SIZE.
+    """
+    var p = Pointer(to=masks.unsafe_ptr()[unsafe_offset=Int(b) * cap])
+    comptime if cap == NIBBLE_TABLE_SIZE:
+        return nibble_lookup(
+            p.unsafe_load[width=NIBBLE_TABLE_SIZE](), state_vec
+        )
+    elif cap == 32:
+        return table_lookup_32(p.unsafe_load[width=32](), state_vec)
+    else:
+        comptime assert cap == 64
+        return table_lookup_64(p.unsafe_load[width=64](), state_vec)
+
+
 # --- Comptime mask builders -------------------------------------------------
 
 
@@ -191,26 +212,100 @@ def stops_from_bitmap(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> List[Int]:
     return stops^
 
 
+def build_nib_masks(
+    stop_bytes: List[Int], mut t0: List[Int], mut t1: List[Int]
+) -> Int:
+    """Comptime: encode a byte set as nibble masks — shufti when exact,
+    truffle otherwise — and return the kind (ACCEL_SHUFTI/_TRUFFLE)."""
+    if shufti_encodable(stop_bytes):
+        build_shufti_masks(stop_bytes, t0, t1)
+        return ACCEL_SHUFTI
+    build_truffle_masks(stop_bytes, t0, t1)
+    return ACCEL_TRUFFLE
+
+
 def build_class_masks(
     stop_bytes: List[Int],
 ) -> Tuple[Int, _NibbleTable, _NibbleTable]:
-    """Comptime: encode a byte set as (kind, t0, t1) for find_in_class —
-    shufti when exact, truffle otherwise."""
+    """Comptime: encode a byte set as (kind, t0, t1) for find_in_class."""
     var t0 = List[Int]()
     var t1 = List[Int]()
-    if shufti_encodable(stop_bytes):
-        build_shufti_masks(stop_bytes, t0, t1)
-        return (
-            ACCEL_SHUFTI,
-            nibble_table_from(t0, 0),
-            nibble_table_from(t1, 0),
-        )
-    build_truffle_masks(stop_bytes, t0, t1)
-    return (
-        ACCEL_TRUFFLE,
-        nibble_table_from(t0, 0),
-        nibble_table_from(t1, 0),
-    )
+    var kind = build_nib_masks(stop_bytes, t0, t1)
+    return (kind, nibble_table_from(t0, 0), nibble_table_from(t1, 0))
+
+
+def accel_exits(exit_lanes: SIMD[DType.bool, 256]) -> List[Int]:
+    """Comptime: the exit bytes (set lanes) of a state that self-loops on
+    the other bytes, or empty when it never exits or never self-loops —
+    nothing to skip either way."""
+    var n = 0
+    for b in range(256):
+        if exit_lanes[b]:
+            n += 1
+    var exits = List[Int]()
+    if n == 0 or n == 256:
+        return exits^
+    for b in range(256):
+        if exit_lanes[b]:
+            exits.append(b)
+    return exits^
+
+
+struct AccelSet(Copyable, Movable):
+    """Comptime acceleration data of a table: states that self-loop on all
+    but an exit-byte set, which the walkers SIMD-scan to the next exit
+    byte instead of stepping the table. <= 2 exit bytes (e.g. the `.*`
+    state of `.*x`) use direct compares; larger sets (e.g. the `\\w+`
+    self-loop) are nibble-encoded (`build_nib_masks`), only on targets
+    with a native byte shuffle."""
+
+    var states: List[Int]
+    var exit1: List[Int]  # first exit byte per state
+    var exit2: List[Int]  # second exit byte, or -1 if only one
+    var nib_states: List[Int]
+    var nib_kind: List[Int]  # ACCEL_SHUFTI or ACCEL_TRUFFLE
+    var nib_t0: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+    var nib_t1: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+
+    def __init__(out self):
+        self.states = List[Int]()
+        self.exit1 = List[Int]()
+        self.exit2 = List[Int]()
+        self.nib_states = List[Int]()
+        self.nib_kind = List[Int]()
+        self.nib_t0 = List[Int]()
+        self.nib_t1 = List[Int]()
+
+    def add(mut self, s: Int, exits: List[Int]):
+        """Comptime: accelerate state `s` over its non-empty exit set
+        (`accel_exits`); a no-op for > 2 exits off shuffle targets."""
+        if len(exits) <= 2:
+            self.states.append(s)
+            self.exit1.append(exits[0])
+            self.exit2.append(exits[1] if len(exits) == 2 else -1)
+        elif HAS_FAST_BYTE_SHUFFLE:
+            var t0 = List[Int]()
+            var t1 = List[Int]()
+            self.nib_kind.append(build_nib_masks(exits, t0, t1))
+            self.nib_states.append(s)
+            self.nib_t0.extend(t0^)
+            self.nib_t1.extend(t1^)
+
+    def mask_word(self, word: Int) -> UInt64:
+        """Comptime: bitmask of accelerated state ids in
+        [word*64, (word+1)*64)."""
+        var m = UInt64(0)
+        for s in self.states:
+            if s >> 6 == word:
+                m |= UInt64(1) << UInt64(s & 63)
+        for s in self.nib_states:
+            if s >> 6 == word:
+                m |= UInt64(1) << UInt64(s & 63)
+        return m
+
+    def any(self) -> Bool:
+        """Comptime: does any state carry acceleration data?"""
+        return len(self.states) > 0 or len(self.nib_states) > 0
 
 
 # --- Scanners ---------------------------------------------------------------

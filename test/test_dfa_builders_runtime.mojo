@@ -19,7 +19,7 @@ answer). Nothing here selects a lane, so no lane pin applies.
 
 from emberregex.nfa import build_nfa, NFA
 from emberregex.parser import parse
-from emberregex.constants import CHAR_NEWLINE
+from emberregex.constants import CHAR_NEWLINE, is_word_byte
 from emberregex.simd_kernels import (
     ACCEL_SHUFTI,
     ACCEL_TRUFFLE,
@@ -30,7 +30,6 @@ from emberregex.static_dfa import (
     _minimize,
     EDFA_DEAD,
     EDFA_NFA_CAP,
-    edfa_is_word,
 )
 from emberregex.static_rdfa import (
     build_reverse_dfa,
@@ -78,7 +77,7 @@ def _find_start(d: RDFA, text: String, end: Int, floor: Int = 0) -> Int:
         cur = d.seed_at_end
     elif input[end] == CHAR_NEWLINE:
         cur = d.seed_at_nl
-    elif edfa_is_word(input[end]):
+    elif is_word_byte(input[end]):
         cur = d.seed_other_word
     else:
         cur = d.seed_other
@@ -96,7 +95,7 @@ def _find_start(d: RDFA, text: String, end: Int, floor: Int = 0) -> Int:
         if (f & RDFA_BOLNL) != 0 and b == CHAR_NEWLINE:
             best = pos
         if (f & (RDFA_WB_LEFT_WORD | RDFA_WB_LEFT_NONWORD)) != 0:
-            if ((f & RDFA_WB_LEFT_WORD) != 0) == edfa_is_word(b):
+            if ((f & RDFA_WB_LEFT_WORD) != 0) == is_word_byte(b):
                 best = pos
         if pos <= floor:
             return best
@@ -343,52 +342,52 @@ def test_reverse_dfa_reuses_states_and_accelerates_runs() raises:
     assert_equal(_step(loop, 2, "b"), EDFA_DEAD)
     assert_equal(_find_start(loop, "xaab", 4), 1)
     assert_equal(_find_start(loop, "xaab", 4, floor=2), 2)
-    assert_equal(len(loop.accel_states), 0)
+    assert_equal(len(loop.accel.states), 0)
     # `.*x`: the state after `x` self-loops on everything but '\n' — one
     # exit byte; `[^ab]*x` two.
     var dot = _rdfa(".*x")
     assert_equal(dot.num_states, 2)
     assert_equal(dot.flags, [0, Int(RDFA_NORM)])
-    assert_equal(dot.accel_states, [1])
-    assert_equal(dot.accel_exit1, [Int(CHAR_NEWLINE)])
-    assert_equal(dot.accel_exit2, [-1])
-    assert_equal(len(dot.accel_nib_states), 0)
+    assert_equal(dot.accel.states, [1])
+    assert_equal(dot.accel.exit1, [Int(CHAR_NEWLINE)])
+    assert_equal(dot.accel.exit2, [-1])
+    assert_equal(len(dot.accel.nib_states), 0)
     assert_equal(_find_start(dot, "ab\ncdx", 6), 3)
     assert_equal(_find_start(dot, "abx", 3), 0)
     var two = _rdfa("[^ab]*x")
-    assert_equal(two.accel_states, [1])
-    assert_equal(two.accel_exit1, [ord("a")])
-    assert_equal(two.accel_exit2, [ord("b")])
+    assert_equal(two.accel.states, [1])
+    assert_equal(two.accel.exit1, [ord("a")])
+    assert_equal(two.accel.exit2, [ord("b")])
     assert_equal(_find_start(two, "xbyyx", 5), 2)
     # A state whose acceptance depends on the byte about to be consumed
     # (here a BOL flag) is never accelerated, self-loop or not.
     var bol = _rdfa("^.*x")
     assert_equal(bol.num_states, 2)
     assert_equal(bol.flags, [0, Int(RDFA_BOL0)])
-    assert_equal(len(bol.accel_states), 0)
-    assert_equal(len(bol.accel_nib_states), 0)
+    assert_equal(len(bol.accel.states), 0)
+    assert_equal(len(bol.accel.nib_states), 0)
     assert_equal(_find_start(bol, "ab\ncdx", 6), -1)
     assert_equal(_find_start(bol, "abx", 3), 0)
     comptime if HAS_FAST_BYTE_SHUFFLE:
-        assert_equal(loop.accel_nib_states, [2])
-        assert_equal(loop.accel_nib_kind, [ACCEL_TRUFFLE])
-        assert_equal(len(loop.accel_nib_t0), NIBBLE_TABLE_SIZE)
-        assert_equal(len(loop.accel_nib_t1), NIBBLE_TABLE_SIZE)
+        assert_equal(loop.accel.nib_states, [2])
+        assert_equal(loop.accel.nib_kind, [ACCEL_TRUFFLE])
+        assert_equal(len(loop.accel.nib_t0), NIBBLE_TABLE_SIZE)
+        assert_equal(len(loop.accel.nib_t1), NIBBLE_TABLE_SIZE)
         # Three exits in one high nibble: shufti. `[\x01-\x7f]*x` exits
         # on 0x00 and 0x80-0xFF — nine high nibbles — so truffle.
         var sh = _rdfa("[^abc]*x")
-        assert_equal(len(sh.accel_states), 0)
-        assert_equal(sh.accel_nib_states, [1])
-        assert_equal(sh.accel_nib_kind, [ACCEL_SHUFTI])
+        assert_equal(len(sh.accel.states), 0)
+        assert_equal(sh.accel.nib_states, [1])
+        assert_equal(sh.accel.nib_kind, [ACCEL_SHUFTI])
         assert_equal(_find_start(sh, "cxyyx", 5), 1)
         var tr = _rdfa("[\\x01-\\x7f]*x")
-        assert_equal(len(tr.accel_states), 0)
-        assert_equal(tr.accel_nib_states, [1])
-        assert_equal(tr.accel_nib_kind, [ACCEL_TRUFFLE])
+        assert_equal(len(tr.accel.states), 0)
+        assert_equal(tr.accel.nib_states, [1])
+        assert_equal(tr.accel.nib_kind, [ACCEL_TRUFFLE])
         assert_equal(_find_start(tr, "\nxyyx", 5), 0)
     else:
-        assert_equal(len(loop.accel_nib_states), 0)
-        assert_equal(len(_rdfa("[^abc]*x").accel_nib_states), 0)
+        assert_equal(len(loop.accel.nib_states), 0)
+        assert_equal(len(_rdfa("[^abc]*x").accel.nib_states), 0)
 
 
 def test_reverse_dfa_minimize_merges_and_crosses_64_states() raises:

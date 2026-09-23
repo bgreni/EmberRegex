@@ -197,7 +197,7 @@ def test_onepass_walker_acceleration() raises:
     # the shape gate keeps such patterns off `_use_onepass`.
     comptime op = build_onepass(_build_static_nfa("(a)([^;]*);(b)"), True)
     assert_true(op.valid)
-    comptime accel = len(op.accel.accel_states) + len(op.accel.accel_nib_states)
+    comptime accel = len(op.accel.accel.states) + len(op.accel.accel.nib_states)
     assert_true(accel >= 1)
     comptime TN = onepass_table_len(op)
     comptime TBL = static_bytes[onepass_table_str[TN](op)]()
