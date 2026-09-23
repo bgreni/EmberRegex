@@ -74,9 +74,9 @@ from .static_dfa import (
     _bs_eq,
     _bs_hash,
     _bs_set,
-    _byte_classes,
-    _flatten_nfa,
-    _is_word_byte,
+    _FlatNFA,
+    _class_ranges,
+    _word_classes,
     _minimize,
     _nfa_has_word_anchor,
     _wb_holds,
@@ -287,42 +287,17 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
         return result^
     var preds = _reverse_edges(nfa)
 
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref eol_bits = flat.eol_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     var pred_data = List[Int]()
     var pred_off = List[Int]()
@@ -426,12 +401,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var gval_n = List[_StateBits]()
     var one_seed = List[Int](fill=0, length=1)
     var need_nl_variant = has_bol_ml or _bs_any(eol_bits)
-    var word_cls = SIMD[DType.uint64, 4](0)
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)
 
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0

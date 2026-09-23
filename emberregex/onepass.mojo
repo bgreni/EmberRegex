@@ -93,11 +93,10 @@ from .static_dfa import (
     EDFA_TABLE_MIN_BYTES,
     EagerDFA,
     _StateBits,
+    _FlatNFA,
     _bs_set,
-    _byte_classes,
     _edfa_accel_skip,
     _edfa_has_accel,
-    _flatten_nfa,
     _is_word_byte,
     _nfa_has_word_anchor,
     _wb_holds,
@@ -341,34 +340,16 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     var has_wb = _nfa_has_word_anchor(nfa)
 
     # Byte classes and the flat NFA views (shared with the eager DFAs).
-    var class_of = List[Int](fill=0, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var flat_has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        flat_has_bol_ml,
-    )
+    var flat = _FlatNFA(nfa)
+    ref class_of = flat.class_of
+    ref reps = flat.reps
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
     var save_slots = List[Int]()
     for i in range(n):
         save_slots.append(nfa.states[i].save_slot)
@@ -648,7 +629,8 @@ def build_onepass(nfa: NFA, enabled: Bool) -> OnePass:
     result.valid = True
     result.num_states = num_states
     result.nclasses = nclasses
-    result.class_of = class_of^
+    result.class_of = flat.class_of^
+    flat.class_of = List[Int]()  # a moved-out field must be reinitialized
     result.trans_next = trans_next^
     result.trans_eps = trans_eps^
     result.eps_sets = eps_sets^

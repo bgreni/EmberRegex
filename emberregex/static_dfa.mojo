@@ -825,81 +825,163 @@ def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
     return reps^
 
 
-def _flatten_nfa(
-    nfa: NFA,
-    class_of: List[Int],
-    nclasses: Int,
-    nl_class: Int,
-    mut kinds: List[Int],
-    mut out1s: List[Int],
-    mut out2s: List[Int],
-    mut anchors: List[Int],
-    mut cls_mask: List[SIMD[DType.uint64, 4]],
-    mut consuming_bits: _StateBits,
-    mut match_bits: _StateBits,
-    mut eol_bits: _StateBits,
-    mut has_bol_ml: Bool,
-):
-    """One flat pass over the NFA, shared by the bitset determinizers.
+struct _FlatNFA:
+    """Byte classes plus one flat pass over the NFA — the setup every bitset
+    determinizer shares. Built ONCE per build, in place (`var f =
+    _FlatNFA(nfa)`); callers bind the fields they need to locals with `ref`
+    and pass those, never the struct, into the hot loops, which then never
+    carry an aggregate across a call boundary."""
 
-    Fills flat views for the closure walks, membership bitsets, and each
-    state's accepted-class mask (classes are byte intervals wholly inside
-    or outside every accept set, so a class bitmask per state captures
-    acceptance exactly). Called ONCE per build: the point of the flat
-    views is that the hot loops never pass the NFA aggregate across a
-    call boundary again.
-    """
-    var n = len(nfa.states)
-    for i in range(n):
-        var kind = nfa.states[i].kind
-        kinds.append(kind)
-        out1s.append(nfa.states[i].out1)
-        out2s.append(nfa.states[i].out2)
-        var at = nfa.states[i].anchor_type
-        anchors.append(at)
-        var cm = SIMD[DType.uint64, 4](0)
-        if kind == NFAStateKind.CHAR:
-            var c = Int(nfa.states[i].char_value)
-            if c < 256:
-                var ci = class_of[c]
-                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.ANY:
-            for ci in range(nclasses):
-                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
-                UInt64(1) << UInt64(nl_class & 63)
-            )
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.CHARSET:
-            var cs = nfa.states[i].charset_index
-            for r in range(len(nfa.charsets[cs].ranges)):
-                var lo = Int(nfa.charsets[cs].ranges[r].lo)
-                var hi = Int(nfa.charsets[cs].ranges[r].hi)
-                if lo > hi or lo > 255:
-                    continue
-                if hi > 255:
-                    hi = 255
-                # _byte_classes marked lo and hi+1, so the classes of lo
-                # and hi bound exactly the classes inside [lo, hi].
-                for ci in range(class_of[lo], class_of[hi] + 1):
+    var class_of: List[Int]  # 256 entries: byte -> class (_byte_classes)
+    var reps: List[Int]  # first byte of each class; classes are intervals
+    var nclasses: Int
+    var nl_class: Int  # the class of '\n'
+    # Flat views for the closure walks.
+    var kinds: List[Int]
+    var out1s: List[Int]
+    var out2s: List[Int]
+    var anchors: List[Int]
+    # Each state's accepted-class mask (classes are byte intervals wholly
+    # inside or outside every accept set, so a class bitmask per state
+    # captures acceptance exactly).
+    var cls_mask: List[SIMD[DType.uint64, 4]]
+    var consuming_bits: _StateBits
+    var match_bits: _StateBits
+    var eol_bits: _StateBits  # EOL / EOL_MULTILINE anchors
+    var has_bol_ml: Bool
+
+    def __init__(out self, nfa: NFA):
+        self.class_of = List[Int](fill=-1, length=256)
+        self.reps = _byte_classes(nfa, self.class_of)
+        var nclasses = len(self.reps)
+        var nl_class = self.class_of[Int(CHAR_NEWLINE)]
+        self.nclasses = nclasses
+        self.nl_class = nl_class
+        self.kinds = List[Int]()
+        self.out1s = List[Int]()
+        self.out2s = List[Int]()
+        self.anchors = List[Int]()
+        self.cls_mask = List[SIMD[DType.uint64, 4]]()
+        self.consuming_bits = _StateBits(0)
+        self.match_bits = _StateBits(0)
+        self.eol_bits = _StateBits(0)
+        self.has_bol_ml = False
+        var n = len(nfa.states)
+        for i in range(n):
+            var kind = nfa.states[i].kind
+            self.kinds.append(kind)
+            self.out1s.append(nfa.states[i].out1)
+            self.out2s.append(nfa.states[i].out2)
+            var at = nfa.states[i].anchor_type
+            self.anchors.append(at)
+            var cm = SIMD[DType.uint64, 4](0)
+            if kind == NFAStateKind.CHAR:
+                var c = Int(nfa.states[i].char_value)
+                if c < 256:
+                    var ci = self.class_of[c]
                     cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            if nfa.charsets[cs].negated:
-                # Classes are pure w.r.t. this charset, so negation is
-                # exact at class granularity.
-                for w in range(4):
-                    cm[w] = ~cm[w]
-                for ci in range(nclasses, 256):
-                    cm[ci >> 6] = cm[ci >> 6] & ~(UInt64(1) << UInt64(ci & 63))
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.MATCH:
-            _bs_set(match_bits, i)
-        elif kind == NFAStateKind.ANCHOR:
-            if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
-                _bs_set(eol_bits, i)
-            elif at == AnchorKind.BOL_MULTILINE:
-                has_bol_ml = True
-        cls_mask.append(cm)
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.ANY:
+                for ci in range(nclasses):
+                    cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+                cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
+                    UInt64(1) << UInt64(nl_class & 63)
+                )
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.CHARSET:
+                var cs = nfa.states[i].charset_index
+                for r in range(len(nfa.charsets[cs].ranges)):
+                    var lo = Int(nfa.charsets[cs].ranges[r].lo)
+                    var hi = Int(nfa.charsets[cs].ranges[r].hi)
+                    if lo > hi or lo > 255:
+                        continue
+                    if hi > 255:
+                        hi = 255
+                    # _byte_classes marked lo and hi+1, so the classes of
+                    # lo and hi bound exactly the classes inside [lo, hi].
+                    for ci in range(self.class_of[lo], self.class_of[hi] + 1):
+                        cm[ci >> 6] = cm[ci >> 6] | (
+                            UInt64(1) << UInt64(ci & 63)
+                        )
+                if nfa.charsets[cs].negated:
+                    # Classes are pure w.r.t. this charset, so negation is
+                    # exact at class granularity.
+                    for w in range(4):
+                        cm[w] = ~cm[w]
+                    for ci in range(nclasses, 256):
+                        cm[ci >> 6] = cm[ci >> 6] & ~(
+                            UInt64(1) << UInt64(ci & 63)
+                        )
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.MATCH:
+                _bs_set(self.match_bits, i)
+            elif kind == NFAStateKind.ANCHOR:
+                if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
+                    _bs_set(self.eol_bits, i)
+                elif at == AnchorKind.BOL_MULTILINE:
+                    self.has_bol_ml = True
+            self.cls_mask.append(cm)
+
+
+def _class_ranges(
+    reps: List[Int],
+    mut rep_lo: SIMD[DType.int32, 256],
+    mut rep_hi: SIMD[DType.int32, 256],
+):
+    """Comptime: class c is the byte interval [rep_lo[c], rep_hi[c]], from
+    the first bytes `reps` (`_byte_classes`)."""
+    var nclasses = len(reps)
+    for ci in range(nclasses):
+        rep_lo[ci] = Int32(reps[ci])
+        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
+            255
+        )
+
+
+def _word_classes(
+    rep_lo: SIMD[DType.int32, 256], nclasses: Int
+) -> SIMD[DType.uint64, 4]:
+    """Comptime: the classes of word bytes, as a class bitmask (classes are
+    pure w.r.t. the word set when the NFA has a word anchor)."""
+    var word_cls = SIMD[DType.uint64, 4](0)
+    for ci in range(nclasses):
+        if _is_word_byte(Int(rep_lo[ci])):
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (
+                UInt64(1) << UInt64(ci & 63)
+            )
+    return word_cls
+
+
+def _eol_ok_bits(
+    nfa: NFA,
+    f: _FlatNFA,
+    mut eol_end_ok: _StateBits,
+    mut eol_nl_ok: _StateBits,
+):
+    """Comptime: pending-EOL resolution per anchor state, as bitsets — does
+    its continuation reach MATCH at end of input (`eol_end_ok`) / at a
+    '\n' (`eol_nl_ok`)? The question `_check_eol_match` asks per member,
+    precomputed so a state's flags are bitset ANDs."""
+    for s in range(len(f.kinds)):
+        if (f.eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
+            continue
+        if _reaches_match(nfa, f.out1s[s], True):
+            _bs_set(eol_end_ok, s)
+        if f.anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
+            nfa, f.out1s[s], False
+        ):
+            _bs_set(eol_nl_ok, s)
+
+
+def _bs_members(bits: _StateBits) -> List[Int]:
+    """Comptime: the members of a bitset, ascending."""
+    var members = List[Int]()
+    for l in range(64):
+        var w = bits[l]
+        while w != 0:
+            members.append(64 * l + Int(count_trailing_zeros(w)))
+            w &= w - 1
+    return members^
 
 
 # --- Hopcroft minimization -------------------------------------------------
@@ -1256,44 +1338,21 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     if n > EDFA_NFA_CAP:
         return result^  # cannot bitset; would blow EDFA_STATE_CAP anyway
 
-    # --- Byte classes: intervals with a representative first byte. ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    # --- Byte classes + one flat pass over the NFA (see _FlatNFA). ---
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref consuming_bits = flat.consuming_bits
+    ref match_bits = flat.match_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    # --- One flat pass over the NFA (see _flatten_nfa). ---
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     # --- Continuation closures, memoized by target state. ---
     # closure(union of targets) == union of closures, so per-member work in
@@ -1330,21 +1389,9 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     var lazy_members = 0
     var pool_threshold = 2 * n
 
-    # Pending-EOL resolution per anchor state, as bitsets: does the
-    # continuation reach MATCH at end of input / at a '\n'? (Same
-    # question `_check_eol_match` asks per member; precomputed so the
-    # per-state flag computation is two bitset ANDs.)
     var eol_end_ok = _StateBits(0)
     var eol_nl_ok = _StateBits(0)
-    for s in range(n):
-        if (eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
-            continue
-        if _reaches_match(nfa, out1s[s], True):
-            _bs_set(eol_end_ok, s)
-        if anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
-            nfa, out1s[s], False
-        ):
-            _bs_set(eol_nl_ok, s)
+    _eol_ok_bits(nfa, flat, eol_end_ok, eol_nl_ok)
 
     # --- Word boundaries: look-behind class per state. ---
     # A DFA state is (set, prev_word): the set keeps word anchors as
@@ -1356,12 +1403,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     # feed the word / non-word byte classes of the transitions.
     var has_wb = _nfa_has_word_anchor(nfa)
     var wb_bits = _word_anchor_bits(kinds, anchors)
-    var word_cls = SIMD[DType.uint64, 4](0)  # classes of word bytes
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)
 
     # --- State-set bookkeeping: bitsets, hashes in SIMD lanes, flags. ---
     var sets_bits = List[_StateBits]()

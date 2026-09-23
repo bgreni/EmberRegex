@@ -59,11 +59,13 @@ from .set_pike import SetSpan
 from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
+    _FlatNFA,
     _StateBits,
     _bs_any,
+    _bs_members,
     _bs_set,
     _byte_classes,
-    _flatten_nfa,
+    _class_ranges,
     _wb_holds,
     WB_DROP,
     WB_PENDING,
@@ -452,42 +454,17 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
     var preds = _reverse_edges(nfa)
 
     # --- Byte classes + flat views (shared with the forward builders). ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref eol_bits = flat.eol_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     # Predecessors, flattened, plus a predecessor bitset per state (the
     # raw reverse step is then a union of per-member bitsets filtered by
@@ -671,14 +648,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
     var n_sets = len(sets_bits)
     var sets = List[List[Int]]()
     for si in range(n_sets):
-        var bits = sets_bits.unsafe_get(si)
-        var members = List[Int]()
-        for l in range(64):
-            var w = bits[l]
-            while w != 0:
-                members.append(64 * l + Int(count_trailing_zeros(w)))
-                w &= w - 1
-        sets.append(members^)
+        sets.append(_bs_members(sets_bits.unsafe_get(si)))
     # One 256-lane vector store per row (see static_dfa `_edfa_finish`).
     var table = List[Int](fill=-1, length=n_sets * 256)
     for si in range(n_sets):

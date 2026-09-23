@@ -52,13 +52,15 @@ from .simd_scan import first_lane_index, lane_bits
 from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
+    _FlatNFA,
     _StateBits,
     _bs_eq,
     _bs_hash,
+    _bs_members,
     _byte_classes,
+    _class_ranges,
     _find_exit2,
     _flat_closure,
-    _flatten_nfa,
     WB_DROP,
 )
 
@@ -314,44 +316,20 @@ def build_multi_dfa(nfa: NFA, enabled: Bool) -> MultiDFA:
 
     var n = len(nfa.states)
 
-    # --- Byte classes: intervals with a representative first byte. ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    # --- Byte classes + one flat pass over the NFA (see _FlatNFA). ---
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref consuming_bits = flat.consuming_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    # --- One flat pass over the NFA (see _flatten_nfa). ---
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     # --- The folded unanchored restart, precomputed per context. ---
     var start_o = _flat_closure(
@@ -461,14 +439,7 @@ def build_multi_dfa(nfa: NFA, enabled: Bool) -> MultiDFA:
     var n_sets = len(sets_bits)
     var sets = List[List[Int]]()
     for si in range(n_sets):
-        var bits = sets_bits.unsafe_get(si)
-        var members = List[Int]()
-        for l in range(64):
-            var w = bits[l]
-            while w != 0:
-                members.append(64 * l + Int(count_trailing_zeros(w)))
-                w &= w - 1
-        sets.append(members^)
+        sets.append(_bs_members(sets_bits.unsafe_get(si)))
 
     return _mdfa_finish(nfa, sets, rows^, s0, result^)
 
