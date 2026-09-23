@@ -2884,12 +2884,6 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                             and input_bytes.unsafe_get(pos - 1) == CHAR_NEWLINE
                         ):
                             continue
-                        # Otherwise skip to the next BOL
-                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
-                        if nl < 0:
-                            break
-                        pos = nl + 1
-                        continue
                     # Skip to next BOL position
                     var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                     if nl < 0:
@@ -2897,7 +2891,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     pos = nl + 1
                 return results^
 
-            elif Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+            else:
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
@@ -2920,22 +2914,21 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     else:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 return results^
-        return results^
 
     @always_inline
-    def _findall_append[
-        n: Int
-    ](
+    def _findall_append(
         self,
         mut results: List[String],
         input: String,
         pos: Int,
         end: Int,
-        slots: Array[Int, n],
+        slots: Array[Int, Self._num_slots],
     ):
+        """findall's per-match string: group 1 when it participated, else
+        the whole span."""
         var input_bytes = input.as_bytes()
         comptime if Self._num_slots >= 2:
-            if Self._group_count > 0 and slots[0] >= 0 and slots[1] >= 0:
+            if slots[0] >= 0 and slots[1] >= 0:
                 results.append(
                     String(unsafe_from_utf8=input_bytes[slots[0] : slots[1]])
                 )
@@ -2961,23 +2954,9 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             if not result.matched:
                 # Unanchored: a miss covers every start >= pos.
                 break
-            comptime if Self._group_count > 0:
-                if result.group_matched(1):
-                    results.append(result.group_str(input_bytes, 1))
-                else:
-                    results.append(
-                        String(
-                            unsafe_from_utf8=input_bytes[
-                                result.start : result.end
-                            ]
-                        )
-                    )
-            else:
-                results.append(
-                    String(
-                        unsafe_from_utf8=input_bytes[result.start : result.end]
-                    )
-                )
+            self._findall_append(
+                results, input, result.start, result.end, result.slots
+            )
             if result.end > result.start:
                 pos = result.end
             else:
@@ -3031,12 +3010,6 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                             and input_bytes.unsafe_get(pos - 1) == CHAR_NEWLINE
                         ):
                             continue
-                        # Otherwise skip to the next BOL
-                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
-                        if nl < 0:
-                            break
-                        pos = nl + 1
-                        continue
                     # Skip to next BOL position
                     var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                     if nl < 0:
@@ -3044,7 +3017,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     pos = nl + 1
                 return results^
 
-            elif Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+            else:
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
@@ -3071,7 +3044,6 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     else:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 return results^
-        return results^
 
     def replace(mut self, input: String, replacement: String) -> String:
         """Replace all non-overlapping matches with replacement string.
