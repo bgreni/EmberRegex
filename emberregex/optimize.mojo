@@ -631,7 +631,7 @@ def extract_literal_suffix(nfa: NFA) -> List[UInt8]:
 # keeps the consuming lanes far below this.
 comptime INNER_LIT_MAX_STATES = 512
 # Longest literal kept. Any prefix of a required run is itself required,
-# so truncation is sound — the truncated run merely stops being a suffix.
+# so truncation is sound.
 comptime INNER_LIT_MAX_LEN = 16
 # Alternation nesting the walk resolves before giving up.
 comptime _INNER_MAX_DEPTH = 12
@@ -647,11 +647,8 @@ struct InnerLiteral(Copyable, Movable):
     fixed offset 0 are excluded — those belong to the prefix scanners
     (extract_literal_prefix / extract_filter_prefix / extract_alt_prefix).
 
-    `is_suffix` marks a run that ends every match (no bytes are consumed
-    after it); it is extracted and pinned but unused by the engine until
-    a suffix end-window verifier (effect (c)) exists. `valid` requires a
-    run of >= 2 bytes: a single required byte is already covered by
-    extract_required_byte.
+    `valid` requires a run of >= 2 bytes: a single required byte is
+    already covered by extract_required_byte.
 
     The engine uses this as a prefilter (Rust regex's ReverseSuffix /
     ReverseInner, effects (a)+(b)): no occurrence of `bytes` at or after
@@ -664,7 +661,6 @@ struct InnerLiteral(Copyable, Movable):
     var caseless: List[Bool]
     var min_offset: Int
     var max_offset: Int
-    var is_suffix: Bool
 
     def __init__(out self):
         self.valid = False
@@ -672,7 +668,6 @@ struct InnerLiteral(Copyable, Movable):
         self.caseless = List[Bool]()
         self.min_offset = 0
         self.max_offset = 0
-        self.is_suffix = False
 
 
 @always_inline
@@ -890,7 +885,6 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
     var buf_c = List[Bool]()
     var buf_min = 0
     var buf_max = 0
-    var suffix_flag = False  # the LAST closed run abutted MATCH
 
     var visited = SIMD[DType.uint8, _INNER_BITS](0)
     var s = nfa.start
@@ -944,7 +938,6 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
             run_cl.append(buf_c^)
             buf_b = List[UInt8]()
             buf_c = List[Bool]()
-            suffix_flag = kind == NFAStateKind.MATCH
 
         if kind == NFAStateKind.MATCH:
             break
@@ -1000,13 +993,12 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
             break
 
     # A bailed walk can leave a run open; its bytes were established from
-    # mandatory states, so keep it (suffix unknown -> False).
+    # mandatory states, so keep it.
     if len(buf_b) > 0:
         run_min.append(buf_min)
         run_max.append(buf_max)
         run_bytes.append(buf_b^)
         run_cl.append(buf_c^)
-        suffix_flag = False
 
     # Selection: drop fixed-offset-0 runs, require length >= 2, prefer
     # the rarest (then the longer) run.
@@ -1038,14 +1030,12 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
     if best < 0:
         return res^
 
-    var truncated = len(run_bytes[best]) > INNER_LIT_MAX_LEN
     var m = min(len(run_bytes[best]), INNER_LIT_MAX_LEN)
     for k in range(m):
         res.bytes.append(run_bytes[best][k])
         res.caseless.append(run_cl[best][k])
     res.min_offset = run_min[best]
     res.max_offset = run_max[best]
-    res.is_suffix = best == len(run_bytes) - 1 and suffix_flag and not truncated
     res.valid = True
     return res^
 

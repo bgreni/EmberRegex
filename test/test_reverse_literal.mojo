@@ -34,7 +34,6 @@ def _assert_inner[
     expect: StaticString,
     min_off: Int,
     max_off: Int,
-    suffix: Bool,
 ]() raises:
     comptime il = Regex[p]._inner_lit
     assert_true(il.valid, String("inner literal missing for ", p))
@@ -47,7 +46,6 @@ def _assert_inner[
         assert_equal(Int(bi), Int(ei), String("byte ", i, " of ", p))
     assert_equal(il.min_offset, min_off, String("min_offset for ", p))
     assert_equal(il.max_offset, max_off, String("max_offset for ", p))
-    assert_equal(il.is_suffix, suffix, String("is_suffix for ", p))
 
 
 def _assert_no_inner[p: StaticString]() raises:
@@ -58,21 +56,21 @@ def _assert_no_inner[p: StaticString]() raises:
 def test_extraction_suffix_after_loop() raises:
     # The canonical reverse-suffix shape: an unbounded loop, then a
     # required literal ending the match.
-    _assert_inner["\\w+\\.txt", ".txt", 1, -1, True]()
-    _assert_inner["\\d+\\.txt", ".txt", 1, -1, True]()
+    _assert_inner["\\w+\\.txt", ".txt", 1, -1]()
+    _assert_inner["\\d+\\.txt", ".txt", 1, -1]()
     # ANY-based loop.
-    _assert_inner[".+\\.txt", ".txt", 1, -1, True]()
+    _assert_inner[".+\\.txt", ".txt", 1, -1]()
     # Literal run preceded by a loop plus an exact byte; the run absorbs
     # the byte ("z.txt"), so the gap is the loop alone.
-    _assert_inner["[ab]+z\\.txt", "z.txt", 1, -1, True]()
+    _assert_inner["[ab]+z\\.txt", "z.txt", 1, -1]()
 
 
 def test_extraction_inner_run() raises:
     # The reverse-inner shape: the run continues into more consuming
-    # states, so it is not a suffix.
-    _assert_inner["[a-z]+://[^ ]+", "://", 1, -1, False]()
-    # Same run, nothing after it: a suffix.
-    _assert_inner["[a-z]+://", "://", 1, -1, True]()
+    # states.
+    _assert_inner["[a-z]+://[^ ]+", "://", 1, -1]()
+    # Same run, nothing after it (the reverse-suffix shape).
+    _assert_inner["[a-z]+://", "://", 1, -1]()
 
 
 def test_extraction_alternation_gap() raises:
@@ -80,13 +78,13 @@ def test_extraction_alternation_gap() raises:
     # alternations are Teddy-owned (see test_strategy_on_for_bounded_gap
     # for the shapes that actually run effect (b)).
     # Both arms consume exactly 3 bytes: the gap is bounded.
-    _assert_inner["(foo|bar)\\.txt", ".txt", 3, 3, True]()
-    _assert_inner["(?:foo|bar)\\.txt", ".txt", 3, 3, True]()
-    # Arms of different lengths: min 1, max 2; trailing charset means the
-    # run is not a suffix.
-    _assert_inner["(a|bb)cde[0-9]", "cde", 1, 2, False]()
+    _assert_inner["(foo|bar)\\.txt", ".txt", 3, 3]()
+    _assert_inner["(?:foo|bar)\\.txt", ".txt", 3, 3]()
+    # Arms of different lengths: min 1, max 2; the trailing charset
+    # closes the run.
+    _assert_inner["(a|bb)cde[0-9]", "cde", 1, 2]()
     # Multi-way alternation (a chained SPLIT tree).
-    _assert_inner["(?:a|bb|ccc)\\.txt", ".txt", 1, 3, True]()
+    _assert_inner["(?:a|bb|ccc)\\.txt", ".txt", 1, 3]()
     # The only mandatory run after the alternation is one byte long:
     # a single required byte is `required_byte`'s territory, not a
     # literal worth a memmem.
@@ -98,10 +96,10 @@ def test_extraction_bounded_counted_gap() raises:
     # compose min/max through the alternation walk. These four shapes
     # also HOLD the strategy at the engine level (unlike the literal
     # alternations above) — they are the effect-(b) test fleet.
-    _assert_inner["[ab]{0,3}foo", "foo", 0, 3, True]()
-    _assert_inner["[0-9]{2,5}xy", "xy", 2, 5, True]()
-    _assert_inner[".{0,2}foo", "foo", 0, 2, True]()
-    _assert_inner["[ab]?[cd]?foo", "foo", 0, 2, True]()
+    _assert_inner["[ab]{0,3}foo", "foo", 0, 3]()
+    _assert_inner["[0-9]{2,5}xy", "xy", 2, 5]()
+    _assert_inner[".{0,2}foo", "foo", 0, 2]()
+    _assert_inner["[ab]?[cd]?foo", "foo", 0, 2]()
 
 
 def test_extraction_rejects_prefix_and_short_runs() raises:
@@ -121,7 +119,7 @@ def test_extraction_rejects_prefix_and_short_runs() raises:
 def test_extraction_prefix_run_skipped_inner_kept() raises:
     # "ab" is the pattern's literal prefix (fixed offset 0) — skipped;
     # "cd" after the loop is the inner literal.
-    _assert_inner["ab\\d+cd", "cd", 3, -1, True]()
+    _assert_inner["ab\\d+cd", "cd", 3, -1]()
 
 
 def test_extraction_caseless() raises:
@@ -138,14 +136,13 @@ def test_extraction_caseless() raises:
         assert_true(ci)
     assert_equal(il.min_offset, 1)
     assert_equal(il.max_offset, -1)
-    assert_true(il.is_suffix)
 
 
 def test_extraction_prefers_rarest_run() raises:
     # Two mandatory runs; "qux" ('q' is rarer than anything in "the")
     # wins regardless of order.
-    _assert_inner["[0-9]+the[0-9]+qux[0-9]+", "qux", 5, -1, False]()
-    _assert_inner["[0-9]+qux[0-9]+the[0-9]+", "qux", 1, -1, False]()
+    _assert_inner["[0-9]+the[0-9]+qux[0-9]+", "qux", 5, -1]()
+    _assert_inner["[0-9]+qux[0-9]+the[0-9]+", "qux", 1, -1]()
 
 
 # --- Strategy selection ------------------------------------------------------
