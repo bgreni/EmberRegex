@@ -2337,9 +2337,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 end=self._lf_end_at(
                                     input_bytes, pos, match_end
                                 ),
-                                slots=Array[Int, Self._num_slots](
-                                    fill=-1
-                                ),
+                                slots=Array[Int, Self._num_slots](fill=-1),
                             )
                         var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                         if nl < 0:
@@ -2364,9 +2362,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                     end=self._lf_end_at(
                                         input_bytes, pos, match_end
                                     ),
-                                    slots=Array[Int, Self._num_slots](
-                                        fill=-1
-                                    ),
+                                    slots=Array[Int, Self._num_slots](fill=-1),
                                 )
                             pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         else:
@@ -2380,9 +2376,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                     end=self._lf_end_at(
                                         input_bytes, range[0], range[1]
                                     ),
-                                    slots=Array[Int, Self._num_slots](
-                                        fill=-1
-                                    ),
+                                    slots=Array[Int, Self._num_slots](fill=-1),
                                 )
                             return MatchResult[Self._num_slots].no_match()
                     return MatchResult[Self._num_slots].no_match()
