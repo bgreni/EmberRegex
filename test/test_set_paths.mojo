@@ -438,22 +438,6 @@ def test_reverse_dfa_bol_slices() raises:
     assert_equal(len(never.pool), 1)
 
 
-def test_reverse_dfa_shared_entry_uses_exact_start_scan() raises:
-    # Two ids whose fragments share an entry state defeat the one-id-per-
-    # state map, so the finish falls back to the exact per-pattern scan
-    # and the shared state's norm slice carries BOTH ids.
-    var nfa = build_union_nfa(["ab", "cd"])
-    nfa.pattern_starts[1] = nfa.pattern_starts[0]
-    var rd = build_reverse_dfa(nfa, True)
-    assert_true(rd.valid)
-    var shared = 0
-    for s in range(rd.num_states):
-        if rd.norm_len[s] == 2:
-            shared += 1
-            assert_equal(_ids(rd.pool, rd.norm_off[s], 2), [0, 1])
-    assert_equal(shared, 1)
-
-
 def test_reverse_dfa_caps() raises:
     # Reversed, `[ab]{10}a[ab]*` is `[ab]*a[ab]{10}` anchored at its
     # start: the forward table is small, the reverse one blows

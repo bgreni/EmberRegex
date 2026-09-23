@@ -192,41 +192,22 @@ def _rev_closure(
     sort(out)
 
 
-def _start_ids(nfa: NFA, states: List[Int]) -> List[Int]:
-    """Comptime: ids whose fragment entry is live in this set."""
-    var ids = List[Int]()
-    for i in range(len(nfa.pattern_starts)):
-        var st = nfa.pattern_starts[i]
-        if st < 0:
-            continue
-        for s in states:
-            if s == st:
-                ids.append(i)
-                break
-    return _sorted_dedup(ids^)
-
-
 def _start_id_map(nfa: NFA) -> List[Int]:
     """Comptime: NFA state -> the pattern id whose fragment entry it is,
-    -1 elsewhere; -2 in slot 0 when two patterns share an entry state
-    (then `_start_ids` must do the exact scan)."""
+    -1 elsewhere. One id per state suffices: the union builders
+    (`build_union_subset_nfa`, `splice_nfa`) give every pattern a fresh
+    entry state."""
     var m = List[Int](fill=-1, length=len(nfa.states))
-    var dup = False
     for i in range(len(nfa.pattern_starts)):
         var st = nfa.pattern_starts[i]
-        if st < 0:
-            continue
-        if m[st] >= 0:
-            dup = True
-        m[st] = i
-    if dup and len(m) > 0:
-        m[0] = -2
+        if st >= 0:
+            m[st] = i
     return m^
 
 
 def _start_ids_mapped(start_id_of: List[Int], states: List[Int]) -> List[Int]:
-    """`_start_ids` in O(members): one map read per member. Same ids in
-    the same (sorted, deduplicated) order."""
+    """Comptime: ids whose fragment entry is live in this set, sorted and
+    deduplicated — one map read per member."""
     var ids = List[Int]()
     for s in states:
         var i = start_id_of[s]
@@ -750,22 +731,18 @@ def _rdfa_finish(
     result.bol0_len = List[Int](fill=0, length=n)
     result.bolnl_off = List[Int](fill=0, length=n)
     result.bolnl_len = List[Int](fill=0, length=n)
-    # One NFA-state -> pattern-id map for the whole finish: `_start_ids`
-    # scanned every pattern against every member per state, O(patterns x
-    # members) List reads — ~17 s for a 456-state reverse DFA over 100
-    # literals. The BOL walks are skipped outright when the union has no
-    # BOL anchor (they return empty then): they allocate a visited array
-    # per member anchor and walk the predecessor lists.
+    # One NFA-state -> pattern-id map for the whole finish: scanning every
+    # pattern against every member per state was O(patterns x members)
+    # List reads — ~17 s for a 456-state reverse DFA over 100 literals.
+    # The BOL walks are skipped outright when the union has no BOL anchor
+    # (they return empty then): they allocate a visited array per member
+    # anchor and walk the predecessor lists.
     var start_id_of = _start_id_map(nfa)
-    var exact_starts = len(start_id_of) > 0 and start_id_of[0] == -2
     var has_bol = _nfa_has_bol(nfa)
     for s in range(n):
-        var ids: List[Int]
-        if exact_starts:
-            ids = _start_ids(nfa, sets[s])
-        else:
-            ids = _start_ids_mapped(start_id_of, sets[s])
-        var sn = _pool_slice(result.pool, ids)
+        var sn = _pool_slice(
+            result.pool, _start_ids_mapped(start_id_of, sets[s])
+        )
         result.norm_off[s] = sn[0]
         result.norm_len[s] = sn[1]
         var s0 = _pool_slice(
