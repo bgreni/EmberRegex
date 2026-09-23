@@ -86,7 +86,7 @@ from .set_literal import (
     _assign_buckets,
     teddy_front_end,
 )
-from .set_pike import SetMatch
+from .set_pike import SetMatch, _before, dedup_reports, sort_reports
 from .set_semantics import (
     EXT_EDIT_DISTANCE,
     EXT_HAMMING_DISTANCE,
@@ -1191,43 +1191,6 @@ def rose_flags_arr[n: Int](r: RoseSet) -> Array[UInt8, n]:
 
 
 # --- Report ordering --------------------------------------------------------
-
-
-@always_inline
-def _before(a: SetMatch, b: SetMatch) -> Bool:
-    """Contract order: nondecreasing end, ties ascending id."""
-    return a.end < b.end or (a.end == b.end and a.id <= b.id)
-
-
-def sort_reports(mut r: List[SetMatch]):
-    """Order reports by (end, id).
-
-    Reports leave the scan grouped by candidate start, and candidates
-    advance monotonically, so displacement is bounded by how far one
-    confirm walk can reach past the next candidate — a few bytes for the
-    literal-ish patterns this lane accepts (`_conf_dfa_ok` already keeps
-    the far-walking ones off it). Insertion sort is near-linear there and
-    allocates nothing, which matters: on dense input this runs over
-    thousands of reports per scan.
-    """
-    for i in range(1, len(r)):
-        var key = r[i]
-        var j = i - 1
-        while j >= 0 and not _before(r[j], key):
-            r[j + 1] = r[j]
-            j -= 1
-        r[j + 1] = key
-
-
-def dedup_reports(mut r: List[SetMatch]):
-    """Collapse duplicate (id, end) pairs in a sorted report list."""
-    var w = 0
-    for i in range(len(r)):
-        if w > 0 and r[i] == r[w - 1]:
-            continue
-        r[w] = r[i]
-        w += 1
-    r.resize(w, SetMatch(0, 0))
 
 
 def merge_reports(var a: List[SetMatch], b: List[SetMatch]) -> List[SetMatch]:

@@ -67,6 +67,43 @@ struct SetSpan(Equatable, TrivialRegisterPassable, Writable):
         )
 
 
+@always_inline
+def _before(a: SetMatch, b: SetMatch) -> Bool:
+    """Contract order: nondecreasing end, ties ascending id."""
+    return a.end < b.end or (a.end == b.end and a.id <= b.id)
+
+
+def sort_reports(mut r: List[SetMatch]):
+    """Order reports by (end, id).
+
+    The Teddy and Rose scans emit reports grouped by candidate start, and
+    candidates advance monotonically, so displacement is bounded — by the
+    literal length spread, or by how far one Rose confirm walk can reach
+    past the next candidate (`_conf_dfa_ok` keeps the far-walking ones off
+    that lane). Insertion sort is near-linear there and allocates nothing,
+    which matters: on dense input this runs over thousands of reports per
+    scan.
+    """
+    for i in range(1, len(r)):
+        var key = r[i]
+        var j = i - 1
+        while j >= 0 and not _before(r[j], key):
+            r[j + 1] = r[j]
+            j -= 1
+        r[j + 1] = key
+
+
+def dedup_reports(mut r: List[SetMatch]):
+    """Collapse duplicate (id, end) pairs in a sorted report list."""
+    var w = 0
+    for i in range(len(r)):
+        if w > 0 and r[i] == r[w - 1]:
+            continue
+        r[w] = r[i]
+        w += 1
+    r.resize(w, SetMatch(0, 0))
+
+
 def _set_add_state[
     origin: Origin, //
 ](

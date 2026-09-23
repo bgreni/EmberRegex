@@ -25,7 +25,7 @@ from std.sys import simd_width_of
 
 from .nfa import NFA, NFAStateKind
 from .optimize import _charset_filter_byte
-from .set_pike import SetMatch
+from .set_pike import SetMatch, dedup_reports, sort_reports
 from .simd_kernels import NIBBLE_TABLE_SIZE, nibble_lookup
 from .simd_scan import clear_first_lane, first_lane_index, lane_bits
 from .teddy import _lit_at
@@ -396,21 +396,6 @@ def _litset_verify_at[
                         out.append(SetMatch(rid, at + L))
 
 
-def _sort_reports(mut r: List[SetMatch]):
-    """Order reports by (end, id). The scan emits grouped by
-    nondecreasing start, so displacement is bounded by the literal
-    length spread and insertion sort runs near-linear."""
-    for i in range(1, len(r)):
-        var key = r[i]
-        var j = i - 1
-        while j >= 0 and (
-            r[j].end > key.end or (r[j].end == key.end and r[j].id > key.id)
-        ):
-            r[j + 1] = r[j]
-            j -= 1
-        r[j + 1] = key
-
-
 # `@always_inline` for the same reason as `mdfa_scan` and the eager
 # walkers: `ls` is a List-carrying value parameter, and an out-of-line
 # instantiation prints it into its symbol name (a 1 MB symbol for the
@@ -431,14 +416,8 @@ def litset_scan[
 
     teddy_front_end[min_len=ls.min_len, masks=litset_masks(ls)](inp, verify)
 
-    _sort_reports(out)
-    # Collapse duplicate (id, end) pairs: same-id arms of an in-pattern
-    # alternation (`ab|ab`-style) can hit at the same end.
-    var w = 0
-    for i in range(len(out)):
-        if w > 0 and out[i] == out[w - 1]:
-            continue
-        out[w] = out[i]
-        w += 1
-    out.resize(w, SetMatch(0, 0))
+    sort_reports(out)
+    # Same-id arms of an in-pattern alternation (`ab|ab`-style) can hit at
+    # the same end.
+    dedup_reports(out)
     return out^
