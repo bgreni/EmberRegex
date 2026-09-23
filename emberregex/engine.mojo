@@ -1368,9 +1368,7 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _LFDFA_TABLE_S = edfa_table_str[Self._LFDFA_TN, Self._LFDFA_DT](
         Self._lfdfa
     )
-    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.num_states](
-        Self._lfdfa
-    )
+    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.num_states](Self._lfdfa)
     comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa, Self._use_lf_sheng)
     comptime _LF_SHENG_MASKS_S = sheng_masks_str[Self._LF_SHENG_CAP](
         Self._lfdfa, Self._use_lf_sheng

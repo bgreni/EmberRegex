@@ -2467,9 +2467,9 @@ def edfa_match_at[
             return _edfa_walk_impl[
                 d=d, table=table, flags=flags, accel=True, cap=cap
             ](input, start)
-    return _edfa_walk_impl[
-        d=d, table=table, flags=flags, accel=False, cap=cap
-    ](input, start)
+    return _edfa_walk_impl[d=d, table=table, flags=flags, accel=False, cap=cap](
+        input, start
+    )
 
 
 @always_inline

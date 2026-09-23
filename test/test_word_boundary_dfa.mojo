@@ -238,9 +238,7 @@ def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     var pos = 0
     var i = 0
     while pos <= n:
-        var end = edfa_match_at[d=lf, table=ltbl, flags=lfl](
-            bytes, pos
-        )
+        var end = edfa_match_at[d=lf, table=ltbl, flags=lfl](bytes, pos)
         if end < 0:
             break
         var start = rdfa_find_start[d=rd, table=rtbl, flags=rfl](
