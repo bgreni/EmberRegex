@@ -168,30 +168,23 @@ struct LiteralAlt(Copyable, Movable):
         self.min_len = 0
 
 
-def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
-    """Comptime: detect a pure alternation of 2..TEDDY_MAX_LITERALS plain
-    literals.
-
-    The start must expand (through no-op SPLITs and SAVEs) into a SPLIT
-    tree whose leaves are CHAR chains ending at MATCH. Anything else —
-    anchors, charsets, quantifier cycles, empty branches, nested
-    alternation mid-chain — invalidates the extraction.
-    """
-    var result = LiteralAlt()
+def _alt_heads(nfa: NFA) -> List[Int]:
+    """Comptime: the branch heads of the SPLIT tree the start expands into
+    (through no-op SPLITs and SAVEs), when every leaf is a CHAR or a
+    filterable CHARSET and there are 2..TEDDY_MAX_LITERALS of them; empty
+    otherwise. The expansion budget rejects quantifier cycles (which
+    revisit SPLITs indefinitely)."""
     var num_states = len(nfa.states)
-
-    # Expand the alternation tree into branch heads. The expansion budget
-    # rejects quantifier cycles (which revisit SPLITs indefinitely).
     var heads = List[Int]()
     var stack: List[Int] = [nfa.start]
     var budget = 4 * TEDDY_MAX_LITERALS
     while len(stack) > 0:
         budget -= 1
         if budget < 0:
-            return result^
+            return List[Int]()
         var s = stack.pop()
         if s < 0 or s >= num_states:
-            return result^
+            return List[Int]()
         var kind = nfa.states[s].kind
         if kind == NFAStateKind.SPLIT:
             if nfa.states[s].out2 == -1:
@@ -209,44 +202,74 @@ def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
         ):
             heads.append(s)  # (?i) case pair or single-member charset
         else:
-            return result^
+            return List[Int]()
     if len(heads) < 2 or len(heads) > TEDDY_MAX_LITERALS:
+        return List[Int]()
+    return heads^
+
+
+def _lit_chain(
+    nfa: NFA, head: Int, cap: Int, mut bytes: List[Int], mut cl: List[Bool]
+) -> Bool:
+    """Comptime: append to `bytes` (and the parallel caseless flags `cl`)
+    the literal bytes of the CHAR / filterable-CHARSET chain from `head`,
+    through SAVEs and no-op SPLITs, stopping at the first other state or
+    at `cap` bytes. True when the chain stopped at MATCH."""
+    var num_states = len(nfa.states)
+    var s = head
+    var steps = 0
+    var ended_at_match = False
+    while len(bytes) < cap:
+        steps += 1
+        if steps > num_states or s < 0 or s >= num_states:
+            break
+        var kind = nfa.states[s].kind
+        if kind == NFAStateKind.CHAR:
+            var cv = nfa.states[s].char_value
+            if cv >= 256:
+                break
+            bytes.append(Int(cv))
+            cl.append(False)
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.CHARSET:
+            var fb = _charset_filter_byte(nfa, nfa.states[s].charset_index)
+            if fb[0] < 0:
+                break  # unfilterable charset ends the chain
+            bytes.append(fb[0])
+            cl.append(fb[1])
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.SAVE:
+            s = nfa.states[s].out1
+        elif kind == NFAStateKind.SPLIT and nfa.states[s].out2 == -1:
+            s = nfa.states[s].out1
+        else:
+            ended_at_match = kind == NFAStateKind.MATCH
+            break
+    return ended_at_match
+
+
+def extract_literal_alternation(nfa: NFA) -> LiteralAlt:
+    """Comptime: detect a pure alternation of 2..TEDDY_MAX_LITERALS plain
+    literals.
+
+    The start must expand (through no-op SPLITs and SAVEs) into a SPLIT
+    tree whose leaves are CHAR chains ending at MATCH. Anything else —
+    anchors, charsets, quantifier cycles, empty branches, nested
+    alternation mid-chain — invalidates the extraction.
+    """
+    var result = LiteralAlt()
+    var num_states = len(nfa.states)
+    var heads = _alt_heads(nfa)
+    if len(heads) == 0:
         return result^
 
     var min_len = num_states  # any literal is shorter than the NFA
     for h in heads:
+        # A chain has fewer bytes than the NFA has states, so this cap
+        # never cuts one short of MATCH.
         var bytes = List[Int]()
         var cl = List[Bool]()
-        var s = h
-        var steps = 0
-        while True:
-            steps += 1
-            if steps > num_states or s < 0 or s >= num_states:
-                return result^
-            var kind = nfa.states[s].kind
-            if kind == NFAStateKind.CHAR:
-                var cv = nfa.states[s].char_value
-                if cv >= 256:
-                    return result^
-                bytes.append(Int(cv))
-                cl.append(False)
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.CHARSET:
-                var fb = _charset_filter_byte(nfa, nfa.states[s].charset_index)
-                if fb[0] < 0:
-                    return result^
-                bytes.append(fb[0])
-                cl.append(fb[1])
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.SAVE:
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.SPLIT and nfa.states[s].out2 == -1:
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.MATCH:
-                break
-            else:
-                return result^
-        if len(bytes) == 0:
+        if not _lit_chain(nfa, h, num_states, bytes, cl) or len(bytes) == 0:
             return result^
         if len(bytes) < min_len:
             min_len = len(bytes)
@@ -270,37 +293,8 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
     full Teddy engine owns that), when any arm starts with a non-CHAR
     state, or when more than TEDDY_MAX_LITERALS arms exist."""
     var result = LiteralAlt()
-    var num_states = len(nfa.states)
-
-    var heads = List[Int]()
-    var stack: List[Int] = [nfa.start]
-    var budget = 4 * TEDDY_MAX_LITERALS
-    while len(stack) > 0:
-        budget -= 1
-        if budget < 0:
-            return result^
-        var s = stack.pop()
-        if s < 0 or s >= num_states:
-            return result^
-        var kind = nfa.states[s].kind
-        if kind == NFAStateKind.SPLIT:
-            if nfa.states[s].out2 == -1:
-                stack.append(nfa.states[s].out1)
-            else:
-                stack.append(nfa.states[s].out2)
-                stack.append(nfa.states[s].out1)
-        elif kind == NFAStateKind.SAVE:
-            stack.append(nfa.states[s].out1)
-        elif kind == NFAStateKind.CHAR:
-            heads.append(s)
-        elif (
-            kind == NFAStateKind.CHARSET
-            and _charset_filter_byte(nfa, nfa.states[s].charset_index)[0] >= 0
-        ):
-            heads.append(s)  # (?i) case pair or single-member charset
-        else:
-            return result^
-    if len(heads) < 2 or len(heads) > TEDDY_MAX_LITERALS:
+    var heads = _alt_heads(nfa)
+    if len(heads) == 0:
         return result^
 
     comptime CHAIN_CAP = 8  # verification cost bound per candidate
@@ -309,39 +303,10 @@ def extract_alt_prefix(nfa: NFA) -> LiteralAlt:
     for h in heads:
         var bytes = List[Int]()
         var cl = List[Bool]()
-        var s = h
-        var steps = 0
-        var ended_at_match = False
-        while len(bytes) < CHAIN_CAP:
-            steps += 1
-            if steps > num_states or s < 0 or s >= num_states:
-                break
-            var kind = nfa.states[s].kind
-            if kind == NFAStateKind.CHAR:
-                var cv = nfa.states[s].char_value
-                if cv >= 256:
-                    break
-                bytes.append(Int(cv))
-                cl.append(False)
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.CHARSET:
-                var fb = _charset_filter_byte(nfa, nfa.states[s].charset_index)
-                if fb[0] < 0:
-                    break  # unfilterable charset ends the chain
-                bytes.append(fb[0])
-                cl.append(fb[1])
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.SAVE:
-                s = nfa.states[s].out1
-            elif kind == NFAStateKind.SPLIT and nfa.states[s].out2 == -1:
-                s = nfa.states[s].out1
-            else:
-                if kind == NFAStateKind.MATCH:
-                    ended_at_match = True
-                break
+        var at_match = _lit_chain(nfa, h, CHAIN_CAP, bytes, cl)
         if len(bytes) < 2:
             return result^  # a 1-byte arm filters no better than the bitmap
-        if not ended_at_match:
+        if not at_match:
             all_end_at_match = False
         if len(bytes) < min_len:
             min_len = len(bytes)
