@@ -27,7 +27,7 @@ from emberregex.static_dfa import (
     edfa_match_at,
     edfa_table_str,
 )
-from emberregex.static_lfdfa import LFDFA, build_lf_dfa, lfdfa_find_end
+from emberregex.static_lfdfa import LFDFA, build_lf_dfa
 from emberregex.static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
@@ -274,7 +274,9 @@ def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     var pos = 0
     var i = 0
     while pos <= n:
-        var end = lfdfa_find_end[lf=lf, table=ltbl, flags=lfl](bytes, pos)
+        var end = edfa_match_at[d=lf.d, table=ltbl, flags=lfl](
+            bytes, pos
+        )
         if end < 0:
             break
         var start = rdfa_find_start[d=rd, table=rtbl, flags=rfl](

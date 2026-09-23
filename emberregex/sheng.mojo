@@ -32,8 +32,8 @@ input too short to amortize the shuffle's fixed costs, which walks the
 same mask table one scalar load per byte instead (`sheng_short_input`,
 `_sheng_scalar_full_match`). Search-family verbs no longer walk per candidate
 position: the leftmost-first DFA (static_lfdfa.mojo) runs one
-unanchored `sheng_walk_from` pass, so there is no shuffle-engine
-search_forward here any more.
+unanchored `sheng_match_at` pass over its own table, so there is no
+shuffle-engine search_forward here any more.
 """
 
 from std.collections import Array
@@ -365,25 +365,21 @@ def _sheng_walk_impl[
     masks: StringLiteral,
     flags: Array[UInt8, ns],
     accel: Bool,
-    s_at0: Int,
-    s_nl: Int,
-    s_other: Int,
-    s_other_w: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
     comptime dead = d.num_states
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
-        cur = s_at0
+        cur = d.start_at_0
     elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
-        cur = s_nl
+        cur = d.start_after_nl
     else:
-        comptime if s_other_w != s_other:
-            cur = s_other_w if is_word_byte(
+        comptime if d.start_other_word != d.start_other:
+            cur = d.start_other_word if is_word_byte(
                 input.unsafe_get(start - 1)
-            ) else s_other
+            ) else d.start_other
         else:
-            cur = s_other
+            cur = d.start_other
     var cur_vec = _ShuffleIndex(UInt8(cur))
 
     var last_match = -1
@@ -431,49 +427,6 @@ def _sheng_walk_impl[
 
 
 @always_inline
-def sheng_walk_from[
-    origin: Origin,
-    ns: Int,
-    //,
-    d: EagerDFA,
-    cap: Int,
-    masks: StringLiteral,
-    flags: Array[UInt8, ns],
-    s_at0: Int,
-    s_nl: Int,
-    s_other: Int,
-    s_other_w: Int = s_other,
-](input: Span[Byte, origin], start: Int) -> Int:
-    """Shuffle walk from `start` in explicit start states (mirrors
-    edfa_walk_from), with the same per-walk accelerated/plain dispatch."""
-    comptime if _edfa_has_accel(d):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _sheng_walk_impl[
-                d=d,
-                cap=cap,
-                masks=masks,
-                flags=flags,
-                accel=True,
-                s_at0=s_at0,
-                s_nl=s_nl,
-                s_other=s_other,
-                s_other_w=s_other_w,
-            ](input, start)
-    return _sheng_walk_impl[
-        d=d,
-        cap=cap,
-        masks=masks,
-        flags=flags,
-        accel=False,
-        s_at0=s_at0,
-        s_nl=s_nl,
-        s_other=s_other,
-        s_other_w=s_other_w,
-    ](input, start)
-
-
-@always_inline
 def sheng_match_at[
     origin: Origin,
     ns: Int,
@@ -483,15 +436,14 @@ def sheng_match_at[
     masks: StringLiteral,
     flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
-    """Anchored match at `start` (mirrors edfa_match_at): `sheng_walk_from`
-    in the DFA's own start states."""
-    return sheng_walk_from[
-        d=d,
-        cap=cap,
-        masks=masks,
-        flags=flags,
-        s_at0=d.start_at_0,
-        s_nl=d.start_after_nl,
-        s_other=d.start_other,
-        s_other_w=d.start_other_word,
+    """`edfa_match_at` on the shuffle engine, with the same per-walk
+    accelerated/plain dispatch."""
+    comptime if _edfa_has_accel(d):
+        comptime W = simd_width_of[DType.uint8]()
+        if len(input) - start >= W:
+            return _sheng_walk_impl[
+                d=d, cap=cap, masks=masks, flags=flags, accel=True
+            ](input, start)
+    return _sheng_walk_impl[
+        d=d, cap=cap, masks=masks, flags=flags, accel=False
     ](input, start)

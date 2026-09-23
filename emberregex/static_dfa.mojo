@@ -2394,26 +2394,22 @@ def _edfa_walk_impl[
     table: StringLiteral,
     flags: Array[UInt8, ns],
     accel: Bool,
-    s_at0: Int,
-    s_nl: Int,
-    s_other: Int,
-    s_other_w: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
     comptime dt = edfa_id_dtype(d.num_states)
     var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
-        cur = s_at0
+        cur = d.start_at_0
     elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
-        cur = s_nl
+        cur = d.start_after_nl
     else:
-        comptime if s_other_w != s_other:
-            cur = s_other_w if is_word_byte(
+        comptime if d.start_other_word != d.start_other:
+            cur = d.start_other_word if is_word_byte(
                 input.unsafe_get(start - 1)
-            ) else s_other
+            ) else d.start_other
         else:
-            cur = s_other
+            cur = d.start_other
 
     var last_match = -1
     if cur < d.num_match_states:
@@ -2459,60 +2455,6 @@ def _edfa_walk_impl[
 
 
 @always_inline
-def edfa_walk_from[
-    origin: Origin,
-    ns: Int,
-    //,
-    d: EagerDFA,
-    table: StringLiteral,
-    flags: Array[UInt8, ns],
-    s_at0: Int,
-    s_nl: Int,
-    s_other: Int,
-    s_other_w: Int = s_other,
-](input: Span[Byte, origin], start: Int) -> Int:
-    """Table walk from `start` in one of the explicit start states
-    (position 0 / after '\n' / mid-line after a non-word byte / mid-line
-    after a word byte — the last two coincide unless a word anchor is
-    live at the start), returning the last position where a match state
-    (or a resolving EOL / word-boundary flag) was observed, or -1.
-
-    What that position MEANS depends on the table: over the classic
-    subset construction it is the leftmost-longest end of a match
-    anchored at `start`; over a leftmost-first table (static_lfdfa.mojo)
-    it is Python's leftmost-first end, anchored or unanchored according
-    to which start ids the caller hands over.
-
-    Dispatches once per walk between an accelerated and a plain loop:
-    walks that can never reach a full vector chunk take the plain loop
-    and pay no per-byte acceleration checks at all.
-    """
-    comptime if _edfa_has_accel(d):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _edfa_walk_impl[
-                d=d,
-                table=table,
-                flags=flags,
-                accel=True,
-                s_at0=s_at0,
-                s_nl=s_nl,
-                s_other=s_other,
-                s_other_w=s_other_w,
-            ](input, start)
-    return _edfa_walk_impl[
-        d=d,
-        table=table,
-        flags=flags,
-        accel=False,
-        s_at0=s_at0,
-        s_nl=s_nl,
-        s_other=s_other,
-        s_other_w=s_other_w,
-    ](input, start)
-
-
-@always_inline
 def edfa_match_at[
     origin: Origin,
     ns: Int,
@@ -2521,18 +2463,32 @@ def edfa_match_at[
     table: StringLiteral,
     flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
-    """Anchored match at `start`; returns leftmost-longest end or -1
-    (mirrors LazyDFA.match_at). `edfa_walk_from` in the DFA's own start
-    states."""
-    return edfa_walk_from[
-        d=d,
-        table=table,
-        flags=flags,
-        s_at0=d.start_at_0,
-        s_nl=d.start_after_nl,
-        s_other=d.start_other,
-        s_other_w=d.start_other_word,
-    ](input, start)
+    """Table walk from `start` in the DFA's own start states (position 0
+    / after '\n' / mid-line after a non-word byte / mid-line after a word
+    byte — the last two coincide unless a word anchor is live at the
+    start), returning the last position where a match state (or a
+    resolving EOL / word-boundary flag) was observed, or -1.
+
+    What that position MEANS depends on the table: over the classic
+    subset construction it is the leftmost-longest end of a match
+    anchored at `start` (mirrors LazyDFA.match_at); over a leftmost-first
+    table (static_lfdfa.mojo), whose start states are the unanchored
+    ones, it is Python's leftmost-first end of the first match at or
+    after `start`.
+
+    Dispatches once per walk between an accelerated and a plain loop:
+    walks that can never reach a full vector chunk take the plain loop
+    and pay no per-byte acceleration checks at all.
+    """
+    comptime if _edfa_has_accel(d):
+        comptime W = simd_width_of[DType.uint8]()
+        if len(input) - start >= W:
+            return _edfa_walk_impl[d=d, table=table, flags=flags, accel=True](
+                input, start
+            )
+    return _edfa_walk_impl[d=d, table=table, flags=flags, accel=False](
+        input, start
+    )
 
 
 @always_inline

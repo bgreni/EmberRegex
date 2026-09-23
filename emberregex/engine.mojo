@@ -94,11 +94,7 @@ from .static_dfa import (
     edfa_match_at,
     pivot_first_candidate,
 )
-from .static_lfdfa import (
-    build_lf_dfa,
-    lfdfa_find_end,
-    sheng_lfdfa_find_end,
-)
+from .static_lfdfa import build_lf_dfa
 from .static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
@@ -1628,15 +1624,15 @@ struct Regex[pattern: String](Copyable, Movable):
     ](self, input: Span[Byte, origin], pos: Int) -> Int:
         """Leftmost-first match END at or after `pos`, or -1."""
         comptime if Self._use_lf_sheng:
-            return sheng_lfdfa_find_end[
-                lf=Self._lfdfa,
+            return sheng_match_at[
+                d=Self._lfdfa.d,
                 cap=Self._LF_SHENG_CAP,
                 masks=Self._LF_SHENG_MASKS,
                 flags=Self._LFDFA_FLAGS,
             ](input, pos)
         else:
-            return lfdfa_find_end[
-                lf=Self._lfdfa,
+            return edfa_match_at[
+                d=Self._lfdfa.d,
                 table=Self._LFDFA_TABLE,
                 flags=Self._LFDFA_FLAGS,
             ](input, pos)

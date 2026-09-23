@@ -19,14 +19,11 @@ from emberregex.static_dfa import (
     EagerDFA,
     edfa_flags_arr,
     edfa_id_dtype,
+    edfa_match_at,
     edfa_table_str,
 )
 from emberregex.static_rdfa import rdfa_find_start
-from emberregex.static_lfdfa import (
-    LF_LIST_CAP,
-    build_lf_dfa,
-    lfdfa_find_end,
-)
+from emberregex.static_lfdfa import LF_LIST_CAP, build_lf_dfa
 from std.benchmark import keep
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 from std.time import perf_counter_ns
@@ -694,11 +691,11 @@ def test_wide_list_signature_renumbering() raises:
     comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
     var input = String("!!!!!!!!!!!!!!!!!!!!q!!")
     var bytes = input.as_bytes()
-    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes, 0), 21)
-    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes, 21), -1)
+    assert_equal(edfa_match_at[d=lf.d, table=table, flags=flags](bytes, 0), 21)
+    assert_equal(edfa_match_at[d=lf.d, table=table, flags=flags](bytes, 21), -1)
     var input2 = String("!!!!!!!!!!!!!!!!!!!!7!!")
     var bytes2 = input2.as_bytes()
-    assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes2, 0), 21)
+    assert_equal(edfa_match_at[d=lf.d, table=table, flags=flags](bytes2, 0), 21)
     # And on the engine: a class arm keeps Teddy off, so the same lists
     # drive search/findall through the lane.
     comptime W = Regex[_WIDE_ALT + "|[!?]{2}"]

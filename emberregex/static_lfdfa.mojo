@@ -45,7 +45,6 @@ Continuation closures are memoized per target state in one flat pool.
 """
 
 from std.bit import count_leading_zeros, count_trailing_zeros
-from std.collections import Array
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
@@ -75,9 +74,7 @@ from .static_dfa import (
     _word_anchor_bits,
     WB_PENDING,
     WB_RESOLVE,
-    edfa_walk_from,
 )
-from .sheng import sheng_walk_from
 
 # Lanes of a state's ordered-list vector. The last three lanes are the
 # tail-kind, restart and look-behind markers, so a state holds at most
@@ -1090,58 +1087,3 @@ def build_lf_dfa(
         result.d.start_other_word = pstarts[3]
     result.valid = True
     return result^
-
-
-# --- Runtime walkers ---------------------------------------------------------
-#
-# Both are the eager table walk (`edfa_walk_from`) in different start
-# states — the leftmost-first bookkeeping is entirely in the table. The
-# Sheng variants are the shuffle walk over masks built from the same
-# table (`sheng_masks_arr(lf.d, ...)`).
-
-
-@always_inline
-def lfdfa_find_end[
-    origin: Origin,
-    ns: Int,
-    //,
-    lf: LFDFA,
-    table: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], start: Int) -> Int:
-    """Unanchored scan from `start`: the END of the leftmost-first match
-    beginning at or after `start` (Python `re.search` semantics), or -1.
-    The start context (position 0 / after '\\n' / mid-line) is read from
-    `input[start - 1]`."""
-    return edfa_walk_from[
-        d=lf.d,
-        table=table,
-        flags=flags,
-        s_at0=lf.d.start_at_0,
-        s_nl=lf.d.start_after_nl,
-        s_other=lf.d.start_other,
-        s_other_w=lf.d.start_other_word,
-    ](input, start)
-
-
-@always_inline
-def sheng_lfdfa_find_end[
-    origin: Origin,
-    ns: Int,
-    //,
-    lf: LFDFA,
-    cap: Int,
-    masks: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], start: Int) -> Int:
-    """`lfdfa_find_end` on the shuffle engine."""
-    return sheng_walk_from[
-        d=lf.d,
-        cap=cap,
-        masks=masks,
-        flags=flags,
-        s_at0=lf.d.start_at_0,
-        s_nl=lf.d.start_after_nl,
-        s_other=lf.d.start_other,
-        s_other_w=lf.d.start_other_word,
-    ](input, start)
