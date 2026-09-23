@@ -10,7 +10,12 @@ from std.math import max, min
 from .constants import CHAR_A_LOWER, CHAR_A_UPPER, CHAR_Z_LOWER, CHAR_Z_UPPER
 from .ast import AST, ASTNode, ASTNodeKind, AnchorKind
 from .charset import BITMAP_WIDTH, CharSet, CharRange
-from .utf8 import UTF8_SEQ_LEN_SHIFT, UTF8_SEQ_WORDS, utf8_seq_table
+from .utf8 import (
+    UTF8_SEQ_LEN_SHIFT,
+    UTF8_SEQ_WORDS,
+    negate_ranges,
+    utf8_seq_table,
+)
 from .flags import RegexFlags
 from .parser import parse
 from std.os import abort
@@ -908,50 +913,7 @@ def _charset_codepoint_ranges(cs: CharSet) -> List[Int]:
         out.append(Int(r.lo))
         out.append(Int(r.hi))
     if cs.negated:
-        return _negate_cp(out)
-    return out^
-
-
-def _negate_cp(ranges: List[Int]) -> List[Int]:
-    var n = len(ranges) // 2
-    var los = List[Int]()
-    var his = List[Int]()
-    for i in range(n):
-        los.append(ranges[2 * i])
-        his.append(ranges[2 * i + 1])
-    # Insertion sort, with the already-in-order case costing ONE comptime
-    # element access instead of five. The property tables are sorted and
-    # disjoint by construction (test_unicode_tables pins that for all 84),
-    # so every `\p{...}` takes the skip on every element; the original
-    # wrote `kl`/`kh` straight back over themselves 683 times for a
-    # `\p{L}`, and a comptime access is ~61 us. `prev` stays valid across
-    # an insertion: los[0..i] ends sorted, and `cur < prev` means its new
-    # maximum is still `prev`.
-    var prev = los[0] if n > 0 else 0
-    for i in range(1, n):
-        var cur = los[i]
-        if cur >= prev:
-            prev = cur
-            continue
-        var kh = his[i]
-        var j = i - 1
-        while j >= 0 and los[j] > cur:
-            los[j + 1] = los[j]
-            his[j + 1] = his[j]
-            j -= 1
-        los[j + 1] = cur
-        his[j + 1] = kh
-    var out = List[Int]()
-    var cursor = 0
-    for i in range(n):
-        if los[i] > cursor:
-            out.append(cursor)
-            out.append(los[i] - 1)
-        if his[i] + 1 > cursor:
-            cursor = Int(his[i]) + 1
-    if cursor <= 0x10FFFF:
-        out.append(cursor)
-        out.append(0x10FFFF)
+        return negate_ranges(out)
     return out^
 
 
