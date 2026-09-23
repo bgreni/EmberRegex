@@ -276,13 +276,7 @@ def _flush_spans(
 
 def _flush_reports(mut ids: List[Int], end: Int, mut out: List[SetMatch]):
     """Emit this position's reports in ascending id order."""
-    for i in range(1, len(ids)):
-        var key = ids[i]
-        var j = i - 1
-        while j >= 0 and ids[j] > key:
-            ids[j + 1] = ids[j]
-            j -= 1
-        ids[j + 1] = key
+    sort(ids)
     for i in range(len(ids)):
         out.append(SetMatch(ids[i], end))
 
