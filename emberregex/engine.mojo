@@ -51,7 +51,6 @@ from .optimize import (
     LiteralAlt,
 )
 from .teddy import (
-    teddy_find_prefix,
     teddy_full_match,
     teddy_match_at,
     teddy_search_forward,
@@ -3646,7 +3645,9 @@ struct Regex[pattern: String](Copyable, Movable):
         comptime if Self._strategy.fprefix_len > 0:
             return self._find_prefix_candidate(input, input_len, pos)
         else:
-            return teddy_find_prefix[alt=Self._alt_prefix](input, pos)
+            return teddy_search_forward[alt=Self._alt_prefix, want_end=False](
+                input, pos
+            )[0]
 
     @always_inline
     def _find_prefix_candidate[
