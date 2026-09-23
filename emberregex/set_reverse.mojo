@@ -838,6 +838,17 @@ def leftmost_nonoverlapping(
 
     Output is ordered by (start, id).
     """
+
+    # Both orders are total over their inputs: one id reports each end
+    # once, and one id's survivors have strictly increasing starts.
+    @always_inline
+    def start_then_longest(a: SetSpan, b: SetSpan) -> Bool:
+        return a.start < b.start or (a.start == b.start and a.end > b.end)
+
+    @always_inline
+    def start_then_id(a: SetSpan, b: SetSpan) -> Bool:
+        return a.start < b.start or (a.start == b.start and a.id < b.id)
+
     var out = List[SetSpan]()
     for id in range(num_patterns):
         # (start asc, end desc) so the first survivor at a start is the
@@ -846,16 +857,7 @@ def leftmost_nonoverlapping(
         for s in spans:
             if s.id == id and s.start >= 0:
                 mine.append(s)
-        for i in range(1, len(mine)):
-            var key = mine[i]
-            var j = i - 1
-            while j >= 0 and (
-                mine[j].start > key.start
-                or (mine[j].start == key.start and mine[j].end < key.end)
-            ):
-                mine[j + 1] = mine[j]
-                j -= 1
-            mine[j + 1] = key
+        sort(mine, start_then_longest)
         var next_allowed = 0
         for s in mine:
             if s.start < next_allowed:
@@ -864,16 +866,7 @@ def leftmost_nonoverlapping(
             # An empty match must still advance, or iteration stalls.
             next_allowed = s.end if s.end > s.start else s.start + 1
     # (start, id) order across ids.
-    for i in range(1, len(out)):
-        var key = out[i]
-        var j = i - 1
-        while j >= 0 and (
-            out[j].start > key.start
-            or (out[j].start == key.start and out[j].id > key.id)
-        ):
-            out[j + 1] = out[j]
-            j -= 1
-        out[j + 1] = key
+    sort(out, start_then_id)
     return out^
 
 
