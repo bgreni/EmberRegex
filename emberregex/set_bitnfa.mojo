@@ -437,9 +437,6 @@ def build_bitnfa(nfa: NFA, enabled: Bool) -> BitNFA:
     return result^
 
 
-# --- Comptime materialization helpers ---------------------------------------
-
-
 # --- Runtime walker ----------------------------------------------------------
 
 
@@ -459,6 +456,80 @@ def _shl1[K: Int](v: SIMD[DType.uint64, K]) -> SIMD[DType.uint64, K]:
         return v << 1
     else:
         return (v << 1) | (v >> 63).shift_right[1]()
+
+
+@always_inline
+def _bn_consume[
+    rn: Int, //, d: BitNFA
+](
+    rch: Array[UInt64, rn],
+    b: Byte,
+    active: SIMD[DType.uint64, d.lanes],
+    gated: SIMD[DType.uint64, d.lanes],
+) -> SIMD[DType.uint64, d.lanes]:
+    """The positions that consume `b`: the active set gathered through
+    the reach table, plus the newline-gated set when `b` is '\\n'."""
+    comptime K = d.lanes
+    var rb = SIMD[DType.uint64, K](0)
+    comptime for l in range(K):
+        rb[l] = rch.unsafe_get(Int(b) * K + l)
+
+    var consumed = active & rb
+    comptime if d.has_gated:
+        if b == CHAR_NEWLINE:
+            consumed |= gated & rb
+    return consumed
+
+
+@always_inline
+def _bn_advance[
+    xn: Int, pn: Int, //, d: BitNFA
+](
+    exd: Array[UInt64, xn],
+    exi: Array[Int16, pn],
+    b: Byte,
+    consumed: SIMD[DType.uint64, d.lanes],
+    mut active: SIMD[DType.uint64, d.lanes],
+    mut gated: SIMD[DType.uint64, d.lanes],
+):
+    """Advance past `b`: shift the limited chains, table the exceptions,
+    fold the restart seeds."""
+    comptime K = d.lanes
+    comptime BitVec = SIMD[DType.uint64, K]
+    comptime limited_v = _bitvec[K](d.limited)
+    comptime exceptions_v = _bitvec[K](d.exceptions)
+    comptime seed_o_v = _bitvec[K](d.seed_other)
+    comptime seed_n_v = _bitvec[K](d.seed_nl)
+    comptime seed_go_v = _bitvec[K](d.seed_gated_other)
+    comptime seed_gn_v = _bitvec[K](d.seed_gated_nl)
+
+    var nxt = _shl1(consumed & limited_v)
+    var gated_next = BitVec(0)
+    var ex = consumed & exceptions_v
+    if ex.reduce_or() != 0:
+        var is_nl = b == CHAR_NEWLINE
+        comptime for l in range(K):
+            var bits = ex[l]
+            while bits != 0:
+                var p = 64 * l + Int(count_trailing_zeros(bits))
+                bits &= bits - 1
+                var xi = Int(exi.unsafe_get(p))
+                var base = xi * 4 * K + (K if is_nl else 0)
+                comptime for j in range(K):
+                    nxt[j] |= exd.unsafe_get(base + j)
+                comptime if d.has_gated:
+                    var gbase = xi * 4 * K + 2 * K + (K if is_nl else 0)
+                    comptime for j in range(K):
+                        gated_next[j] |= exd.unsafe_get(gbase + j)
+
+    if b == CHAR_NEWLINE:
+        active = nxt | seed_n_v
+        comptime if d.has_gated:
+            gated = gated_next | seed_gn_v
+    else:
+        active = nxt | seed_o_v
+        comptime if d.has_gated:
+            gated = gated_next | seed_go_v
 
 
 @always_inline
@@ -552,16 +623,9 @@ def bitnfa_scan[
     contract. Non-mutating; O(n * lanes) with exception work only when
     exception bits actually fire."""
     comptime K = d.lanes
-    comptime BitVec = SIMD[DType.uint64, K]
-    comptime limited_v = _bitvec[K](d.limited)
-    comptime exceptions_v = _bitvec[K](d.exceptions)
     comptime accept_v = _bitvec[K](d.accept_union)
     comptime entry_v = _bitvec[K](d.entry)
     comptime entry_gated_v = _bitvec[K](d.entry_gated)
-    comptime seed_o_v = _bitvec[K](d.seed_other)
-    comptime seed_n_v = _bitvec[K](d.seed_nl)
-    comptime seed_go_v = _bitvec[K](d.seed_gated_other)
-    comptime seed_gn_v = _bitvec[K](d.seed_gated_nl)
 
     # Comptime arrays bound to the binary's constant data (no copy).
     var rch = materialize[reach]()
@@ -577,14 +641,7 @@ def bitnfa_scan[
     var pos = 0
     while pos < input_len:
         var b = input.unsafe_get(pos)
-        var rb = BitVec(0)
-        comptime for l in range(K):
-            rb[l] = rch.unsafe_get(Int(b) * K + l)
-
-        var consumed = active & rb
-        comptime if d.has_gated:
-            if b == CHAR_NEWLINE:
-                consumed |= gated & rb
+        var consumed = _bn_consume[d=d](rch, b, active, gated)
 
         # Reports: matches ending at pos + 1.
         var acc = consumed & accept_v
@@ -596,35 +653,7 @@ def bitnfa_scan[
                 acc, b, pos + 1, nb, ids, out
             )
 
-        # Advance: shift the limited chains, table the exceptions,
-        # fold the restart seeds.
-        var nxt = _shl1(consumed & limited_v)
-        var gated_next = BitVec(0)
-        var ex = consumed & exceptions_v
-        if ex.reduce_or() != 0:
-            var is_nl = b == CHAR_NEWLINE
-            comptime for l in range(K):
-                var bits = ex[l]
-                while bits != 0:
-                    var p = 64 * l + Int(count_trailing_zeros(bits))
-                    bits &= bits - 1
-                    var xi = Int(exi.unsafe_get(p))
-                    var base = xi * 4 * K + (K if is_nl else 0)
-                    comptime for j in range(K):
-                        nxt[j] |= exd.unsafe_get(base + j)
-                    comptime if d.has_gated:
-                        var gbase = xi * 4 * K + 2 * K + (K if is_nl else 0)
-                        comptime for j in range(K):
-                            gated_next[j] |= exd.unsafe_get(gbase + j)
-
-        if b == CHAR_NEWLINE:
-            active = nxt | seed_n_v
-            comptime if d.has_gated:
-                gated = gated_next | seed_gn_v
-        else:
-            active = nxt | seed_o_v
-            comptime if d.has_gated:
-                gated = gated_next | seed_go_v
+        _bn_advance[d=d](exd, exi, b, consumed, active, gated)
         pos += 1
 
     return out^
@@ -719,18 +748,12 @@ def bitnfa_stream_chunk[
 ):
     """Consume one chunk, appending reports at GLOBAL offsets.
 
-    Mirrors `bitnfa_scan`'s loop exactly; the only differences are the
-    global offset and the one-step report delay.
+    `bitnfa_scan`'s loop (the same `_bn_consume` / `_bn_advance` step);
+    the only differences are the global offset and the one-step report
+    delay.
     """
     comptime K = d.lanes
-    comptime BitVec = SIMD[DType.uint64, K]
-    comptime limited_v = _bitvec[K](d.limited)
-    comptime exceptions_v = _bitvec[K](d.exceptions)
     comptime accept_v = _bitvec[K](d.accept_union)
-    comptime seed_o_v = _bitvec[K](d.seed_other)
-    comptime seed_n_v = _bitvec[K](d.seed_nl)
-    comptime seed_go_v = _bitvec[K](d.seed_gated_other)
-    comptime seed_gn_v = _bitvec[K](d.seed_gated_nl)
 
     # Only EOL-sensitive sets need the one-step delay: `nl` and `end`
     # slices resolve against the byte AFTER the match. Everything else
@@ -751,14 +774,7 @@ def bitnfa_stream_chunk[
                 st, Int(b), ids, out
             )
 
-        var rb = BitVec(0)
-        comptime for l in range(K):
-            rb[l] = rch.unsafe_get(Int(b) * K + l)
-
-        var consumed = st.active & rb
-        comptime if d.has_gated:
-            if b == CHAR_NEWLINE:
-                consumed |= st.gated & rb
+        var consumed = _bn_consume[d=d](rch, b, st.active, st.gated)
 
         var acc = consumed & accept_v
         comptime if NEEDS_DELAY:
@@ -772,33 +788,7 @@ def bitnfa_stream_chunk[
                     acc, b, st.offset + pos + 1, -1, ids, out
                 )
 
-        var nxt = _shl1(consumed & limited_v)
-        var gated_next = BitVec(0)
-        var ex = consumed & exceptions_v
-        if ex.reduce_or() != 0:
-            var is_nl = b == CHAR_NEWLINE
-            comptime for l in range(K):
-                var bits = ex[l]
-                while bits != 0:
-                    var p = 64 * l + Int(count_trailing_zeros(bits))
-                    bits &= bits - 1
-                    var xi = Int(exi.unsafe_get(p))
-                    var base = xi * 4 * K + (K if is_nl else 0)
-                    comptime for j in range(K):
-                        nxt[j] |= exd.unsafe_get(base + j)
-                    comptime if d.has_gated:
-                        var gbase = xi * 4 * K + 2 * K + (K if is_nl else 0)
-                        comptime for j in range(K):
-                            gated_next[j] |= exd.unsafe_get(gbase + j)
-
-        if b == CHAR_NEWLINE:
-            st.active = nxt | seed_n_v
-            comptime if d.has_gated:
-                st.gated = gated_next | seed_gn_v
-        else:
-            st.active = nxt | seed_o_v
-            comptime if d.has_gated:
-                st.gated = gated_next | seed_go_v
+        _bn_advance[d=d](exd, exi, b, consumed, st.active, st.gated)
         pos += 1
 
     st.offset += input_len
