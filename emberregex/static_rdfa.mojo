@@ -63,7 +63,6 @@ from .simd_kernels import (
     shufti_encodable,
 )
 from .simd_scan import lane_bits, last_lane_index
-from .static_bytes import table_bytes
 from .static_dfa import (
     edfa_id_dtype,
     EDFA_DEAD,
@@ -742,14 +741,6 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     result.seed_at_end = starts[2]
     result.seed_other_word = starts[3] if has_wb else starts[0]
     return result^
-
-
-def rdfa_table_str[n: Int, dt: DType](d: RDFA) -> String:
-    """Comptime: the flat table as `n` little-endian `dt` entries (narrow id
-    type from `edfa_id_dtype`, `n` from `edfa_table_len`; EDFA_DEAD
-    survives). See static_bytes.mojo for why a string."""
-    assert n == 0 or n >= len(d.table), "table string shorter than the table"
-    return table_bytes[dt](d.table, n)
 
 
 def rdfa_flags_arr[n: Int](d: RDFA) -> Array[UInt8, n]:

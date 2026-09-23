@@ -86,7 +86,6 @@ from .static_dfa import (
     _wb_cont_reaches_bol,
     _pivot_prefilter,
     build_eager_dfa,
-    edfa_table_str,
     edfa_table_len,
     edfa_flags_arr,
     edfa_id_dtype,
@@ -103,9 +102,8 @@ from .static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
     rdfa_flags_arr,
-    rdfa_table_str,
 )
-from .static_bytes import static_bytes
+from .static_bytes import static_bytes, table_bytes
 from .sheng import (
     sheng_cap_for,
     sheng_full_match,
@@ -1355,8 +1353,8 @@ struct Regex[pattern: String](Copyable, Movable):
     # of a per-call stack copy (see edfa_table_len).
     comptime _EDFA_TN = edfa_table_len(Self._edfa.num_states)
     comptime _EDFA_DT = edfa_id_dtype(Self._edfa.num_states)
-    comptime _EDFA_TABLE_S = edfa_table_str[Self._EDFA_TN, Self._EDFA_DT](
-        Self._edfa
+    comptime _EDFA_TABLE_S = table_bytes[Self._EDFA_DT](
+        Self._edfa.table, Self._EDFA_TN
     )
     comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
     comptime _EDFA_TABLE = static_bytes[Self._EDFA_TABLE_S]()
@@ -1370,8 +1368,8 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _SHENG_MASKS = static_bytes[Self._SHENG_MASKS_S]()
     comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.d.num_states)
     comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.d.num_states)
-    comptime _LFDFA_TABLE_S = edfa_table_str[Self._LFDFA_TN, Self._LFDFA_DT](
-        Self._lfdfa.d
+    comptime _LFDFA_TABLE_S = table_bytes[Self._LFDFA_DT](
+        Self._lfdfa.d.table, Self._LFDFA_TN
     )
     comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.d.num_states](
         Self._lfdfa.d
@@ -1384,8 +1382,8 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _LF_SHENG_MASKS = static_bytes[Self._LF_SHENG_MASKS_S]()
     comptime _RDFA_TN = edfa_table_len(Self._rdfa.num_states)
     comptime _RDFA_DT = edfa_id_dtype(Self._rdfa.num_states)
-    comptime _RDFA_TABLE_S = rdfa_table_str[Self._RDFA_TN, Self._RDFA_DT](
-        Self._rdfa
+    comptime _RDFA_TABLE_S = table_bytes[Self._RDFA_DT](
+        Self._rdfa.table, Self._RDFA_TN
     )
     comptime _RDFA_FLAGS = rdfa_flags_arr[Self._rdfa.num_states](Self._rdfa)
     comptime _RDFA_TABLE = static_bytes[Self._RDFA_TABLE_S]()

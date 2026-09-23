@@ -20,7 +20,6 @@ from .ast import AnchorKind
 from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import PROBE_RANKS
-from .static_bytes import table_bytes
 from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
@@ -1839,18 +1838,6 @@ def _edfa_finish(
     result.table = new_table^
     result.flags = new_flags^
     return pstarts^
-
-
-def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
-    """Comptime: the flat table as `n` little-endian `dt` entries (see
-    static_bytes.mojo for why a string, not an Array).
-
-    `dt` comes from `edfa_id_dtype`, `n` from `edfa_table_len` (it may
-    exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
-    survives the narrowing, so the walkers keep their sign-bit dead test.
-    """
-    assert n == 0 or n >= len(d.table), "table string shorter than the table"
-    return table_bytes[dt](d.table, n)
 
 
 def edfa_flags_arr[n: Int](d: EagerDFA) -> Array[UInt8, n]:
