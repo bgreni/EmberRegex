@@ -23,11 +23,9 @@ from .constants import (
     CHAR_STAR,
     CHAR_ZERO,
 )
-from .parser import parse
 from .nfa import (
     _build_static_nfa,
     _nfa_has_backref,
-    build_nfa,
     split_cycle_flags,
     NFA,
     NFAStateKind,
@@ -49,9 +47,6 @@ from .optimize import (
     lit_bytes_arr,
     lit_flags_arr,
     select_probe_offsets,
-    FilterPrefix,
-    InnerLiteral,
-    LiteralAlt,
 )
 from .teddy import (
     teddy_find_prefix,
@@ -60,7 +55,6 @@ from .teddy import (
     teddy_search_forward,
 )
 from .simd_scan import (
-    clear_first_lane,
     first_lane_index,
     lane_bits,
     simd_find_byte,
@@ -125,7 +119,6 @@ from .simd_kernels import (
 )
 from .executor import PikeVM, _VMBuffers, heapbt_match
 from .onepass import (
-    OnePass,
     build_onepass,
     onepass_shape,
     onepass_class_arr,
@@ -672,10 +665,6 @@ def _lf_end_deterministic_list(nfa: NFA) -> Bool:
     return True
 
 
-# Sometimes this produces better IR since the __init__ gets folded into
-# a constant.
-
-
 @always_inline
 def _bm_word(bm: SIMD[DType.uint8, BITMAP_WIDTH], k: Int) -> UInt64:
     """Bytes [8k, 8k+8) of a charset bitmap as one little-endian word."""
@@ -862,6 +851,8 @@ def _lf_end_deterministic[fast: Bool = True](nfa: NFA) -> Bool:
         return _lf_end_deterministic_list(nfa)
 
 
+# Fresh capture slots: `materialize[ALL_NEG_ONES[n]]()` sometimes gives
+# better IR than `Array(fill=-1)`, the initializer folding to a constant.
 comptime ALL_NEG_ONES[Size: Int] = Array[Int, Size](fill=-1)
 
 # Steps the leftmost-first lane's speculative backtracker attempt may
@@ -910,12 +901,6 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 
 
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
-
-
-# The probe compares (_probe_eq/_probe_eq1) live in simd_scan.mojo as
-# probe_eq/probe_eq1, next to simd_find_literal_rare — the lifted Mula
-# memmem both the filter-prefix scanner and the inner-literal strategy
-# call.
 
 
 def _dfa_candidate(nfa: NFA, cyclic: List[Bool]) -> Bool:
@@ -1596,7 +1581,6 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         comptime if Self._use_lazy_dfa:
             var nfa = materialize[Self.nfa]()
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
-            # self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](materialize[_build_static_nfa(Self.pattern)]())
             var dfa = LazyDFA()
             self._dfa = rebind_var[type_of(self._dfa)](dfa^)
         else:
