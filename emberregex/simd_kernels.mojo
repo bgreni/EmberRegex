@@ -121,6 +121,31 @@ def table_lookup_64(
     )
 
 
+@always_inline
+def _sheng_step[
+    cap: Int
+](masks: StringLiteral, b: Byte, state_vec: _ShuffleIndex) -> _ShuffleIndex:
+    """One Sheng transition (sheng.mojo): shuffle byte `b`'s `cap`-byte
+    mask by the state vector (the state id broadcast across the index
+    register; only lane 0 is ever read back, and its width is
+    independent of the mask width).
+
+    Each branch loads and shuffles at the literal tier width `cap`: only
+    the tier this DFA needs is emitted, and the NEON-only tiers are never
+    elaborated where cap is always NIBBLE_TABLE_SIZE.
+    """
+    var p = Pointer(to=masks.unsafe_ptr()[unsafe_offset=Int(b) * cap])
+    comptime if cap == NIBBLE_TABLE_SIZE:
+        return nibble_lookup(
+            p.unsafe_load[width=NIBBLE_TABLE_SIZE](), state_vec
+        )
+    elif cap == 32:
+        return table_lookup_32(p.unsafe_load[width=32](), state_vec)
+    else:
+        comptime assert cap == 64
+        return table_lookup_64(p.unsafe_load[width=64](), state_vec)
+
+
 # --- Comptime mask builders -------------------------------------------------
 
 

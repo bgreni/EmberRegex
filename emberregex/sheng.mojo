@@ -25,9 +25,10 @@ x86 pshufb has no multi-register form, so SHENG_STATE_CAP falls back to 16
 there (HAS_WIDE_BYTE_SHUFFLE); selection additionally requires
 HAS_FAST_BYTE_SHUFFLE, and other targets keep the eager table walk.
 
-The walkers mirror the eager DFA walkers exactly (start contexts, EOL
-flags, acceleration, per-walk accel dispatch) — only the transition
-mechanism differs. The one exception is an anchored full match on an
+The walkers ARE the eager DFA walkers (static_dfa.mojo's
+`_edfa_walk_impl` / `_edfa_full_match_impl` at a `cap` tier: start
+contexts, EOL flags, acceleration, per-walk accel dispatch) — only the
+transition mechanism differs. The one exception is an anchored full match on an
 input too short to amortize the shuffle's fixed costs, which walks the
 same mask table one scalar load per byte instead (`sheng_short_input`,
 `_sheng_scalar_full_match`). Search-family verbs no longer walk per candidate
@@ -39,26 +40,15 @@ shuffle-engine search_forward here any more.
 from std.collections import Array
 from std.sys import simd_width_of
 
-from .constants import CHAR_NEWLINE, is_word_byte
 from .static_bytes import filled_string
 from .static_dfa import (
     EDFA_EOL_AT_END,
-    EDFA_EOL_AT_NEWLINE,
-    EDFA_MATCH_IF_WORD,
     EagerDFA,
-    _edfa_accel_skip,
+    _edfa_full_match_impl,
     _edfa_has_accel,
-    _edfa_has_region,
-    _edfa_region_skip,
+    edfa_match_at,
 )
-from .simd_kernels import (
-    HAS_WIDE_BYTE_SHUFFLE,
-    NIBBLE_TABLE_SIZE,
-    _ShuffleIndex,
-    nibble_lookup,
-    table_lookup_32,
-    table_lookup_64,
-)
+from .simd_kernels import HAS_WIDE_BYTE_SHUFFLE, NIBBLE_TABLE_SIZE
 
 # Widest tbl tier this target can do in one instruction (see module
 # docstring) — an algorithmic constant, NOT a platform vector width.
@@ -139,36 +129,6 @@ def sheng_masks_str[cap: Int](d: EagerDFA, enabled: Bool) -> String:
                 wide[j * cap + s] = nxt[c * CHUNK + j]
         Pointer(to=p[unsafe_offset=c * WIDE]).unsafe_store(wide)
     return out^
-
-
-@always_inline
-def _sheng_step[
-    cap: Int
-](masks: StringLiteral, b: Byte, state_vec: _ShuffleIndex) -> _ShuffleIndex:
-    """One transition: shuffle the byte's mask by the state vector (the
-    state id broadcast across the index register; only lane 0 is ever
-    read back, and its width is independent of the mask width).
-
-    Each branch loads and shuffles at the literal tier width `cap`: only the tier this DFA needs is emitted,
-    and the NEON-only tiers are never elaborated where cap is always
-    NIBBLE_TABLE_SIZE.
-    """
-    var p = Pointer(to=masks.unsafe_ptr()[unsafe_offset=Int(b) * cap])
-    comptime if cap == NIBBLE_TABLE_SIZE:
-        return nibble_lookup(
-            p.unsafe_load[width=NIBBLE_TABLE_SIZE](), state_vec
-        )
-    elif cap == 32:
-        return table_lookup_32(p.unsafe_load[width=32](), state_vec)
-    else:
-        comptime assert cap == 64
-        return table_lookup_64(p.unsafe_load[width=64](), state_vec)
-
-
-# Bytes walked between dead-state checks on the non-accelerated full-match
-# loop. Bounds the wasted shuffles after an early death while keeping the
-# vector->scalar state extract off the per-byte path.
-comptime _SHENG_DEAD_CHECK_STRIDE = 64
 
 
 def sheng_short_input(cap: Int) -> Int:
@@ -261,66 +221,6 @@ def _sheng_scalar_full_match[
 
 
 @always_inline
-def _sheng_full_match_impl[
-    origin: Origin,
-    ns: Int,
-    //,
-    d: EagerDFA,
-    cap: Int,
-    masks: StringLiteral,
-    flags: Array[UInt8, ns],
-    accel: Bool,
-](input: Span[Byte, origin]) -> Bool:
-    comptime dead = d.num_states
-    # `masks` / `flags` are comptime arrays; `materialize` binds them to the
-    # constant data emitted in the binary (no copy) so the walk can index them.
-    var flg = materialize[flags]()
-    var cur_vec = _ShuffleIndex(UInt8(d.start_at_0))
-    var cur = d.start_at_0
-    var pos = 0
-    var input_len = len(input)
-    comptime if accel:
-        while pos < input_len:
-            var unused = -1
-            var skipped = _edfa_accel_skip[d=d](input, cur, pos, unused)
-            comptime if _edfa_has_region(d):
-                var before = cur
-                skipped = _edfa_region_skip[d=d](input, cur, skipped)
-                if cur != before:
-                    cur_vec = _ShuffleIndex(UInt8(cur))
-            pos = skipped
-            if pos >= input_len:
-                break
-            cur_vec = _sheng_step[cap](masks, input.unsafe_get(pos), cur_vec)
-            cur = Int(cur_vec[0])
-            if cur == dead:
-                return False
-            pos += 1
-    else:
-        # The dead-state early exit is only an optimization (the dead
-        # state self-loops), so the vector->scalar extract runs once per
-        # stride instead of per byte — the per-byte loop is then just the
-        # load+shuffle dependency chain.
-        while pos < input_len:
-            var chunk_end = min(pos + _SHENG_DEAD_CHECK_STRIDE, input_len)
-            while pos < chunk_end:
-                cur_vec = _sheng_step[cap](
-                    masks, input.unsafe_get(pos), cur_vec
-                )
-                pos += 1
-            cur = Int(cur_vec[0])
-            if cur == dead:
-                return False
-    comptime if d.any_eol_end:
-        return (
-            cur < d.num_match_states
-            or (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0
-        )
-    else:
-        return cur < d.num_match_states
-
-
-@always_inline
 def sheng_full_match[
     origin: Origin,
     ns: Int,
@@ -347,83 +247,12 @@ def sheng_full_match[
     comptime if _edfa_has_accel(d):
         comptime W = simd_width_of[DType.uint8]()
         if len(input) >= W:
-            return _sheng_full_match_impl[
-                d=d, cap=cap, masks=masks, flags=flags, accel=True
+            return _edfa_full_match_impl[
+                d=d, table=masks, flags=flags, accel=True, cap=cap
             ](input)
-    return _sheng_full_match_impl[
-        d=d, cap=cap, masks=masks, flags=flags, accel=False
+    return _edfa_full_match_impl[
+        d=d, table=masks, flags=flags, accel=False, cap=cap
     ](input)
-
-
-@always_inline
-def _sheng_walk_impl[
-    origin: Origin,
-    ns: Int,
-    //,
-    d: EagerDFA,
-    cap: Int,
-    masks: StringLiteral,
-    flags: Array[UInt8, ns],
-    accel: Bool,
-](input: Span[Byte, origin], start: Int) -> Int:
-    comptime dead = d.num_states
-    var flg = materialize[flags]()
-    var cur: Int
-    if start == 0:
-        cur = d.start_at_0
-    elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
-        cur = d.start_after_nl
-    else:
-        comptime if d.start_other_word != d.start_other:
-            cur = d.start_other_word if is_word_byte(
-                input.unsafe_get(start - 1)
-            ) else d.start_other
-        else:
-            cur = d.start_other
-    var cur_vec = _ShuffleIndex(UInt8(cur))
-
-    var last_match = -1
-    if cur < d.num_match_states:
-        last_match = start
-
-    var pos = start
-    var input_len = len(input)
-    while pos < input_len:
-        comptime if accel:
-            var skipped = _edfa_accel_skip[d=d](input, cur, pos, last_match)
-            comptime if _edfa_has_region(d):
-                var before = cur
-                skipped = _edfa_region_skip[d=d](input, cur, skipped)
-                if cur != before:
-                    cur_vec = _ShuffleIndex(UInt8(cur))
-            pos = skipped
-            if pos >= input_len:
-                break
-        var b = input.unsafe_get(pos)
-        comptime if d.any_eol_nl:
-            if (
-                b == CHAR_NEWLINE
-                and (flg.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
-            ):
-                last_match = pos
-        comptime if d.any_wb:
-            if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
-                var f = flg.unsafe_get(cur)
-                if ((f & EDFA_MATCH_IF_WORD) != 0) == is_word_byte(b):
-                    last_match = pos
-        cur_vec = _sheng_step[cap](masks, b, cur_vec)
-        cur = Int(cur_vec[0])
-        if cur == dead:
-            # Died mid-input: EOL-at-end flags don't apply (mirrors
-            # edfa_match_at).
-            return last_match
-        pos += 1
-        if cur < d.num_match_states:
-            last_match = pos
-    comptime if d.any_eol_end:
-        if (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
-            last_match = pos
-    return last_match
 
 
 @always_inline
@@ -436,14 +265,5 @@ def sheng_match_at[
     masks: StringLiteral,
     flags: Array[UInt8, ns],
 ](input: Span[Byte, origin], start: Int) -> Int:
-    """`edfa_match_at` on the shuffle engine, with the same per-walk
-    accelerated/plain dispatch."""
-    comptime if _edfa_has_accel(d):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _sheng_walk_impl[
-                d=d, cap=cap, masks=masks, flags=flags, accel=True
-            ](input, start)
-    return _sheng_walk_impl[
-        d=d, cap=cap, masks=masks, flags=flags, accel=False
-    ](input, start)
+    """`edfa_match_at` on the shuffle engine."""
+    return edfa_match_at[d=d, table=masks, flags=flags, cap=cap](input, start)
