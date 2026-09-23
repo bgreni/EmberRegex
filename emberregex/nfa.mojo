@@ -1125,10 +1125,10 @@ def _build_fragment(
         if not greedy:
             nfa.has_lazy = True
 
-        if min_rep == 0 and max_rep == -1:
-            return _build_star(nfa, ast, child_idx, greedy, flags)
-        elif min_rep == 1 and max_rep == -1:
-            return _build_plus(nfa, ast, child_idx, greedy, flags)
+        if max_rep == -1 and min_rep <= 1:
+            return _build_loop(
+                nfa, ast, child_idx, greedy, flags, at_least_one=min_rep == 1
+            )
         elif min_rep == 0 and max_rep == 1:
             return _build_question(nfa, ast, child_idx, greedy, flags)
         else:
@@ -1265,47 +1265,18 @@ def _compute_fixed_length(
     return -1
 
 
-def _build_star(
+def _build_loop(
     mut nfa: NFA,
     ast: AST,
     child_idx: Int,
     greedy: Bool,
     flags: RegexFlags,
+    at_least_one: Bool,
 ) raises -> NFAFragment:
-    """Build NFA fragment for * (zero or more)."""
-    var body = _build_fragment(nfa, ast, child_idx, flags)
-    var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
-
-    ref state = nfa.states[split_idx]
-
-    if greedy:
-        state.out1 = body.start  # Prefer looping
-        state.out2 = -1  # Skip (dangling)
-    else:
-        state.out1 = -1  # Prefer skipping
-        state.out2 = body.start  # Loop
-
-    state.greedy = greedy
-
-    # Patch body outputs back to the split state (loop)
-    nfa.patch(body, split_idx)
-
-    var frag = NFAFragment(split_idx)
-    if greedy:
-        frag.add_out(split_idx, 2)  # The skip edge is dangling
-    else:
-        frag.add_out(split_idx, 1)  # The skip edge is dangling
-    return frag^
-
-
-def _build_plus(
-    mut nfa: NFA,
-    ast: AST,
-    child_idx: Int,
-    greedy: Bool,
-    flags: RegexFlags,
-) raises -> NFAFragment:
-    """Build NFA fragment for + (one or more)."""
+    """Build NFA fragment for * (zero or more) or, with `at_least_one`,
+    + (one or more). Same states either way: the body loops back through
+    one SPLIT whose other edge is the dangling exit; `+` enters at the
+    body, `*` at the split."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
     var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
 
@@ -1320,15 +1291,14 @@ def _build_plus(
 
     state.greedy = greedy
 
-    # Patch body outputs to the split state
+    # Patch body outputs back to the split state (loop)
     nfa.patch(body, split_idx)
 
-    # Fragment starts at the body, exits from the split
-    var frag = NFAFragment(body.start)
+    var frag = NFAFragment(body.start if at_least_one else split_idx)
     if greedy:
-        frag.add_out(split_idx, 2)
+        frag.add_out(split_idx, 2)  # The exit edge is dangling
     else:
-        frag.add_out(split_idx, 1)
+        frag.add_out(split_idx, 1)  # The exit edge is dangling
     return frag^
 
 
@@ -1416,10 +1386,12 @@ def _build_repetition(
 
     if max_rep == -1:
         # {n,} — required copies + star loop. n >= 2 here: the QUANTIFIER
-        # arm of _build_fragment sends `{0,}` to _build_star and `{1,}` to
-        # _build_plus, so a required copy always exists to patch.
+        # arm of _build_fragment sends `{0,}` and `{1,}` to _build_loop,
+        # so a required copy always exists to patch.
         assert has_result, "{n,} reached _build_repetition with n == 0"
-        var star = _build_star(nfa, ast, child_idx, greedy, flags)
+        var star = _build_loop(
+            nfa, ast, child_idx, greedy, flags, at_least_one=False
+        )
         var patch_frag = NFAFragment(res_start)
         patch_frag.outs = res_outs.copy()
         patch_frag.out_slots = res_out_slots.copy()
