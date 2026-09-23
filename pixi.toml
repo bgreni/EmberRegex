@@ -54,10 +54,10 @@ format = "mojo format emberregex test bench"
 mojo = "==1.1.0rc0"
 
 [feature.cov.dependencies]
-# One LLVM for opt/llc/llvm-cov (llvm-tools), the link driver (clang), the
-# gcov runtime (compiler-rt) and the linker (lld: Apple's ld asserts on
-# Mojo's long symbol names). Mojo itself is LLVM 24 trunk; the closest
-# release keeps the IR parseable.
+# One LLVM for llc (llvm-tools), the link driver (clang), the builtins
+# archive clang links into every binary (compiler-rt: libclang_rt.osx.a)
+# and the linker (lld: Apple's ld asserts on Mojo's long symbol names).
+# Mojo itself is LLVM 24 trunk; the closest release keeps the IR parseable.
 llvm-tools = "23.*"
 clang = "23.*"
 compiler-rt = "23.*"

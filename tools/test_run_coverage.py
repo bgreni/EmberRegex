@@ -198,18 +198,6 @@ class TestCounts(unittest.TestCase):
         self.assertEqual(rc.counts_from_dump(sites, blob), {("a.mojo", 1): 12, ("a.mojo", 2): 0})
 
 
-class TestGcovParse(unittest.TestCase):
-    def test_lcount_per_file_sums_repeats(self):
-        text = (
-            "file:emberregex/a.mojo\nfunction:3,1,f\nlcount:3,1\nlcount:4,0\n"
-            "branch:4,taken\nlcount:3,2\nfile:/x/t.mojo\nlcount:9,1\n"
-        )
-        self.assertEqual(
-            rc.parse_gcov_intermediate(text),
-            {"emberregex/a.mojo": {3: 3, 4: 0}, "/x/t.mojo": {9: 1}},
-        )
-
-
 class TestAggregation(unittest.TestCase):
     def test_library_path(self):
         self.assertEqual(rc.library_path("emberregex/engine.mojo"), "emberregex/engine.mojo")

@@ -27,15 +27,6 @@ file, in parallel:
    binary runs (pass/fail judged exactly as run_test.py does) and the
    counter file is read back against the site table.
 
-`--gcov` runs the reference pipeline instead — `opt -passes=
-insert-gcov-profiling`, `clang --coverage`, `llvm-cov gcov -i` — as a
-cross-check for non-inlined code (the two agree on every line both
-instrument). Mojo emits two compile units (the test file, and `<unknown>`
-holding the library and stdlib); the gcov pass instruments the module
-once per unit, so the FIRST unit's files carry every function and the
-second's `.gcda` is rejected by llvm-cov ("Invalid .gcda File!" on
-stderr), contributing nothing to the union.
-
 Line hits are unioned across all test binaries (a line is covered when
 any binary executed it) and reported per library source. Only RUNTIME
 code is visible: everything that executes in the comptime interpreter
@@ -49,7 +40,7 @@ reason; `--no-skip` re-runs them), and `coverage-baseline.json` holds the
 ratio CI ratchets against: `--check-baseline` fails a run that falls
 below it, `--update-baseline` rewrites it.
 
-Usage: python3 run_coverage.py [-j N] [--only SUBSTR] [--missing] [--gcov]
+Usage: python3 run_coverage.py [-j N] [--only SUBSTR] [--missing]
                                [--opt-level N] [--llvm-bin DIR] [--keep] [--no-pkg]
                                [--no-skip] [--check-baseline | --update-baseline]
        python3 run_coverage.py instrument SRC.ll DST.ll DUMP SITES.json
@@ -75,7 +66,7 @@ COV_DIR = os.path.join(ROOT, ".coverage")
 DUMP_C = os.path.join(ROOT, "tools", "cov_dump.c")
 LIB_PREFIX = "emberregex" + os.sep
 MOJO_RUNTIME_LIB = "KGENCompilerRTShared"
-STAGES = ("emit", "instrument", "opt", "llc", "link", "run", "collect")
+STAGES = ("emit", "instrument", "llc", "link", "run", "collect")
 
 
 # --- Inline-aware instrumentation (pure; tools/test_run_coverage.py) --------
@@ -263,27 +254,6 @@ def instrument_file(src, dst, dump, sites_path):
         json.dump(inst.sites, f)
 
 
-# --- gcov intermediate format (pure) ----------------------------------------
-
-
-def parse_gcov_intermediate(text):
-    """`llvm-cov gcov -i` output: `file:<path>` headers followed by
-    `lcount:<line>,<count>` records (`function:`/`branch:` ignored).
-    Returns {path: {line: count}}; a line repeated within one file (one
-    entry per function covering it) sums."""
-    out = {}
-    cur = None
-    for ln in text.splitlines():
-        if ln.startswith("file:"):
-            cur = ln[5:].strip()
-            out.setdefault(cur, {})
-        elif ln.startswith("lcount:") and cur is not None:
-            parts = ln[7:].split(",")
-            n, c = int(parts[0]), int(parts[1])
-            out[cur][n] = out[cur].get(n, 0) + c
-    return out
-
-
 # --- Aggregation and report (pure) ------------------------------------------
 
 
@@ -464,7 +434,7 @@ class Outcome:
         return sum(self.stages.values())
 
 
-def cover_one(path, flags, tools, lib_dir, opt_level, gcov, keep):
+def cover_one(path, flags, tools, lib_dir, opt_level, keep):
     name = os.path.splitext(os.path.basename(path))[0]
     d = os.path.join(COV_DIR, name)
     shutil.rmtree(d, ignore_errors=True)
@@ -481,7 +451,6 @@ def cover_one(path, flags, tools, lib_dir, opt_level, gcov, keep):
 
     ll = os.path.join(d, name + ".ll")
     ll2 = os.path.join(d, name + ".cov.ll")
-    bc = os.path.join(d, name + ".bc")
     obj = os.path.join(d, name + ".o")
     exe = os.path.join(d, name)
     dump = os.path.join(d, "counters.bin")
@@ -490,26 +459,16 @@ def cover_one(path, flags, tools, lib_dir, opt_level, gcov, keep):
     if step("emit", ["mojo", "build", "--emit", "llvm", "--debug-level", "line-tables",
                      f"-O{opt_level}", *flags, path, "-o", ll]).returncode:
         return out
-    if gcov:
-        # cwd = d: the pass bakes `<cwd>/<unit>.gcda` into the binary as
-        # the path the runtime writes to, and drops the .gcno beside it.
-        if step("opt", [tools["opt"], "-passes=insert-gcov-profiling", ll, "-o", bc], cwd=d).returncode:
-            return out
-        codegen_in = bc
-    else:
-        # A subprocess, not a call: the pool is threads, and six Python
-        # passes over 100 MB of IR would serialize on the GIL while the
-        # compilers around them run in parallel.
-        if step("instrument", [sys.executable, os.path.abspath(__file__), "instrument",
-                               ll, ll2, dump, sites_path]).returncode:
-            return out
-        codegen_in = ll2
-    if step("llc", [tools["llc"], "-O0", "-filetype=obj", codegen_in, "-o", obj]).returncode:
+    # A subprocess, not a call: the pool is threads, and six Python
+    # passes over 100 MB of IR would serialize on the GIL while the
+    # compilers around them run in parallel.
+    if step("instrument", [sys.executable, os.path.abspath(__file__), "instrument",
+                           ll, ll2, dump, sites_path]).returncode:
         return out
-    link = [tools["clang"], "-fuse-ld=lld", obj, "-L", lib_dir, "-l" + MOJO_RUNTIME_LIB,
-            "-Wl,-rpath," + lib_dir, "-o", exe]
-    link += ["--coverage"] if gcov else [DUMP_C]
-    if step("link", link).returncode:
+    if step("llc", [tools["llc"], "-O0", "-filetype=obj", ll2, "-o", obj]).returncode:
+        return out
+    if step("link", [tools["clang"], "-fuse-ld=lld", obj, "-L", lib_dir, "-l" + MOJO_RUNTIME_LIB,
+                     "-Wl,-rpath," + lib_dir, "-o", exe, DUMP_C]).returncode:
         return out
 
     ret = step("run", [exe], cwd=d)
@@ -519,29 +478,18 @@ def cover_one(path, flags, tools, lib_dir, opt_level, gcov, keep):
         return out
 
     t0 = time.monotonic()
-    if gcov:
-        gcdas = sorted(glob.glob(os.path.join(d, "*.gcda")))
-        if not gcdas:
-            out.error = f"no .gcda written for {path} (binary did not exit normally?)"
-            return out
-        if step("collect", [tools["llvm-cov"], "gcov", "-i", *gcdas], cwd=d).returncode:
-            return out
-        for g in glob.glob(os.path.join(d, "*.gcov")):
-            with open(g) as f:
-                merge_coverage(out.coverage, parse_gcov_intermediate(f.read()))
-    else:
-        if not os.path.exists(dump):
-            out.error = f"no counter dump written for {path} (binary did not exit normally?)"
-            return out
-        with open(sites_path) as f:
-            sites = [tuple(s) for s in json.load(f)]
-        with open(dump, "rb") as f:
-            counts = counts_from_dump(sites, f.read())
-        per_file = {}
-        for (p, n), c in counts.items():
-            per_file.setdefault(p, {})[n] = c
-        merge_coverage(out.coverage, per_file)
-    out.stages["collect"] = out.stages.get("collect", 0.0) + time.monotonic() - t0
+    if not os.path.exists(dump):
+        out.error = f"no counter dump written for {path} (binary did not exit normally?)"
+        return out
+    with open(sites_path) as f:
+        sites = [tuple(s) for s in json.load(f)]
+    with open(dump, "rb") as f:
+        counts = counts_from_dump(sites, f.read())
+    per_file = {}
+    for (p, n), c in counts.items():
+        per_file.setdefault(p, {})[n] = c
+    merge_coverage(out.coverage, per_file)
+    out.stages["collect"] = time.monotonic() - t0
     if not out.coverage:
         out.error = f"no library lines collected for {path}"
         return out
@@ -565,16 +513,12 @@ def main():
                     help="only test files whose path contains this substring")
     ap.add_argument("--missing", action="store_true",
                     help="list the unexecuted line ranges per file")
-    ap.add_argument("--gcov", action="store_true",
-                    help="use LLVM's gcov pass instead of the inline-aware"
-                         " counters (blind to @always_inline bodies)")
     ap.add_argument("--opt-level", type=int, default=0, choices=(0, 1, 2, 3),
                     help="mojo optimization level for the IR (default 0; higher"
                          " levels merge and drop lines, use only for a file that"
                          " misbehaves at -O0)")
     ap.add_argument("--llvm-bin", type=str, default=None,
-                    help="directory holding llc, clang (and opt, llvm-cov for --gcov);"
-                         " default: PATH")
+                    help="directory holding llc and clang; default: PATH")
     ap.add_argument("--keep", action="store_true",
                     help="keep the per-test IR, objects, binaries and counter data"
                          " under .coverage/ (a failed file's are always kept)")
@@ -596,13 +540,8 @@ def main():
     if args.only and (args.check_baseline or args.update_baseline):
         sys.exit("ERROR: --only measures part of the suite; its total cannot"
                  " be compared with or written to the baseline")
-    if args.gcov and (args.check_baseline or args.update_baseline):
-        sys.exit("ERROR: --gcov instruments a different (smaller) set of lines than"
-                 " the default counters, so its total is not the baseline's."
-                 " The baseline tracks the default mode.")
 
-    names = ("llc", "clang") + (("opt", "llvm-cov") if args.gcov else ())
-    tools = find_tools(names, args.llvm_bin)
+    tools = find_tools(("llc", "clang"), args.llvm_bin)
     lib_dir = mojo_lib_dir()
     normal, _cfail = run_test.collect_files()
     if args.only:
@@ -624,8 +563,7 @@ def main():
             sys.exit("ERROR: mojo precompile failed (output above); try --no-pkg")
         include_dir = os.path.relpath(run_test.CACHE_DIR, ROOT)
     flags = run_test.mojo_flags(include_dir)
-    mode = "gcov" if args.gcov else "inline-aware counters"
-    print(f"{ver}; {llvm_ver} ({os.path.dirname(tools['llc'])}); {mode}, -O{args.opt_level};"
+    print(f"{ver}; {llvm_ver} ({os.path.dirname(tools['llc'])}); -O{args.opt_level};"
           f" {len(normal)} test files, -j{args.j}")
     for path, reason in skipped:
         print(f"skipped {path}: {reason}")
@@ -635,8 +573,7 @@ def main():
     results = run_test.load_results()
     outcomes = []
     with ThreadPoolExecutor(max_workers=args.j) as pool:
-        futs = [pool.submit(cover_one, p, flags, tools, lib_dir, args.opt_level,
-                            args.gcov, args.keep)
+        futs = [pool.submit(cover_one, p, flags, tools, lib_dir, args.opt_level, args.keep)
                 for p in run_test.order_files(normal, results)]
         for fut in as_completed(futs):
             o = fut.result()
@@ -658,9 +595,8 @@ def main():
     failed = [o.path for o in outcomes if not o.ok]
 
     print()
-    print(f"Line coverage of emberregex/ over the suite ({mode}; runtime code only,"
-          " comptime-executed lines are not instrumentable"
-          + ("; @always_inline bodies are not counted" if args.gcov else "") + ")")
+    print("Line coverage of emberregex/ over the suite (runtime code only,"
+          " comptime-executed lines are not instrumentable)")
     if failed:
         print(f"  WARNING: {len(failed)} of {len(outcomes)} test files failed"
               " (listed below); their coverage is missing from these numbers")
