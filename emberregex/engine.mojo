@@ -1714,6 +1714,28 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             ](input, start)
 
     @always_inline
+    def _bt[
+        origin: Origin,
+        //,
+        state_idx: Int = Self._start,
+        anchored_end: Bool = False,
+    ](
+        self,
+        input: Span[Byte, origin],
+        pos: Int,
+        mut slots: Array[Int, Self._num_slots],
+        mut memo: List[UInt64],
+        end_at: Int = -1,
+    ) raises -> Int:
+        """`_sbt_run` on this pattern with this Regex's cached stack range."""
+        return _sbt_run[
+            pattern=Self._pat,
+            state_idx=state_idx,
+            num_slots=Self._num_slots,
+            anchored_end=anchored_end,
+        ](input, pos, slots, memo, end_at, self._stack_lo, self._stack_hi)
+
+    @always_inline
     def _sbt_match_at[
         origin: Origin, //
     ](self, input: Span[Byte, origin], start: Int) -> Int:
@@ -2083,19 +2105,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             if pike[].sbt_ok:
                 try:
                     var memo = List[UInt64]()
-                    var got = _sbt_run[
-                        pattern=Self._pat,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                        anchored_end=True,
-                    ](
-                        input,
-                        start,
-                        slots,
-                        memo,
-                        end_at=end,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
+                    var got = self._bt[anchored_end=True](
+                        input, start, slots, memo, end_at=end
                     )
                     if got == end:
                         return
@@ -2280,18 +2291,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 # anchored_end: MATCH only accepts at end of input, so
                 # alternatives that prefer a shorter match (e.g. `(a|ab)`
                 # on "ab") can't mask a valid full match.
-                var end = _sbt_run[
-                    pattern=Self._pat,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                    anchored_end=True,
-                ](
-                    input.as_bytes(),
-                    0,
-                    slots,
-                    sbt_memo,
-                    stack_lo=self._stack_lo,
-                    stack_hi=self._stack_hi,
+                var end = self._bt[anchored_end=True](
+                    input.as_bytes(), 0, slots, sbt_memo
                 )
                 if end >= 0:
                     return MatchResult[Self._num_slots](
@@ -2469,18 +2470,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             # other two branches own theirs.
             var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                0,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -2515,18 +2505,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input, pos, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -2571,17 +2550,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     pos = nl + 1
                     continue
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=entry_state,
-                num_slots=Self._num_slots,
-            ](
-                input,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
+            var end = self._bt[state_idx=entry_state](
+                input, pos, slots, sbt_memo
             )
             if end >= 0:
                 return MatchResult[Self._num_slots](
@@ -2986,18 +2956,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         # BOL anchor: only position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                0,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 self._findall_append(results, input, 0, end, slots)
             return results^
@@ -3008,18 +2967,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 var pos = 0
                 while pos <= input_len:
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self._pat,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end >= 0:
                         self._findall_append(results, input, pos, end, slots)
                         if end > pos:
@@ -3059,18 +3007,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 input_bytes, input_len, pos
                             )
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self._pat,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end < 0:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         continue
@@ -3158,18 +3095,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         # BOL anchor: only position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                0,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 results.append(
                     MatchResult[Self._num_slots](
@@ -3184,18 +3110,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 var pos = 0
                 while pos <= input_len:
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self._pat,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end >= 0:
                         results.append(
                             MatchResult[Self._num_slots](
@@ -3239,18 +3154,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 input_bytes, input_len, pos
                             )
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self._pat,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end < 0:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         continue
@@ -3471,18 +3375,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, pos, slots, sbt_memo)
             if end < 0:
                 pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 continue
@@ -3653,18 +3546,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self._pat,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, pos, slots, sbt_memo)
             if end < 0:
                 pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 continue
@@ -3876,18 +3758,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 # and a destructor edge on a path that never uses it.
                 var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                var end = _sbt_run[
-                    pattern=Self._pat,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                ](
-                    input,
-                    start,
-                    slots,
-                    sbt_memo,
-                    stack_lo=self._stack_lo,
-                    stack_hi=self._stack_hi,
-                )
+                var end = self._bt(input, start, slots, sbt_memo)
                 if end >= 0:
                     return end
             except:
