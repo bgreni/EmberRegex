@@ -42,7 +42,6 @@ MBLACK_CACHE_DIR = "$CONDA_PREFIX/.mblack-cache"
 
 [tasks]
 test = { cmd = "python3 run_test.py" }
-build = { cmd = "mojo precompile emberregex -o emberregex.mojoc"}
 bench = { cmd = "mojo -I . bench/bench.mojo" }
 bench_set = { cmd = "mojo -I . bench/bench_set.mojo" }
 bench_all = {depends-on=["bench", "bench_set"]}

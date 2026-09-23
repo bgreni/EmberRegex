@@ -22,7 +22,7 @@ REPEAT   = 5      # timeit repetitions per benchmark
 NUMBER   = 10000  # calls per repetition (sum of many runs → less variance)
 BAR_COLS = 20     # width of the speedup bar
 
-# Must match comptime ITERS_PER_CALL in bench_static.mojo.
+# Must match comptime ITERS_PER_CALL in bench.mojo.
 # Each Mojo call() invocation runs the function this many times; divide to get per-call µs.
 MOJO_ITERS_PER_CALL = 100
 
@@ -44,15 +44,15 @@ def section(title):
     print(f"{'─'*72}")
 
 
-def _run_mojo_task(task: str) -> dict[str, float]:
-    """Run a pixi bench task and parse its markdown table output."""
+def run_mojo_static_benchmarks() -> dict[str, float]:
+    """Run `pixi run bench` (bench/bench.mojo) and parse its markdown table."""
     pixi_cmd = shutil.which("pixi")
     if pixi_cmd is None:
-        print(f"  [warning] pixi not found in PATH — skipping {task}")
+        print("  [warning] pixi not found in PATH — skipping bench")
         return {}
 
     result = subprocess.run(
-        [pixi_cmd, "run", task],
+        [pixi_cmd, "run", "bench"],
         capture_output=True, text=True,
         cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
     )
@@ -81,11 +81,6 @@ def _run_mojo_task(task: str) -> dict[str, float]:
         timings[name] = met_ms * 1000.0 / MOJO_ITERS_PER_CALL
 
     return timings
-
-
-def run_mojo_static_benchmarks() -> dict[str, float]:
-    """Run bench_static.mojo (Regex) via pixi."""
-    return _run_mojo_task("bench")
 
 
 def speedup_bar(ratio: float, cols: int = BAR_COLS) -> str:
@@ -167,7 +162,7 @@ def print_comparison(
 
 
 # ---------------------------------------------------------------------------
-# Python re benchmark suite  (names must match bench_static.mojo BenchIds)
+# Python re benchmark suite  (names must match bench.mojo BenchIds)
 # ---------------------------------------------------------------------------
 
 def run_python_benchmarks() -> dict[str, float]:

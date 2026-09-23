@@ -23,7 +23,6 @@ from reportlab.lib.units import cm
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
 )
-from reportlab.lib.enums import TA_CENTER
 
 OUTPUT = os.path.join(os.path.dirname(__file__), "..", "bench_results.pdf")
 
@@ -123,7 +122,6 @@ def assign_sections(names: list[str]) -> dict[str, str]:
 
 GREEN = colors.HexColor("#2e7d32")
 RED   = colors.HexColor("#c62828")
-LIGHT_GREEN = colors.HexColor("#e8f5e9")
 LIGHT_RED   = colors.HexColor("#ffebee")
 HEADER_BG   = colors.HexColor("#263238")
 SECTION_BG  = colors.HexColor("#eceff1")

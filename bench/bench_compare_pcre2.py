@@ -157,7 +157,7 @@ def main() -> None:
     if not pcre2:
         print("\n  [note] PCRE2 data unavailable.")
     if not static:
-        print("\n  [note] Regex data unavailable (pixi run bench_static failed).")
+        print("\n  [note] Regex data unavailable (pixi run bench failed).")
 
     if args.pdf:
         if "reportlab" not in sys.modules:

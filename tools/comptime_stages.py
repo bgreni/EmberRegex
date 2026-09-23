@@ -20,7 +20,7 @@ value cannot be folded away unevaluated.
 Usage:
     python3 tools/comptime_stages.py                 # default pattern sets
     python3 tools/comptime_stages.py rose_log        # one set
-    python3 tools/comptime_stages.py --repeat 3      # median of 3
+    python3 tools/comptime_stages.py --repeat 3      # min of 3
 
 Read the DELTA column, not the absolute times: every row pays the same
 fixed Mojo startup + codegen baseline.
@@ -32,7 +32,6 @@ rescue a saturated box. Use --repeat 3 for anything you intend to quote.
 """
 
 import argparse
-import statistics
 import sys
 import tempfile
 
