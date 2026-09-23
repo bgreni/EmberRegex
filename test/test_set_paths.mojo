@@ -18,11 +18,9 @@ that must treat SAVE as epsilon and BACKREF as unrunnable get pinned too.
 from emberregex import RegexSet
 from emberregex.nfa import build_nfa, NFA, NFAStateKind
 from emberregex.parser import parse
+from emberregex.static_bytes import int_arr, list_arr
 from emberregex.set_bitnfa import (
-    bitnfa_ex_idx_arr,
-    bitnfa_i32_arr,
     bitnfa_scan,
-    bitnfa_u64_arr,
     build_bitnfa,
     BITNFA_POS_CAP,
 )
@@ -114,11 +112,11 @@ def _bitnfa_scan_direct[
     """Scan on the bit-parallel NFA, bypassing engine selection."""
     comptime S = RegexSet[patterns]
     comptime BN = build_bitnfa(S.nfa, S.nfa.can_use_dfa)
-    comptime REACH = bitnfa_u64_arr[256 * BN.lanes](BN.reach)
-    comptime EX = bitnfa_u64_arr[len(BN.ex_data)](BN.ex_data)
-    comptime EXIDX = bitnfa_ex_idx_arr[BN.num_positions](BN)
-    comptime POOL = bitnfa_i32_arr[len(BN.pool)](BN.pool)
-    comptime SLICES = bitnfa_i32_arr[12 * BN.num_positions](BN.slices)
+    comptime REACH = list_arr[UInt64, 256 * BN.lanes](BN.reach, 0)
+    comptime EX = list_arr[UInt64, len(BN.ex_data)](BN.ex_data, 0)
+    comptime EXIDX = int_arr[DType.int16, BN.num_positions](BN.ex_index, -1)
+    comptime POOL = int_arr[DType.int32, len(BN.pool)](BN.pool, 0)
+    comptime SLICES = int_arr[DType.int32, 12 * BN.num_positions](BN.slices, 0)
     return bitnfa_scan[
         d=BN,
         reach=REACH,

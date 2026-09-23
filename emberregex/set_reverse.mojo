@@ -835,13 +835,6 @@ def rdfa_table_str[n: Int](d: ReverseDFA) -> String:
     return table_bytes[DType.int32](d.table, n)
 
 
-def rdfa_pool_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(n):
-        arr[i] = Int32(d.pool[i])
-    return arr^
-
-
 def rdfa_slices_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:
     """Per-state slice metadata, 6 Int32 per state:
     (norm_off, norm_len, bol0_off, bol0_len, bolnl_off, bolnl_len)."""

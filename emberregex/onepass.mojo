@@ -67,11 +67,11 @@ passes keeps the caller's -1.
 Tables (POD + Array rule: the struct crosses into the walkers as a
 comptime parameter, the bulk as separate arrays padded to at least
 EDFA_TABLE_MIN_BYTES so they lower to shared constant data):
-`onepass_table_arr` — `num_states x nclasses` Int32 cells, -1 dead, else
+`onepass_table_str` — `num_states x nclasses` Int32 cells, -1 dead, else
 the premultiplied next row, the next state id and the slot-set id packed
-(`_OP_*` shifts); `onepass_class_arr` — byte to class; `onepass_eps_arr` —
-slot bitsets by id (id 0 is the empty set); `onepass_state_arr` — per
-state the match flags (`OP_*`) and the match slot-set id.
+(`_OP_*` shifts); `class_of` — byte to class; `eps_sets` — slot bitsets
+by id (id 0 is the empty set); `onepass_state_arr` — per state the match
+flags (`OP_*`) and the match slot-set id.
 
 States that self-loop on all but a few bytes with no slot writes are
 accelerated exactly like the eager DFA's (`_edfa_accel_skip` over the
@@ -703,31 +703,12 @@ def onepass_table_str[n: Int](op: OnePass) -> String:
 comptime ONEPASS_CLASS_LEN = EDFA_TABLE_MIN_BYTES
 
 
-def onepass_class_arr(op: OnePass) -> Array[UInt8, ONEPASS_CLASS_LEN]:
-    """Comptime: byte -> class, padded (see ONEPASS_CLASS_LEN)."""
-    var arr = Array[UInt8, ONEPASS_CLASS_LEN](fill=0)
-    for b in range(256):
-        arr[b] = UInt8(op.class_of[b])
-    return arr^
-
-
 def onepass_eps_len(op: OnePass) -> Int:
     """Comptime: entry count of the slot-set array, padded to
     EDFA_TABLE_MIN_BYTES."""
     var n = len(op.eps_sets)
     var min_n = EDFA_TABLE_MIN_BYTES // 8
     return n if n > min_n else min_n
-
-
-def onepass_eps_arr[n: Int](op: OnePass) -> Array[UInt64, n]:
-    """Comptime: slot bitset per slot-set id."""
-    var arr = Array[UInt64, n](fill=0)
-    var m = len(op.eps_sets)
-    if n < m:
-        m = n
-    for i in range(m):
-        arr[i] = op.eps_sets[i]
-    return arr^
 
 
 def onepass_state_len(op: OnePass) -> Int:

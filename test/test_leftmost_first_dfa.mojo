@@ -13,11 +13,10 @@ newlines and bytes >= 0x80.
 
 from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
-from emberregex.static_bytes import static_bytes, table_bytes
+from emberregex.static_bytes import int_arr, static_bytes, table_bytes
 from emberregex.static_dfa import (
     EDFA_TABLE_MIN_BYTES,
     EagerDFA,
-    edfa_flags_arr,
     edfa_id_dtype,
 )
 from emberregex.static_rdfa import rdfa_find_start
@@ -690,7 +689,7 @@ def test_wide_list_signature_renumbering() raises:
     comptime tn = lf.d.num_states * 256
     comptime dt = edfa_id_dtype(lf.d.num_states)
     comptime table = static_bytes[table_bytes[dt](lf.d.table, tn)]()
-    comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
+    comptime flags = int_arr[DType.uint8, lf.d.num_states](lf.d.flags, 0)
     var input = String("!!!!!!!!!!!!!!!!!!!!q!!")
     var bytes = input.as_bytes()
     assert_equal(lfdfa_find_end[lf=lf, table=table, flags=flags](bytes, 0), 21)

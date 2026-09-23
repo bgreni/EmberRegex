@@ -508,13 +508,6 @@ def ac_rep_arr[n: Int](d: ACSet) -> Array[Int32, n]:
     return arr^
 
 
-def ac_pool_arr[n: Int](d: ACSet) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(n):
-        arr[i] = Int32(d.pool[i])
-    return arr^
-
-
 # --- Runtime walker ---------------------------------------------------------
 
 

@@ -1005,23 +1005,6 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
     return res^
 
 
-def lit_bytes_arr[n: Int](l: List[UInt8]) -> Array[UInt8, n]:
-    """Comptime: List -> Array so literal bytes can ride as walker
-    comptime parameters (List-bearing values must not)."""
-    var a = Array[UInt8, n](fill=0)
-    for i in range(min(n, len(l))):
-        a[i] = l[i]
-    return a^
-
-
-def lit_flags_arr[n: Int](l: List[Bool]) -> Array[Bool, n]:
-    """Comptime: List -> Array for the parallel caseless flags."""
-    var a = Array[Bool, n](fill=False)
-    for i in range(min(n, len(l))):
-        a[i] = l[i]
-    return a^
-
-
 def _probe_rank_vec() -> SIMD[DType.int32, 256]:
     """Comptime: approximate background byte frequency (0 = rarest, 255 =
     most common) over typical text/code, for prefilter probe selection.

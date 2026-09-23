@@ -20,6 +20,7 @@ from .ast import AnchorKind
 from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import PROBE_RANKS
+from .static_bytes import int_arr
 from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
@@ -548,7 +549,8 @@ struct EagerDFA(Copyable, Movable):
     """Comptime-computed DFA: flat transition table + per-state flags.
 
     Only ever exists as a comptime value; the runtime engine reads the
-    materialized Array forms (see edfa_table_arr / edfa_flags_arr).
+    materialized forms (the table as a string literal, the flags as an
+    Array — `Regex._EDFA_TABLE` / `_EDFA_FLAGS`).
     """
 
     var valid: Bool
@@ -1840,14 +1842,6 @@ def _edfa_finish(
     return pstarts^
 
 
-def edfa_flags_arr[n: Int](d: EagerDFA) -> Array[UInt8, n]:
-    """Comptime conversion of per-state flags to a materializable array."""
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(d.flags[i])
-    return arr^
-
-
 # --- Runtime table walkers -------------------------------------------------
 #
 # The DFA metadata `d` and the table/flags arrive as comptime parameters, so
@@ -1890,14 +1884,6 @@ def _accel_mask_word(d: EagerDFA, word: Int) -> UInt64:
         if s >> 6 == word:
             m |= UInt64(1) << UInt64(s & 63)
     return m
-
-
-def _region_land_arr(d: EagerDFA) -> Array[Int16, 256]:
-    """Comptime: `region_land` as a materializable array."""
-    var arr = Array[Int16, 256](fill=-1)
-    for b in range(len(d.region_land)):
-        arr[b] = Int16(d.region_land[b])
-    return arr^
 
 
 @always_inline
@@ -2005,7 +1991,7 @@ def _edfa_region_skip[
             if p2 > p:
                 # Every skipped byte's target is the same from any
                 # member: the state is whatever the last one selected.
-                comptime land = _region_land_arr(d)
+                comptime land = int_arr[DType.int16, 256](d.region_land, -1)
                 var lnd = materialize[land]()
                 cur = Int(lnd.unsafe_get(Int(input.unsafe_get(p2 - 1))))
                 p = p2

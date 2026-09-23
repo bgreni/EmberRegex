@@ -743,13 +743,6 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     return result^
 
 
-def rdfa_flags_arr[n: Int](d: RDFA) -> Array[UInt8, n]:
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(d.flags[i])
-    return arr^
-
-
 @always_inline
 def _rfind_exit2[
     origin: Origin, //, e1: UInt8, e2: UInt8

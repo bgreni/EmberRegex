@@ -440,27 +440,6 @@ def build_bitnfa(nfa: NFA, enabled: Bool) -> BitNFA:
 # --- Comptime materialization helpers ---------------------------------------
 
 
-def bitnfa_u64_arr[n: Int](data: List[UInt64]) -> Array[UInt64, n]:
-    var arr = Array[UInt64, n](fill=0)
-    for i in range(n):
-        arr[i] = data[i]
-    return arr^
-
-
-def bitnfa_i32_arr[n: Int](data: List[Int]) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(n):
-        arr[i] = Int32(data[i])
-    return arr^
-
-
-def bitnfa_ex_idx_arr[n: Int](d: BitNFA) -> Array[Int16, n]:
-    var arr = Array[Int16, n](fill=-1)
-    for i in range(n):
-        arr[i] = Int16(d.ex_index[i])
-    return arr^
-
-
 # --- Runtime walker ----------------------------------------------------------
 
 

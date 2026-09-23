@@ -718,13 +718,6 @@ def mdfa_table_str[n: Int](d: MultiDFA) -> String:
     return table_bytes[DType.int16](d.table, n)
 
 
-def mdfa_pool_arr[n: Int](d: MultiDFA) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(n):
-        arr[i] = Int32(d.pool[i])
-    return arr^
-
-
 def mdfa_slices_arr[n: Int](d: MultiDFA) -> Array[Int32, n]:
     """Per-state slice metadata, interleaved as 6 Int32 per state:
     (norm_off, norm_len, nl_off, nl_len, end_off, end_len)."""

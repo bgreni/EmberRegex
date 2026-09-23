@@ -19,7 +19,7 @@ matches, adjacent matches, matches at 0 and EOF, newlines and bytes >=
 """
 
 from emberregex import Regex
-from emberregex.optimize import lit_bytes_arr, lit_flags_arr
+from emberregex.static_bytes import list_arr
 from emberregex.simd_scan import simd_find_literal_rare
 from std.benchmark import keep
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
@@ -211,10 +211,10 @@ def test_strategy_off_without_a_literal_or_off_lane() raises:
 # --- The memmem kernel -------------------------------------------------------
 
 
-comptime _TXT_LIT = lit_bytes_arr[4]([0x2E, 0x74, 0x78, 0x74])  # ".txt"
-comptime _TXT_CL = lit_flags_arr[4]([False, False, False, False])
-comptime _AB_LIT = lit_bytes_arr[2]([0x61, 0x62])  # "ab"
-comptime _AB_CL_A = lit_flags_arr[2]([True, False])  # caseless 'a'
+comptime _TXT_LIT = list_arr[UInt8, 4]([0x2E, 0x74, 0x78, 0x74], 0)  # ".txt"
+comptime _TXT_CL = list_arr[Bool, 4]([False, False, False, False], False)
+comptime _AB_LIT = list_arr[UInt8, 2]([0x61, 0x62], 0)  # "ab"
+comptime _AB_CL_A = list_arr[Bool, 2]([True, False], False)  # caseless 'a'
 
 
 def _find_txt(input: String, start: Int) -> Int:
