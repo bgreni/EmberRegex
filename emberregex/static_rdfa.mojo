@@ -99,7 +99,8 @@ comptime RDFA_STATE_CAP = _MIN_CAP
 
 struct RDFA(Copyable, Movable):
     """Comptime-computed reverse DFA. Only ever exists as a comptime
-    value; the walker reads the materialized Array forms."""
+    value; the walker reads the materialized forms (rdfa_table_str /
+    rdfa_flags_arr)."""
 
     var valid: Bool
     var num_states: Int

@@ -67,7 +67,8 @@ passes keeps the caller's -1.
 Tables (POD + Array rule: the struct crosses into the walkers as a
 comptime parameter, the bulk as separate arrays padded to at least
 EDFA_TABLE_MIN_BYTES so they lower to shared constant data):
-`onepass_table_arr` — `num_states x nclasses` Int32 cells, -1 dead, else
+`onepass_table_str` — `num_states x nclasses` Int32 cells (a string
+literal, see static_bytes.mojo), -1 dead, else
 the premultiplied next row, the next state id and the slot-set id packed
 (`_OP_*` shifts); `onepass_class_arr` — byte to class; `onepass_eps_arr` —
 slot bitsets by id (id 0 is the empty set); `onepass_state_arr` — per

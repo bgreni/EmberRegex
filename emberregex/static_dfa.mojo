@@ -582,7 +582,7 @@ struct EagerDFA(Copyable, Movable):
     """Comptime-computed DFA: flat transition table + per-state flags.
 
     Only ever exists as a comptime value; the runtime engine reads the
-    materialized Array forms (see edfa_table_arr / edfa_flags_arr).
+    materialized forms (see edfa_table_str / edfa_flags_arr).
     """
 
     var valid: Bool
