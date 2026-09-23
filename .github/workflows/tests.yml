@@ -36,6 +36,12 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # Unit tests for run_test.py / run_coverage.py: stdlib-only Python,
+      # so the runner's own interpreter will do, and one OS is enough.
+      - name: Test the test tooling
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
+
       - name: Install pixi
         id: pixi
         run: |
