@@ -1,6 +1,7 @@
 """Tests for inline flags: (?i) ignorecase, (?m) multiline, (?s) dotall."""
 
 from emberregex import Regex, RegexFlags
+from emberregex.nfa import apply_flags
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -127,6 +128,18 @@ def test_explicit_flags_param() raises:
     var r = re2.search("foo\nHELLO")
     assert_true(r.matched)
     assert_equal(r.span(), inline2.search("foo\nHELLO").span())
+    # The same rewrite at runtime (the comptime asserts above run it only
+    # in the interpreter): every letter, a verb prefix, an unclosed verb.
+    comptime ALL = (
+        RegexFlags.IGNORECASE
+        | RegexFlags.MULTILINE
+        | RegexFlags.DOTALL
+        | RegexFlags.VERBOSE
+        | RegexFlags.UNICODE
+    )
+    assert_equal(apply_flags("ab", ALL), "(?imsxu)ab")
+    assert_equal(apply_flags("(*UTF8)ab", RegexFlags.DOTALL), "(*UTF8)(?s)ab")
+    assert_equal(apply_flags("(*UTF8", RegexFlags.MULTILINE), "(?m)(*UTF8")
 
 
 def test_combined_all_three() raises:
