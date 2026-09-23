@@ -115,7 +115,7 @@ def test_tail_kind_shared_without_bol_multiline() raises:
     # restarting state (114 states, past the cap for the {6} sibling).
     comptime S = Regex["(?:a|b|\n)*a(?:a|b|\n){5}"]
     assert_true(S._lfdfa.valid)
-    assert_equal(S._lfdfa.d.num_states, 96)
+    assert_equal(S._lfdfa.num_states, 96)
     assert_true(S._use_lf_dfa)
     var re = S()
     var input = String("b\nab") + "a" * 3 + "\n" + "b" * 5 + "a"
@@ -136,8 +136,8 @@ def test_spurious_self_loops_are_not_accelerated() raises:
         "|lap|lab|mop|mob|net|nap|owl|oak|pin|pit|rat|rib|sun|sit|tap|[0-9]{3}"
     ]
     assert_true(A._use_lf_dfa)
-    comptime a_accel = len(A._lfdfa.d.accel.states) + len(
-        A._lfdfa.d.accel.nib_states
+    comptime a_accel = len(A._lfdfa.accel.states) + len(
+        A._lfdfa.accel.nib_states
     )
     assert_equal(a_accel, 1)
     # A genuine single-byte loop (the `a+` run) IS accelerated, on both
@@ -145,8 +145,8 @@ def test_spurious_self_loops_are_not_accelerated() raises:
     # 20 KB run measured 16x slower when a loop-set threshold dropped it.
     comptime B = Regex["a+e|x"]
     assert_true(B._use_lf_dfa)
-    comptime b_lf_accel = len(B._lfdfa.d.accel.states) + len(
-        B._lfdfa.d.accel.nib_states
+    comptime b_lf_accel = len(B._lfdfa.accel.states) + len(
+        B._lfdfa.accel.nib_states
     )
     comptime b_classic_accel = len(B._edfa.accel.states) + len(
         B._edfa.accel.nib_states
@@ -232,7 +232,7 @@ def test_lazy_stops_at_first_close() raises:
     # Structural proof that the scan stops: the state after the first
     # `>` is a match state with no live transition, so the walker
     # returns there instead of walking the rest of the line.
-    comptime dead = _lf_row_dead_after(S._lfdfa.d, "<ab>")
+    comptime dead = _lf_row_dead_after(S._lfdfa, "<ab>")
     assert_true(dead)
     var re2 = Regex["x*?y"]()
     assert_equal(re2.search("xxxyxy").end, 4)
@@ -276,7 +276,7 @@ def test_tiny_tables_materialize_as_shared_data() raises:
     # materialized arrays are padded to that size, so the constant is a
     # shared global and a short walk costs per-byte work only.
     comptime S = Regex["<.*?>"]
-    comptime assert S._lfdfa.d.num_states * 256 < EDFA_TABLE_MIN_BYTES
+    comptime assert S._lfdfa.num_states * 256 < EDFA_TABLE_MIN_BYTES
     comptime assert S._LFDFA_TN >= EDFA_TABLE_MIN_BYTES
     comptime assert S._RDFA_TN >= EDFA_TABLE_MIN_BYTES
     comptime assert S._EDFA_TN >= EDFA_TABLE_MIN_BYTES
@@ -685,17 +685,17 @@ def test_wide_list_signature_renumbering() raises:
     # lists wider than the signature bitstring.
     comptime lf = build_lf_dfa(Regex[_WIDE_ALT].nfa, True)
     assert_true(lf.valid)
-    comptime tn = lf.d.num_states * 256
-    comptime dt = edfa_id_dtype(lf.d.num_states)
-    comptime table = static_bytes[edfa_table_str[tn, dt](lf.d)]()
-    comptime flags = edfa_flags_arr[lf.d.num_states](lf.d)
+    comptime tn = lf.num_states * 256
+    comptime dt = edfa_id_dtype(lf.num_states)
+    comptime table = static_bytes[edfa_table_str[tn, dt](lf)]()
+    comptime flags = edfa_flags_arr[lf.num_states](lf)
     var input = String("!!!!!!!!!!!!!!!!!!!!q!!")
     var bytes = input.as_bytes()
-    assert_equal(edfa_match_at[d=lf.d, table=table, flags=flags](bytes, 0), 21)
-    assert_equal(edfa_match_at[d=lf.d, table=table, flags=flags](bytes, 21), -1)
+    assert_equal(edfa_match_at[d=lf, table=table, flags=flags](bytes, 0), 21)
+    assert_equal(edfa_match_at[d=lf, table=table, flags=flags](bytes, 21), -1)
     var input2 = String("!!!!!!!!!!!!!!!!!!!!7!!")
     var bytes2 = input2.as_bytes()
-    assert_equal(edfa_match_at[d=lf.d, table=table, flags=flags](bytes2, 0), 21)
+    assert_equal(edfa_match_at[d=lf, table=table, flags=flags](bytes2, 0), 21)
     # And on the engine: a class arm keeps Teddy off, so the same lists
     # drive search/findall through the lane.
     comptime W = Regex[_WIDE_ALT + "|[!?]{2}"]

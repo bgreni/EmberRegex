@@ -1295,7 +1295,7 @@ struct Regex[pattern: String](Copyable, Movable):
         and not (
             Self.nfa.has_word_boundary
             and Self._use_scan_filter
-            and not _edfa_has_region(Self._lfdfa.d)
+            and not _edfa_has_region(Self._lfdfa)
         )
     )
     # The DFA-bounded capture lane (Rust regex's meta "Core" strategy):
@@ -1312,7 +1312,7 @@ struct Regex[pattern: String](Copyable, Movable):
         and not (
             Self.nfa.has_word_boundary
             and Self._use_scan_filter
-            and not _edfa_has_region(Self._lfdfa.d)
+            and not _edfa_has_region(Self._lfdfa)
         )
     )
     comptime _use_lf_lane = Self._use_lf_dfa or Self._use_dfa_span
@@ -1329,7 +1329,7 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _span_lane = Self._group_count > 0
     comptime _use_lf_sheng = (
         Self._use_lf_lane
-        and sheng_viable(Self._lfdfa.d)
+        and sheng_viable(Self._lfdfa)
         and HAS_FAST_BYTE_SHUFFLE
     )
     # LazyDFA only backs DFA patterns whose CLASSIC comptime
@@ -1363,17 +1363,17 @@ struct Regex[pattern: String](Copyable, Movable):
     )
     # Leftmost-first lane tables (same materialization rules as above).
     comptime _SHENG_MASKS = static_bytes[Self._SHENG_MASKS_S]()
-    comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.d.num_states)
-    comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.d.num_states)
+    comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.num_states)
+    comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.num_states)
     comptime _LFDFA_TABLE_S = edfa_table_str[Self._LFDFA_TN, Self._LFDFA_DT](
-        Self._lfdfa.d
+        Self._lfdfa
     )
-    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.d.num_states](
-        Self._lfdfa.d
+    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.num_states](
+        Self._lfdfa
     )
-    comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa.d, Self._use_lf_sheng)
+    comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa, Self._use_lf_sheng)
     comptime _LF_SHENG_MASKS_S = sheng_masks_str[Self._LF_SHENG_CAP](
-        Self._lfdfa.d, Self._use_lf_sheng
+        Self._lfdfa, Self._use_lf_sheng
     )
     comptime _LFDFA_TABLE = static_bytes[Self._LFDFA_TABLE_S]()
     comptime _LF_SHENG_MASKS = static_bytes[Self._LF_SHENG_MASKS_S]()
@@ -1624,14 +1624,14 @@ struct Regex[pattern: String](Copyable, Movable):
         """Leftmost-first match END at or after `pos`, or -1."""
         comptime if Self._use_lf_sheng:
             return sheng_match_at[
-                d=Self._lfdfa.d,
+                d=Self._lfdfa,
                 cap=Self._LF_SHENG_CAP,
                 masks=Self._LF_SHENG_MASKS,
                 flags=Self._LFDFA_FLAGS,
             ](input, pos)
         else:
             return edfa_match_at[
-                d=Self._lfdfa.d,
+                d=Self._lfdfa,
                 table=Self._LFDFA_TABLE,
                 flags=Self._LFDFA_FLAGS,
             ](input, pos)
