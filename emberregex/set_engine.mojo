@@ -68,7 +68,7 @@ from .set_dfa import (
     mdfa_slices_arr,
     mdfa_table_str,
 )
-from .set_literal import extract_literal_set, litset_scan
+from .set_literal import extract_literal_set, litset_masks, litset_scan
 from .set_nfa import build_union_nfa, build_union_subset_nfa, _union_any_unicode
 from .set_pike import utf8_mid_codepoint
 from .set_pike import (
@@ -284,6 +284,7 @@ struct RegexSet[
     )
     comptime _ROSE_BCLS = rose_bcls_arr[rose_bcls_len(Self._rose)](Self._rose)
     comptime _ROSE_LOOK = rose_look_arr[rose_look_len(Self._rose)](Self._rose)
+    comptime _ROSE_MASKS = litset_masks(Self._rose.lit)
 
     # Patterns Rose could not decompose keep a per-byte automaton, over
     # their own (smaller, better-accelerating) union.
@@ -749,6 +750,7 @@ struct RegexSet[
                 lits=Self._ROSE_LITS,
                 bcls=Self._ROSE_BCLS,
                 look=Self._ROSE_LOOK,
+                masks=Self._ROSE_MASKS,
             ](input)
             comptime if Self._has_residual:
                 return merge_reports(reports^, self._scan_residual(input))

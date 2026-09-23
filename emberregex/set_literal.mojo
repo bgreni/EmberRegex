@@ -307,6 +307,70 @@ def _litset_pos_masks(
     return (lo, hi)
 
 
+comptime _PosMasks = Tuple[_NibbleTable, _NibbleTable]
+comptime TeddyMasks = Tuple[_PosMasks, _PosMasks, _PosMasks]
+
+
+def litset_masks(ls: LiteralSet) -> TeddyMasks:
+    """Comptime: the nibble tables for the first k = min(3, min_len)
+    literal positions (positions past k repeat position 0; the front end
+    never reads them)."""
+    var k = min(3, ls.min_len)
+    return (
+        _litset_pos_masks(ls, 0),
+        _litset_pos_masks(ls, 1 if k > 1 else 0),
+        _litset_pos_masks(ls, 2 if k > 2 else 0),
+    )
+
+
+@always_inline
+def teddy_front_end[
+    origin: ImmOrigin,
+    F: def(Int, UInt8) -> None,
+    //,
+    min_len: Int,
+    masks: TeddyMasks,
+](input: Span[Byte, origin], verify: F):
+    """The bucketed-Teddy candidate loop shared by `litset_scan` and
+    `rose_scan`: `verify(at, bucket_mask)` for every candidate lane, then
+    `verify(at, 0xFF)` at each tail position with room for the shortest
+    literal. `input` is an immutable view so the verify closure can
+    capture it too."""
+    comptime W = simd_width_of[DType.uint8]()
+    comptime k = min(3, min_len)
+    comptime m0 = masks[0]
+    comptime m1 = masks[1]
+    comptime m2 = masks[2]
+
+    var input_len = len(input)
+    var pos = 0
+    var ptr = Pointer(input.unsafe_ptr())
+
+    while pos + W <= input_len:
+        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
+        var lo = v & 0x0F
+        var hi = v >> 4
+        var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
+        comptime if k > 1:
+            var c1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
+            cand &= c1.shift_left[1]()
+        comptime if k > 2:
+            var c2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
+            cand &= c2.shift_left[2]()
+        var bits = lane_bits(cand.ne(0))
+        while bits != 0:
+            var lane = first_lane_index(bits)
+            verify(pos + lane, cand[lane])
+            bits = clear_first_lane(bits)
+        # The last k-1 lanes were masked off by the zero-filling lane
+        # shifts; rescan them as the head of the next chunk.
+        pos += W - (k - 1)
+
+    while pos + min_len <= input_len:
+        verify(pos, UInt8(0xFF))
+        pos += 1
+
+
 @always_inline
 def _litset_verify_at[
     origin: Origin, //, ls: LiteralSet
@@ -358,40 +422,14 @@ def litset_scan[
 ](input: Span[Byte, origin]) -> List[SetMatch]:
     """Scan the whole input, reporting every (id, end) per the set
     contract. Non-mutating; buffers are local."""
-    comptime W = simd_width_of[DType.uint8]()
-    comptime k = min(3, ls.min_len)
-    comptime m0 = _litset_pos_masks(ls, 0)
-    comptime m1 = _litset_pos_masks(ls, 1 if k > 1 else 0)
-    comptime m2 = _litset_pos_masks(ls, 2 if k > 2 else 0)
-
     var out = List[SetMatch]()
-    var input_len = len(input)
-    var pos = 0
-    var ptr = Pointer(input.unsafe_ptr())
+    var inp = Span[Byte, ImmOrigin(origin)](input)
 
-    while pos + W <= input_len:
-        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
-        var lo = v & 0x0F
-        var hi = v >> 4
-        var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
-        comptime if k > 1:
-            var c1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
-            cand &= c1.shift_left[1]()
-        comptime if k > 2:
-            var c2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
-            cand &= c2.shift_left[2]()
-        var bits = lane_bits(cand.ne(0))
-        while bits != 0:
-            var lane = first_lane_index(bits)
-            _litset_verify_at[ls=ls](input, pos + lane, cand[lane], out)
-            bits = clear_first_lane(bits)
-        # The last k-1 lanes were masked off by the zero-filling lane
-        # shifts; rescan them as the head of the next chunk.
-        pos += W - (k - 1)
+    @always_inline
+    def verify(at: Int, bucket_mask: UInt8) {mut out, imm inp}:
+        _litset_verify_at[ls=ls](inp, at, bucket_mask, out)
 
-    while pos + ls.min_len <= input_len:
-        _litset_verify_at[ls=ls](input, pos, UInt8(0xFF), out)
-        pos += 1
+    teddy_front_end[min_len=ls.min_len, masks=litset_masks(ls)](inp, verify)
 
     _sort_reports(out)
     # Collapse duplicate (id, end) pairs: same-id arms of an in-pattern

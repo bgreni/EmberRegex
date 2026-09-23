@@ -72,8 +72,6 @@ sort+dedup.
 """
 
 from std.collections import Array
-from std.math import min
-from std.sys import simd_width_of
 
 from .charset import BITMAP_WIDTH
 from .constants import CHAR_NEWLINE
@@ -83,8 +81,10 @@ from .parser import parse
 from .set_literal import (
     LITSET_MAX,
     LiteralSet,
+    TeddyMasks,
     _NUM_BUCKETS,
     _assign_buckets,
+    teddy_front_end,
 )
 from .set_pike import SetMatch
 from .set_semantics import (
@@ -92,12 +92,7 @@ from .set_semantics import (
     EXT_HAMMING_DISTANCE,
     ext_of,
 )
-from .simd_kernels import (
-    HAS_FAST_BYTE_SHUFFLE,
-    NIBBLE_TABLE_SIZE,
-    nibble_lookup,
-)
-from .simd_scan import clear_first_lane, first_lane_index, lane_bits
+from .simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_EOL_AT_END,
@@ -109,8 +104,6 @@ from .static_dfa import (
     build_eager_dfa,
 )
 from .teddy import _lit_at
-
-comptime _NibbleTable = SIMD[DType.uint8, NIBBLE_TABLE_SIZE]
 
 # A 1-byte factor filters no better than the first-byte bitmap the
 # residual automaton already has, and drags every occurrence of a common
@@ -415,34 +408,6 @@ def _bucket_entries[
         if Int(meta[_M_STRIDE * i + _M_BUCKET]) == b:
             out.append(i)
     return out^
-
-
-def _rose_pos_masks[
-    mn: Int, ln: Int
-](
-    meta: Array[Int32, mn],
-    lits: Array[Int32, ln],
-    n_entries: Int,
-    j: Int,
-) -> Tuple[_NibbleTable, _NibbleTable]:
-    """Comptime: (lo, hi) nibble tables for factor byte position j; entry
-    bits are BUCKET indices. Caseless positions admit both cases (same low
-    nibble, both high nibbles). Mirrors _litset_pos_masks over the flat
-    pools."""
-    var lo = _NibbleTable(0)
-    var hi = _NibbleTable(0)
-    for i in range(n_entries):
-        var base = _M_STRIDE * i
-        var packed = Int(lits[Int(meta[base + _M_BYTE_OFF]) + j])
-        var b = packed & 0xFF
-        var bit = UInt8(1) << UInt8(Int(meta[base + _M_BUCKET]))
-        lo[b & 0x0F] |= bit
-        hi[b >> 4] |= bit
-        if (packed & 0x100) != 0:
-            var u = b - 32  # the uppercase member
-            lo[u & 0x0F] |= bit
-            hi[u >> 4] |= bit
-    return (lo, hi)
 
 
 # --- Factor extraction ------------------------------------------------------
@@ -1584,52 +1549,19 @@ def rose_scan[
     lits: Array[Int32, ln],
     bcls: Array[Int32, bn],
     look: Array[Int32, kn],
+    masks: TeddyMasks,
 ](input: Span[Byte, origin]) -> List[SetMatch]:
-    """Scan for the factor-group patterns: Teddy front end, per-candidate
-    confirmation. Returns contract-ordered, deduped reports.
+    """Scan for the factor-group patterns: Teddy front end
+    (`teddy_front_end`, over `masks` = `litset_masks` of the factor set),
+    per-candidate confirmation. Returns contract-ordered, deduped reports.
 
-    Non-mutating; buffers are local. The chunk loop mirrors
-    litset_scan — lane shifts zero-fill, so the last k-1 lanes of each
-    chunk are re-examined as the head of the next.
+    Non-mutating; buffers are local.
     """
-    comptime W = simd_width_of[DType.uint8]()
-    comptime k = min(3, r.min_len)
-    comptime m0 = _rose_pos_masks(meta, lits, r.n_entries, 0)
-    comptime m1 = _rose_pos_masks(meta, lits, r.n_entries, 1 if k > 1 else 0)
-    comptime m2 = _rose_pos_masks(meta, lits, r.n_entries, 2 if k > 2 else 0)
-
     var out = List[SetMatch]()
-    var input_len = len(input)
-    var pos = 0
-    var ptr = Pointer(input.unsafe_ptr())
+    var inp = Span[Byte, ImmOrigin(origin)](input)
 
-    while pos + W <= input_len:
-        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
-        var lo = v & 0x0F
-        var hi = v >> 4
-        var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
-        comptime if k > 1:
-            var c1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
-            cand &= c1.shift_left[1]()
-        comptime if k > 2:
-            var c2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
-            cand &= c2.shift_left[2]()
-        var bits = lane_bits(cand.ne(0))
-        while bits != 0:
-            var lane = first_lane_index(bits)
-            _rose_verify_at[
-                r=r,
-                table=table,
-                flags=flags,
-                meta=meta,
-                lits=lits,
-                bcls=bcls,
-                look=look,
-            ](input, pos + lane, cand[lane], out)
-            bits = clear_first_lane(bits)
-        pos += W - (k - 1)
-
-    while pos + r.min_len <= input_len:
+    @always_inline
+    def verify(at: Int, bucket_mask: UInt8) {mut out, imm inp}:
         _rose_verify_at[
             r=r,
             table=table,
@@ -1638,9 +1570,9 @@ def rose_scan[
             lits=lits,
             bcls=bcls,
             look=look,
-        ](input, pos, UInt8(0xFF), out)
-        pos += 1
+        ](inp, at, bucket_mask, out)
 
+    teddy_front_end[min_len=r.min_len, masks=masks](inp, verify)
     sort_reports(out)
     dedup_reports(out)
     return out^
