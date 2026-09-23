@@ -10,12 +10,7 @@ per-state heap allocations. SAVE states use in-place modification
 with restore-on-return to eliminate slot copying.
 """
 
-from .constants import (
-    CHAR_A_UPPER,
-    CHAR_NEWLINE,
-    CHAR_Z_UPPER,
-    is_word_byte,
-)
+from .constants import CHAR_NEWLINE, ascii_to_lower, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .ast import AnchorKind
 from .result import MatchResult
@@ -769,9 +764,9 @@ def _heapbt_core[
                 var same = True
                 if state.icase:
                     for i in range(n):
-                        if _bt_to_lower(
+                        if ascii_to_lower(
                             input.unsafe_get(gs + i)
-                        ) != _bt_to_lower(input.unsafe_get(pos + i)):
+                        ) != ascii_to_lower(input.unsafe_get(pos + i)):
                             same = False
                             break
                 else:
@@ -814,9 +809,3 @@ def _bt_check_anchor[
         var right = pos < input_len and is_word_byte(input.unsafe_get(pos))
         return (left != right) == (anchor_type == AnchorKind.WORD_BOUNDARY)
     return False
-
-
-def _bt_to_lower(ch: Byte) -> Byte:
-    if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
-        return ch + 32
-    return ch

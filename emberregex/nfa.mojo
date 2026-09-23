@@ -7,7 +7,13 @@ a list of dangling output arrows (patch list).
 
 from std.math import max, min
 
-from .constants import CHAR_A_LOWER, CHAR_A_UPPER, CHAR_Z_LOWER, CHAR_Z_UPPER
+from .constants import (
+    CHAR_A_LOWER,
+    CHAR_A_UPPER,
+    CHAR_Z_LOWER,
+    CHAR_Z_UPPER,
+    ascii_to_lower,
+)
 from .ast import AST, ASTNode, ASTNodeKind, AnchorKind
 from .charset import BITMAP_WIDTH, CharSet, CharRange
 from .utf8 import UTF8_SEQ_LEN_SHIFT, UTF8_SEQ_WORDS, utf8_seq_table
@@ -975,7 +981,7 @@ def _build_fragment(
             one.append(Int(ch))
             return _utf8_class_fragment(nfa, one)
         if flags.ignorecase():
-            var lo = _to_lower(ch)
+            var lo = ascii_to_lower(ch)
             var up = _to_upper(ch)
             if lo != up:
                 var cs = CharSet()
@@ -1491,13 +1497,6 @@ def _build_repetition(
         frag.outs = res_outs^
         frag.out_slots = res_out_slots^
         return frag^
-
-
-def _to_lower(ch: UInt32) -> UInt32:
-    """Convert ASCII uppercase to lowercase."""
-    if ch >= UInt32(CHAR_A_UPPER) and ch <= UInt32(CHAR_Z_UPPER):
-        return ch + 32
-    return ch
 
 
 def _to_upper(ch: UInt32) -> UInt32:

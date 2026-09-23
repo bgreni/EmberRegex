@@ -42,12 +42,7 @@ from std.ffi import external_call
 from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 
-from .constants import (
-    CHAR_A_UPPER,
-    CHAR_NEWLINE,
-    CHAR_Z_UPPER,
-    is_word_byte,
-)
+from .constants import CHAR_NEWLINE, ascii_to_lower, is_word_byte
 from .nfa import (
     _build_static_nfa,
     split_cycle_flags,
@@ -64,13 +59,6 @@ from .simd_kernels import (
     stops_from_bitmap,
     _class_contains,
 )
-
-
-@always_inline
-def _sbt_to_lower(ch: Byte) -> Byte:
-    if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
-        return ch + 32
-    return ch
 
 
 @always_inline
@@ -2190,9 +2178,9 @@ def _sbt_try_match[
                 return -1
             comptime if state.icase:
                 for i in range(ref_len):
-                    if _sbt_to_lower(input.unsafe_get(gs + i)) != _sbt_to_lower(
-                        input.unsafe_get(pos + i)
-                    ):
+                    if ascii_to_lower(
+                        input.unsafe_get(gs + i)
+                    ) != ascii_to_lower(input.unsafe_get(pos + i)):
                         return -1
             else:
                 for i in range(ref_len):
