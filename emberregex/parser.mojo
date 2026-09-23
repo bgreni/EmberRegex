@@ -800,12 +800,11 @@ struct Parser[origin: Origin](Movable):
                 cs = CharSet.word()
             else:
                 cs = CharSet.whitespace()
-            var negated = ch <= CHAR_Z_UPPER  # the uppercase forms
-            if negated:
+            if ch <= CHAR_Z_UPPER:  # the uppercase forms
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            return self.ast.add_node(ASTNode.char_class(cs_idx, negated))
+            return self.ast.add_node(ASTNode.char_class(cs_idx))
 
         # Word boundary anchors
         if ch == CHAR_B_LOWER:
@@ -961,7 +960,7 @@ struct Parser[origin: Origin](Movable):
                 )
             pcs.build_bitmap()
             var pidx = self.ast.add_charset(pcs^)
-            return self.ast.add_node(ASTNode.char_class(pidx, False))
+            return self.ast.add_node(ASTNode.char_class(pidx))
 
         # Literal character escapes
         if ch == CHAR_t:
@@ -1341,7 +1340,7 @@ struct Parser[origin: Origin](Movable):
             cs.negate()
 
         var cs_idx = self.ast.add_charset(cs^)
-        return self.ast.add_node(ASTNode.char_class(cs_idx, negated))
+        return self.ast.add_node(ASTNode.char_class(cs_idx))
 
 
 def parse(pattern: String) raises -> AST:
