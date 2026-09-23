@@ -2302,16 +2302,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
 
     def search(mut self, input: String) -> MatchResult[Self._num_slots]:
         """Search for the first occurrence of the pattern in the input."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return MatchResult[Self._num_slots].no_match()
+        if self._required_byte_absent(input):
+            return MatchResult[Self._num_slots].no_match()
         comptime if Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2401,12 +2393,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                             return MatchResult[Self._num_slots].no_match()
                     return MatchResult[Self._num_slots].no_match()
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_search(input)
                 else:
@@ -2553,16 +2540,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
 
         No per-match String allocation: slice lazily via span() /
         group_str(). findall() is a wrapper over this."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return List[MatchResult[Self._num_slots]]()
+        if self._required_byte_absent(input):
+            return List[MatchResult[Self._num_slots]]()
         comptime if Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2697,12 +2676,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 )
                     return results^
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_finditer(input)
                 else:
@@ -2731,16 +2705,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         wrapper over it: materializing the intermediate MatchResult list
         measured 1.3-1.9x on findall-heavy rows. Keep the iteration
         structure of the two in sync."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return List[String]()
+        if self._required_byte_absent(input):
+            return List[String]()
         comptime if Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2890,12 +2856,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 )
                     return results^
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_findall(input)
                 else:
@@ -3183,12 +3144,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             try:
                 return self._replace_dfa(input, replacement)
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_replace(input, replacement)
                 else:
@@ -3460,12 +3416,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 input_bytes, start
                             )
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_split(input)
                 else:
@@ -3596,6 +3547,21 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 off_a=probes[0],
                 off_b=probes[1],
             ](input, start)
+
+    @always_inline
+    def _required_byte_absent(self, input: String) -> Bool:
+        """Required-byte fast-fail for the unanchored verbs (see
+        `_compute_strategy`): True when a byte every match contains is
+        missing from `input`. Always False, at comptime, without one."""
+        comptime if Self._strategy.required_byte >= 0:
+            return (
+                simd_find_byte(
+                    input.as_bytes(), UInt8(Self._strategy.required_byte), 0
+                )
+                < 0
+            )
+        else:
+            return False
 
     @always_inline
     def _first_byte_hit(self, b: Byte) -> Bool:
