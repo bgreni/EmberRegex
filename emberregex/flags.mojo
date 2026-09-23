@@ -22,9 +22,6 @@ struct RegexFlags(ImplicitlyCopyable, Movable):
     def __or__(self, other: Self) -> Self:
         return RegexFlags(self.value | other.value)
 
-    def __and__(self, other: Self) -> Self:
-        return RegexFlags(self.value & other.value)
-
     def has(self, flag: Int) -> Bool:
         return (self.value & flag) != 0
 

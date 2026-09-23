@@ -15,9 +15,12 @@ backtrack.mojo for what that does and does not flatten.
 
 from .constants import (
     CHAR_BACKSLASH,
+    CHAR_LPAREN,
     CHAR_NEWLINE,
     CHAR_NINE,
     CHAR_ONE,
+    CHAR_RPAREN,
+    CHAR_STAR,
     CHAR_ZERO,
 )
 from .parser import parse
@@ -1179,9 +1182,49 @@ struct _LFWalk[num_slots: Int, span: Bool, origin: MutOrigin](
         self.pike = pike
 
 
-struct Regex[pattern: String](Copyable, Movable):
+def _apply_flags(pattern: String, flags: RegexFlags) -> String:
+    """`pattern` with `flags` spelled as one leading inline group
+    (`(?imsxu)`), placed after any leading `(*UTF8)` verbs — the parser
+    only accepts those first (see `Parser._consume_verbs`)."""
+    var letters = String()
+    if flags.ignorecase():
+        letters += "i"
+    if flags.multiline():
+        letters += "m"
+    if flags.dotall():
+        letters += "s"
+    if flags.verbose():
+        letters += "x"
+    if flags.unicode():
+        letters += "u"
+    var b = pattern.as_bytes()
+    var pos = 0
+    while (
+        pos + 2 < len(b) and b[pos] == CHAR_LPAREN and b[pos + 1] == CHAR_STAR
+    ):
+        var close = pos + 2
+        while close < len(b) and b[close] != CHAR_RPAREN:
+            close += 1
+        if close >= len(b):
+            break
+        pos = close + 1
+    return (
+        String(unsafe_from_utf8=b[:pos])
+        + "(?"
+        + letters
+        + ")"
+        + String(unsafe_from_utf8=b[pos:])
+    )
+
+
+struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
+    Copyable, Movable
+):
     """A compile-time regex where parsing and NFA construction happen during
     compilation.
+
+    `flags` is the same as writing them inline: `Regex["ab", RegexFlags(
+    RegexFlags.IGNORECASE)]` compiles `(?i)ab`.
 
     The backtracking engine is specialized per-NFA-state via comptime
     parameters. Each NFA state becomes a distinct function instantiation that
@@ -1190,7 +1233,15 @@ struct Regex[pattern: String](Copyable, Movable):
     recurse — see backtrack.mojo.
     """
 
-    comptime nfa = _build_static_nfa(Self.pattern)
+    # The pattern every lane compiles: exactly `pattern` for the default
+    # flags, so those instantiations share the memoized NFA and the
+    # backtracker's symbol names with the flag-free spelling. The ternary
+    # is load-bearing: a String RETURNED by a comptime call is a different
+    # interpreter value (and symbol mangling) even when equal.
+    comptime _pat = Self.pattern if Self.flags.value == 0 else _apply_flags(
+        Self.pattern, Self.flags
+    )
+    comptime nfa = _build_static_nfa(Self._pat)
     # One Tarjan pass and one depth plan per pattern: the selection
     # predicates below used to each call `split_cycle_flags(Self.nfa)`
     # inside their own bodies, and calls made inside interpreted bodies
@@ -1713,7 +1764,7 @@ struct Regex[pattern: String](Copyable, Movable):
         left of it on return (negative after a -2).
         """
         var end = _sbt_try_match[
-            pattern=Self.pattern,
+            pattern=Self._pat,
             state_idx=Self._start,
             num_slots=Self._num_slots,
             anchored_end=False,
@@ -2033,7 +2084,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 try:
                     var memo = List[UInt64]()
                     var got = _sbt_run[
-                        pattern=Self.pattern,
+                        pattern=Self._pat,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                         anchored_end=True,
@@ -2230,7 +2281,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # alternatives that prefer a shorter match (e.g. `(a|ab)`
                 # on "ab") can't mask a valid full match.
                 var end = _sbt_run[
-                    pattern=Self.pattern,
+                    pattern=Self._pat,
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
                     anchored_end=True,
@@ -2336,9 +2387,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 end=self._lf_end_at(
                                     input_bytes, pos, match_end
                                 ),
-                                slots=Array[Int, Self._num_slots](
-                                    fill=-1
-                                ),
+                                slots=Array[Int, Self._num_slots](fill=-1),
                             )
                         var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                         if nl < 0:
@@ -2363,9 +2412,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                     end=self._lf_end_at(
                                         input_bytes, pos, match_end
                                     ),
-                                    slots=Array[Int, Self._num_slots](
-                                        fill=-1
-                                    ),
+                                    slots=Array[Int, Self._num_slots](fill=-1),
                                 )
                             pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         else:
@@ -2379,9 +2426,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                     end=self._lf_end_at(
                                         input_bytes, range[0], range[1]
                                     ),
-                                    slots=Array[Int, Self._num_slots](
-                                        fill=-1
-                                    ),
+                                    slots=Array[Int, Self._num_slots](fill=-1),
                                 )
                             return MatchResult[Self._num_slots].no_match()
                     return MatchResult[Self._num_slots].no_match()
@@ -2425,7 +2470,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
             ](
@@ -2471,7 +2516,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos = self._next_candidate_pos(input, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
             ](
@@ -2527,7 +2572,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     continue
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=entry_state,
                 num_slots=Self._num_slots,
             ](
@@ -2942,7 +2987,7 @@ struct Regex[pattern: String](Copyable, Movable):
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
             ](
@@ -2964,7 +3009,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 while pos <= input_len:
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
-                        pattern=Self.pattern,
+                        pattern=Self._pat,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
@@ -3015,7 +3060,7 @@ struct Regex[pattern: String](Copyable, Movable):
                             )
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
-                        pattern=Self.pattern,
+                        pattern=Self._pat,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
@@ -3114,7 +3159,7 @@ struct Regex[pattern: String](Copyable, Movable):
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
             ](
@@ -3140,7 +3185,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 while pos <= input_len:
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
-                        pattern=Self.pattern,
+                        pattern=Self._pat,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
@@ -3195,7 +3240,7 @@ struct Regex[pattern: String](Copyable, Movable):
                             )
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = _sbt_run[
-                        pattern=Self.pattern,
+                        pattern=Self._pat,
                         state_idx=Self._start,
                         num_slots=Self._num_slots,
                     ](
@@ -3427,7 +3472,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
             ](
@@ -3609,7 +3654,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = _sbt_run[
-                pattern=Self.pattern,
+                pattern=Self._pat,
                 state_idx=Self._start,
                 num_slots=Self._num_slots,
             ](
@@ -3832,7 +3877,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                 var end = _sbt_run[
-                    pattern=Self.pattern,
+                    pattern=Self._pat,
                     state_idx=Self._start,
                     num_slots=Self._num_slots,
                 ](

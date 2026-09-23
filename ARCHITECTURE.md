@@ -2,8 +2,9 @@
 
 Two public entry points, one shared front end:
 
-- **`Regex[pattern]`** — a single pattern, matched with Python-style
-  leftmost-first semantics.
+- **`Regex[pattern, flags]`** — a single pattern, matched with Python-style
+  leftmost-first semantics (`flags` defaults to none; it is compiled as a
+  leading inline group, `Regex._pat`).
 - **`RegexSet[patterns]`** — a multi-pattern database in the shape of
   Intel Hyperscan: scan once, report every pattern that matches and where.
 

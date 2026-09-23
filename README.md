@@ -75,7 +75,7 @@ mojo -I /path/to/emberregex your_file.mojo
 
 ## API Reference
 
-`Regex[pattern]` takes the pattern as a compile-time string literal. All parsing and NFA construction happen during compilation.
+`Regex[pattern, flags]` takes the pattern as a compile-time string literal and optional [`RegexFlags`](#flags). All parsing and NFA construction happen during compilation.
 
 ### Matching
 
@@ -160,7 +160,9 @@ var parts = re.split("one, two; three   four")
 
 ### Flags
 
-Pass flags as a second parameter, or use inline flag syntax in the pattern:
+Pass `RegexFlags` as a second parameter, or use inline flag syntax in the
+pattern. The parameter is sugar for the inline form: `Regex[p, flags]`
+compiles `(?flags)p` (after any leading `(*UTF8)` verb).
 
 ```mojo
 from emberregex import Regex, RegexFlags
@@ -173,15 +175,26 @@ re.match("HELLO").matched  # True
 var re2 = Regex["(?i)hello"]()
 re2.match("HeLLo").matched  # True
 
-# Multiline: ^ and $ match at \n boundaries
-var re3 = Regex["(?m)^\\w+"]()
-var lines = re3.findall("foo\nbar\nbaz")
-# lines: ["foo", "bar", "baz"]
+# Combined flags: `|` the values (same as inline `(?im)`)
+comptime IM = RegexFlags(RegexFlags.IGNORECASE) | RegexFlags(
+    RegexFlags.MULTILINE
+)
+var re3 = Regex["^[a-z]+", IM]()
+var lines = re3.findall("foo\nBAR\nbaz")
+# lines: ["foo", "BAR", "baz"]
 
 # Dotall: . matches \n
 var re4 = Regex["(?s)a.b"]()
 re4.match("a\nb").matched  # True
 ```
+
+| Flag | Inline | Effect |
+| --- | --- | --- |
+| `RegexFlags.IGNORECASE` | `(?i)` | case-insensitive matching |
+| `RegexFlags.MULTILINE` | `(?m)` | `^` and `$` also match at `\n` boundaries |
+| `RegexFlags.DOTALL` | `(?s)` | `.` also matches `\n` |
+| `RegexFlags.VERBOSE` | `(?x)` | whitespace and `#` comments in the pattern are ignored |
+| `RegexFlags.UNICODE` | `(?u)`, `(*UTF8)` | UTF-8 mode: `.` and classes match one codepoint (see below) |
 
 Bare inline flag groups like `(?i)` must appear **before any pattern
 content** (Python's rule — `a(?i)b` is a compile error). To apply flags
