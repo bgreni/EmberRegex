@@ -88,13 +88,13 @@ def _bytes(s: String) -> List[Byte]:
 
 def test_stream_lane_available() raises:
     comptime S = RegexSet[["ERROR", "\\d+ms"]]
-    comptime can = S._can_stream
+    comptime can = S._bitnfa.valid
     assert_true(can)
     # Word boundaries keep a set off the automaton lanes entirely, so it
     # cannot stream; `SetStream` refuses such a set at COMPILE time
     # (comptime assert), which is why there is no runtime test here.
     comptime T = RegexSet[["\\bcat\\b"]]
-    comptime cant = T._can_stream
+    comptime cant = T._bitnfa.valid
     assert_false(cant)
 
 

@@ -93,7 +93,6 @@ from .set_semantics import (
     ext_of,
 )
 from .simd_kernels import HAS_FAST_BYTE_SHUFFLE
-from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
@@ -151,8 +150,8 @@ comptime ROSE_CONF_STATE_CAP = 512
 
 struct RoseSet(Copyable, Movable):
     """Comptime-computed decomposition. Only ever exists as a comptime
-    value; the runtime walker reads the materialized Array forms
-    (rose_table_arr / rose_flags_arr).
+    value; the runtime walker reads the materialized forms (RegexSet's
+    `_ROSE_*` decls).
 
     `lit` is entry-indexed and holds exactly what the phase-1 Teddy
     machinery needs (bytes, caseless flags, report ids, buckets);
@@ -1172,22 +1171,6 @@ def build_rose(
     result.residual = residual^
     result.valid = True
     return result^
-
-
-# --- Comptime materialization helpers ---------------------------------------
-
-
-def rose_table_str[n: Int](r: RoseSet) -> String:
-    """The concatenated confirm tables as `n` little-endian Int32
-    entries; see static_bytes.mojo for why a string."""
-    return table_bytes[DType.int32](r.conf_table, n)
-
-
-def rose_flags_arr[n: Int](r: RoseSet) -> Array[UInt8, n]:
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(r.conf_flags[i])
-    return arr^
 
 
 # --- Report ordering --------------------------------------------------------

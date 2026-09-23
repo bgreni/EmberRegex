@@ -128,12 +128,12 @@ struct SetStream[patterns: List[String], allow_empty: Bool = False](
     """
 
     comptime _db = RegexSet[Self.patterns, Self.allow_empty]
-    comptime _bn = Self._db._stream_bn
+    comptime _bn = Self._db._bitnfa
     comptime _K = Self._bn.lanes
     comptime _stream_ok = _check_streamable(
         Self.patterns,
         Self._db.nfa.can_use_dfa,
-        Self._db._can_stream,
+        Self._db._bitnfa.valid,
         Self._db._needs_confirm,
         Self._db._confirm_ids,
     )
@@ -164,11 +164,11 @@ struct SetStream[patterns: List[String], allow_empty: Bool = False](
         var out = List[SetMatch]()
         bitnfa_stream_chunk[
             d=Self._bn,
-            reach=Self._db._SBN_REACH,
-            ex_data=Self._db._SBN_EX,
-            ex_idx=Self._db._SBN_EXIDX,
-            pool=Self._db._SBN_POOL,
-            slices=Self._db._SBN_SLICES,
+            reach=Self._db._BN_REACH,
+            ex_data=Self._db._BN_EX,
+            ex_idx=Self._db._BN_EXIDX,
+            pool=Self._db._BN_POOL,
+            slices=Self._db._BN_SLICES,
         ](self._st, input, out)
         return out^
 
@@ -181,11 +181,11 @@ struct SetStream[patterns: List[String], allow_empty: Bool = False](
         for c in chunks:
             bitnfa_stream_chunk[
                 d=Self._bn,
-                reach=Self._db._SBN_REACH,
-                ex_data=Self._db._SBN_EX,
-                ex_idx=Self._db._SBN_EXIDX,
-                pool=Self._db._SBN_POOL,
-                slices=Self._db._SBN_SLICES,
+                reach=Self._db._BN_REACH,
+                ex_data=Self._db._BN_EX,
+                ex_idx=Self._db._BN_EXIDX,
+                pool=Self._db._BN_POOL,
+                slices=Self._db._BN_SLICES,
             ](self._st, c, out)
         return out^
 
@@ -196,7 +196,7 @@ struct SetStream[patterns: List[String], allow_empty: Bool = False](
         var out = List[SetMatch]()
         bitnfa_stream_close[
             d=Self._bn,
-            pool=Self._db._SBN_POOL,
-            slices=Self._db._SBN_SLICES,
+            pool=Self._db._BN_POOL,
+            slices=Self._db._BN_SLICES,
         ](self._st, out)
         return out^

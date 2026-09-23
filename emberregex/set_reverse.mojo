@@ -56,7 +56,6 @@ from .set_dfa import (
     new_set_index,
 )
 from .set_pike import SetSpan
-from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
     _FlatNFA,
@@ -774,12 +773,6 @@ def _rdfa_finish(
 
 
 # --- Comptime materialization helpers ---------------------------------------
-
-
-def rdfa_table_str[n: Int](d: ReverseDFA) -> String:
-    """The flat table as `n` little-endian Int32 entries; see
-    static_bytes.mojo for why a string."""
-    return table_bytes[DType.int32](d.table, n)
 
 
 def rdfa_slices_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:

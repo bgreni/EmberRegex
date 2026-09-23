@@ -45,7 +45,6 @@ from .simd_kernels import (
     nibble_table_from,
 )
 from .simd_scan import first_lane_index, lane_bits
-from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
     _FlatNFA,
@@ -69,8 +68,8 @@ comptime MDFA_STATE_CAP = 512
 
 struct MultiDFA(Copyable, Movable):
     """Comptime-computed multi-accept DFA. Only ever exists as a
-    comptime value; the runtime walker reads the materialized
-    Array forms (mdfa_*_arr)."""
+    comptime value; the runtime walker reads the materialized forms
+    (the `table_bytes` string, the pool, `mdfa_slices_arr`)."""
 
     var valid: Bool
     var num_states: Int
@@ -641,12 +640,6 @@ def _build_multi_dfa_list(nfa: NFA) -> MultiDFA:
 
 
 # --- Comptime materialization helpers ---------------------------------------
-
-
-def mdfa_table_str[n: Int](d: MultiDFA) -> String:
-    """Int16 state ids (MDFA_STATE_CAP < 32768 by construction) as `n`
-    little-endian entries; see static_bytes.mojo for why a string."""
-    return table_bytes[DType.int16](d.table, n)
 
 
 def mdfa_slices_arr[n: Int](d: MultiDFA) -> Array[Int32, n]:
