@@ -117,7 +117,8 @@ struct Parser[origin: Origin](Movable):
             # top level there is no group to close). '|' is always eaten.
             assert self._peek() == CHAR_RPAREN, "parse stopped early"
             raise _regex_error("Unmatched ')'", self.pos)
-        # Build bitmaps for all charsets
+        # Build bitmaps for all charsets (the only place the parser's
+        # pooled charsets get one)
         for i in range(len(self.ast.charsets)):
             self.ast.charsets[i].build_bitmap()
         # Store inline flags on the AST so callers can access them
@@ -802,7 +803,6 @@ struct Parser[origin: Origin](Movable):
                 cs = CharSet.whitespace()
             if ch <= CHAR_Z_UPPER:  # the uppercase forms
                 cs.negate()
-            cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
             return self.ast.add_node(ASTNode.char_class(cs_idx))
 
@@ -949,8 +949,8 @@ struct Parser[origin: Origin](Movable):
             # interpreter copies the aggregate across every call — over
             # the 684 ranges of `\p{L}` (934 of `\p{Word}`) that is a
             # quadratic ~470k scalar copies for what is 684 appends.
-            # `add_range` does nothing else but clear `bitmap_valid`,
-            # which `build_bitmap` sets again below.
+            # `add_range` does nothing else but clear `bitmap_valid`, and
+            # `parse()` builds every charset's bitmap once at the end.
             var pcs = CharSet()
             for i in range(len(pranges) // 2):
                 pcs.ranges.append(
@@ -958,7 +958,6 @@ struct Parser[origin: Origin](Movable):
                         UInt32(pranges[2 * i]), UInt32(pranges[2 * i + 1])
                     )
                 )
-            pcs.build_bitmap()
             var pidx = self.ast.add_charset(pcs^)
             return self.ast.add_node(ASTNode.char_class(pidx))
 
