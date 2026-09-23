@@ -61,7 +61,7 @@ struct LiteralSet(Copyable, Movable):
     var walk_pops: Int
     """How many states the head walk popped. Diagnostic only — it exists
     so a test can pin that the walk is bounded by the NFA, not by the
-    entry cap (see the budget note in extract_literal_chains)."""
+    entry cap (see the visited-set note in extract_literal_chains)."""
 
     def __init__(out self):
         self.valid = False
@@ -122,18 +122,11 @@ def extract_literal_chains(
     # rather than refused: a diamond in the epsilon region is legitimate
     # (it just yields a duplicate head), while a real cycle always puts a
     # two-way SPLIT on some chain, and the chain walk below refuses that.
-    #
-    # The budget survives only as a belt-and-braces bound; `seen` makes
-    # it unreachable.
     var heads = List[Int]()
     var stack: List[Int] = [nfa.start]
     var seen = List[Bool](fill=False, length=num_states)
-    var budget = 2 * num_states + 8
     while len(stack) > 0:
-        budget -= 1
         result.walk_pops += 1
-        if budget < 0:
-            return result^
         var s = stack.pop()
         if s < 0 or s >= num_states:
             return result^
