@@ -432,7 +432,7 @@ struct PikeVM[num_slots: Int](Copyable):
 
             elif kind == NFAStateKind.ANCHOR:
                 gen.unsafe_set(state_idx, gen_val)
-                if self._check_anchor(state.anchor_type, input, input_len, pos):
+                if _bt_check_anchor(state.anchor_type, input, input_len, pos):
                     state_idx = state.out1
                     continue
                 return
@@ -507,52 +507,6 @@ struct PikeVM[num_slots: Int](Copyable):
                 for s in range(Self._stride):
                     slot_data.append(slots.unsafe_get(s))
                 return
-
-    def _check_anchor[
-        origin: Origin, //
-    ](
-        self,
-        anchor_type: Int,
-        input: Span[Byte, origin],
-        input_len: Int,
-        pos: Int,
-    ) -> Bool:
-        """Check if an anchor assertion holds at the given position.
-
-        MULTILINE behavior is baked into the anchor kind at NFA construction time:
-        BOL_MULTILINE / EOL_MULTILINE handle line-boundary matching without a runtime flag check.
-        """
-        var ptr = Pointer(input.unsafe_ptr())
-        if anchor_type == AnchorKind.BOL:
-            return pos == 0
-        elif anchor_type == AnchorKind.BOL_MULTILINE:
-            return pos == 0 or input.unsafe_get(pos - 1) == CHAR_NEWLINE
-        elif anchor_type == AnchorKind.EOL:
-            return pos == input_len
-        elif anchor_type == AnchorKind.EOL_MULTILINE:
-            return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
-        elif anchor_type == AnchorKind.WORD_BOUNDARY:
-            var before_word = pos > 0 and Self._is_word_char(
-                ptr.unsafe_offset(pos - 1).unsafe_load()
-            )
-            var after_word = pos < input_len and Self._is_word_char(
-                ptr.unsafe_offset(pos).unsafe_load()
-            )
-            return before_word != after_word
-        elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
-            var before_word = pos > 0 and Self._is_word_char(
-                ptr.unsafe_offset(pos - 1).unsafe_load()
-            )
-            var after_word = pos < input_len and Self._is_word_char(
-                ptr.unsafe_offset(pos).unsafe_load()
-            )
-            return before_word == after_word
-        return False
-
-    @staticmethod
-    def _is_word_char(ch: Byte) -> Bool:
-        """Check if a character is a word character [a-zA-Z0-9_]."""
-        return is_word_byte(ch)
 
 
 def _bt_try_match[
@@ -852,27 +806,14 @@ def _bt_check_anchor[
         return pos == input_len
     elif anchor_type == AnchorKind.EOL_MULTILINE:
         return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
-    elif anchor_type == AnchorKind.WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
-        return left_is_word != right_is_word
-    elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
-        return left_is_word == right_is_word
+    elif (
+        anchor_type == AnchorKind.WORD_BOUNDARY
+        or anchor_type == AnchorKind.NOT_WORD_BOUNDARY
+    ):
+        var left = pos > 0 and is_word_byte(input.unsafe_get(pos - 1))
+        var right = pos < input_len and is_word_byte(input.unsafe_get(pos))
+        return (left != right) == (anchor_type == AnchorKind.WORD_BOUNDARY)
     return False
-
-
-def _bt_is_word_char(ch: Byte) -> Bool:
-    return is_word_byte(ch)
 
 
 def _bt_to_lower(ch: Byte) -> Byte:

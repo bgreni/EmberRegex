@@ -67,11 +67,6 @@ from .simd_kernels import (
 
 
 @always_inline
-def _sbt_is_word_char(ch: Byte) -> Bool:
-    return is_word_byte(ch)
-
-
-@always_inline
 def _sbt_to_lower(ch: Byte) -> Byte:
     if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
         return ch + 32
@@ -109,22 +104,13 @@ def _sbt_check_anchor[
         return pos == input_len
     elif anchor_type == AnchorKind.EOL_MULTILINE:
         return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
-    elif anchor_type == AnchorKind.WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _sbt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _sbt_is_word_char(input.unsafe_get(pos))
-        return left_is_word != right_is_word
-    elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _sbt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _sbt_is_word_char(input.unsafe_get(pos))
-        return left_is_word == right_is_word
+    elif (
+        anchor_type == AnchorKind.WORD_BOUNDARY
+        or anchor_type == AnchorKind.NOT_WORD_BOUNDARY
+    ):
+        var left = pos > 0 and is_word_byte(input.unsafe_get(pos - 1))
+        var right = pos < input_len and is_word_byte(input.unsafe_get(pos))
+        return (left != right) == (anchor_type == AnchorKind.WORD_BOUNDARY)
     return False
 
 
