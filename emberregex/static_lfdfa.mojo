@@ -516,26 +516,17 @@ def build_lf_dfa(
             acc_h ^= _WB_PREV_SALT
         var found = -1
         var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
-        for j in range(4):
-            if found >= 0:
-                break
-            var word: UInt64
-            if j == 0:
-                word = _lane_word(eqm.slice[64, offset=0]())
-            elif j == 1:
-                word = _lane_word(eqm.slice[64, offset=64]())
-            elif j == 2:
-                word = _lane_word(eqm.slice[64, offset=128]())
-            else:
-                word = _lane_word(eqm.slice[64, offset=192]())
-            while word != 0:
-                var cand = 64 * j + Int(count_trailing_zeros(word))
-                word &= word - 1
-                if cand >= len(st_list):
-                    break
-                if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
-                    found = cand
-                    break
+        comptime for j in range(4):
+            if found < 0:
+                var word = _lane_word(eqm.slice[64, offset=64 * j]())
+                while word != 0:
+                    var cand = 64 * j + Int(count_trailing_zeros(word))
+                    word &= word - 1
+                    if cand >= len(st_list):
+                        break
+                    if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
+                        found = cand
+                        break
         if found < 0:
             found = len(st_list)
             hashv[found] = acc_h
@@ -1019,26 +1010,19 @@ def build_lf_dfa(
                     acc_h ^= _WB_PREV_SALT
                 var found = -1
                 var eqm = hashv.eq(SIMD[DType.uint64, 256](acc_h))
-                for j in range(4):
-                    if found >= 0:
-                        break
-                    var word: UInt64
-                    if j == 0:
-                        word = _lane_word(eqm.slice[64, offset=0]())
-                    elif j == 1:
-                        word = _lane_word(eqm.slice[64, offset=64]())
-                    elif j == 2:
-                        word = _lane_word(eqm.slice[64, offset=128]())
-                    else:
-                        word = _lane_word(eqm.slice[64, offset=192]())
-                    while word != 0:
-                        var cand = 64 * j + Int(count_trailing_zeros(word))
-                        word &= word - 1
-                        if cand >= len(st_list):
-                            break
-                        if ((st_list.unsafe_get(cand) ^ acc).reduce_or()) == 0:
-                            found = cand
-                            break
+                comptime for j in range(4):
+                    if found < 0:
+                        var word = _lane_word(eqm.slice[64, offset=64 * j]())
+                        while word != 0:
+                            var cand = 64 * j + Int(count_trailing_zeros(word))
+                            word &= word - 1
+                            if cand >= len(st_list):
+                                break
+                            if (
+                                (st_list.unsafe_get(cand) ^ acc).reduce_or()
+                            ) == 0:
+                                found = cand
+                                break
                 if found < 0:
                     if len(st_list) >= EDFA_STATE_CAP + 1:
                         return result^  # state blowup: stay invalid
