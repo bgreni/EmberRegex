@@ -1723,20 +1723,9 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     def _sbt_match_at[
         origin: Origin, //
     ](self, input: Span[Byte, origin], start: Int) -> Int:
-        """`_sbt_match_at` discarding the capture slots."""
+        """`_sbt_match_at` discarding the capture slots, with a fresh
+        LF_SBT_ATTEMPT_BUDGET."""
         var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-        return self._sbt_match_at(input, start, slots)
-
-    @always_inline
-    def _sbt_match_at[
-        origin: Origin, //
-    ](
-        self,
-        input: Span[Byte, origin],
-        start: Int,
-        mut slots: Array[Int, Self._num_slots],
-    ) -> Int:
-        """`_sbt_match_at` with a fresh LF_SBT_ATTEMPT_BUDGET."""
         var budget = LF_SBT_ATTEMPT_BUDGET
         return self._sbt_match_at(input, start, slots, budget)
 
