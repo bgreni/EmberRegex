@@ -2045,16 +2045,39 @@ def _sbt_try_match[
                 ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
             return -1
 
-        elif kind == NFAStateKind.LOOKAHEAD:
+        elif (
+            kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND
+        ):
+            var matched = False
             var sub_slots = slots.copy()
-            var sub_result = _sbt_try_match[
-                pattern=pattern,
-                state_idx=state.sub_start,
-                num_slots=num_slots,
-                anchored_end=False,
-                memo_on=memo_on,
-            ](input, pos, sub_slots, budget, memo_addr, stack_floor, end_at)
-            var matched = sub_result >= 0
+            comptime if kind == NFAStateKind.LOOKAHEAD:
+                var sub_result = _sbt_try_match[
+                    pattern=pattern,
+                    state_idx=state.sub_start,
+                    num_slots=num_slots,
+                    anchored_end=False,
+                    memo_on=memo_on,
+                ](input, pos, sub_slots, budget, memo_addr, stack_floor, end_at)
+                matched = sub_result >= 0
+            else:
+                comptime lb_len = state.lookbehind_len
+                if pos >= lb_len:
+                    var sub_result = _sbt_try_match[
+                        pattern=pattern,
+                        state_idx=state.sub_start,
+                        num_slots=num_slots,
+                        anchored_end=False,
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos - lb_len,
+                        sub_slots,
+                        budget,
+                        memo_addr,
+                        stack_floor,
+                        end_at,
+                    )
+                    matched = sub_result >= 0 and sub_result == pos
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
@@ -2079,70 +2102,6 @@ def _sbt_try_match[
                     # writes (Python/PCRE/Perl/Ruby/JS all agree); restore
                     # them if the continuation fails so outer backtracking
                     # cannot leak them into other attempts.
-                    var saved_slots = slots.copy()
-                    slots = sub_slots^
-                    var cont = _sbt_try_match[
-                        pattern=pattern,
-                        state_idx=state.out1,
-                        num_slots=num_slots,
-                        anchored_end=anchored_end,
-                        memo_on=memo_on,
-                    ](
-                        input,
-                        pos,
-                        slots,
-                        budget,
-                        memo_addr,
-                        stack_floor,
-                        end_at,
-                    )
-                    if cont < 0:
-                        slots = saved_slots^
-                    return cont
-                return -1
-
-        elif kind == NFAStateKind.LOOKBEHIND:
-            comptime lb_len = state.lookbehind_len
-            var matched = False
-            var sub_slots = slots.copy()
-            if pos >= lb_len:
-                var sub_result = _sbt_try_match[
-                    pattern=pattern,
-                    state_idx=state.sub_start,
-                    num_slots=num_slots,
-                    anchored_end=False,
-                    memo_on=memo_on,
-                ](
-                    input,
-                    pos - lb_len,
-                    sub_slots,
-                    budget,
-                    memo_addr,
-                    stack_floor,
-                    end_at,
-                )
-                matched = sub_result >= 0 and sub_result == pos
-            comptime if state.negated:
-                if not matched:
-                    return _sbt_try_match[
-                        pattern=pattern,
-                        state_idx=state.out1,
-                        num_slots=num_slots,
-                        anchored_end=anchored_end,
-                        memo_on=memo_on,
-                    ](
-                        input,
-                        pos,
-                        slots,
-                        budget,
-                        memo_addr,
-                        stack_floor,
-                        end_at,
-                    )
-                return -1
-            else:
-                if matched:
-                    # Same keep/restore rule as LOOKAHEAD above.
                     var saved_slots = slots.copy()
                     slots = sub_slots^
                     var cont = _sbt_try_match[

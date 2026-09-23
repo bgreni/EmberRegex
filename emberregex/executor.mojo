@@ -432,52 +432,41 @@ struct PikeVM[num_slots: Int](Copyable):
                     continue
                 return
 
-            elif kind == NFAStateKind.LOOKAHEAD:
+            elif (
+                kind == NFAStateKind.LOOKAHEAD
+                or kind == NFAStateKind.LOOKBEHIND
+            ):
                 gen.unsafe_set(state_idx, gen_val)
+                var matched = False
                 var sub_slots = slots.copy()
-                var match_end = _bt_try_match(
-                    self.nfa, input, state.sub_start, pos, sub_slots
-                )
-                if (match_end >= 0) != state.negated:
-                    if match_end >= 0:
+                if kind == NFAStateKind.LOOKAHEAD:
+                    matched = (
+                        _bt_try_match(
+                            self.nfa, input, state.sub_start, pos, sub_slots
+                        )
+                        >= 0
+                    )
+                else:
+                    var lb_len = state.lookbehind_len
+                    if pos >= lb_len:
+                        matched = (
+                            _bt_try_match(
+                                self.nfa,
+                                input,
+                                state.sub_start,
+                                pos - lb_len,
+                                sub_slots,
+                            )
+                            == pos
+                        )
+                if matched != state.negated:
+                    if matched:
                         # Successful POSITIVE assertion: the continuation
                         # sees its capture writes; restore after the
                         # subtree so sibling threads are unaffected
                         # (mirrors the SAVE branch above).
                         var saved_slots = slots.copy()
                         slots = sub_slots^
-                        self._add_state(
-                            state_list,
-                            slot_data,
-                            gen,
-                            gen_val,
-                            state.out1,
-                            slots,
-                            input,
-                            input_len,
-                            pos,
-                        )
-                        slots = saved_slots^
-                        return
-                    state_idx = state.out1
-                    continue
-                return
-
-            elif kind == NFAStateKind.LOOKBEHIND:
-                gen.unsafe_set(state_idx, gen_val)
-                var lb_len = state.lookbehind_len
-                var lb_matched = False
-                var lb_slots = slots.copy()
-                if pos >= lb_len:
-                    var match_end = _bt_try_match(
-                        self.nfa, input, state.sub_start, pos - lb_len, lb_slots
-                    )
-                    lb_matched = match_end == pos
-                if lb_matched != state.negated:
-                    if lb_matched:
-                        # Same keep/restore rule as LOOKAHEAD above.
-                        var saved_slots = slots.copy()
-                        slots = lb_slots^
                         self._add_state(
                             state_list,
                             slot_data,
