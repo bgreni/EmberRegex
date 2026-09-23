@@ -257,21 +257,19 @@ def _pike_add[
 
 
 def _flush_spans(
-    mut ids: List[Int], mut som: List[Int], end: Int, mut out: List[SetSpan]
+    ids: List[Int], som: List[Int], end: Int, mut out: List[SetSpan]
 ):
-    """Emit this position's reports in ascending id order."""
-    for i in range(1, len(ids)):
-        var key = ids[i]
-        var key_som = som[i]
-        var j = i - 1
-        while j >= 0 and ids[j] > key:
-            ids[j + 1] = ids[j]
-            som[j + 1] = som[j]
-            j -= 1
-        ids[j + 1] = key
-        som[j + 1] = key_som
+    """Emit this position's reports in ascending id order (ids are unique
+    per position: one MATCH state per pattern, visited once)."""
+    var base = len(out)
     for i in range(len(ids)):
         out.append(SetSpan(ids[i], som[i], end))
+
+    @always_inline
+    def by_id(a: SetSpan, b: SetSpan) -> Bool:
+        return a.id < b.id
+
+    sort(Span(out)[base:], by_id)
 
 
 def _flush_reports(mut ids: List[Int], end: Int, mut out: List[SetMatch]):
