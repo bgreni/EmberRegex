@@ -66,17 +66,8 @@ struct MatchResult[num_slots: Int](Copyable, Movable, Writable):
         return self.slots[2 * index - 2] != -1
 
     def group_str(self, input: String, index: Int) -> String:
-        """Extract the text matched by capture group `index` (1-based).
-
-        Returns empty string if the group didn't match.
-        """
-        if index < 1 or index > Self.group_count or not self.matched:
-            return ""
-        var s = self.slots[2 * index - 2]
-        var e = self.slots[2 * index - 1]
-        if s == -1 or e == -1:
-            return ""
-        return String(unsafe_from_utf8=input.as_bytes()[s:e])
+        """`group_str` over `input`'s bytes."""
+        return self.group_str(input.as_bytes(), index)
 
     def group_str[
         origin: Origin, //

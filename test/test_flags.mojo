@@ -1,6 +1,6 @@
 """Tests for inline flags: (?i) ignorecase, (?m) multiline, (?s) dotall."""
 
-from emberregex import Regex
+from emberregex import Regex, RegexFlags
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -108,6 +108,25 @@ def test_dotall_multiple_newlines() raises:
 def test_combined_ignorecase_multiline() raises:
     var re = Regex["(?im)^hello"]()
     assert_true(re.search("foo\nHELLO").matched)
+
+
+def test_explicit_flags_param() raises:
+    # Regex[p, flags] compiles `(?flags)p` (after any leading verbs) and
+    # the default flags leave the pattern untouched.
+    comptime I = RegexFlags(RegexFlags.IGNORECASE)
+    comptime IM = I | RegexFlags(RegexFlags.MULTILINE)
+    comptime assert Regex["(?i)hello"]._pat == "(?i)hello"
+    comptime assert Regex["hello", I]._pat == "(?i)hello"
+    comptime assert Regex["(*UTF8)a", IM]._pat == "(*UTF8)(?im)a"
+    var re = Regex["hello", I]()
+    var inline = Regex["(?i)hello"]()
+    for s in ["hElLo", "HELLO", "hell"]:
+        assert_equal(re.match(s).matched, inline.match(s).matched)
+    var re2 = Regex["^hello", IM]()
+    var inline2 = Regex["(?im)^hello"]()
+    var r = re2.search("foo\nHELLO")
+    assert_true(r.matched)
+    assert_equal(r.span(), inline2.search("foo\nHELLO").span())
 
 
 def test_combined_all_three() raises:
