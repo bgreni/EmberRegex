@@ -828,7 +828,7 @@ def extract_inner_literal(nfa: NFA, cyclic: List[Bool]) -> InnerLiteral:
 
     Among the collected runs, positions at fixed offset 0 are dropped and
     the rarest run of length >= 2 wins (score = the run's rarest byte by
-    _probe_rank_table, caseless positions counting both cases; ties
+    PROBE_RANKS, caseless positions counting both cases; ties
     prefer the longer run)."""
     var res = InnerLiteral()
     var n = len(nfa.states)
@@ -1056,7 +1056,7 @@ def select_probe_offsets(
     prefix: List[UInt8], caseless: List[Bool]
 ) -> Tuple[Int, Int]:
     """Comptime: offsets of the two rarest prefix positions for the
-    two-byte candidate filter, per _probe_rank_table. A caseless position
+    two-byte candidate filter, per PROBE_RANKS. A caseless position
     matches both cases, so its rank is the sum of both cases' frequencies.
     Ties prefer later offsets (larger spread rejects repeated-byte runs
     sooner). Requires len(prefix) >= 2; returns (off_a, off_b) with

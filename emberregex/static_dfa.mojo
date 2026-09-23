@@ -827,7 +827,7 @@ def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
 
 struct _FlatNFA:
     """Byte classes plus one flat pass over the NFA — the setup every bitset
-    determinizer shares. Built ONCE per build, in place (`var f =
+    determinizer shares. Built ONCE per build, in place (`var flat =
     _FlatNFA(nfa)`); callers bind the fields they need to locals with `ref`
     and pass those, never the struct, into the hot loops, which then never
     carry an aggregate across a call boundary."""
@@ -960,7 +960,7 @@ def _eol_ok_bits(
 ):
     """Comptime: pending-EOL resolution per anchor state, as bitsets — does
     its continuation reach MATCH at end of input (`eol_end_ok`) / at a
-    '\n' (`eol_nl_ok`)? The question `_check_eol_match` asks per member,
+    '\\n' (`eol_nl_ok`)? The question `_check_eol_match` asks per member,
     precomputed so a state's flags are bitset ANDs."""
     for s in range(len(f.kinds)):
         if (f.eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
@@ -1675,8 +1675,8 @@ def _edfa_finish(
     `starts` holds any number of start ids in the caller's order, the
     first three being (other, after-'\\n', at-0) for the `start_*`
     fields; the permuted ids come back in the same order so a producer
-    with extra start contexts (the leftmost-first DFA's anchored starts)
-    can record them. The first `nregion` of them are the candidates for
+    with extra ids to track (the leftmost-first DFA's look-behind-"word"
+    states, `LFDFA.prev_ids`) can record them. The first `nregion` of them are the candidates for
     region acceleration (the unanchored start contexts). Marks `result`
     valid.
     """
