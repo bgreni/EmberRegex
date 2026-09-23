@@ -1844,9 +1844,6 @@ def _find_exit2[
     return input_len
 
 
-
-
-
 @always_inline
 def _edfa_accel_skip[
     origin: Origin, //, d: EagerDFA
