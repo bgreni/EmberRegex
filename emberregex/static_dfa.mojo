@@ -551,44 +551,6 @@ def _wb_normalize(fl: Int) -> Int:
     return fl
 
 
-def _wb_cont_reaches_bol(nfa: NFA) -> Bool:
-    """Comptime: does some word anchor's epsilon continuation reach a BOL
-    kind (`\\b^`, `(?m)\\b^x`)? The DFA lanes expand a word anchor's
-    continuation when the anchor resolves, without the position context
-    a BOL kind needs, so such patterns stay off them (the mirror of
-    `_eol_continuation_crosses_anchor`). The walk follows every anchor
-    conservatively."""
-    var num_states = len(nfa.states)
-    for i in range(num_states):
-        if nfa.states[i].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[i].anchor_type
-        if (
-            at != AnchorKind.WORD_BOUNDARY
-            and at != AnchorKind.NOT_WORD_BOUNDARY
-        ):
-            continue
-        var visited = List[Bool](length=num_states, fill=False)
-        var stack: List[Int] = [nfa.states[i].out1]
-        while len(stack) > 0:
-            var s = stack.pop()
-            if s < 0 or s >= num_states or visited[s]:
-                continue
-            visited[s] = True
-            var kind = nfa.states[s].kind
-            if kind == NFAStateKind.SPLIT:
-                stack.append(nfa.states[s].out1)
-                stack.append(nfa.states[s].out2)
-            elif kind == NFAStateKind.SAVE:
-                stack.append(nfa.states[s].out1)
-            elif kind == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[s].anchor_type
-                if at2 == AnchorKind.BOL or at2 == AnchorKind.BOL_MULTILINE:
-                    return True
-                stack.append(nfa.states[s].out1)
-    return False
-
-
 struct EagerDFA(Copyable, Movable):
     """Comptime-computed DFA: flat transition table + per-state flags.
 
@@ -675,66 +637,20 @@ struct EagerDFA(Copyable, Movable):
         self.region_land = List[Int]()
 
 
-def _eol_ml_continuation_consumes(nfa: NFA) -> Bool:
-    """Comptime: does any EOL_MULTILINE anchor's continuation consume?
-
-    The DFA lanes keep EOL anchors unresolved in state sets and resolve
-    them via per-state flags, so a continuation that must consume more
-    input (e.g. `(?m)a$\\nb`) is unreachable there — the DFA silently
-    under-reports. Such patterns must stay off the DFA lanes. Strict EOL
-    needs no such guard: it holds only at end of input, where a
-    consuming continuation is provably dead. The walk follows any
-    anchor conservatively (assume it could hold).
-    """
+def _anchor_cont_hits[
+    seed_mask: Int, hit_anchor_mask: Int, hit_consuming: Bool
+](nfa: NFA) -> Bool:
+    """Comptime: does the epsilon continuation (`out1`) of some anchor whose
+    kind is in `seed_mask` reach an anchor whose kind is in
+    `hit_anchor_mask`, or, with `hit_consuming`, a consuming state (CHAR,
+    CHARSET, ANY, BACKREF)? Masks are `1 << AnchorKind`. The walk follows
+    SPLIT, SAVE and every other anchor (conservatively assuming it holds);
+    anything else ends it."""
     var num_states = len(nfa.states)
     for i in range(num_states):
         if nfa.states[i].kind != NFAStateKind.ANCHOR:
             continue
-        if nfa.states[i].anchor_type != AnchorKind.EOL_MULTILINE:
-            continue
-        var visited = List[Bool](length=num_states, fill=False)
-        var stack: List[Int] = [nfa.states[i].out1]
-        while len(stack) > 0:
-            var s = stack.pop()
-            if s < 0 or s >= num_states or visited[s]:
-                continue
-            visited[s] = True
-            var kind = nfa.states[s].kind
-            if (
-                kind == NFAStateKind.CHAR
-                or kind == NFAStateKind.CHARSET
-                or kind == NFAStateKind.ANY
-                or kind == NFAStateKind.BACKREF
-            ):
-                return True
-            if kind == NFAStateKind.SPLIT:
-                stack.append(nfa.states[s].out1)
-                stack.append(nfa.states[s].out2)
-            elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
-                stack.append(nfa.states[s].out1)
-    return False
-
-
-def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
-    """Comptime: does any EOL anchor's continuation reach an anchor whose
-    truth is NOT implied by the EOL that precedes it?
-
-    The DFA lanes resolve EOL anchors with per-state flag bytes, which
-    carry one bit of context ("we are at a '\\n'" / "we are at the end").
-    A nested EOL anchor is fine — `_reaches_match` follows the kinds that
-    hold in the same context, which is what makes `ab$$` work. A BOL kind
-    or a word boundary is not: whether it holds depends on the *preceding*
-    byte, which the flag cannot express, so the walk would have to guess.
-    Such patterns stay off these lanes rather than guess (the same
-    treatment `_eol_ml_continuation_consumes` gives consuming
-    continuations).
-    """
-    var num_states = len(nfa.states)
-    for i in range(num_states):
-        if nfa.states[i].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[i].anchor_type
-        if at != AnchorKind.EOL and at != AnchorKind.EOL_MULTILINE:
+        if (seed_mask >> nfa.states[i].anchor_type) & 1 == 0:
             continue
         var visited = List[Bool](length=num_states, fill=False)
         var stack: List[Int] = [nfa.states[i].out1]
@@ -750,14 +666,51 @@ def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
             elif kind == NFAStateKind.SAVE:
                 stack.append(nfa.states[s].out1)
             elif kind == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[s].anchor_type
-                if at2 == AnchorKind.EOL or at2 == AnchorKind.EOL_MULTILINE:
-                    stack.append(nfa.states[s].out1)
-                else:
+                if (hit_anchor_mask >> nfa.states[s].anchor_type) & 1 != 0:
                     return True
-            # consuming states end the walk; the consuming case has its
-            # own guard (_eol_ml_continuation_consumes)
+                stack.append(nfa.states[s].out1)
+            elif hit_consuming and (
+                kind == NFAStateKind.CHAR
+                or kind == NFAStateKind.CHARSET
+                or kind == NFAStateKind.ANY
+                or kind == NFAStateKind.BACKREF
+            ):
+                return True
     return False
+
+
+comptime _EOL_KINDS = (1 << AnchorKind.EOL) | (1 << AnchorKind.EOL_MULTILINE)
+
+comptime _wb_cont_reaches_bol = _anchor_cont_hits[
+    (1 << AnchorKind.WORD_BOUNDARY) | (1 << AnchorKind.NOT_WORD_BOUNDARY),
+    (1 << AnchorKind.BOL) | (1 << AnchorKind.BOL_MULTILINE),
+    False,
+]
+"""Does some word anchor's continuation reach a BOL kind (`\\b^`,
+`(?m)\\b^x`)? The DFA lanes expand a word anchor's continuation when the
+anchor resolves, without the position context a BOL kind needs, so such
+patterns stay off them."""
+
+comptime _eol_ml_continuation_consumes = _anchor_cont_hits[
+    1 << AnchorKind.EOL_MULTILINE, 0, True
+]
+"""Does any EOL_MULTILINE anchor's continuation consume? The DFA lanes keep
+EOL anchors unresolved in state sets and resolve them via per-state flags,
+so a continuation that must consume more input (`(?m)a$\\nb`) is
+unreachable there and the DFA would silently under-report. Strict EOL
+needs no such guard: it holds only at end of input, where a consuming
+continuation is provably dead."""
+
+comptime _eol_continuation_crosses_anchor = _anchor_cont_hits[
+    _EOL_KINDS, ~_EOL_KINDS, False
+]
+"""Does any EOL anchor's continuation reach an anchor whose truth is NOT
+implied by the EOL before it? The flag bytes carry one bit of context ("at
+a '\\n'" / "at the end"): a nested EOL is fine (`_reaches_match` follows
+it, which is what makes `ab$$` work), but a BOL kind or word boundary
+depends on the PRECEDING byte, so such patterns stay off these lanes
+rather than guess. (Consuming continuations are
+`_eol_ml_continuation_consumes`'s.)"""
 
 
 # Folded into a state's hash when its look-behind class is "word".
