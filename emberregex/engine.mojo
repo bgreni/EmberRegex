@@ -2220,12 +2220,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 comptime sb = Self._sandwich.suffix[i]
                 if ptr[unsafe_offset=input_len - suffix_len + i] != sb:
                     return MatchResult[Self._num_slots].no_match()
-            return MatchResult[Self._num_slots](
-                matched=True,
-                start=0,
-                end=input_len,
-                slots=Array[Int, Self._num_slots](fill=-1),
-            )
+            return Self._span_result(0, input_len)
         elif Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2235,22 +2230,12 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     width=Self._strategy.prefix_len
                 ]()
                 if chunk == lit:
-                    return MatchResult[Self._num_slots](
-                        matched=True,
-                        start=0,
-                        end=Self._strategy.prefix_len,
-                        slots=Array[Int, Self._num_slots](fill=-1),
-                    )
+                    return Self._span_result(0, Self._strategy.prefix_len)
             return MatchResult[Self._num_slots].no_match()
         elif Self._strategy.use_dfa:
             try:
                 if self._dfa_full_match(input):
-                    return MatchResult[Self._num_slots](
-                        matched=True,
-                        start=0,
-                        end=input.byte_length(),
-                        slots=Array[Int, Self._num_slots](fill=-1),
-                    )
+                    return Self._span_result(0, input.byte_length())
                 return MatchResult[Self._num_slots].no_match()
             except:
                 # Only the lazy DFA can raise here (DFA_STATE_CAP): for
@@ -2335,12 +2320,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             var pos = simd_find_literal(input_bytes, lit, 0)
             if pos < 0:
                 return MatchResult[Self._num_slots].no_match()
-            return MatchResult[Self._num_slots](
-                matched=True,
-                start=pos,
-                end=pos + Self._strategy.prefix_len,
-                slots=Array[Int, Self._num_slots](fill=-1),
-            )
+            return Self._span_result(pos, pos + Self._strategy.prefix_len)
         elif Self._use_lf_lane:
             # The same two-line prologue opens every leftmost-first lane
             # verb: the walk's state lives in the verb's frame and the
@@ -2367,11 +2347,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 comptime if Self._strategy.start_anchor == AnchorKind.BOL:
                     var match_end = self._dfa_match_at(input_bytes, 0)
                     if match_end >= 0:
-                        return MatchResult[Self._num_slots](
-                            matched=True,
-                            start=0,
-                            end=self._lf_end_at(input_bytes, 0, match_end),
-                            slots=Array[Int, Self._num_slots](fill=-1),
+                        return Self._span_result(
+                            0, self._lf_end_at(input_bytes, 0, match_end)
                         )
                     return MatchResult[Self._num_slots].no_match()
 
@@ -2382,13 +2359,9 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     while pos <= input_len:
                         var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
-                            return MatchResult[Self._num_slots](
-                                matched=True,
-                                start=pos,
-                                end=self._lf_end_at(
-                                    input_bytes, pos, match_end
-                                ),
-                                slots=Array[Int, Self._num_slots](fill=-1),
+                            return Self._span_result(
+                                pos,
+                                self._lf_end_at(input_bytes, pos, match_end),
                             )
                         var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                         if nl < 0:
@@ -2407,13 +2380,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 return MatchResult[Self._num_slots].no_match()
                             var match_end = self._dfa_match_at(input_bytes, pos)
                             if match_end >= 0:
-                                return MatchResult[Self._num_slots](
-                                    matched=True,
-                                    start=pos,
-                                    end=self._lf_end_at(
+                                return Self._span_result(
+                                    pos,
+                                    self._lf_end_at(
                                         input_bytes, pos, match_end
                                     ),
-                                    slots=Array[Int, Self._num_slots](fill=-1),
                                 )
                             pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         else:
@@ -2421,13 +2392,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                                 input_bytes, pos
                             )
                             if range[0] >= 0:
-                                return MatchResult[Self._num_slots](
-                                    matched=True,
-                                    start=range[0],
-                                    end=self._lf_end_at(
+                                return Self._span_result(
+                                    range[0],
+                                    self._lf_end_at(
                                         input_bytes, range[0], range[1]
                                     ),
-                                    slots=Array[Int, Self._num_slots](fill=-1),
                                 )
                             return MatchResult[Self._num_slots].no_match()
                     return MatchResult[Self._num_slots].no_match()
@@ -3196,11 +3165,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 if literal_replacement:
                     output += replacement
                 else:
-                    var match_result = MatchResult[Self._num_slots](
-                        matched=True,
-                        start=pos,
-                        end=pos + Self._strategy.prefix_len,
-                        slots=Array[Int, Self._num_slots](fill=-1),
+                    var match_result = Self._span_result(
+                        pos, pos + Self._strategy.prefix_len
                     )
                     output += self._expand_replacement(
                         input_bytes, match_result, replacement
@@ -3329,12 +3295,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             if literal_replacement:
                 output += replacement
             else:
-                var match_result = MatchResult[Self._num_slots](
-                    matched=True,
-                    start=start,
-                    end=end,
-                    slots=Array[Int, Self._num_slots](fill=-1),
-                )
+                var match_result = Self._span_result(start, end)
                 output += self._expand_replacement(
                     input_bytes, match_result, replacement
                 )
