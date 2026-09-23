@@ -409,6 +409,35 @@ struct Parser[origin: Origin](Movable):
                 at,
             )
 
+    def _utf8_tail(mut self, lead: Byte) -> UInt32:
+        """Codepoint of the UTF-8 sequence whose lead byte (>= 0xC0) was
+        just consumed: reads its 1-3 continuation bytes, stopping early at
+        the end of the pattern."""
+        var extra = 1
+        var cp = UInt32(lead) & 0x1F
+        if lead >= 0xF0:
+            extra = 3
+            cp = UInt32(lead) & 0x07
+        elif lead >= 0xE0:
+            extra = 2
+            cp = UInt32(lead) & 0x0F
+        for _ in range(extra):
+            if self._at_end():
+                break
+            cp = (cp << 6) | (UInt32(self._advance()) & 0x3F)
+        return cp
+
+    def _parse_control(mut self) raises -> UInt32:
+        """`\\cX`, after the `c`. PCRE/Perl formula: uppercase X, then XOR
+        0x40 (identical to & 0x1F for letters, differs for punctuation:
+        \\c{ is ';', \\c; is '{')."""
+        if self._at_end():
+            raise _regex_error("Expected character after \\c", self.pos - 1)
+        var ctrl = Int(self._advance())
+        if ctrl >= 97 and ctrl <= 122:
+            ctrl -= 32
+        return UInt32(ctrl ^ 0x40)
+
     def _skip_verbose(mut self):
         """Skip whitespace and # comments when verbose mode is active."""
         if not self.inline_flags.verbose():
@@ -473,20 +502,7 @@ struct Parser[origin: Origin](Movable):
             # to the same sequence but makes `α+` quantify only the last
             # byte — the reason this branch exists.
             if self.inline_flags.unicode() and ch >= 0xC0:
-                var extra = 1
-                var cp = UInt32(ch) & 0x1F
-                if ch >= 0xF0:
-                    extra = 3
-                    cp = UInt32(ch) & 0x07
-                elif ch >= 0xE0:
-                    extra = 2
-                    cp = UInt32(ch) & 0x0F
-                for _ in range(extra):
-                    if self._at_end():
-                        break
-                    var cont = self._advance()
-                    cp = (cp << 6) | (UInt32(cont) & 0x3F)
-                return self.ast.add_node(ASTNode.literal(cp))
+                return self.ast.add_node(ASTNode.literal(self._utf8_tail(ch)))
             return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
     def _consume_verbs(mut self) raises:
@@ -751,32 +767,45 @@ struct Parser[origin: Origin](Movable):
         elif ch == CHAR_Z_LOWER or ch == CHAR_Z_UPPER:
             return self.ast.add_node(ASTNode.anchor(AnchorKind.EOS))
 
-        # Horizontal / vertical whitespace classes, PCRE and Hyperscan
-        # semantics. NOTE the deliberate divergence from Python, where \v
-        # is the single vertical-tab character rather than a class
-        # (decided 2026-07-27; Hyperscan parity is this plan's goal and
-        # \v previously errored, so nothing silently changed meaning).
-        if ch == CHAR_H_LOWER or ch == CHAR_H_UPPER:
-            var cs = CharSet()
-            cs.add_range(UInt32(CHAR_SPACE), UInt32(CHAR_SPACE))
-            cs.add_range(UInt32(CHAR_TAB), UInt32(CHAR_TAB))
-            if ch == CHAR_H_UPPER:
+        # Shorthand classes \h \v \d \w \s; the uppercase forms (\H \V \D
+        # \W \S) are their complements. \h / \v are the horizontal /
+        # vertical whitespace classes, PCRE and Hyperscan semantics. NOTE
+        # the deliberate divergence from Python, where \v is the single
+        # vertical-tab character rather than a class (decided 2026-07-27;
+        # Hyperscan parity is this plan's goal and \v previously errored,
+        # so nothing silently changed meaning).
+        if (
+            ch == CHAR_H_LOWER
+            or ch == CHAR_H_UPPER
+            or ch == CHAR_V_LOWER
+            or ch == CHAR_V_UPPER
+            or ch == CHAR_D_LOWER
+            or ch == CHAR_D_UPPER
+            or ch == CHAR_W_LOWER
+            or ch == CHAR_W_UPPER
+            or ch == CHAR_S_LOWER
+            or ch == CHAR_S
+        ):
+            var cs: CharSet
+            if ch == CHAR_H_LOWER or ch == CHAR_H_UPPER:
+                cs = CharSet()
+                cs.add_range(UInt32(CHAR_SPACE), UInt32(CHAR_SPACE))
+                cs.add_range(UInt32(CHAR_TAB), UInt32(CHAR_TAB))
+            elif ch == CHAR_V_LOWER or ch == CHAR_V_UPPER:
+                cs = CharSet()
+                cs.add_range(UInt32(CHAR_NEWLINE), UInt32(CHAR_CR))  # \n-\r
+            elif ch == CHAR_D_LOWER or ch == CHAR_D_UPPER:
+                cs = CharSet.digit()
+            elif ch == CHAR_W_LOWER or ch == CHAR_W_UPPER:
+                cs = CharSet.word()
+            else:
+                cs = CharSet.whitespace()
+            var negated = ch <= CHAR_Z_UPPER  # the uppercase forms
+            if negated:
                 cs.negate()
             cs.build_bitmap()
             var cs_idx = self.ast.add_charset(cs^)
-            return self.ast.add_node(
-                ASTNode.char_class(cs_idx, ch == CHAR_H_UPPER)
-            )
-        if ch == CHAR_V_LOWER or ch == CHAR_V_UPPER:
-            var cs = CharSet()
-            cs.add_range(UInt32(CHAR_NEWLINE), UInt32(CHAR_CR))  # \n \v \f \r
-            if ch == CHAR_V_UPPER:
-                cs.negate()
-            cs.build_bitmap()
-            var cs_idx = self.ast.add_charset(cs^)
-            return self.ast.add_node(
-                ASTNode.char_class(cs_idx, ch == CHAR_V_UPPER)
-            )
+            return self.ast.add_node(ASTNode.char_class(cs_idx, negated))
 
         # Word boundary anchors
         if ch == CHAR_B_LOWER:
@@ -886,37 +915,16 @@ struct Parser[origin: Origin](Movable):
         # Unicode escapes: \uHHHH and \UHHHHHHHH
         if ch == CHAR_U_LOWER:
             var cp = self._parse_hex_digits(4)
-            if cp > 255 and not self.inline_flags.unicode():
-                raise _regex_error(
-                    (
-                        "Unicode code point > U+00FF needs UTF-8 mode"
-                        " — prefix the pattern with (?u) or (*UTF8)"
-                    ),
-                    self.pos - 5,
-                )
+            self._check_needs_unicode(cp, self.pos - 5)
             return self.ast.add_node(ASTNode.literal(cp))
         if ch == CHAR_U_UPPER:
             var cp = self._parse_hex_digits(8)
-            if cp > 255 and not self.inline_flags.unicode():
-                raise _regex_error(
-                    (
-                        "Unicode code point > U+00FF needs UTF-8 mode"
-                        " — prefix the pattern with (?u) or (*UTF8)"
-                    ),
-                    self.pos - 9,
-                )
+            self._check_needs_unicode(cp, self.pos - 9)
             return self.ast.add_node(ASTNode.literal(cp))
 
-        # Control character: \cX — PCRE/Perl formula: uppercase X, then
-        # XOR 0x40 (identical to & 0x1F for letters, differs for
-        # punctuation: \c{ is ';', \c; is '{').
+        # Control character: \cX
         if ch == CHAR_C_LOWER:
-            if self._at_end():
-                raise _regex_error("Expected character after \\c", self.pos - 1)
-            var ctrl = Int(self._advance())
-            if ctrl >= 97 and ctrl <= 122:
-                ctrl -= 32
-            return self.ast.add_node(ASTNode.literal(UInt32(ctrl ^ 0x40)))
+            return self.ast.add_node(ASTNode.literal(self._parse_control()))
 
         # Unicode properties: \p{L}, \P{Nd}, \p{Greek}. The ranges are
         # CODEPOINT ranges; UTF-8 mode compiles them to byte sequences,
@@ -954,32 +962,6 @@ struct Parser[origin: Origin](Movable):
             pcs.build_bitmap()
             var pidx = self.ast.add_charset(pcs^)
             return self.ast.add_node(ASTNode.char_class(pidx, False))
-
-        # Shorthand character classes
-        if ch == CHAR_D_LOWER or ch == CHAR_D_UPPER:
-            var cs = CharSet.digit()
-            if ch == CHAR_D_UPPER:
-                cs.negate()
-            cs.build_bitmap()
-            var cs_idx = self.ast.add_charset(cs^)
-            var node = ASTNode.char_class(cs_idx, ch == CHAR_D_UPPER)
-            return self.ast.add_node(node^)
-        elif ch == CHAR_W_LOWER or ch == CHAR_W_UPPER:
-            var cs = CharSet.word()
-            if ch == CHAR_W_UPPER:
-                cs.negate()
-            cs.build_bitmap()
-            var cs_idx = self.ast.add_charset(cs^)
-            return self.ast.add_node(
-                ASTNode.char_class(cs_idx, ch == CHAR_W_UPPER)
-            )
-        elif ch == CHAR_S_LOWER or ch == CHAR_S:
-            var cs = CharSet.whitespace()
-            if ch == CHAR_S:
-                cs.negate()
-            cs.build_bitmap()
-            var cs_idx = self.ast.add_charset(cs^)
-            return self.ast.add_node(ASTNode.char_class(cs_idx, ch == CHAR_S))
 
         # Literal character escapes
         if ch == CHAR_t:
@@ -1032,24 +1014,7 @@ struct Parser[origin: Origin](Movable):
             # reading (each byte a member), which is what ROADMAP §3
             # records as the byte-mode charset question.
             if self.inline_flags.unicode() and ch >= 0xC0:
-                var extra = 1
-                if ch >= 0xF0:
-                    extra = 3
-                elif ch >= 0xE0:
-                    extra = 2
-                var cp: UInt32
-                if ch >= 0xF0:
-                    cp = UInt32(ch) & 0x07
-                elif ch >= 0xE0:
-                    cp = UInt32(ch) & 0x0F
-                else:
-                    cp = UInt32(ch) & 0x1F
-                for _ in range(extra):
-                    if self._at_end():
-                        break
-                    var cont = self._advance()
-                    cp = (cp << 6) | (UInt32(cont) & 0x3F)
-                return cp
+                return self._utf8_tail(ch)
             return UInt32(ch)
 
         # It is an escape
@@ -1103,34 +1068,14 @@ struct Parser[origin: Origin](Movable):
             return self._parse_hex_digits(2)
         elif esc == CHAR_U_LOWER:
             var cp = self._parse_hex_digits(4)
-            if cp > 255 and not self.inline_flags.unicode():
-                raise _regex_error(
-                    (
-                        "Unicode code point > U+00FF needs UTF-8 mode"
-                        " — prefix the pattern with (?u) or (*UTF8)"
-                    ),
-                    self.pos - 5,
-                )
+            self._check_needs_unicode(cp, self.pos - 5)
             return cp
         elif esc == CHAR_U_UPPER:
             var cp = self._parse_hex_digits(8)
-            if cp > 255 and not self.inline_flags.unicode():
-                raise _regex_error(
-                    (
-                        "Unicode code point > U+00FF needs UTF-8 mode"
-                        " — prefix the pattern with (?u) or (*UTF8)"
-                    ),
-                    self.pos - 9,
-                )
+            self._check_needs_unicode(cp, self.pos - 9)
             return cp
         elif esc == CHAR_C_LOWER:
-            # Same PCRE/Perl formula as the atom path: uppercase, XOR 0x40.
-            if self._at_end():
-                raise _regex_error("Expected character after \\c", self.pos - 1)
-            var ctrl = Int(self._advance())
-            if ctrl >= 97 and ctrl <= 122:
-                ctrl -= 32
-            return UInt32(ctrl ^ 0x40)
+            return self._parse_control()
         # Python's rule: an escaped ASCII letter or digit that is not a
         # recognized escape is an ERROR ([\p{L}] silently becoming the
         # literal set {p,{,L,}} was worse than a rejection). Escaped
