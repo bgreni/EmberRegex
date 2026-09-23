@@ -292,40 +292,28 @@ def simd_find_literal_rare[
     # where the tail dominates); a caseless first byte falls back to the
     # per-position verify.
     comptime c0 = cl[0]
-    comptime if not c0:
-        comptime fb = lit[0]
-        while True:
+    # An exact first byte is already verified by the hop.
+    comptime j0 = 0 if c0 else 1
+    while True:
+        comptime if not c0:
+            comptime fb = lit[0]
             var candidate = simd_find_byte(input, fb, pos)
             if candidate < 0:
                 return -1
             pos = candidate
-            if pos + n > input_len:
-                return -1
-            var ok = True
-            comptime for j in range(1, n):
-                comptime cj = cl[j]
-                comptime bj = lit[j]
-                if ok:
-                    ok = probe_eq1[caseless=cj, target=bj](
-                        input.unsafe_get(pos + j)
-                    )
+        if pos + n > input_len:
+            return -1
+        var ok = True
+        comptime for j in range(j0, n):
+            comptime cj = cl[j]
+            comptime bj = lit[j]
             if ok:
-                return pos
-            pos += 1
-    else:
-        while pos + n <= input_len:
-            var ok = True
-            comptime for j in range(n):
-                comptime cj = cl[j]
-                comptime bj = lit[j]
-                if ok:
-                    ok = probe_eq1[caseless=cj, target=bj](
-                        input.unsafe_get(pos + j)
-                    )
-            if ok:
-                return pos
-            pos += 1
-        return -1
+                ok = probe_eq1[caseless=cj, target=bj](
+                    input.unsafe_get(pos + j)
+                )
+        if ok:
+            return pos
+        pos += 1
 
 
 def simd_find_literal[
