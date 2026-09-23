@@ -13,6 +13,7 @@ which keeps its own 4096-state cap and Pike VM fallback.
 
 from std.bit import count_trailing_zeros, pop_count
 from std.collections import Array
+from std.math import iota
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
@@ -212,16 +213,9 @@ def _bs_eq(a: _StateBits, b: _StateBits) -> Bool:
     return (a ^ b).reduce_or() == 0
 
 
-def _mk_bs_salt() -> SIMD[DType.uint64, 64]:
-    """Distinct odd multiplier per lane so identical words in different
-    lanes hash differently."""
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
-    return v
-
-
-comptime _BS_SALT = _mk_bs_salt()
+# Distinct odd multiplier per lane so identical words in different lanes
+# hash differently.
+comptime _BS_SALT = (2 * iota[DType.uint64, 64]() + 1) * 0x9E3779B97F4A7C15
 
 
 @always_inline
@@ -748,14 +742,7 @@ def _classic_flags(
     return fl
 
 
-def _mk_iota256_i64() -> SIMD[DType.int64, 256]:
-    var v = SIMD[DType.int64, 256](0)
-    for i in range(256):
-        v[i] = Int64(i)
-    return v
-
-
-comptime _IOTA256_I64 = _mk_iota256_i64()
+comptime _IOTA256_I64 = iota[DType.int64, 256]()
 
 
 def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
@@ -939,35 +926,12 @@ comptime _MIN_CAP = 128
 comptime _COL_CHUNK = 8
 
 
-def _mk_bit64() -> SIMD[DType.uint64, 64]:
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(1) << UInt64(i)
-    return v
-
-
-comptime _BIT64 = _mk_bit64()
-
-
-def _mk_iota256() -> SIMD[DType.int32, 256]:
-    var v = SIMD[DType.int32, 256](0)
-    for i in range(256):
-        v[i] = Int32(i)
-    return v
-
-
-comptime _IOTA256 = _mk_iota256()
-
-
-def _mk_col_salt() -> SIMD[DType.uint64, _MIN_CAP]:
-    """Distinct odd multiplier per state lane, as in _mk_bs_salt."""
-    var v = SIMD[DType.uint64, _MIN_CAP](0)
-    for i in range(_MIN_CAP):
-        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
-    return v
-
-
-comptime _COL_SALT = _mk_col_salt()
+comptime _BIT64 = SIMD[DType.uint64, 64](1) << iota[DType.uint64, 64]()
+comptime _IOTA256 = iota[DType.int32, 256]()
+# Distinct odd multiplier per state lane, as in _BS_SALT.
+comptime _COL_SALT = (
+    2 * iota[DType.uint64, _MIN_CAP]() + 1
+) * 0x9E3779B97F4A7C15
 
 
 @always_inline

@@ -46,6 +46,7 @@ Continuation closures are memoized per target state in one flat pool.
 
 from std.bit import count_leading_zeros, count_trailing_zeros
 from std.collections import Array
+from std.math import iota
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE
@@ -215,14 +216,7 @@ comptime _LF_TAIL_SALT_O: UInt64 = 0x165667B19E3779F9
 comptime _LF_TAIL_SALT_N: UInt64 = 0x27D4EB2F165667C5
 
 
-def _mk_iota64() -> SIMD[DType.uint64, 64]:
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(i)
-    return v
-
-
-comptime _IOTA64 = _mk_iota64()
+comptime _IOTA64 = iota[DType.uint64, 64]()
 
 
 def _lf_memo_closure(
