@@ -82,3 +82,12 @@ def is_word_byte(ch: Byte) -> Bool:
         or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
         or ch == CHAR_UNDERSCORE
     )
+
+
+@always_inline
+def ascii_to_lower[dt: DType, //](ch: Scalar[dt]) -> Scalar[dt]:
+    """ASCII `A-Z` to `a-z`; every other value (bytes or codepoints) is
+    returned unchanged."""
+    if ch >= CHAR_A_UPPER.cast[dt]() and ch <= CHAR_Z_UPPER.cast[dt]():
+        return ch + 32
+    return ch

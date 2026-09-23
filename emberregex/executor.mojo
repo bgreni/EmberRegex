@@ -10,19 +10,8 @@ per-state heap allocations. SAVE states use in-place modification
 with restore-on-return to eliminate slot copying.
 """
 
-from .constants import (
-    CHAR_A_LOWER,
-    CHAR_A_UPPER,
-    CHAR_NEWLINE,
-    CHAR_NINE,
-    CHAR_UNDERSCORE,
-    CHAR_ZERO,
-    CHAR_Z_LOWER,
-    CHAR_Z_UPPER,
-    is_word_byte,
-)
-from .nfa import NFA, NFAState, NFAStateKind
-from .charset import CharSet
+from .constants import CHAR_NEWLINE, ascii_to_lower, is_word_byte
+from .nfa import NFA, NFAStateKind
 from .ast import AnchorKind
 from .result import MatchResult
 from std.collections import Array
@@ -128,14 +117,12 @@ struct PikeVM[num_slots: Int](Copyable):
         input: Span[Byte, origin],
         start_pos: Int,
         mut bufs: _VMBuffers,
-        max_pos: Int = -1,
         full: Bool = False,
         unanchored: Bool = False,
         end_at: Int = -1,
     ) -> MatchResult[Self.num_slots]:
         """Core NFA simulation using pre-allocated buffers.
 
-        If max_pos >= 0, limits processing to positions < max_pos.
         If full is True, MATCH only accepts at end of input (fullmatch);
         otherwise the VM implements leftmost-first (Python re) semantics.
         If unanchored is True, a fresh start-state thread is injected at
@@ -145,16 +132,14 @@ struct PikeVM[num_slots: Int](Copyable):
         If end_at >= 0, MATCH accepts only at exactly that position (the
         first thread in priority order there wins, as in fullmatch) and
         the simulation stops there — but anchors and word boundaries
-        still see the REAL input: `max_pos` would truncate `input_len`,
-        so `$` would hold at the pin and `\b` would see no byte after
-        it, which is wrong for the DFA-span capture lane (engine.mojo
-        `_span_fill_slots`), whose span ends mid-input.
+        still see the REAL input: truncating it at the pin would make `$`
+        hold there and leave `\b` no byte after it, which is wrong for
+        the DFA-span capture lane (engine.mojo `_span_fill_slots`), whose
+        span ends mid-input.
         """
         var input_len = len(input)
-        if max_pos >= 0 and max_pos < input_len:
-            input_len = max_pos
         # Where the simulation stops and fullmatch-style acceptance
-        # applies: the end pin, else the (possibly truncated) input end.
+        # applies: the end pin, else the input end.
         var stop = input_len
         var pinned = full
         if end_at >= 0 and end_at <= input_len:
@@ -189,34 +174,15 @@ struct PikeVM[num_slots: Int](Copyable):
 
         var pos = start_pos
         while True:
-            # Check for match states
-            if pinned:
-                # Fullmatch / end pin: MATCH only accepts at `stop`; the
-                # first (highest-priority) thread that reached it wins.
-                if pos >= stop:
-                    for i in range(len(bufs.current_states)):
-                        if (
-                            self.nfa.states.unsafe_get(
-                                bufs.current_states.unsafe_get(i)
-                            ).kind
-                            == NFAStateKind.MATCH
-                        ):
-                            matched = True
-                            best_match_end = pos
-                            for s in range(Self._stride):
-                                bufs.best_slots.unsafe_set(
-                                    s,
-                                    bufs.current_slot_data.unsafe_get(
-                                        i * Self._stride + s
-                                    ),
-                                )
-                            break
-            else:
-                # Leftmost-first (Python re semantics): the first thread in
-                # priority order to reach MATCH beats every lower-priority
-                # thread, so record it and cut those threads. Surviving
-                # higher-priority threads may still override with a match
-                # they reach later (e.g. the greedy arm of `a*`).
+            # Check for match states. Fullmatch / end pin: MATCH only
+            # accepts at `stop`, where the first (highest-priority) thread
+            # that reached it wins. Otherwise leftmost-first (Python re
+            # semantics): the first thread in priority order to reach
+            # MATCH beats every lower-priority thread, so record it and cut
+            # those threads. Surviving higher-priority threads may still
+            # override with a match they reach later (e.g. the greedy arm
+            # of `a*`).
+            if not pinned or pos >= stop:
                 for i in range(len(bufs.current_states)):
                     if (
                         self.nfa.states.unsafe_get(
@@ -233,8 +199,9 @@ struct PikeVM[num_slots: Int](Copyable):
                                     i * Self._stride + s
                                 ),
                             )
-                        bufs.current_states.resize(i, 0)
-                        bufs.current_slot_data.resize(i * Self._stride, 0)
+                        if not pinned:
+                            bufs.current_states.resize(i, 0)
+                            bufs.current_slot_data.resize(i * Self._stride, 0)
                         break
 
             if pos >= stop:
@@ -258,46 +225,27 @@ struct PikeVM[num_slots: Int](Copyable):
                         s, bufs.current_slot_data.unsafe_get(base + s)
                     )
 
+                var ok = False
                 if kind == NFAStateKind.CHAR:
-                    if ch == state.char_value:
-                        self._add_state(
-                            bufs.next_states,
-                            bufs.next_slot_data,
-                            bufs.gen,
-                            next_gen,
-                            out1,
-                            bufs.temp_slots,
-                            input,
-                            input_len,
-                            pos + 1,
-                        )
+                    ok = ch == state.char_value
                 elif kind == NFAStateKind.ANY:
-                    if ch != UInt32(CHAR_NEWLINE):
-                        self._add_state(
-                            bufs.next_states,
-                            bufs.next_slot_data,
-                            bufs.gen,
-                            next_gen,
-                            out1,
-                            bufs.temp_slots,
-                            input,
-                            input_len,
-                            pos + 1,
-                        )
+                    ok = ch != UInt32(CHAR_NEWLINE)
                 elif kind == NFAStateKind.CHARSET:
-                    var cs_idx = state.charset_index
-                    if self.nfa.charsets.unsafe_get(cs_idx).contains(ch):
-                        self._add_state(
-                            bufs.next_states,
-                            bufs.next_slot_data,
-                            bufs.gen,
-                            next_gen,
-                            out1,
-                            bufs.temp_slots,
-                            input,
-                            input_len,
-                            pos + 1,
-                        )
+                    ok = self.nfa.charsets.unsafe_get(
+                        state.charset_index
+                    ).contains(ch)
+                if ok:
+                    self._add_state(
+                        bufs.next_states,
+                        bufs.next_slot_data,
+                        bufs.gen,
+                        next_gen,
+                        out1,
+                        bufs.temp_slots,
+                        input,
+                        input_len,
+                        pos + 1,
+                    )
 
             # Unanchored: seed a fresh lowest-priority thread at the next
             # position while no match is recorded (earlier-start threads
@@ -438,57 +386,46 @@ struct PikeVM[num_slots: Int](Copyable):
 
             elif kind == NFAStateKind.ANCHOR:
                 gen.unsafe_set(state_idx, gen_val)
-                if self._check_anchor(state.anchor_type, input, input_len, pos):
+                if _bt_check_anchor(state.anchor_type, input, input_len, pos):
                     state_idx = state.out1
                     continue
                 return
 
-            elif kind == NFAStateKind.LOOKAHEAD:
+            elif (
+                kind == NFAStateKind.LOOKAHEAD
+                or kind == NFAStateKind.LOOKBEHIND
+            ):
                 gen.unsafe_set(state_idx, gen_val)
+                var matched = False
                 var sub_slots = slots.copy()
-                var match_end = _bt_try_match(
-                    self.nfa, input, state.sub_start, pos, sub_slots
-                )
-                if (match_end >= 0) != state.negated:
-                    if match_end >= 0:
+                if kind == NFAStateKind.LOOKAHEAD:
+                    matched = (
+                        _bt_try_match(
+                            self.nfa, input, state.sub_start, pos, sub_slots
+                        )
+                        >= 0
+                    )
+                else:
+                    var lb_len = state.lookbehind_len
+                    if pos >= lb_len:
+                        matched = (
+                            _bt_try_match(
+                                self.nfa,
+                                input,
+                                state.sub_start,
+                                pos - lb_len,
+                                sub_slots,
+                            )
+                            == pos
+                        )
+                if matched != state.negated:
+                    if matched:
                         # Successful POSITIVE assertion: the continuation
                         # sees its capture writes; restore after the
                         # subtree so sibling threads are unaffected
                         # (mirrors the SAVE branch above).
                         var saved_slots = slots.copy()
                         slots = sub_slots^
-                        self._add_state(
-                            state_list,
-                            slot_data,
-                            gen,
-                            gen_val,
-                            state.out1,
-                            slots,
-                            input,
-                            input_len,
-                            pos,
-                        )
-                        slots = saved_slots^
-                        return
-                    state_idx = state.out1
-                    continue
-                return
-
-            elif kind == NFAStateKind.LOOKBEHIND:
-                gen.unsafe_set(state_idx, gen_val)
-                var lb_len = state.lookbehind_len
-                var lb_matched = False
-                var lb_slots = slots.copy()
-                if pos >= lb_len:
-                    var match_end = _bt_try_match(
-                        self.nfa, input, state.sub_start, pos - lb_len, lb_slots
-                    )
-                    lb_matched = match_end == pos
-                if lb_matched != state.negated:
-                    if lb_matched:
-                        # Same keep/restore rule as LOOKAHEAD above.
-                        var saved_slots = slots.copy()
-                        slots = lb_slots^
                         self._add_state(
                             state_list,
                             slot_data,
@@ -513,52 +450,6 @@ struct PikeVM[num_slots: Int](Copyable):
                 for s in range(Self._stride):
                     slot_data.append(slots.unsafe_get(s))
                 return
-
-    def _check_anchor[
-        origin: Origin, //
-    ](
-        self,
-        anchor_type: Int,
-        input: Span[Byte, origin],
-        input_len: Int,
-        pos: Int,
-    ) -> Bool:
-        """Check if an anchor assertion holds at the given position.
-
-        MULTILINE behavior is baked into the anchor kind at NFA construction time:
-        BOL_MULTILINE / EOL_MULTILINE handle line-boundary matching without a runtime flag check.
-        """
-        var ptr = Pointer(input.unsafe_ptr())
-        if anchor_type == AnchorKind.BOL:
-            return pos == 0
-        elif anchor_type == AnchorKind.BOL_MULTILINE:
-            return pos == 0 or input.unsafe_get(pos - 1) == CHAR_NEWLINE
-        elif anchor_type == AnchorKind.EOL:
-            return pos == input_len
-        elif anchor_type == AnchorKind.EOL_MULTILINE:
-            return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
-        elif anchor_type == AnchorKind.WORD_BOUNDARY:
-            var before_word = pos > 0 and Self._is_word_char(
-                ptr.unsafe_offset(pos - 1).unsafe_load()
-            )
-            var after_word = pos < input_len and Self._is_word_char(
-                ptr.unsafe_offset(pos).unsafe_load()
-            )
-            return before_word != after_word
-        elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
-            var before_word = pos > 0 and Self._is_word_char(
-                ptr.unsafe_offset(pos - 1).unsafe_load()
-            )
-            var after_word = pos < input_len and Self._is_word_char(
-                ptr.unsafe_offset(pos).unsafe_load()
-            )
-            return before_word == after_word
-        return False
-
-    @staticmethod
-    def _is_word_char(ch: Byte) -> Bool:
-        """Check if a character is a word character [a-zA-Z0-9_]."""
-        return is_word_byte(ch)
 
 
 def _bt_try_match[
@@ -821,9 +712,9 @@ def _heapbt_core[
                 var same = True
                 if state.icase:
                     for i in range(n):
-                        if _bt_to_lower(
+                        if ascii_to_lower(
                             input.unsafe_get(gs + i)
-                        ) != _bt_to_lower(input.unsafe_get(pos + i)):
+                        ) != ascii_to_lower(input.unsafe_get(pos + i)):
                             same = False
                             break
                 else:
@@ -858,30 +749,11 @@ def _bt_check_anchor[
         return pos == input_len
     elif anchor_type == AnchorKind.EOL_MULTILINE:
         return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
-    elif anchor_type == AnchorKind.WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
-        return left_is_word != right_is_word
-    elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _bt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _bt_is_word_char(input.unsafe_get(pos))
-        return left_is_word == right_is_word
+    elif (
+        anchor_type == AnchorKind.WORD_BOUNDARY
+        or anchor_type == AnchorKind.NOT_WORD_BOUNDARY
+    ):
+        var left = pos > 0 and is_word_byte(input.unsafe_get(pos - 1))
+        var right = pos < input_len and is_word_byte(input.unsafe_get(pos))
+        return (left != right) == (anchor_type == AnchorKind.WORD_BOUNDARY)
     return False
-
-
-def _bt_is_word_char(ch: Byte) -> Bool:
-    return is_word_byte(ch)
-
-
-def _bt_to_lower(ch: Byte) -> Byte:
-    if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
-        return ch + 32
-    return ch
