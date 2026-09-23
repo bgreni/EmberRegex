@@ -132,9 +132,10 @@ SECTION_BG  = colors.HexColor("#eceff1")
 def build_table_data(
     py: dict[str, float],
     static_mojo: dict[str, float],
+    baseline_label: str = "Python",
 ) -> tuple[list, list]:
-    """Return (table_rows, style_commands)."""
-    rows = [["Benchmark", "Regex (µs)", "Python (µs)", "Ratio"]]
+    """Return (table_rows, style_commands); ratio = baseline ÷ Regex."""
+    rows = [["Benchmark", "Regex (µs)", f"{baseline_label} (µs)", "Ratio"]]
     styles = [
         # Header row
         ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
@@ -213,15 +214,15 @@ def build_table_data(
     return rows, styles
 
 
-def generate_pdf(output_path: str):
-    print("Running benchmarks...")
-    py   = run_python_benchmarks()
-    static_mojo = run_mojo_static_benchmarks()
-
-    print("Getting machine specs...")
+def generate_pdf(
+    output_path: str,
+    py: dict[str, float],
+    static_mojo: dict[str, float],
+    baseline_label: str = "Python",
+    title: str = "Regex vs Python re — Benchmark Results",
+    subtitle: str = "Ratio = Python time ÷ Regex time.  &gt;1x = Regex faster.",
+):
     specs = get_machine_specs()
-
-    print(f"Generating PDF → {output_path}")
     doc = SimpleDocTemplate(
         output_path,
         pagesize=A4,
@@ -260,11 +261,8 @@ def generate_pdf(output_path: str):
     elements = []
 
     # Title
-    elements.append(Paragraph("Regex vs Python re — Benchmark Results", title_style))
-    elements.append(Paragraph(
-        "Ratio = Python time ÷ Regex time.  &gt;1x = Regex faster.",
-        subtitle_style,
-    ))
+    elements.append(Paragraph(title, title_style))
+    elements.append(Paragraph(subtitle, subtitle_style))
 
     # Machine specs table
     spec_rows = [[Paragraph(f"<b>{k}</b>", spec_style), Paragraph(v, spec_style)] for k, v in specs]
@@ -282,14 +280,20 @@ def generate_pdf(output_path: str):
 
     # Benchmark table
     col_widths = [7.5 * cm, 2.8 * cm, 2.8 * cm, 2.0 * cm]
-    table_rows, table_styles = build_table_data(py, static_mojo)
+    table_rows, table_styles = build_table_data(py, static_mojo, baseline_label)
     table = Table(table_rows, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle(table_styles))
     elements.append(table)
 
     doc.build(elements)
-    print(f"Done: {output_path}")
 
 
 if __name__ == "__main__":
-    generate_pdf(os.path.abspath(OUTPUT))
+    out = os.path.abspath(OUTPUT)
+    print("Running benchmarks...")
+    py = run_python_benchmarks()
+    static_mojo = run_mojo_static_benchmarks()
+    print("Getting machine specs...")
+    print(f"Generating PDF → {out}")
+    generate_pdf(out, py, static_mojo)
+    print(f"Done: {out}")
