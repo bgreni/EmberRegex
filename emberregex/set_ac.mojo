@@ -490,14 +490,6 @@ def ac_table_str[n: Int](d: ACSet) -> String:
     return out^
 
 
-def ac_cls_arr(d: ACSet) -> Array[UInt8, 256]:
-    """Byte -> class map. Class 0 collects every byte no literal uses."""
-    var arr = Array[UInt8, 256](fill=0)
-    for b in range(256):
-        arr[b] = UInt8(d.class_map[b])
-    return arr^
-
-
 def ac_rep_arr[n: Int](d: ACSet) -> Array[Int32, n]:
     """Per-state report slice, interleaved as (offset, length) so the
     hot-path length test and the offset it needs share a cache line."""
@@ -505,13 +497,6 @@ def ac_rep_arr[n: Int](d: ACSet) -> Array[Int32, n]:
     for s in range(d.num_states):
         arr[2 * s] = Int32(d.rep_off[s])
         arr[2 * s + 1] = Int32(d.rep_len[s])
-    return arr^
-
-
-def ac_pool_arr[n: Int](d: ACSet) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(n):
-        arr[i] = Int32(d.pool[i])
     return arr^
 
 

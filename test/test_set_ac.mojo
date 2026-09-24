@@ -18,13 +18,11 @@ tests one rung down the ladder:
 """
 
 from emberregex import SetMatch, SetSpan, RegexSet
-from emberregex.static_bytes import static_bytes
+from emberregex.static_bytes import int_arr, static_bytes
 from emberregex.set_ac import (
     AC_MAX,
     AC_POOL_CAP,
     AC_TABLE_CAP,
-    ac_cls_arr,
-    ac_pool_arr,
     ac_rep_arr,
     ac_scan,
     ac_table_str,
@@ -68,9 +66,9 @@ def ac_direct_scan[
     comptime A = build_ac(S.nfa, S.num_patterns, True)
     comptime V = ac_view(A)
     comptime T = static_bytes[ac_table_str[A.num_states * A.num_classes](A)]()
-    comptime C = ac_cls_arr(A)
+    comptime C = int_arr[DType.uint8, 256](A.class_map, 0)
     comptime R = ac_rep_arr[2 * A.num_states](A)
-    comptime P = ac_pool_arr[len(A.pool)](A)
+    comptime P = int_arr[DType.int32, len(A.pool)](A.pool, 0)
     return ac_scan[v=V, table=T, cls=C, rep=R, pool=P](input)
 
 

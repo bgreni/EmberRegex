@@ -22,7 +22,7 @@ REPEAT   = 5      # timeit repetitions per benchmark
 NUMBER   = 10000  # calls per repetition (sum of many runs → less variance)
 BAR_COLS = 20     # width of the speedup bar
 
-# Must match comptime ITERS_PER_CALL in bench_static.mojo.
+# Must match comptime ITERS_PER_CALL in bench.mojo.
 # Each Mojo call() invocation runs the function this many times; divide to get per-call µs.
 MOJO_ITERS_PER_CALL = 100
 
@@ -44,15 +44,15 @@ def section(title):
     print(f"{'─'*72}")
 
 
-def _run_mojo_task(task: str) -> dict[str, float]:
-    """Run a pixi bench task and parse its markdown table output."""
+def run_mojo_static_benchmarks() -> dict[str, float]:
+    """Run `pixi run bench` (bench/bench.mojo) and parse its markdown table."""
     pixi_cmd = shutil.which("pixi")
     if pixi_cmd is None:
-        print(f"  [warning] pixi not found in PATH — skipping {task}")
+        print("  [warning] pixi not found in PATH — skipping bench")
         return {}
 
     result = subprocess.run(
-        [pixi_cmd, "run", task],
+        [pixi_cmd, "run", "bench"],
         capture_output=True, text=True,
         cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
     )
@@ -83,15 +83,10 @@ def _run_mojo_task(task: str) -> dict[str, float]:
     return timings
 
 
-def run_mojo_static_benchmarks() -> dict[str, float]:
-    """Run bench_static.mojo (Regex) via pixi."""
-    return _run_mojo_task("bench")
-
-
-def speedup_bar(ratio: float) -> str:
+def speedup_bar(ratio: float, cols: int = BAR_COLS) -> str:
     """Return a coloured bar string representing the speedup ratio."""
-    filled = min(int(ratio / 10.0 * BAR_COLS), BAR_COLS) if ratio <= 10 else BAR_COLS
-    bar = "█" * filled + "░" * (BAR_COLS - filled)
+    filled = min(int(ratio / 10.0 * cols), cols) if ratio <= 10 else cols
+    bar = "█" * filled + "░" * (cols - filled)
     if ratio >= 1.0:
         return f"\033[32m{bar}\033[0m"   # green = faster
     else:
@@ -108,20 +103,25 @@ def _ratio_str(ratio: float) -> str:
 def print_comparison(
     py: dict[str, float],
     static: dict[str, float],
+    labels=("Python", "Static", "Py/Stat  Bar (10x=full)"),
+    widths=(9, 9, 14, 50),  # baseline col, Regex col, missing-ratio dash, rule
+    summary="Python vs Static  — faster",
+    bar_cols=BAR_COLS,
 ):
-    """Print the two-column comparison table."""
+    """Print the two-column comparison table; ratio = baseline ÷ Regex."""
+    base_w, ours_w, dash_w, rule_w = widths
     all_names = list(py.keys())
     if not all_names:
-        print("  No Python results collected.")
+        print(f"  No {labels[0]} results collected.")
         return
 
     col_name = max(max(len(n) for n in all_names), 34)
 
     header = (
-        f"  {'Benchmark':<{col_name}}  {'Python':>9}  "
-        f"{'Static':>9}  {'Py/Stat':>7}  Bar (10x=full)"
+        f"  {'Benchmark':<{col_name}}  {labels[0]:>{base_w}}  "
+        f"{labels[1]:>{ours_w}}  {labels[2]}"
     )
-    sep = "  " + "─" * (col_name + 50)
+    sep = "  " + "─" * (col_name + rule_w)
 
     print()
     print(header)
@@ -133,36 +133,36 @@ def print_comparison(
         py_us   = py[name]
         stat_us = static.get(name)
 
-        stat_str = f"{stat_us:>9.3f}" if stat_us is not None else f"{'—':>9}"
+        stat_str = f"{stat_us:>{ours_w}.3f}" if stat_us is not None else f"{'—':>{ours_w}}"
 
         if stat_us is not None and stat_us > 0:
             ratio = py_us / stat_us
             ratio_str = _ratio_str(ratio)
-            bar = speedup_bar(ratio)
+            bar = speedup_bar(ratio, bar_cols)
             if ratio >= 1.0:
                 faster += 1
             else:
                 slower += 1
         else:
-            ratio_str = f"{'—':>14}"
-            bar = speedup_bar(0)
+            ratio_str = f"{'—':>{dash_w}}"
+            bar = speedup_bar(0, bar_cols)
             if stat_us is None:
                 missing += 1
 
         print(
-            f"  {name:<{col_name}}  {py_us:>9.3f}  "
+            f"  {name:<{col_name}}  {py_us:>{base_w}.3f}  "
             f"{stat_str}  {ratio_str}  {bar}"
         )
 
     print(sep)
     print(
-        f"  Python vs Static  — faster: {faster}  |  slower: {slower}"
+        f"  {summary}: {faster}  |  slower: {slower}"
         + (f"  |  no data: {missing}" if missing else "")
     )
 
 
 # ---------------------------------------------------------------------------
-# Python re benchmark suite  (names must match bench_static.mojo BenchIds)
+# Python re benchmark suite  (names must match bench.mojo BenchIds)
 # ---------------------------------------------------------------------------
 
 def run_python_benchmarks() -> dict[str, float]:

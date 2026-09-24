@@ -13,28 +13,25 @@ which keeps its own 4096-state cap and Pike VM fallback.
 
 from std.bit import count_trailing_zeros, pop_count
 from std.collections import Array
+from std.math import iota
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
 from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import PROBE_RANKS
-from .static_bytes import table_bytes
+from .static_bytes import int_arr
 from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
 from .simd_kernels import (
-    ACCEL_SHUFTI,
-    ACCEL_TRUFFLE,
-    HAS_FAST_BYTE_SHUFFLE,
+    AccelSet,
+    _ShuffleIndex,
     _class_contains,
-    build_class_masks,
-    build_shufti_masks,
-    build_truffle_masks,
+    _sheng_step,
+    accel_exits,
     find_in_class,
     nibble_table_from,
-    shufti_encodable,
-    stops_from_bitmap,
 )
 
 # Per-state flag bits (see EagerDFA.flags)
@@ -159,13 +156,6 @@ def _is_word_byte(b: Int) -> Bool:
     return b >= 0 and b < 256 and is_word_byte(Byte(b))
 
 
-@always_inline
-def edfa_is_word(b: Byte) -> Bool:
-    """Runtime twin of `_is_word_byte`: the shared `constants.is_word_byte`
-    every engine's `\\b` check uses."""
-    return is_word_byte(b)
-
-
 def _wb_holds(anchor_kind: Int, prev_word: Bool, next_word: Bool) -> Bool:
     """Comptime: does a word-boundary anchor of `anchor_kind` hold between
     a byte of class `prev_word` and one of class `next_word`? Out of
@@ -212,16 +202,9 @@ def _bs_eq(a: _StateBits, b: _StateBits) -> Bool:
     return (a ^ b).reduce_or() == 0
 
 
-def _mk_bs_salt() -> SIMD[DType.uint64, 64]:
-    """Distinct odd multiplier per lane so identical words in different
-    lanes hash differently."""
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
-    return v
-
-
-comptime _BS_SALT = _mk_bs_salt()
+# Distinct odd multiplier per lane so identical words in different lanes
+# hash differently.
+comptime _BS_SALT = (2 * iota[DType.uint64, 64]() + 1) * 0x9E3779B97F4A7C15
 
 
 @always_inline
@@ -551,49 +534,12 @@ def _wb_normalize(fl: Int) -> Int:
     return fl
 
 
-def _wb_cont_reaches_bol(nfa: NFA) -> Bool:
-    """Comptime: does some word anchor's epsilon continuation reach a BOL
-    kind (`\\b^`, `(?m)\\b^x`)? The DFA lanes expand a word anchor's
-    continuation when the anchor resolves, without the position context
-    a BOL kind needs, so such patterns stay off them (the mirror of
-    `_eol_continuation_crosses_anchor`). The walk follows every anchor
-    conservatively."""
-    var num_states = len(nfa.states)
-    for i in range(num_states):
-        if nfa.states[i].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[i].anchor_type
-        if (
-            at != AnchorKind.WORD_BOUNDARY
-            and at != AnchorKind.NOT_WORD_BOUNDARY
-        ):
-            continue
-        var visited = List[Bool](length=num_states, fill=False)
-        var stack: List[Int] = [nfa.states[i].out1]
-        while len(stack) > 0:
-            var s = stack.pop()
-            if s < 0 or s >= num_states or visited[s]:
-                continue
-            visited[s] = True
-            var kind = nfa.states[s].kind
-            if kind == NFAStateKind.SPLIT:
-                stack.append(nfa.states[s].out1)
-                stack.append(nfa.states[s].out2)
-            elif kind == NFAStateKind.SAVE:
-                stack.append(nfa.states[s].out1)
-            elif kind == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[s].anchor_type
-                if at2 == AnchorKind.BOL or at2 == AnchorKind.BOL_MULTILINE:
-                    return True
-                stack.append(nfa.states[s].out1)
-    return False
-
-
 struct EagerDFA(Copyable, Movable):
     """Comptime-computed DFA: flat transition table + per-state flags.
 
     Only ever exists as a comptime value; the runtime engine reads the
-    materialized Array forms (see edfa_table_arr / edfa_flags_arr).
+    materialized forms (the table as a string literal, the flags as an
+    Array — `Regex._EDFA_TABLE` / `_EDFA_FLAGS`).
     """
 
     var valid: Bool
@@ -616,18 +562,8 @@ struct EagerDFA(Copyable, Movable):
     var any_eol_nl: Bool  # some state carries EDFA_EOL_AT_NEWLINE
     var any_eol_end: Bool  # some state carries EDFA_EOL_AT_END
     var any_wb: Bool  # some state carries EDFA_MATCH_IF_WORD / _NONWORD
-    # Accelerated states: self-loop on all but <= 2 bytes. The walkers
-    # SIMD-scan to the next exit byte instead of stepping the table.
-    var accel_states: List[Int]
-    var accel_exit1: List[Int]  # first exit byte per accelerated state
-    var accel_exit2: List[Int]  # second exit byte, or -1 if only one
-    # Nibble-accelerated states: self-loop on all but an arbitrary exit-byte
-    # set, encoded as shufti or truffle masks (see simd_kernels.mojo). Only
-    # populated when the target has a native byte shuffle.
-    var accel_nib_states: List[Int]
-    var accel_nib_kind: List[Int]  # ACCEL_SHUFTI or ACCEL_TRUFFLE
-    var accel_nib_t0: List[Int]  # NIBBLE_TABLE_SIZE entries per state
-    var accel_nib_t1: List[Int]  # NIBBLE_TABLE_SIZE entries per state
+    # Accelerated states (see AccelSet).
+    var accel: AccelSet
     # Region acceleration: a small set of flag-free states whose rows
     # agree on every byte outside an exit set and land inside the set —
     # the look-behind-split restart states of a word-anchor pattern
@@ -636,11 +572,7 @@ struct EagerDFA(Copyable, Movable):
     # The walkers SIMD-scan to the next exit byte as for a single state
     # and land in the member the last skipped byte selects.
     var region_states: List[Int]
-    var region_exit1: Int  # -1 when the exit set is nibble-encoded
-    var region_exit2: Int  # or -1
-    var region_nib_kind: Int
-    var region_nib_t0: List[Int]
-    var region_nib_t1: List[Int]
+    var region_exits: AccelSet  # the region's exit set, as one entry
     var region_land: List[Int]  # 256 entries: member landed in per byte
 
     def __init__(out self):
@@ -659,82 +591,26 @@ struct EagerDFA(Copyable, Movable):
         self.any_eol_nl = False
         self.any_eol_end = False
         self.any_wb = False
-        self.accel_states = List[Int]()
-        self.accel_exit1 = List[Int]()
-        self.accel_exit2 = List[Int]()
-        self.accel_nib_states = List[Int]()
-        self.accel_nib_kind = List[Int]()
-        self.accel_nib_t0 = List[Int]()
-        self.accel_nib_t1 = List[Int]()
+        self.accel = AccelSet()
         self.region_states = List[Int]()
-        self.region_exit1 = -1
-        self.region_exit2 = -1
-        self.region_nib_kind = 0
-        self.region_nib_t0 = List[Int]()
-        self.region_nib_t1 = List[Int]()
+        self.region_exits = AccelSet()
         self.region_land = List[Int]()
 
 
-def _eol_ml_continuation_consumes(nfa: NFA) -> Bool:
-    """Comptime: does any EOL_MULTILINE anchor's continuation consume?
-
-    The DFA lanes keep EOL anchors unresolved in state sets and resolve
-    them via per-state flags, so a continuation that must consume more
-    input (e.g. `(?m)a$\\nb`) is unreachable there — the DFA silently
-    under-reports. Such patterns must stay off the DFA lanes. Strict EOL
-    needs no such guard: it holds only at end of input, where a
-    consuming continuation is provably dead. The walk follows any
-    anchor conservatively (assume it could hold).
-    """
+def _anchor_cont_hits[
+    seed_mask: Int, hit_anchor_mask: Int, hit_consuming: Bool
+](nfa: NFA) -> Bool:
+    """Comptime: does the epsilon continuation (`out1`) of some anchor whose
+    kind is in `seed_mask` reach an anchor whose kind is in
+    `hit_anchor_mask`, or, with `hit_consuming`, a consuming state (CHAR,
+    CHARSET, ANY, BACKREF)? Masks are `1 << AnchorKind`. The walk follows
+    SPLIT, SAVE and every other anchor (conservatively assuming it holds);
+    anything else ends it."""
     var num_states = len(nfa.states)
     for i in range(num_states):
         if nfa.states[i].kind != NFAStateKind.ANCHOR:
             continue
-        if nfa.states[i].anchor_type != AnchorKind.EOL_MULTILINE:
-            continue
-        var visited = List[Bool](length=num_states, fill=False)
-        var stack: List[Int] = [nfa.states[i].out1]
-        while len(stack) > 0:
-            var s = stack.pop()
-            if s < 0 or s >= num_states or visited[s]:
-                continue
-            visited[s] = True
-            var kind = nfa.states[s].kind
-            if (
-                kind == NFAStateKind.CHAR
-                or kind == NFAStateKind.CHARSET
-                or kind == NFAStateKind.ANY
-                or kind == NFAStateKind.BACKREF
-            ):
-                return True
-            if kind == NFAStateKind.SPLIT:
-                stack.append(nfa.states[s].out1)
-                stack.append(nfa.states[s].out2)
-            elif kind == NFAStateKind.SAVE or kind == NFAStateKind.ANCHOR:
-                stack.append(nfa.states[s].out1)
-    return False
-
-
-def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
-    """Comptime: does any EOL anchor's continuation reach an anchor whose
-    truth is NOT implied by the EOL that precedes it?
-
-    The DFA lanes resolve EOL anchors with per-state flag bytes, which
-    carry one bit of context ("we are at a '\\n'" / "we are at the end").
-    A nested EOL anchor is fine — `_reaches_match` follows the kinds that
-    hold in the same context, which is what makes `ab$$` work. A BOL kind
-    or a word boundary is not: whether it holds depends on the *preceding*
-    byte, which the flag cannot express, so the walk would have to guess.
-    Such patterns stay off these lanes rather than guess (the same
-    treatment `_eol_ml_continuation_consumes` gives consuming
-    continuations).
-    """
-    var num_states = len(nfa.states)
-    for i in range(num_states):
-        if nfa.states[i].kind != NFAStateKind.ANCHOR:
-            continue
-        var at = nfa.states[i].anchor_type
-        if at != AnchorKind.EOL and at != AnchorKind.EOL_MULTILINE:
+        if (seed_mask >> nfa.states[i].anchor_type) & 1 == 0:
             continue
         var visited = List[Bool](length=num_states, fill=False)
         var stack: List[Int] = [nfa.states[i].out1]
@@ -750,14 +626,51 @@ def _eol_continuation_crosses_anchor(nfa: NFA) -> Bool:
             elif kind == NFAStateKind.SAVE:
                 stack.append(nfa.states[s].out1)
             elif kind == NFAStateKind.ANCHOR:
-                var at2 = nfa.states[s].anchor_type
-                if at2 == AnchorKind.EOL or at2 == AnchorKind.EOL_MULTILINE:
-                    stack.append(nfa.states[s].out1)
-                else:
+                if (hit_anchor_mask >> nfa.states[s].anchor_type) & 1 != 0:
                     return True
-            # consuming states end the walk; the consuming case has its
-            # own guard (_eol_ml_continuation_consumes)
+                stack.append(nfa.states[s].out1)
+            elif hit_consuming and (
+                kind == NFAStateKind.CHAR
+                or kind == NFAStateKind.CHARSET
+                or kind == NFAStateKind.ANY
+                or kind == NFAStateKind.BACKREF
+            ):
+                return True
     return False
+
+
+comptime _EOL_KINDS = (1 << AnchorKind.EOL) | (1 << AnchorKind.EOL_MULTILINE)
+
+comptime _wb_cont_reaches_bol = _anchor_cont_hits[
+    (1 << AnchorKind.WORD_BOUNDARY) | (1 << AnchorKind.NOT_WORD_BOUNDARY),
+    (1 << AnchorKind.BOL) | (1 << AnchorKind.BOL_MULTILINE),
+    False,
+]
+"""Does some word anchor's continuation reach a BOL kind (`\\b^`,
+`(?m)\\b^x`)? The DFA lanes expand a word anchor's continuation when the
+anchor resolves, without the position context a BOL kind needs, so such
+patterns stay off them."""
+
+comptime _eol_ml_continuation_consumes = _anchor_cont_hits[
+    1 << AnchorKind.EOL_MULTILINE, 0, True
+]
+"""Does any EOL_MULTILINE anchor's continuation consume? The DFA lanes keep
+EOL anchors unresolved in state sets and resolve them via per-state flags,
+so a continuation that must consume more input (`(?m)a$\\nb`) is
+unreachable there and the DFA would silently under-report. Strict EOL
+needs no such guard: it holds only at end of input, where a consuming
+continuation is provably dead."""
+
+comptime _eol_continuation_crosses_anchor = _anchor_cont_hits[
+    _EOL_KINDS, ~_EOL_KINDS, False
+]
+"""Does any EOL anchor's continuation reach an anchor whose truth is NOT
+implied by the EOL before it? The flag bytes carry one bit of context ("at
+a '\\n'" / "at the end"): a nested EOL is fine (`_reaches_match` follows
+it, which is what makes `ab$$` work), but a BOL kind or word boundary
+depends on the PRECEDING byte, so such patterns stay off these lanes
+rather than guess. (Consuming continuations are
+`_eol_ml_continuation_consumes`'s.)"""
 
 
 # Folded into a state's hash when its look-behind class is "word".
@@ -795,14 +708,7 @@ def _classic_flags(
     return fl
 
 
-def _mk_iota256_i64() -> SIMD[DType.int64, 256]:
-    var v = SIMD[DType.int64, 256](0)
-    for i in range(256):
-        v[i] = Int64(i)
-    return v
-
-
-comptime _IOTA256_I64 = _mk_iota256_i64()
+comptime _IOTA256_I64 = iota[DType.int64, 256]()
 
 
 def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
@@ -884,81 +790,163 @@ def _byte_classes(nfa: NFA, mut class_of: List[Int]) -> List[Int]:
     return reps^
 
 
-def _flatten_nfa(
-    nfa: NFA,
-    class_of: List[Int],
-    nclasses: Int,
-    nl_class: Int,
-    mut kinds: List[Int],
-    mut out1s: List[Int],
-    mut out2s: List[Int],
-    mut anchors: List[Int],
-    mut cls_mask: List[SIMD[DType.uint64, 4]],
-    mut consuming_bits: _StateBits,
-    mut match_bits: _StateBits,
-    mut eol_bits: _StateBits,
-    mut has_bol_ml: Bool,
-):
-    """One flat pass over the NFA, shared by the bitset determinizers.
+struct _FlatNFA:
+    """Byte classes plus one flat pass over the NFA — the setup every bitset
+    determinizer shares. Built ONCE per build, in place (`var flat =
+    _FlatNFA(nfa)`); callers bind the fields they need to locals with `ref`
+    and pass those, never the struct, into the hot loops, which then never
+    carry an aggregate across a call boundary."""
 
-    Fills flat views for the closure walks, membership bitsets, and each
-    state's accepted-class mask (classes are byte intervals wholly inside
-    or outside every accept set, so a class bitmask per state captures
-    acceptance exactly). Called ONCE per build: the point of the flat
-    views is that the hot loops never pass the NFA aggregate across a
-    call boundary again.
-    """
-    var n = len(nfa.states)
-    for i in range(n):
-        var kind = nfa.states[i].kind
-        kinds.append(kind)
-        out1s.append(nfa.states[i].out1)
-        out2s.append(nfa.states[i].out2)
-        var at = nfa.states[i].anchor_type
-        anchors.append(at)
-        var cm = SIMD[DType.uint64, 4](0)
-        if kind == NFAStateKind.CHAR:
-            var c = Int(nfa.states[i].char_value)
-            if c < 256:
-                var ci = class_of[c]
-                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.ANY:
-            for ci in range(nclasses):
-                cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
-                UInt64(1) << UInt64(nl_class & 63)
-            )
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.CHARSET:
-            var cs = nfa.states[i].charset_index
-            for r in range(len(nfa.charsets[cs].ranges)):
-                var lo = Int(nfa.charsets[cs].ranges[r].lo)
-                var hi = Int(nfa.charsets[cs].ranges[r].hi)
-                if lo > hi or lo > 255:
-                    continue
-                if hi > 255:
-                    hi = 255
-                # _byte_classes marked lo and hi+1, so the classes of lo
-                # and hi bound exactly the classes inside [lo, hi].
-                for ci in range(class_of[lo], class_of[hi] + 1):
+    var class_of: List[Int]  # 256 entries: byte -> class (_byte_classes)
+    var reps: List[Int]  # first byte of each class; classes are intervals
+    var nclasses: Int
+    var nl_class: Int  # the class of '\n'
+    # Flat views for the closure walks.
+    var kinds: List[Int]
+    var out1s: List[Int]
+    var out2s: List[Int]
+    var anchors: List[Int]
+    # Each state's accepted-class mask (classes are byte intervals wholly
+    # inside or outside every accept set, so a class bitmask per state
+    # captures acceptance exactly).
+    var cls_mask: List[SIMD[DType.uint64, 4]]
+    var consuming_bits: _StateBits
+    var match_bits: _StateBits
+    var eol_bits: _StateBits  # EOL / EOL_MULTILINE anchors
+    var has_bol_ml: Bool
+
+    def __init__(out self, nfa: NFA):
+        self.class_of = List[Int](fill=-1, length=256)
+        self.reps = _byte_classes(nfa, self.class_of)
+        var nclasses = len(self.reps)
+        var nl_class = self.class_of[Int(CHAR_NEWLINE)]
+        self.nclasses = nclasses
+        self.nl_class = nl_class
+        self.kinds = List[Int]()
+        self.out1s = List[Int]()
+        self.out2s = List[Int]()
+        self.anchors = List[Int]()
+        self.cls_mask = List[SIMD[DType.uint64, 4]]()
+        self.consuming_bits = _StateBits(0)
+        self.match_bits = _StateBits(0)
+        self.eol_bits = _StateBits(0)
+        self.has_bol_ml = False
+        var n = len(nfa.states)
+        for i in range(n):
+            var kind = nfa.states[i].kind
+            self.kinds.append(kind)
+            self.out1s.append(nfa.states[i].out1)
+            self.out2s.append(nfa.states[i].out2)
+            var at = nfa.states[i].anchor_type
+            self.anchors.append(at)
+            var cm = SIMD[DType.uint64, 4](0)
+            if kind == NFAStateKind.CHAR:
+                var c = Int(nfa.states[i].char_value)
+                if c < 256:
+                    var ci = self.class_of[c]
                     cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
-            if nfa.charsets[cs].negated:
-                # Classes are pure w.r.t. this charset, so negation is
-                # exact at class granularity.
-                for w in range(4):
-                    cm[w] = ~cm[w]
-                for ci in range(nclasses, 256):
-                    cm[ci >> 6] = cm[ci >> 6] & ~(UInt64(1) << UInt64(ci & 63))
-            _bs_set(consuming_bits, i)
-        elif kind == NFAStateKind.MATCH:
-            _bs_set(match_bits, i)
-        elif kind == NFAStateKind.ANCHOR:
-            if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
-                _bs_set(eol_bits, i)
-            elif at == AnchorKind.BOL_MULTILINE:
-                has_bol_ml = True
-        cls_mask.append(cm)
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.ANY:
+                for ci in range(nclasses):
+                    cm[ci >> 6] = cm[ci >> 6] | (UInt64(1) << UInt64(ci & 63))
+                cm[nl_class >> 6] = cm[nl_class >> 6] & ~(
+                    UInt64(1) << UInt64(nl_class & 63)
+                )
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.CHARSET:
+                var cs = nfa.states[i].charset_index
+                for r in range(len(nfa.charsets[cs].ranges)):
+                    var lo = Int(nfa.charsets[cs].ranges[r].lo)
+                    var hi = Int(nfa.charsets[cs].ranges[r].hi)
+                    if lo > hi or lo > 255:
+                        continue
+                    if hi > 255:
+                        hi = 255
+                    # _byte_classes marked lo and hi+1, so the classes of
+                    # lo and hi bound exactly the classes inside [lo, hi].
+                    for ci in range(self.class_of[lo], self.class_of[hi] + 1):
+                        cm[ci >> 6] = cm[ci >> 6] | (
+                            UInt64(1) << UInt64(ci & 63)
+                        )
+                if nfa.charsets[cs].negated:
+                    # Classes are pure w.r.t. this charset, so negation is
+                    # exact at class granularity.
+                    for w in range(4):
+                        cm[w] = ~cm[w]
+                    for ci in range(nclasses, 256):
+                        cm[ci >> 6] = cm[ci >> 6] & ~(
+                            UInt64(1) << UInt64(ci & 63)
+                        )
+                _bs_set(self.consuming_bits, i)
+            elif kind == NFAStateKind.MATCH:
+                _bs_set(self.match_bits, i)
+            elif kind == NFAStateKind.ANCHOR:
+                if at == AnchorKind.EOL or at == AnchorKind.EOL_MULTILINE:
+                    _bs_set(self.eol_bits, i)
+                elif at == AnchorKind.BOL_MULTILINE:
+                    self.has_bol_ml = True
+            self.cls_mask.append(cm)
+
+
+def _class_ranges(
+    reps: List[Int],
+    mut rep_lo: SIMD[DType.int32, 256],
+    mut rep_hi: SIMD[DType.int32, 256],
+):
+    """Comptime: class c is the byte interval [rep_lo[c], rep_hi[c]], from
+    the first bytes `reps` (`_byte_classes`)."""
+    var nclasses = len(reps)
+    for ci in range(nclasses):
+        rep_lo[ci] = Int32(reps[ci])
+        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
+            255
+        )
+
+
+def _word_classes(
+    rep_lo: SIMD[DType.int32, 256], nclasses: Int
+) -> SIMD[DType.uint64, 4]:
+    """Comptime: the classes of word bytes, as a class bitmask (classes are
+    pure w.r.t. the word set when the NFA has a word anchor)."""
+    var word_cls = SIMD[DType.uint64, 4](0)
+    for ci in range(nclasses):
+        if _is_word_byte(Int(rep_lo[ci])):
+            word_cls[ci >> 6] = word_cls[ci >> 6] | (
+                UInt64(1) << UInt64(ci & 63)
+            )
+    return word_cls
+
+
+def _eol_ok_bits(
+    nfa: NFA,
+    f: _FlatNFA,
+    mut eol_end_ok: _StateBits,
+    mut eol_nl_ok: _StateBits,
+):
+    """Comptime: pending-EOL resolution per anchor state, as bitsets — does
+    its continuation reach MATCH at end of input (`eol_end_ok`) / at a
+    '\\n' (`eol_nl_ok`)? The question `_check_eol_match` asks per member,
+    precomputed so a state's flags are bitset ANDs."""
+    for s in range(len(f.kinds)):
+        if (f.eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
+            continue
+        if _reaches_match(nfa, f.out1s[s], True):
+            _bs_set(eol_end_ok, s)
+        if f.anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
+            nfa, f.out1s[s], False
+        ):
+            _bs_set(eol_nl_ok, s)
+
+
+def _bs_members(bits: _StateBits) -> List[Int]:
+    """Comptime: the members of a bitset, ascending."""
+    var members = List[Int]()
+    for l in range(64):
+        var w = bits[l]
+        while w != 0:
+            members.append(64 * l + Int(count_trailing_zeros(w)))
+            w &= w - 1
+    return members^
 
 
 # --- Hopcroft minimization -------------------------------------------------
@@ -986,35 +974,12 @@ comptime _MIN_CAP = 128
 comptime _COL_CHUNK = 8
 
 
-def _mk_bit64() -> SIMD[DType.uint64, 64]:
-    var v = SIMD[DType.uint64, 64](0)
-    for i in range(64):
-        v[i] = UInt64(1) << UInt64(i)
-    return v
-
-
-comptime _BIT64 = _mk_bit64()
-
-
-def _mk_iota256() -> SIMD[DType.int32, 256]:
-    var v = SIMD[DType.int32, 256](0)
-    for i in range(256):
-        v[i] = Int32(i)
-    return v
-
-
-comptime _IOTA256 = _mk_iota256()
-
-
-def _mk_col_salt() -> SIMD[DType.uint64, _MIN_CAP]:
-    """Distinct odd multiplier per state lane, as in _mk_bs_salt."""
-    var v = SIMD[DType.uint64, _MIN_CAP](0)
-    for i in range(_MIN_CAP):
-        v[i] = UInt64(2 * i + 1) * 0x9E3779B97F4A7C15
-    return v
-
-
-comptime _COL_SALT = _mk_col_salt()
+comptime _BIT64 = SIMD[DType.uint64, 64](1) << iota[DType.uint64, 64]()
+comptime _IOTA256 = iota[DType.int32, 256]()
+# Distinct odd multiplier per state lane, as in _BS_SALT.
+comptime _COL_SALT = (
+    2 * iota[DType.uint64, _MIN_CAP]() + 1
+) * 0x9E3779B97F4A7C15
 
 
 @always_inline
@@ -1338,44 +1303,21 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     if n > EDFA_NFA_CAP:
         return result^  # cannot bitset; would blow EDFA_STATE_CAP anyway
 
-    # --- Byte classes: intervals with a representative first byte. ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    # --- Byte classes + one flat pass over the NFA (see _FlatNFA). ---
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref out1s = flat.out1s
+    ref out2s = flat.out2s
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref consuming_bits = flat.consuming_bits
+    ref match_bits = flat.match_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    # --- One flat pass over the NFA (see _flatten_nfa). ---
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     # --- Continuation closures, memoized by target state. ---
     # closure(union of targets) == union of closures, so per-member work in
@@ -1412,21 +1354,9 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     var lazy_members = 0
     var pool_threshold = 2 * n
 
-    # Pending-EOL resolution per anchor state, as bitsets: does the
-    # continuation reach MATCH at end of input / at a '\n'? (Same
-    # question `_check_eol_match` asks per member; precomputed so the
-    # per-state flag computation is two bitset ANDs.)
     var eol_end_ok = _StateBits(0)
     var eol_nl_ok = _StateBits(0)
-    for s in range(n):
-        if (eol_bits[s >> 6] >> UInt64(s & 63)) & 1 == 0:
-            continue
-        if _reaches_match(nfa, out1s[s], True):
-            _bs_set(eol_end_ok, s)
-        if anchors[s] == AnchorKind.EOL_MULTILINE and _reaches_match(
-            nfa, out1s[s], False
-        ):
-            _bs_set(eol_nl_ok, s)
+    _eol_ok_bits(nfa, flat, eol_end_ok, eol_nl_ok)
 
     # --- Word boundaries: look-behind class per state. ---
     # A DFA state is (set, prev_word): the set keeps word anchors as
@@ -1438,12 +1368,7 @@ def build_eager_dfa(nfa: NFA, enabled: Bool, minimize: Bool = True) -> EagerDFA:
     # feed the word / non-word byte classes of the transitions.
     var has_wb = _nfa_has_word_anchor(nfa)
     var wb_bits = _word_anchor_bits(kinds, anchors)
-    var word_cls = SIMD[DType.uint64, 4](0)  # classes of word bytes
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)
 
     # --- State-set bookkeeping: bitsets, hashes in SIMD lanes, flags. ---
     var sets_bits = List[_StateBits]()
@@ -1715,9 +1640,9 @@ def _edfa_finish(
     `starts` holds any number of start ids in the caller's order, the
     first three being (other, after-'\\n', at-0) for the `start_*`
     fields; the permuted ids come back in the same order so a producer
-    with extra start contexts (the leftmost-first DFA's anchored starts)
-    can record them. The first `nregion` of them are the candidates for
-    region acceleration (the unanchored start contexts). Marks `result`
+    with extra ids to track can record them. The first `nregion` of them
+    are the candidates for region acceleration (the unanchored start
+    contexts). Marks `result`
     valid.
     """
     # Merge states no input can tell apart. Before the permutation and
@@ -1808,31 +1733,16 @@ def _edfa_finish(
         # bytes 80 -> 22 us, 4 exits 80 -> 45 us, 8 exits 79 -> 89 us
         # (slower), 26 exits (`\b[a-z]+ing\b`) 101 -> 128 us (slower).
         if len(exits) > 0 and len(exits) <= _REGION_MAX_EXITS:
-            var encodable = len(exits) <= 2 or HAS_FAST_BYTE_SHUFFLE
-            if encodable:
+            var region_exits = AccelSet()
+            region_exits.add(members[0], exits)
+            if region_exits.any():  # encodable on this target
                 result.region_states = members.copy()
                 result.region_land = land^
-                if len(exits) <= 2:
-                    result.region_exit1 = exits[0]
-                    result.region_exit2 = exits[1] if len(exits) == 2 else -1
-                else:
-                    var t0 = List[Int]()
-                    var t1 = List[Int]()
-                    if shufti_encodable(exits):
-                        build_shufti_masks(exits, t0, t1)
-                        result.region_nib_kind = ACCEL_SHUFTI
-                    else:
-                        build_truffle_masks(exits, t0, t1)
-                        result.region_nib_kind = ACCEL_TRUFFLE
-                    result.region_nib_t0 = t0^
-                    result.region_nib_t1 = t1^
+                result.region_exits = region_exits^
 
-    # Acceleration: a state that self-loops on all but an exit-byte set gets
-    # a SIMD scan to its next exit byte instead of a per-byte table walk.
-    # <= 2 exit bytes (e.g. the `.*` state of `.*x`) use direct compares;
-    # larger sets (e.g. the `\w+` self-loop) are nibble-encoded as shufti
-    # masks when exact, truffle otherwise — only on targets with a native
-    # byte shuffle. EOL_AT_NEWLINE-flagged states are excluded: skipping
+    # Acceleration (see AccelSet): a state that self-loops on all but an
+    # exit-byte set gets a SIMD scan to its next exit byte instead of a
+    # per-byte table walk. EOL_AT_NEWLINE-flagged states are excluded: skipping
     # bytes would skip their per-'\n' last_match updates when '\n'
     # self-loops. So are states the producer vetoed (EDFA_NO_ACCEL) and
     # states whose match-ness depends on the next byte's word class
@@ -1849,13 +1759,6 @@ def _edfa_finish(
             != 0
         ):
             continue
-        var row = new_rows.unsafe_get(s)
-        var exit_count = 0
-        for byte in range(256):
-            if Int(row[byte]) != s:
-                exit_count += 1
-        if exit_count == 0 or exit_count == 256:
-            continue  # never exits / never self-loops: nothing to skip
         # A region member takes the region skip instead: its own loop
         # set is a byte class (word bytes, say) whose runs are a few
         # bytes long in prose, while the region's exit set is sparse —
@@ -1867,26 +1770,11 @@ def _edfa_finish(
                 is_member = True
         if is_member:
             continue
-        var exits = List[Int]()
-        for byte in range(256):
-            if Int(row[byte]) != s:
-                exits.append(byte)
-        if len(exits) <= 2:
-            result.accel_states.append(s)
-            result.accel_exit1.append(exits[0])
-            result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
-            var t0 = List[Int]()
-            var t1 = List[Int]()
-            if shufti_encodable(exits):
-                build_shufti_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_SHUFTI)
-            else:
-                build_truffle_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_TRUFFLE)
-            result.accel_nib_states.append(s)
-            result.accel_nib_t0.extend(t0^)
-            result.accel_nib_t1.extend(t1^)
+        var exits = accel_exits(
+            new_rows.unsafe_get(s).ne(SIMD[DType.int32, 256](Int32(s)))
+        )
+        if len(exits) > 0:
+            result.accel.add(s, exits)
     # The veto has done its job; the walkers' flag bytes never carry it.
     for s in range(nsets):
         new_flags[s] &= ~Int(EDFA_NO_ACCEL)
@@ -1924,26 +1812,6 @@ def _edfa_finish(
     return pstarts^
 
 
-def edfa_table_str[n: Int, dt: DType](d: EagerDFA) -> String:
-    """Comptime: the flat table as `n` little-endian `dt` entries (see
-    static_bytes.mojo for why a string, not an Array).
-
-    `dt` comes from `edfa_id_dtype`, `n` from `edfa_table_len` (it may
-    exceed the table: the tail stays EDFA_DEAD padding); EDFA_DEAD (-1)
-    survives the narrowing, so the walkers keep their sign-bit dead test.
-    """
-    assert n == 0 or n >= len(d.table), "table string shorter than the table"
-    return table_bytes[dt](d.table, n)
-
-
-def edfa_flags_arr[n: Int](d: EagerDFA) -> Array[UInt8, n]:
-    """Comptime conversion of per-state flags to a materializable array."""
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(d.flags[i])
-    return arr^
-
-
 # --- Runtime table walkers -------------------------------------------------
 #
 # The DFA metadata `d` and the table/flags arrive as comptime parameters, so
@@ -1976,26 +1844,6 @@ def _find_exit2[
     return input_len
 
 
-def _accel_mask_word(d: EagerDFA, word: Int) -> UInt64:
-    """Comptime: bitmask of accelerated state ids in [word*64, (word+1)*64)."""
-    var m = UInt64(0)
-    for s in d.accel_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    for s in d.accel_nib_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    return m
-
-
-def _region_land_arr(d: EagerDFA) -> Array[Int16, 256]:
-    """Comptime: `region_land` as a materializable array."""
-    var arr = Array[Int16, 256](fill=-1)
-    for b in range(len(d.region_land)):
-        arr[b] = Int16(d.region_land[b])
-    return arr^
-
-
 @always_inline
 def _edfa_accel_skip[
     origin: Origin, //, d: EagerDFA
@@ -2016,8 +1864,8 @@ def _edfa_accel_skip[
     comptime W = simd_width_of[DType.uint8]()
     if pos + W > len(input):
         return pos
-    comptime m0 = _accel_mask_word(d, 0)
-    comptime m1 = _accel_mask_word(d, 1)
+    comptime m0 = d.accel.mask_word(0)
+    comptime m1 = d.accel.mask_word(1)
     comptime if d.num_states <= 64:
         if (m0 >> UInt64(cur)) & 1 == 0:
             return pos
@@ -2027,21 +1875,21 @@ def _edfa_accel_skip[
             return pos
 
     var p = pos
-    comptime for ai in range(len(d.accel_states)):
-        comptime a_state = d.accel_states[ai]
-        comptime a_e1 = UInt8(d.accel_exit1[ai])
+    comptime for ai in range(len(d.accel.states)):
+        comptime a_state = d.accel.states[ai]
+        comptime a_e1 = UInt8(d.accel.exit1[ai])
         comptime a_e2 = UInt8(
-            d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
+            d.accel.exit2[ai] if d.accel.exit2[ai] >= 0 else d.accel.exit1[ai]
         )
         if cur == a_state:
             p = _find_exit2[e1=a_e1, e2=a_e2](input, p)
             comptime if a_state < d.num_match_states:
                 last_match = p
-    comptime for ai in range(len(d.accel_nib_states)):
-        comptime a_state = d.accel_nib_states[ai]
-        comptime a_kind = d.accel_nib_kind[ai]
-        comptime a_t0 = nibble_table_from(d.accel_nib_t0, ai)
-        comptime a_t1 = nibble_table_from(d.accel_nib_t1, ai)
+    comptime for ai in range(len(d.accel.nib_states)):
+        comptime a_state = d.accel.nib_states[ai]
+        comptime a_kind = d.accel.nib_kind[ai]
+        comptime a_t0 = nibble_table_from(d.accel.nib_t0, ai)
+        comptime a_t1 = nibble_table_from(d.accel.nib_t1, ai)
         if cur == a_state:
             # Scalar peek: only vectorize when the current byte actually
             # self-loops; instant exits go back to the table walk.
@@ -2077,10 +1925,11 @@ def _edfa_region_skip[
                 in_region = True
         if in_region and p < len(input):
             var p2 = p
-            comptime if d.region_exit1 >= 0:
-                comptime r_e1 = UInt8(d.region_exit1)
+            comptime if len(d.region_exits.states) > 0:
+                comptime r_e1 = UInt8(d.region_exits.exit1[0])
                 comptime r_e2 = UInt8(
-                    d.region_exit2 if d.region_exit2 >= 0 else d.region_exit1
+                    d.region_exits.exit2[0] if d.region_exits.exit2[0]
+                    >= 0 else d.region_exits.exit1[0]
                 )
                 # Scalar peek: a region is re-entered right after landing
                 # on an exit byte (a false candidate), where a vector
@@ -2089,9 +1938,9 @@ def _edfa_region_skip[
                 if b0 != r_e1 and b0 != r_e2:
                     p2 = _find_exit2[e1=r_e1, e2=r_e2](input, p + 1)
             else:
-                comptime r_kind = d.region_nib_kind
-                comptime r_t0 = nibble_table_from(d.region_nib_t0, 0)
-                comptime r_t1 = nibble_table_from(d.region_nib_t1, 0)
+                comptime r_kind = d.region_exits.nib_kind[0]
+                comptime r_t0 = nibble_table_from(d.region_exits.nib_t0, 0)
+                comptime r_t1 = nibble_table_from(d.region_exits.nib_t1, 0)
                 if not _class_contains[kind=r_kind, t0=r_t0, t1=r_t1](
                     input.unsafe_get(p)
                 ):
@@ -2101,7 +1950,7 @@ def _edfa_region_skip[
             if p2 > p:
                 # Every skipped byte's target is the same from any
                 # member: the state is whatever the last one selected.
-                comptime land = _region_land_arr(d)
+                comptime land = int_arr[DType.int16, 256](d.region_land, -1)
                 var lnd = materialize[land]()
                 cur = Int(lnd.unsafe_get(Int(input.unsafe_get(p2 - 1))))
                 p = p2
@@ -2115,15 +1964,11 @@ def _edfa_has_region(d: EagerDFA) -> Bool:
 
 def _edfa_has_accel(d: EagerDFA) -> Bool:
     """Comptime: does any state carry acceleration data?"""
-    return (
-        len(d.accel_states) > 0
-        or len(d.accel_nib_states) > 0
-        or len(d.region_states) >= 2
-    )
+    return d.accel.any() or len(d.region_states) >= 2
 
 
 def _start_run_skip_idx(d: EagerDFA) -> Int:
-    """Comptime: index into accel_nib_* of a self-looping nib-accel state
+    """Comptime: index into accel.nib_* of a self-looping nib-accel state
     `S1` such that the mid-line start state (`start_other`, `S0`)
     transitions to `S1` on *every* byte that `S1` self-loops on — else -1.
 
@@ -2150,8 +1995,8 @@ def _start_run_skip_idx(d: EagerDFA) -> Int:
         .unsafe_bitcast[Int64]()
         .unsafe_load[width=256]()
     )
-    for i in range(len(d.accel_nib_states)):
-        var s1 = d.accel_nib_states[i]
+    for i in range(len(d.accel.nib_states)):
+        var s1 = d.accel.nib_states[i]
         var row1 = (
             Pointer(to=d.table[s1 * 256])
             .unsafe_bitcast[Int64]()
@@ -2177,7 +2022,7 @@ def _start_run_skip_idx(d: EagerDFA) -> Int:
 
 
 def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
-    """Comptime: (accel_nib index of S1, pivot byte P) enabling the
+    """Comptime: (accel.nib_* index of S1, pivot byte P) enabling the
     pivot-anchored search prefilter, or (-1, -1).
 
     Qualifying shape — the `[class]+ P …` family (e.g. an email regex's
@@ -2198,7 +2043,7 @@ def _pivot_prefilter(d: EagerDFA) -> Tuple[Int, Int]:
     var rs = _start_run_skip_idx(d)
     if rs < 0:
         return (-1, -1)
-    var s1 = d.accel_nib_states[rs]
+    var s1 = d.accel.nib_states[rs]
     var n = d.num_states
     # Rows as 256-lane vectors throughout: the cell-by-cell form read the
     # whole table several times over at ~50 us per List element.
@@ -2299,7 +2144,7 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
     var chain = List[Int]()
     if pv[0] < 0:
         return chain^
-    var s1 = d.accel_nib_states[pv[0]]
+    var s1 = d.accel.nib_states[pv[0]]
     var cur = d.table[s1 * 256 + pv[1]]
     var cap = 4
     while cap > 0 and cur >= 0:
@@ -2326,6 +2171,12 @@ def _pivot_forced_chain(d: EagerDFA, pv: Tuple[Int, Int]) -> List[Int]:
     return chain^
 
 
+# Bytes walked between dead-state checks on the plain Sheng full-match
+# loop. Bounds the wasted shuffles after an early death while keeping the
+# vector->scalar state extract off the per-byte path.
+comptime _SHENG_DEAD_CHECK_STRIDE = 64
+
+
 @always_inline
 def _edfa_full_match_impl[
     origin: Origin,
@@ -2335,28 +2186,65 @@ def _edfa_full_match_impl[
     table: StringLiteral,
     flags: Array[UInt8, ns],
     accel: Bool,
+    cap: Int,
 ](input: Span[Byte, origin]) -> Bool:
-    # `table` / `flags` are comptime arrays; `materialize` binds them to the
-    # constant data emitted in the binary (no copy) so the walk can index them.
+    """Anchored full match. `cap == 0` steps the eager table (`table` from
+    `table_bytes`); a Sheng tier `cap` steps by one shuffle over the
+    mask table `table` (`sheng_masks_str`, sheng.mojo), dead state
+    `d.num_states`."""
+    # `table` / `flags` are comptime constants; `materialize` binds them to
+    # the constant data emitted in the binary (no copy) so the walk can
+    # index them.
     comptime dt = edfa_id_dtype(d.num_states)
     var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur = d.start_at_0
+    var cur_vec = _ShuffleIndex(UInt8(cur))  # Sheng state (cap > 0 only)
     var pos = 0
     var input_len = len(input)
-    while pos < input_len:
-        comptime if accel:
-            var unused = -1
-            pos = _edfa_accel_skip[d=d](input, cur, pos, unused)
-            comptime if _edfa_has_region(d):
-                pos = _edfa_region_skip[d=d](input, cur, pos)
-            if pos >= input_len:
-                break
-        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(input.unsafe_get(pos))])
-        if nxt < 0:
-            return False
-        cur = nxt
-        pos += 1
+    comptime if cap > 0 and not accel:
+        # The dead-state early exit is only an optimization (the dead
+        # state self-loops), so the vector->scalar extract runs once per
+        # stride instead of per byte — the per-byte loop is then just the
+        # load+shuffle dependency chain.
+        while pos < input_len:
+            var chunk_end = min(pos + _SHENG_DEAD_CHECK_STRIDE, input_len)
+            while pos < chunk_end:
+                cur_vec = _sheng_step[cap](
+                    table, input.unsafe_get(pos), cur_vec
+                )
+                pos += 1
+            cur = Int(cur_vec[0])
+            if cur == d.num_states:
+                return False
+    else:
+        while pos < input_len:
+            comptime if accel:
+                var unused = -1
+                pos = _edfa_accel_skip[d=d](input, cur, pos, unused)
+                comptime if _edfa_has_region(d):
+                    var before = cur
+                    pos = _edfa_region_skip[d=d](input, cur, pos)
+                    comptime if cap > 0:
+                        if cur != before:
+                            cur_vec = _ShuffleIndex(UInt8(cur))
+                if pos >= input_len:
+                    break
+            comptime if cap > 0:
+                cur_vec = _sheng_step[cap](
+                    table, input.unsafe_get(pos), cur_vec
+                )
+                cur = Int(cur_vec[0])
+                if cur == d.num_states:
+                    return False
+            else:
+                var nxt = Int(
+                    tbl[unsafe_offset=cur * 256 + Int(input.unsafe_get(pos))]
+                )
+                if nxt < 0:
+                    return False
+                cur = nxt
+            pos += 1
     comptime if d.any_eol_end:
         return (
             cur < d.num_match_states
@@ -2385,11 +2273,11 @@ def edfa_full_match[
         comptime W = simd_width_of[DType.uint8]()
         if len(input) >= W:
             return _edfa_full_match_impl[
-                d=d, table=table, flags=flags, accel=True
+                d=d, table=table, flags=flags, accel=True, cap=0
             ](input)
-    return _edfa_full_match_impl[d=d, table=table, flags=flags, accel=False](
-        input
-    )
+    return _edfa_full_match_impl[
+        d=d, table=table, flags=flags, accel=False, cap=0
+    ](input)
 
 
 @always_inline
@@ -2401,26 +2289,26 @@ def _edfa_walk_impl[
     table: StringLiteral,
     flags: Array[UInt8, ns],
     accel: Bool,
-    s_at0: Int,
-    s_nl: Int,
-    s_other: Int,
-    s_other_w: Int,
+    cap: Int,
 ](input: Span[Byte, origin], start: Int) -> Int:
+    """The walk behind `edfa_match_at` / `sheng_match_at`; `cap` picks the
+    transition mechanism as in `_edfa_full_match_impl`."""
     comptime dt = edfa_id_dtype(d.num_states)
     var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:
-        cur = s_at0
+        cur = d.start_at_0
     elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
-        cur = s_nl
+        cur = d.start_after_nl
     else:
-        comptime if s_other_w != s_other:
-            cur = s_other_w if edfa_is_word(
+        comptime if d.start_other_word != d.start_other:
+            cur = d.start_other_word if is_word_byte(
                 input.unsafe_get(start - 1)
-            ) else s_other
+            ) else d.start_other
         else:
-            cur = s_other
+            cur = d.start_other
+    var cur_vec = _ShuffleIndex(UInt8(cur))  # Sheng state (cap > 0 only)
 
     var last_match = -1
     if cur < d.num_match_states:
@@ -2432,7 +2320,11 @@ def _edfa_walk_impl[
         comptime if accel:
             pos = _edfa_accel_skip[d=d](input, cur, pos, last_match)
             comptime if _edfa_has_region(d):
+                var before = cur
                 pos = _edfa_region_skip[d=d](input, cur, pos)
+                comptime if cap > 0:
+                    if cur != before:
+                        cur_vec = _ShuffleIndex(UInt8(cur))
             if pos >= input_len:
                 break
         var b = input.unsafe_get(pos)
@@ -2448,14 +2340,20 @@ def _edfa_walk_impl[
             # Such states occupy one id range (see num_cond_states).
             if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
                 var f = flg.unsafe_get(cur)
-                if ((f & EDFA_MATCH_IF_WORD) != 0) == edfa_is_word(b):
+                if ((f & EDFA_MATCH_IF_WORD) != 0) == is_word_byte(b):
                     last_match = pos
-        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
-        if nxt < 0:
-            # Died mid-input: EOL-at-end flags don't apply (mirrors the
-            # `current >= 0` guard in LazyDFA.match_at).
-            return last_match
-        cur = nxt
+        # Died mid-input: EOL-at-end flags don't apply (mirrors the
+        # `current >= 0` guard in LazyDFA.match_at).
+        comptime if cap > 0:
+            cur_vec = _sheng_step[cap](table, b, cur_vec)
+            cur = Int(cur_vec[0])
+            if cur == d.num_states:
+                return last_match
+        else:
+            var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
+            if nxt < 0:
+                return last_match
+            cur = nxt
         pos += 1
         if cur < d.num_match_states:
             last_match = pos
@@ -2466,29 +2364,30 @@ def _edfa_walk_impl[
 
 
 @always_inline
-def edfa_walk_from[
+def edfa_match_at[
     origin: Origin,
     ns: Int,
     //,
     d: EagerDFA,
     table: StringLiteral,
     flags: Array[UInt8, ns],
-    s_at0: Int,
-    s_nl: Int,
-    s_other: Int,
-    s_other_w: Int = s_other,
+    cap: Int = 0,
 ](input: Span[Byte, origin], start: Int) -> Int:
-    """Table walk from `start` in one of the explicit start states
-    (position 0 / after '\n' / mid-line after a non-word byte / mid-line
-    after a word byte — the last two coincide unless a word anchor is
-    live at the start), returning the last position where a match state
-    (or a resolving EOL / word-boundary flag) was observed, or -1.
+    """Table walk from `start` in the DFA's own start states (position 0
+    / after '\n' / mid-line after a non-word byte / mid-line after a word
+    byte — the last two coincide unless a word anchor is live at the
+    start), returning the last position where a match state (or a
+    resolving EOL / word-boundary flag) was observed, or -1.
 
     What that position MEANS depends on the table: over the classic
     subset construction it is the leftmost-longest end of a match
-    anchored at `start`; over a leftmost-first table (static_lfdfa.mojo)
-    it is Python's leftmost-first end, anchored or unanchored according
-    to which start ids the caller hands over.
+    anchored at `start` (mirrors LazyDFA.match_at); over a leftmost-first
+    table (static_lfdfa.mojo), whose start states are the unanchored
+    ones, it is Python's leftmost-first end of the first match at or
+    after `start`.
+
+    `cap > 0` walks the Sheng masks instead (`table` is then
+    `sheng_masks_str`; see `sheng_match_at`).
 
     Dispatches once per walk between an accelerated and a plain loop:
     walks that can never reach a full vector chunk take the plain loop
@@ -2498,48 +2397,11 @@ def edfa_walk_from[
         comptime W = simd_width_of[DType.uint8]()
         if len(input) - start >= W:
             return _edfa_walk_impl[
-                d=d,
-                table=table,
-                flags=flags,
-                accel=True,
-                s_at0=s_at0,
-                s_nl=s_nl,
-                s_other=s_other,
-                s_other_w=s_other_w,
+                d=d, table=table, flags=flags, accel=True, cap=cap
             ](input, start)
-    return _edfa_walk_impl[
-        d=d,
-        table=table,
-        flags=flags,
-        accel=False,
-        s_at0=s_at0,
-        s_nl=s_nl,
-        s_other=s_other,
-        s_other_w=s_other_w,
-    ](input, start)
-
-
-@always_inline
-def edfa_match_at[
-    origin: Origin,
-    ns: Int,
-    //,
-    d: EagerDFA,
-    table: StringLiteral,
-    flags: Array[UInt8, ns],
-](input: Span[Byte, origin], start: Int) -> Int:
-    """Anchored match at `start`; returns leftmost-longest end or -1
-    (mirrors LazyDFA.match_at). `edfa_walk_from` in the DFA's own start
-    states."""
-    return edfa_walk_from[
-        d=d,
-        table=table,
-        flags=flags,
-        s_at0=d.start_at_0,
-        s_nl=d.start_after_nl,
-        s_other=d.start_other,
-        s_other_w=d.start_other_word,
-    ](input, start)
+    return _edfa_walk_impl[d=d, table=table, flags=flags, accel=False, cap=cap](
+        input, start
+    )
 
 
 @always_inline
@@ -2561,9 +2423,9 @@ def pivot_first_candidate[
     """
     comptime pv = _pivot_prefilter(d)
     comptime assert pv[0] >= 0
-    comptime pk = d.accel_nib_kind[pv[0]]
-    comptime pt0 = nibble_table_from(d.accel_nib_t0, pv[0])
-    comptime pt1 = nibble_table_from(d.accel_nib_t1, pv[0])
+    comptime pk = d.accel.nib_kind[pv[0]]
+    comptime pt0 = nibble_table_from(d.accel.nib_t0, pv[0])
+    comptime pt1 = nibble_table_from(d.accel.nib_t1, pv[0])
     comptime pivot_byte = UInt8(pv[1])
     comptime fchain = _pivot_forced_chain(d, pv)
     var input_len = len(input)

@@ -81,10 +81,11 @@ struct ASTNode(Copyable, Movable):
         return ASTNode(ASTNodeKind.DOT)
 
     @staticmethod
-    def char_class(charset_idx: Int, negated: Bool, out node: ASTNode):
+    def char_class(charset_idx: Int, out node: ASTNode):
+        """Negation lives on the pooled CharSet (`cs.negate()`), which is
+        all the NFA builder reads; `negated` stays False here."""
         node = ASTNode(ASTNodeKind.CHAR_CLASS)
         node.charset_index = charset_idx
-        node.negated = negated
 
     @staticmethod
     def alternation(var children: List[Int], out node: ASTNode):

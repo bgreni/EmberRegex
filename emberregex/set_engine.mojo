@@ -49,10 +49,8 @@ from std.math import max
 from std.os import abort
 
 from .nfa import NFA
-from .static_bytes import static_bytes
+from .static_bytes import int_arr, list_arr, static_bytes, table_bytes
 from .set_ac import (
-    ac_cls_arr,
-    ac_pool_arr,
     ac_rep_arr,
     ac_scan,
     ac_table_str,
@@ -60,20 +58,15 @@ from .set_ac import (
     build_ac,
 )
 from .set_bitnfa import (
-    bitnfa_ex_idx_arr,
-    bitnfa_i32_arr,
     bitnfa_scan,
-    bitnfa_u64_arr,
     build_bitnfa,
 )
 from .set_dfa import (
     build_multi_dfa,
-    mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
-    mdfa_table_str,
 )
-from .set_literal import extract_literal_set, litset_scan
+from .set_literal import extract_literal_set, litset_masks, litset_scan
 from .set_nfa import build_union_nfa, build_union_subset_nfa, _union_any_unicode
 from .set_pike import utf8_mid_codepoint
 from .set_pike import (
@@ -85,32 +78,27 @@ from .set_pike import (
 from .set_rose import (
     build_rose,
     merge_reports,
-    rose_flags_arr,
     rose_bcls_arr,
+    _rose_lits,
+    _rose_meta,
     rose_bcls_len,
-    rose_lits_arr,
     rose_lits_len,
     rose_look_arr,
     rose_look_len,
-    rose_meta_arr,
     rose_meta_len,
     rose_scan,
-    rose_table_str,
     rose_view,
 )
 from .set_reverse import (
     build_reverse_dfa,
     leftmost_nonoverlapping,
-    rdfa_pool_arr,
     rdfa_slices_arr,
-    rdfa_table_str,
     rdfa_view,
     reverse_som,
 )
 from .set_combine import (
     combos_error,
     combos_rpn,
-    combos_rpn_arr,
     evaluate_combinations,
 )
 from .set_prefilter import confirm_span
@@ -257,9 +245,11 @@ struct RegexSet[
     comptime _AC_TABLE_S = ac_table_str[
         Self._ac.num_states * Self._ac.num_classes
     ](Self._ac)
-    comptime _AC_CLS = ac_cls_arr(Self._ac)
+    comptime _AC_CLS = int_arr[DType.uint8, 256](Self._ac.class_map, 0)
     comptime _AC_REP = ac_rep_arr[2 * Self._ac.num_states](Self._ac)
-    comptime _AC_POOL = ac_pool_arr[len(Self._ac.pool)](Self._ac)
+    comptime _AC_POOL = int_arr[DType.int32, len(Self._ac.pool)](
+        Self._ac.pool, 0
+    )
 
     # --- Rose lane: literal decomposition (phase 4) -------------------------
     # Extraction is linear, so this decides before anything determinizes.
@@ -271,20 +261,25 @@ struct RegexSet[
     )
     comptime _use_rose = Self._rose.valid
     comptime _ROSE_TABLE = static_bytes[Self._ROSE_TABLE_S]()
-    comptime _ROSE_TABLE_S = rose_table_str[Self._rose.num_conf_states * 256](
-        Self._rose
+    comptime _ROSE_TABLE_S = table_bytes[DType.int32](
+        Self._rose.conf_table, Self._rose.num_conf_states * 256
     )
-    comptime _ROSE_FLAGS = rose_flags_arr[Self._rose.num_conf_states](
-        Self._rose
+    comptime _ROSE_FLAGS = int_arr[DType.uint8, Self._rose.num_conf_states](
+        Self._rose.conf_flags, 0
     )
     # The walkers take the table-free view: comptime parameter values are
     # mangled into symbol names, and carrying the confirm table there too
     # blew the linker's symbol-length limit on a 32-pattern set.
     comptime _rose_v = rose_view(Self._rose)
-    comptime _ROSE_META = rose_meta_arr[rose_meta_len(Self._rose)](Self._rose)
-    comptime _ROSE_LITS = rose_lits_arr[rose_lits_len(Self._rose)](Self._rose)
+    comptime _ROSE_META = int_arr[DType.int32, rose_meta_len(Self._rose)](
+        _rose_meta(Self._rose), 0
+    )
+    comptime _ROSE_LITS = int_arr[DType.int32, rose_lits_len(Self._rose)](
+        _rose_lits(Self._rose), 0
+    )
     comptime _ROSE_BCLS = rose_bcls_arr[rose_bcls_len(Self._rose)](Self._rose)
     comptime _ROSE_LOOK = rose_look_arr[rose_look_len(Self._rose)](Self._rose)
+    comptime _ROSE_MASKS = litset_masks(Self._rose.lit)
 
     # Patterns Rose could not decompose keep a per-byte automaton, over
     # their own (smaller, better-accelerating) union.
@@ -301,10 +296,12 @@ struct RegexSet[
     )
     comptime _use_res_mdfa = Self._res_mdfa.valid
     comptime _RES_TABLE = static_bytes[Self._RES_TABLE_S]()
-    comptime _RES_TABLE_S = mdfa_table_str[Self._res_mdfa.num_states * 256](
-        Self._res_mdfa
+    comptime _RES_TABLE_S = table_bytes[DType.int16](
+        Self._res_mdfa.table, Self._res_mdfa.num_states * 256
     )
-    comptime _RES_POOL = mdfa_pool_arr[len(Self._res_mdfa.pool)](Self._res_mdfa)
+    comptime _RES_POOL = int_arr[DType.int32, len(Self._res_mdfa.pool)](
+        Self._res_mdfa.pool, 0
+    )
     comptime _RES_SLICES = mdfa_slices_arr[6 * Self._res_mdfa.num_states](
         Self._res_mdfa
     )
@@ -315,21 +312,21 @@ struct RegexSet[
         and not Self._use_res_mdfa,
     )
     comptime _use_res_bitnfa = Self._res_bitnfa.valid
-    comptime _RES_BN_REACH = bitnfa_u64_arr[256 * Self._res_bitnfa.lanes](
-        Self._res_bitnfa.reach
+    comptime _RES_BN_REACH = list_arr[UInt64, 256 * Self._res_bitnfa.lanes](
+        Self._res_bitnfa.reach, 0
     )
-    comptime _RES_BN_EX = bitnfa_u64_arr[len(Self._res_bitnfa.ex_data)](
-        Self._res_bitnfa.ex_data
+    comptime _RES_BN_EX = list_arr[UInt64, len(Self._res_bitnfa.ex_data)](
+        Self._res_bitnfa.ex_data, 0
     )
-    comptime _RES_BN_EXIDX = bitnfa_ex_idx_arr[Self._res_bitnfa.num_positions](
-        Self._res_bitnfa
+    comptime _RES_BN_EXIDX = int_arr[
+        DType.int16, Self._res_bitnfa.num_positions
+    ](Self._res_bitnfa.ex_index, -1)
+    comptime _RES_BN_POOL = int_arr[DType.int32, len(Self._res_bitnfa.pool)](
+        Self._res_bitnfa.pool, 0
     )
-    comptime _RES_BN_POOL = bitnfa_i32_arr[len(Self._res_bitnfa.pool)](
-        Self._res_bitnfa.pool
-    )
-    comptime _RES_BN_SLICES = bitnfa_i32_arr[
-        12 * Self._res_bitnfa.num_positions
-    ](Self._res_bitnfa.slices)
+    comptime _RES_BN_SLICES = int_arr[
+        DType.int32, 12 * Self._res_bitnfa.num_positions
+    ](Self._res_bitnfa.slices, 0)
     comptime _use_res_pike = (
         Self._has_residual
         and not Self._use_res_mdfa
@@ -348,10 +345,13 @@ struct RegexSet[
     )
     comptime _use_mdfa = Self._mdfa.valid
     comptime _MDFA_TABLE = static_bytes[Self._MDFA_TABLE_S]()
-    comptime _MDFA_TABLE_S = mdfa_table_str[Self._mdfa.num_states * 256](
-        Self._mdfa
+    # Int16 state ids: MDFA_STATE_CAP < 32768 by construction.
+    comptime _MDFA_TABLE_S = table_bytes[DType.int16](
+        Self._mdfa.table, Self._mdfa.num_states * 256
     )
-    comptime _MDFA_POOL = mdfa_pool_arr[len(Self._mdfa.pool)](Self._mdfa)
+    comptime _MDFA_POOL = int_arr[DType.int32, len(Self._mdfa.pool)](
+        Self._mdfa.pool, 0
+    )
     comptime _MDFA_SLICES = mdfa_slices_arr[6 * Self._mdfa.num_states](
         Self._mdfa
     )
@@ -364,8 +364,6 @@ struct RegexSet[
     # cliff, so this costs linear comptime work even when a faster lane
     # owns `scan`.
     comptime _bitnfa = build_bitnfa(Self.nfa, Self.nfa.can_use_dfa)
-    comptime _can_stream = Self._bitnfa.valid
-    comptime _stream_bn = Self._bitnfa
     # Cheap lane predicates FIRST: comptime `and` short-circuits during
     # elaboration, so testing `_bitnfa.valid` last means a set that Teddy,
     # Rose or the multi-DFA already owns never runs the LimEx construction at
@@ -379,28 +377,21 @@ struct RegexSet[
         and not Self._use_mdfa
         and Self._bitnfa.valid
     )
-    comptime _BN_REACH = bitnfa_u64_arr[256 * Self._bitnfa.lanes](
-        Self._bitnfa.reach
+    comptime _BN_REACH = list_arr[UInt64, 256 * Self._bitnfa.lanes](
+        Self._bitnfa.reach, 0
     )
-    comptime _BN_EX = bitnfa_u64_arr[len(Self._bitnfa.ex_data)](
-        Self._bitnfa.ex_data
+    comptime _BN_EX = list_arr[UInt64, len(Self._bitnfa.ex_data)](
+        Self._bitnfa.ex_data, 0
     )
-    comptime _BN_EXIDX = bitnfa_ex_idx_arr[Self._bitnfa.num_positions](
-        Self._bitnfa
+    comptime _BN_EXIDX = int_arr[DType.int16, Self._bitnfa.num_positions](
+        Self._bitnfa.ex_index, -1
     )
-    comptime _BN_POOL = bitnfa_i32_arr[len(Self._bitnfa.pool)](
-        Self._bitnfa.pool
+    comptime _BN_POOL = int_arr[DType.int32, len(Self._bitnfa.pool)](
+        Self._bitnfa.pool, 0
     )
-    comptime _BN_SLICES = bitnfa_i32_arr[12 * Self._bitnfa.num_positions](
-        Self._bitnfa.slices
+    comptime _BN_SLICES = int_arr[DType.int32, 12 * Self._bitnfa.num_positions](
+        Self._bitnfa.slices, 0
     )
-    # Stream aliases: same arrays, named for the streaming API so
-    # set_stream.mojo does not reach into block-lane internals.
-    comptime _SBN_REACH = Self._BN_REACH
-    comptime _SBN_EX = Self._BN_EX
-    comptime _SBN_EXIDX = Self._BN_EXIDX
-    comptime _SBN_POOL = Self._BN_POOL
-    comptime _SBN_SLICES = Self._BN_SLICES
 
     comptime _use_pike = (
         not Self._use_litset
@@ -426,10 +417,12 @@ struct RegexSet[
     comptime _use_rdfa = Self._rdfa.valid
     comptime _rdfa_v = rdfa_view(Self._rdfa)
     comptime _RD_TABLE = static_bytes[Self._RD_TABLE_S]()
-    comptime _RD_TABLE_S = rdfa_table_str[Self._rdfa.num_states * 256](
-        Self._rdfa
+    comptime _RD_TABLE_S = table_bytes[DType.int32](
+        Self._rdfa.table, Self._rdfa.num_states * 256
     )
-    comptime _RD_POOL = rdfa_pool_arr[len(Self._rdfa.pool)](Self._rdfa)
+    comptime _RD_POOL = int_arr[DType.int32, len(Self._rdfa.pool)](
+        Self._rdfa.pool, 0
+    )
     comptime _RD_SLICES = rdfa_slices_arr[6 * Self._rdfa.num_states](Self._rdfa)
 
     # --- Exact backrefs / lookaround (phase 7) -----------------------------
@@ -441,13 +434,13 @@ struct RegexSet[
     # --- Logical combinations (phase 7) ------------------------------------
     comptime _num_combos = len(Self.combos)
     comptime _combos_ok = _check_combos(Self.combos, Self.num_patterns)
-    comptime _COMBO_RPN = combos_rpn_arr[
-        max(1, len(combos_rpn(Self.combos, Self.num_patterns)))
-    ](combos_rpn(Self.combos, Self.num_patterns))
+    comptime _COMBO_RPN = int_arr[
+        DType.int32, max(1, len(combos_rpn(Self.combos, Self.num_patterns)))
+    ](combos_rpn(Self.combos, Self.num_patterns), 0)
 
     # --- Semantic surface (phase 7) ----------------------------------------
     comptime _has_sem = has_semantics(Self.flags, Self.ext, Self.num_patterns)
-    comptime _sem_needs_som = needs_som(Self.flags, Self.ext, Self.num_patterns)
+    comptime _sem_needs_som = needs_som(Self.ext, Self.num_patterns)
     comptime _SEM = sem_table_arr[sem_table_len(Self.num_patterns)](
         Self.flags, Self.ext, Self.num_patterns
     )
@@ -556,8 +549,7 @@ struct RegexSet[
                     i += 1
             return self._confirm(input, out^)
         else:
-            ref nfa = rebind[NFA](self._nfa)
-            return self._confirm(input, set_pike_som_scan(nfa, input))
+            return self._confirm(input, set_pike_som_scan(self._nfa, input))
 
     def _scan_residual[
         origin: Origin, //
@@ -744,6 +736,7 @@ struct RegexSet[
                 lits=Self._ROSE_LITS,
                 bcls=Self._ROSE_BCLS,
                 look=Self._ROSE_LOOK,
+                masks=Self._ROSE_MASKS,
             ](input)
             comptime if Self._has_residual:
                 return merge_reports(reports^, self._scan_residual(input))
@@ -766,5 +759,4 @@ struct RegexSet[
                 slices=Self._BN_SLICES,
             ](input)
         else:
-            ref nfa = rebind[NFA](self._nfa)
-            return set_pike_scan(nfa, input)
+            return set_pike_scan(self._nfa, input)

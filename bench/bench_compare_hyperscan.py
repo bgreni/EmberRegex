@@ -32,25 +32,13 @@ import os
 import subprocess
 import sys
 
+from bench_compare_set import PAIRS, run_mojo
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HS_ENV = os.path.join(ROOT, ".pixi", "envs", "hs")
 SRC = os.path.join(ROOT, "comparisons", "bench_hyperscan.c")
 BIN = os.path.join(ROOT, "comparisons", "bench_hyperscan")
 COUNTS = os.path.join(ROOT, "comparisons", "set_counts.mojo")
-
-# Mojo bench row -> the C harness row it should be read against, and the
-# haystack size in bytes (for GB/s).
-PAIRS = [
-    ("set_teddy8_sparse_16k", "teddy8_sparse_16k", 16 * 1024),
-    ("set_teddy8_dense_16k", "teddy8_dense_16k", 16 * 1024),
-    ("set_teddy64_sparse_16k", "teddy64_sparse_16k", 16 * 1024),
-    ("set_teddy64_dense_16k", "teddy64_dense_16k", 16 * 1024),
-    ("set_rose_log_sparse_16k", "log_sparse_16k", 16 * 1024),
-    ("set_rose_log_dense_16k", "log_dense_16k", 16 * 1024),
-    ("set_rose_log_sparse_64k", "log_sparse_64k", 64 * 1024),
-    ("set_rose_full_sparse_64k", "full_sparse_64k", 64 * 1024),
-    ("set_rose_full_dense_16k", "full_dense_16k", 16 * 1024),
-]
 
 
 def build():
@@ -106,24 +94,6 @@ def run_mojo_counts():
     return rows
 
 
-def run_mojo():
-    """{row: GB/s}"""
-    out = subprocess.run(
-        ["pixi", "run", "bench_set"], capture_output=True, text=True, check=True
-    ).stdout
-    rows = {}
-    for line in out.splitlines():
-        if not line.startswith("| set_"):
-            continue
-        cells = [c.strip() for c in line.split("|")]
-        if len(cells) > 4:
-            try:
-                rows[cells[1]] = float(cells[4])
-            except ValueError:
-                pass
-    return rows
-
-
 def main():
     print("building the Vectorscan harness...")
     build()
@@ -138,7 +108,10 @@ def main():
     print(f"{'row':<28} {'ember':>9} {'vectorscan':>11} {'ratio':>8}  matches")
     print("-" * 74)
     mismatched = 0
-    for mojo_row, hs_row, nbytes in PAIRS:
+    # The C harness names its rows like the Python baselines (PAIRS' second
+    # column), and every row name ends in its haystack size ("..._16k").
+    for mojo_row, hs_row in PAIRS:
+        nbytes = int(hs_row.rsplit("_", 1)[1].rstrip("k")) * 1024
         e = mo.get(mojo_row)
         h = hs.get(hs_row)
         if e is None or h is None:

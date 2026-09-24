@@ -191,38 +191,6 @@ class TestFailedFirstOrdering(unittest.TestCase):
         self.assertEqual(order, ["test/b.mojo", "test/a.mojo"])
 
 
-class TestPruneResults(unittest.TestCase):
-    def test_drops_entries_for_files_no_longer_present(self):
-        results = {
-            "test/live.mojo": {"duration": 1.0, "status": "pass"},
-            "test/deleted.mojo": {"duration": 2.0, "status": "pass"},
-        }
-        pruned = run_test.prune_results(results, {"test/live.mojo"})
-        self.assertIn("test/live.mojo", pruned)
-        self.assertNotIn("test/deleted.mojo", pruned)
-
-    def test_keeps_all_live_entries(self):
-        results = {
-            "test/a.mojo": {"duration": 1.0, "status": "pass"},
-            "test/b.mojo": {"duration": 2.0, "status": "fail"},
-        }
-        pruned = run_test.prune_results(
-            results, {"test/a.mojo", "test/b.mojo"}
-        )
-        self.assertEqual(pruned, results)
-
-
-class TestPkgRebuild(unittest.TestCase):
-    def test_missing_record_rebuilds(self):
-        self.assertTrue(run_test.needs_pkg_rebuild(None, "fp"))
-
-    def test_stale_fingerprint_rebuilds(self):
-        self.assertTrue(run_test.needs_pkg_rebuild("old", "fp"))
-
-    def test_fresh_fingerprint_skips_rebuild(self):
-        self.assertFalse(run_test.needs_pkg_rebuild("fp", "fp"))
-
-
 class TestDurationEstimate(unittest.TestCase):
     def test_warm_run_does_not_demote_a_cold_heavy_file(self):
         # The scheduling estimate is the larger of this run's wall time

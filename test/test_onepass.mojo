@@ -19,8 +19,9 @@ assertion so a selection change cannot silently move a test onto — or off
 """
 
 from emberregex import Regex
-from emberregex.static_bytes import static_bytes
+from emberregex.static_bytes import int_arr, list_arr, static_bytes
 from emberregex.onepass import (
+    ONEPASS_CLASS_LEN,
     OnePass,
     OP_MATCH,
     OP_NEED_EOL,
@@ -28,8 +29,6 @@ from emberregex.onepass import (
     OP_NEED_WORD,
     ONEPASS_STATE_CAP,
     build_onepass,
-    onepass_class_arr,
-    onepass_eps_arr,
     onepass_eps_len,
     onepass_match,
     onepass_state_arr,
@@ -197,13 +196,13 @@ def test_onepass_walker_acceleration() raises:
     # the shape gate keeps such patterns off `_use_onepass`.
     comptime op = build_onepass(_build_static_nfa("(a)([^;]*);(b)"), True)
     assert_true(op.valid)
-    comptime accel = len(op.accel.accel_states) + len(op.accel.accel_nib_states)
+    comptime accel = len(op.accel.accel.states) + len(op.accel.accel.nib_states)
     assert_true(accel >= 1)
     comptime TN = onepass_table_len(op)
     comptime TBL = static_bytes[onepass_table_str[TN](op)]()
-    comptime CLS = onepass_class_arr(op)
+    comptime CLS = int_arr[DType.uint8, ONEPASS_CLASS_LEN](op.class_of, 0)
     comptime NE = onepass_eps_len(op)
-    comptime EPS = onepass_eps_arr[NE](op)
+    comptime EPS = list_arr[UInt64, NE](op.eps_sets, 0)
     comptime NS = onepass_state_len(op)
     comptime ST = onepass_state_arr[NS](op)
     # 40-byte middle run so the 16-byte-vector acceleration fires.

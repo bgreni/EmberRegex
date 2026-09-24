@@ -72,8 +72,6 @@ sort+dedup.
 """
 
 from std.collections import Array
-from std.math import min
-from std.sys import simd_width_of
 
 from .charset import BITMAP_WIDTH
 from .constants import CHAR_NEWLINE
@@ -83,22 +81,18 @@ from .parser import parse
 from .set_literal import (
     LITSET_MAX,
     LiteralSet,
+    TeddyMasks,
     _NUM_BUCKETS,
     _assign_buckets,
+    teddy_front_end,
 )
-from .set_pike import SetMatch
+from .set_pike import SetMatch, _before, dedup_reports, sort_reports
 from .set_semantics import (
     EXT_EDIT_DISTANCE,
     EXT_HAMMING_DISTANCE,
     ext_of,
 )
-from .simd_kernels import (
-    HAS_FAST_BYTE_SHUFFLE,
-    NIBBLE_TABLE_SIZE,
-    nibble_lookup,
-)
-from .simd_scan import clear_first_lane, first_lane_index, lane_bits
-from .static_bytes import table_bytes
+from .simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from .static_dfa import (
     EDFA_EOL_AT_END,
     EDFA_EOL_AT_NEWLINE,
@@ -109,8 +103,6 @@ from .static_dfa import (
     build_eager_dfa,
 )
 from .teddy import _lit_at
-
-comptime _NibbleTable = SIMD[DType.uint8, NIBBLE_TABLE_SIZE]
 
 # A 1-byte factor filters no better than the first-byte bitmap the
 # residual automaton already has, and drags every occurrence of a common
@@ -158,8 +150,8 @@ comptime ROSE_CONF_STATE_CAP = 512
 
 struct RoseSet(Copyable, Movable):
     """Comptime-computed decomposition. Only ever exists as a comptime
-    value; the runtime walker reads the materialized Array forms
-    (rose_table_arr / rose_flags_arr).
+    value; the runtime walker reads the materialized forms (RegexSet's
+    `_ROSE_*` decls).
 
     `lit` is entry-indexed and holds exactly what the phase-1 Teddy
     machinery needs (bytes, caseless flags, report ids, buckets);
@@ -257,7 +249,7 @@ struct RoseView(Copyable, Movable):
       - the same data as `Array` costs ~4 chars per element.
 
     So the per-entry pools travel as Array parameters
-    (rose_meta_arr / rose_lits_arr) and this struct carries only scalars.
+    (`_rose_meta` / `_rose_lits`) and this struct carries only scalars.
     The other lanes never hit this because their scan functions stay
     small enough to inline, at which point no symbol spells the values
     at all.
@@ -344,14 +336,6 @@ def rose_lits_len(r: RoseSet) -> Int:
     return max(1, n)
 
 
-def rose_meta_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    var meta = _rose_meta(r)
-    for i in range(min(n, len(meta))):
-        arr[i] = Int32(meta[i])
-    return arr^
-
-
 def rose_bcls_len(r: RoseSet) -> Int:
     return max(1, 8 * len(r.back_classes))
 
@@ -390,14 +374,6 @@ def rose_look_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
     return arr^
 
 
-def rose_lits_arr[n: Int](r: RoseSet) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    var lits = _rose_lits(r)
-    for i in range(min(n, len(lits))):
-        arr[i] = Int32(lits[i])
-    return arr^
-
-
 def _entry_bytes[
     mn: Int, ln: Int
 ](meta: Array[Int32, mn], lits: Array[Int32, ln], i: Int) -> List[Int]:
@@ -431,34 +407,6 @@ def _bucket_entries[
         if Int(meta[_M_STRIDE * i + _M_BUCKET]) == b:
             out.append(i)
     return out^
-
-
-def _rose_pos_masks[
-    mn: Int, ln: Int
-](
-    meta: Array[Int32, mn],
-    lits: Array[Int32, ln],
-    n_entries: Int,
-    j: Int,
-) -> Tuple[_NibbleTable, _NibbleTable]:
-    """Comptime: (lo, hi) nibble tables for factor byte position j; entry
-    bits are BUCKET indices. Caseless positions admit both cases (same low
-    nibble, both high nibbles). Mirrors _litset_pos_masks over the flat
-    pools."""
-    var lo = _NibbleTable(0)
-    var hi = _NibbleTable(0)
-    for i in range(n_entries):
-        var base = _M_STRIDE * i
-        var packed = Int(lits[Int(meta[base + _M_BYTE_OFF]) + j])
-        var b = packed & 0xFF
-        var bit = UInt8(1) << UInt8(Int(meta[base + _M_BUCKET]))
-        lo[b & 0x0F] |= bit
-        hi[b >> 4] |= bit
-        if (packed & 0x100) != 0:
-            var u = b - 32  # the uppercase member
-            lo[u & 0x0F] |= bit
-            hi[u >> 4] |= bit
-    return (lo, hi)
 
 
 # --- Factor extraction ------------------------------------------------------
@@ -1225,60 +1173,7 @@ def build_rose(
     return result^
 
 
-# --- Comptime materialization helpers ---------------------------------------
-
-
-def rose_table_str[n: Int](r: RoseSet) -> String:
-    """The concatenated confirm tables as `n` little-endian Int32
-    entries; see static_bytes.mojo for why a string."""
-    return table_bytes[DType.int32](r.conf_table, n)
-
-
-def rose_flags_arr[n: Int](r: RoseSet) -> Array[UInt8, n]:
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(r.conf_flags[i])
-    return arr^
-
-
 # --- Report ordering --------------------------------------------------------
-
-
-@always_inline
-def _before(a: SetMatch, b: SetMatch) -> Bool:
-    """Contract order: nondecreasing end, ties ascending id."""
-    return a.end < b.end or (a.end == b.end and a.id <= b.id)
-
-
-def sort_reports(mut r: List[SetMatch]):
-    """Order reports by (end, id).
-
-    Reports leave the scan grouped by candidate start, and candidates
-    advance monotonically, so displacement is bounded by how far one
-    confirm walk can reach past the next candidate — a few bytes for the
-    literal-ish patterns this lane accepts (`_conf_dfa_ok` already keeps
-    the far-walking ones off it). Insertion sort is near-linear there and
-    allocates nothing, which matters: on dense input this runs over
-    thousands of reports per scan.
-    """
-    for i in range(1, len(r)):
-        var key = r[i]
-        var j = i - 1
-        while j >= 0 and not _before(r[j], key):
-            r[j + 1] = r[j]
-            j -= 1
-        r[j + 1] = key
-
-
-def dedup_reports(mut r: List[SetMatch]):
-    """Collapse duplicate (id, end) pairs in a sorted report list."""
-    var w = 0
-    for i in range(len(r)):
-        if w > 0 and r[i] == r[w - 1]:
-            continue
-        r[w] = r[i]
-        w += 1
-    r.resize(w, SetMatch(0, 0))
 
 
 def merge_reports(var a: List[SetMatch], b: List[SetMatch]) -> List[SetMatch]:
@@ -1373,16 +1268,10 @@ def _look_ok[
 def _rose_walk[
     origin: Origin,
     fn_: Int,
-    mn: Int,
-    ln: Int,
-    bn: Int,
     //,
     r: RoseView,
     table: StringLiteral,
     flags: Array[UInt8, fn_],
-    meta: Array[Int32, mn],
-    lits: Array[Int32, ln],
-    bcls: Array[Int32, bn],
     pid: Int,
 ](
     input: Span[Byte, origin],
@@ -1431,15 +1320,11 @@ def _rose_confirm[
     origin: Origin,
     fn_: Int,
     mn: Int,
-    ln: Int,
-    bn: Int,
     //,
     r: RoseView,
     table: StringLiteral,
     flags: Array[UInt8, fn_],
     meta: Array[Int32, mn],
-    lits: Array[Int32, ln],
-    bcls: Array[Int32, bn],
     entry: Int,
     pid: Int,
 ](input: Span[Byte, origin], start: Int, mut out: List[SetMatch]):
@@ -1455,15 +1340,7 @@ def _rose_confirm[
         cur = s_nl
     else:
         cur = s_other
-    _rose_walk[
-        r=r,
-        table=table,
-        flags=flags,
-        meta=meta,
-        lits=lits,
-        bcls=bcls,
-        pid=pid,
-    ](input, start, cur, out)
+    _rose_walk[r=r, table=table, flags=flags, pid=pid](input, start, cur, out)
 
 
 @always_inline
@@ -1527,8 +1404,6 @@ def _rose_verify_at[
                                 table=table,
                                 flags=flags,
                                 meta=meta,
-                                lits=lits,
-                                bcls=bcls,
                                 entry=i,
                                 pid=pid,
                             ](input, s0, out)
@@ -1551,13 +1426,7 @@ def _rose_verify_at[
                                 cur = k2
                             if cur >= 0:
                                 _rose_walk[
-                                    r=r,
-                                    table=table,
-                                    flags=flags,
-                                    meta=meta,
-                                    lits=lits,
-                                    bcls=bcls,
-                                    pid=pid,
+                                    r=r, table=table, flags=flags, pid=pid
                                 ](input, at + L, cur, out)
                     elif not skip:
                         if (
@@ -1572,8 +1441,6 @@ def _rose_verify_at[
                                 table=table,
                                 flags=flags,
                                 meta=meta,
-                                lits=lits,
-                                bcls=bcls,
                                 entry=i,
                                 pid=pid,
                             ](input, at - off, out)
@@ -1600,52 +1467,19 @@ def rose_scan[
     lits: Array[Int32, ln],
     bcls: Array[Int32, bn],
     look: Array[Int32, kn],
+    masks: TeddyMasks,
 ](input: Span[Byte, origin]) -> List[SetMatch]:
-    """Scan for the factor-group patterns: Teddy front end, per-candidate
-    confirmation. Returns contract-ordered, deduped reports.
+    """Scan for the factor-group patterns: Teddy front end
+    (`teddy_front_end`, over `masks` = `litset_masks` of the factor set),
+    per-candidate confirmation. Returns contract-ordered, deduped reports.
 
-    Non-mutating; buffers are local. The chunk loop mirrors
-    litset_scan — lane shifts zero-fill, so the last k-1 lanes of each
-    chunk are re-examined as the head of the next.
+    Non-mutating; buffers are local.
     """
-    comptime W = simd_width_of[DType.uint8]()
-    comptime k = min(3, r.min_len)
-    comptime m0 = _rose_pos_masks(meta, lits, r.n_entries, 0)
-    comptime m1 = _rose_pos_masks(meta, lits, r.n_entries, 1 if k > 1 else 0)
-    comptime m2 = _rose_pos_masks(meta, lits, r.n_entries, 2 if k > 2 else 0)
-
     var out = List[SetMatch]()
-    var input_len = len(input)
-    var pos = 0
-    var ptr = Pointer(input.unsafe_ptr())
+    var inp = Span[Byte, ImmOrigin(origin)](input)
 
-    while pos + W <= input_len:
-        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
-        var lo = v & 0x0F
-        var hi = v >> 4
-        var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
-        comptime if k > 1:
-            var c1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
-            cand &= c1.shift_left[1]()
-        comptime if k > 2:
-            var c2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
-            cand &= c2.shift_left[2]()
-        var bits = lane_bits(cand.ne(0))
-        while bits != 0:
-            var lane = first_lane_index(bits)
-            _rose_verify_at[
-                r=r,
-                table=table,
-                flags=flags,
-                meta=meta,
-                lits=lits,
-                bcls=bcls,
-                look=look,
-            ](input, pos + lane, cand[lane], out)
-            bits = clear_first_lane(bits)
-        pos += W - (k - 1)
-
-    while pos + r.min_len <= input_len:
+    @always_inline
+    def verify(at: Int, bucket_mask: UInt8) {mut out, imm inp}:
         _rose_verify_at[
             r=r,
             table=table,
@@ -1654,9 +1488,9 @@ def rose_scan[
             lits=lits,
             bcls=bcls,
             look=look,
-        ](input, pos, UInt8(0xFF), out)
-        pos += 1
+        ](inp, at, bucket_mask, out)
 
+    teddy_front_end[min_len=r.min_len, masks=masks](inp, verify)
     sort_reports(out)
     dedup_reports(out)
     return out^

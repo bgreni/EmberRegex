@@ -7,10 +7,24 @@ a list of dangling output arrows (patch list).
 
 from std.math import max, min
 
-from .constants import CHAR_A_LOWER, CHAR_A_UPPER, CHAR_Z_LOWER, CHAR_Z_UPPER
+from .constants import (
+    CHAR_A_LOWER,
+    CHAR_A_UPPER,
+    CHAR_LPAREN,
+    CHAR_RPAREN,
+    CHAR_STAR,
+    CHAR_Z_LOWER,
+    CHAR_Z_UPPER,
+    ascii_to_lower,
+)
 from .ast import AST, ASTNode, ASTNodeKind, AnchorKind
 from .charset import BITMAP_WIDTH, CharSet, CharRange
-from .utf8 import UTF8_SEQ_LEN_SHIFT, UTF8_SEQ_WORDS, utf8_seq_table
+from .utf8 import (
+    UTF8_SEQ_LEN_SHIFT,
+    UTF8_SEQ_WORDS,
+    negate_ranges,
+    utf8_seq_table,
+)
 from .flags import RegexFlags
 from .parser import parse
 from std.os import abort
@@ -595,10 +609,7 @@ def _utf8_class_fragment(mut nfa: NFA, ranges: List[Int]) raises -> NFAFragment:
         frag.add_out(st, 1)
         return frag^
 
-    var all_idx = List[Int]()
-    for i in range(tbl.count):
-        all_idx.append(i)
-    return _utf8_trie_fragment(nfa, tbl.words, all_idx, 0)
+    return _utf8_trie_fragment(nfa, tbl.words, tbl.count)
 
 
 # Field width of the packed trie records and bucket descriptors built by
@@ -616,10 +627,10 @@ comptime _TRIE_ID_LIMIT = 1 << _TRIE_FIELD_BITS
 def _utf8_trie_fragment(
     mut nfa: NFA,
     seq_words: List[Int],
-    idxs: List[Int],
-    pos: Int,
+    count: Int,
 ) raises -> NFAFragment:
-    """Prefix-factored alternation over byte-range sequences.
+    """Prefix-factored alternation over the `count` byte-range sequences
+    packed in `seq_words`.
 
     Emitting one independent chain per sequence is correct but ruinous
     for the big Unicode classes: `\\p{L}` is 805 sequences, so the naive
@@ -645,7 +656,7 @@ def _utf8_trie_fragment(
     bucket the same thing (a first-seen scan plus a stable counting sort
     backs the fast path up, so unsorted inputs still factor correctly).
     """
-    if len(idxs) >= _TRIE_ID_LIMIT:
+    if count >= _TRIE_ID_LIMIT:
         raise Error("utf8 trie: too many sequences")
 
     # Local state records, one packed Int each; local ids materialize at
@@ -660,11 +671,14 @@ def _utf8_trie_fragment(
 
     # Worklist of subtrees: member indices, byte position, and the local
     # charset state whose out1 the subtree start patches (-1 = root).
+    var all_idx = List[Int]()
+    for i in range(count):
+        all_idx.append(i)
     var task_idxs = List[List[Int]]()
     var task_pos = List[Int]()
     var task_patch = List[Int]()
-    task_idxs.append(idxs.copy())
-    task_pos.append(pos)
+    task_idxs.append(all_idx^)
+    task_pos.append(0)
     task_patch.append(-1)
 
     var t = 0
@@ -908,50 +922,7 @@ def _charset_codepoint_ranges(cs: CharSet) -> List[Int]:
         out.append(Int(r.lo))
         out.append(Int(r.hi))
     if cs.negated:
-        return _negate_cp(out)
-    return out^
-
-
-def _negate_cp(ranges: List[Int]) -> List[Int]:
-    var n = len(ranges) // 2
-    var los = List[Int]()
-    var his = List[Int]()
-    for i in range(n):
-        los.append(ranges[2 * i])
-        his.append(ranges[2 * i + 1])
-    # Insertion sort, with the already-in-order case costing ONE comptime
-    # element access instead of five. The property tables are sorted and
-    # disjoint by construction (test_unicode_tables pins that for all 84),
-    # so every `\p{...}` takes the skip on every element; the original
-    # wrote `kl`/`kh` straight back over themselves 683 times for a
-    # `\p{L}`, and a comptime access is ~61 us. `prev` stays valid across
-    # an insertion: los[0..i] ends sorted, and `cur < prev` means its new
-    # maximum is still `prev`.
-    var prev = los[0] if n > 0 else 0
-    for i in range(1, n):
-        var cur = los[i]
-        if cur >= prev:
-            prev = cur
-            continue
-        var kh = his[i]
-        var j = i - 1
-        while j >= 0 and los[j] > cur:
-            los[j + 1] = los[j]
-            his[j + 1] = his[j]
-            j -= 1
-        los[j + 1] = cur
-        his[j + 1] = kh
-    var out = List[Int]()
-    var cursor = 0
-    for i in range(n):
-        if los[i] > cursor:
-            out.append(cursor)
-            out.append(los[i] - 1)
-        if his[i] + 1 > cursor:
-            cursor = Int(his[i]) + 1
-    if cursor <= 0x10FFFF:
-        out.append(cursor)
-        out.append(0x10FFFF)
+        return negate_ranges(out)
     return out^
 
 
@@ -975,7 +946,7 @@ def _build_fragment(
             one.append(Int(ch))
             return _utf8_class_fragment(nfa, one)
         if flags.ignorecase():
-            var lo = _to_lower(ch)
+            var lo = ascii_to_lower(ch)
             var up = _to_upper(ch)
             if lo != up:
                 var cs = CharSet()
@@ -1163,10 +1134,10 @@ def _build_fragment(
         if not greedy:
             nfa.has_lazy = True
 
-        if min_rep == 0 and max_rep == -1:
-            return _build_star(nfa, ast, child_idx, greedy, flags)
-        elif min_rep == 1 and max_rep == -1:
-            return _build_plus(nfa, ast, child_idx, greedy, flags)
+        if max_rep == -1 and min_rep <= 1:
+            return _build_loop(
+                nfa, ast, child_idx, greedy, flags, at_least_one=min_rep == 1
+            )
         elif min_rep == 0 and max_rep == 1:
             return _build_question(nfa, ast, child_idx, greedy, flags)
         else:
@@ -1303,47 +1274,18 @@ def _compute_fixed_length(
     return -1
 
 
-def _build_star(
+def _build_loop(
     mut nfa: NFA,
     ast: AST,
     child_idx: Int,
     greedy: Bool,
     flags: RegexFlags,
+    at_least_one: Bool,
 ) raises -> NFAFragment:
-    """Build NFA fragment for * (zero or more)."""
-    var body = _build_fragment(nfa, ast, child_idx, flags)
-    var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
-
-    ref state = nfa.states[split_idx]
-
-    if greedy:
-        state.out1 = body.start  # Prefer looping
-        state.out2 = -1  # Skip (dangling)
-    else:
-        state.out1 = -1  # Prefer skipping
-        state.out2 = body.start  # Loop
-
-    state.greedy = greedy
-
-    # Patch body outputs back to the split state (loop)
-    nfa.patch(body, split_idx)
-
-    var frag = NFAFragment(split_idx)
-    if greedy:
-        frag.add_out(split_idx, 2)  # The skip edge is dangling
-    else:
-        frag.add_out(split_idx, 1)  # The skip edge is dangling
-    return frag^
-
-
-def _build_plus(
-    mut nfa: NFA,
-    ast: AST,
-    child_idx: Int,
-    greedy: Bool,
-    flags: RegexFlags,
-) raises -> NFAFragment:
-    """Build NFA fragment for + (one or more)."""
+    """Build NFA fragment for * (zero or more) or, with `at_least_one`,
+    + (one or more). Same states either way: the body loops back through
+    one SPLIT whose other edge is the dangling exit; `+` enters at the
+    body, `*` at the split."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
     var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
 
@@ -1358,15 +1300,14 @@ def _build_plus(
 
     state.greedy = greedy
 
-    # Patch body outputs to the split state
+    # Patch body outputs back to the split state (loop)
     nfa.patch(body, split_idx)
 
-    # Fragment starts at the body, exits from the split
-    var frag = NFAFragment(body.start)
+    var frag = NFAFragment(body.start if at_least_one else split_idx)
     if greedy:
-        frag.add_out(split_idx, 2)
+        frag.add_out(split_idx, 2)  # The exit edge is dangling
     else:
-        frag.add_out(split_idx, 1)
+        frag.add_out(split_idx, 1)  # The exit edge is dangling
     return frag^
 
 
@@ -1454,10 +1395,12 @@ def _build_repetition(
 
     if max_rep == -1:
         # {n,} — required copies + star loop. n >= 2 here: the QUANTIFIER
-        # arm of _build_fragment sends `{0,}` to _build_star and `{1,}` to
-        # _build_plus, so a required copy always exists to patch.
+        # arm of _build_fragment sends `{0,}` and `{1,}` to _build_loop,
+        # so a required copy always exists to patch.
         assert has_result, "{n,} reached _build_repetition with n == 0"
-        var star = _build_star(nfa, ast, child_idx, greedy, flags)
+        var star = _build_loop(
+            nfa, ast, child_idx, greedy, flags, at_least_one=False
+        )
         var patch_frag = NFAFragment(res_start)
         patch_frag.outs = res_outs.copy()
         patch_frag.out_slots = res_out_slots.copy()
@@ -1493,13 +1436,6 @@ def _build_repetition(
         return frag^
 
 
-def _to_lower(ch: UInt32) -> UInt32:
-    """Convert ASCII uppercase to lowercase."""
-    if ch >= UInt32(CHAR_A_UPPER) and ch <= UInt32(CHAR_Z_UPPER):
-        return ch + 32
-    return ch
-
-
 def _to_upper(ch: UInt32) -> UInt32:
     """Convert ASCII lowercase to uppercase."""
     if ch >= UInt32(CHAR_A_LOWER) and ch <= UInt32(CHAR_Z_LOWER):
@@ -1531,7 +1467,43 @@ def _add_case_folding(mut cs: CharSet):
     cs.ranges.extend(new_ranges^)
 
 
-def _build_static_nfa(pattern: String) -> NFA:
+def apply_flags(pattern: String, flag_bits: Int) -> String:
+    """`pattern` with `flags` spelled as one leading inline group
+    (`(?imsxu)`), placed after any leading `(*UTF8)` verbs — the parser
+    only accepts those first (see `Parser._consume_verbs`)."""
+    var flags = RegexFlags(flag_bits)
+    var letters = String()
+    if flags.ignorecase():
+        letters += "i"
+    if flags.multiline():
+        letters += "m"
+    if flags.dotall():
+        letters += "s"
+    if flags.verbose():
+        letters += "x"
+    if flags.unicode():
+        letters += "u"
+    var b = pattern.as_bytes()
+    var pos = 0
+    while (
+        pos + 2 < len(b) and b[pos] == CHAR_LPAREN and b[pos + 1] == CHAR_STAR
+    ):
+        var close = pos + 2
+        while close < len(b) and b[close] != CHAR_RPAREN:
+            close += 1
+        if close >= len(b):
+            break
+        pos = close + 1
+    return (
+        String(unsafe_from_utf8=b[:pos])
+        + "(?"
+        + letters
+        + ")"
+        + String(unsafe_from_utf8=b[pos:])
+    )
+
+
+def _build_static_nfa(pattern: String, flags: Int = 0) -> NFA:
     """Parse and build NFA — called at compile time.
 
     Aborts on invalid pattern (produces compile error at comptime).
@@ -1544,7 +1516,7 @@ def _build_static_nfa(pattern: String) -> NFA:
     states, and a linker failure past a few hundred).
     """
     try:
-        var ast = parse(pattern)
+        var ast = parse(pattern if flags == 0 else apply_flags(pattern, flags))
         var merged_flags = ast.flags
         return build_nfa(ast^, merged_flags)
     except e:

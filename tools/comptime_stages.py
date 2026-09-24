@@ -20,7 +20,7 @@ value cannot be folded away unevaluated.
 Usage:
     python3 tools/comptime_stages.py                 # default pattern sets
     python3 tools/comptime_stages.py rose_log        # one set
-    python3 tools/comptime_stages.py --repeat 3      # median of 3
+    python3 tools/comptime_stages.py --repeat 3      # min of 3
 
 Read the DELTA column, not the absolute times: every row pays the same
 fixed Mojo startup + codegen baseline.
@@ -32,12 +32,10 @@ rescue a saturated box. Use --repeat 3 for anything you intend to quote.
 """
 
 import argparse
-import os
-import statistics
-import subprocess
 import sys
 import tempfile
-import time
+
+from timed_build import compile_once
 
 TIMEOUT_S = 1800
 
@@ -156,28 +154,6 @@ def source_for(pats, decls, body):
     )
 
 
-def compile_once(src_text, workdir, tag):
-    src = os.path.join(workdir, f"{tag}.mojo")
-    with open(src, "w") as f:
-        f.write(src_text)
-    t0 = time.monotonic()
-    try:
-        ret = subprocess.run(
-            ["pixi", "run", "mojo", "build", "-I", ".", src,
-             "-o", os.path.join(workdir, tag)],
-            capture_output=True, text=True, timeout=TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "TIMEOUT"
-    dt = time.monotonic() - t0
-    if ret.returncode != 0:
-        # Surface the first real error — a stage that stops compiling is a
-        # broken harness, not a fast stage.
-        err = [l for l in ret.stderr.splitlines() if "error:" in l]
-        return None, (err[0][:160] if err else "FAILED")
-    return dt, None
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("sets", nargs="*", default=list(SETS))
@@ -198,11 +174,19 @@ def main():
                 times = []
                 err = None
                 for _ in range(args.repeat):
-                    dt, e = compile_once(
-                        source_for(pats, decls, body), workdir, tag
+                    dt, ret = compile_once(
+                        source_for(pats, decls, body), workdir, tag,
+                        flags=("-I", "."), timeout=TIMEOUT_S,
+                        mojo=("pixi", "run", "mojo"),
                     )
-                    if e:
-                        err = e
+                    if dt is None:
+                        err = "TIMEOUT"
+                        break
+                    if ret.returncode != 0:
+                        # Surface the first real error — a stage that stops
+                        # compiling is a broken harness, not a fast stage.
+                        e = [l for l in ret.stderr.splitlines() if "error:" in l]
+                        err = e[0][:160] if e else "FAILED"
                         break
                     times.append(dt)
                 if err:

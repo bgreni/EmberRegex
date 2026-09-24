@@ -42,22 +42,11 @@ from std.ffi import external_call
 from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 
-from .constants import (
-    CHAR_A_LOWER,
-    CHAR_A_UPPER,
-    CHAR_NEWLINE,
-    CHAR_NINE,
-    CHAR_UNDERSCORE,
-    CHAR_ZERO,
-    CHAR_Z_LOWER,
-    CHAR_Z_UPPER,
-    is_word_byte,
-)
+from .constants import CHAR_NEWLINE, ascii_to_lower, is_word_byte
 from .nfa import (
     _build_static_nfa,
     split_cycle_flags,
     NFA,
-    NFAState,
     NFAStateKind,
 )
 from .charset import BITMAP_WIDTH
@@ -70,18 +59,6 @@ from .simd_kernels import (
     stops_from_bitmap,
     _class_contains,
 )
-
-
-@always_inline
-def _sbt_is_word_char(ch: Byte) -> Bool:
-    return is_word_byte(ch)
-
-
-@always_inline
-def _sbt_to_lower(ch: Byte) -> Byte:
-    if ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER:
-        return ch + 32
-    return ch
 
 
 @always_inline
@@ -115,22 +92,13 @@ def _sbt_check_anchor[
         return pos == input_len
     elif anchor_type == AnchorKind.EOL_MULTILINE:
         return pos == input_len or input.unsafe_get(pos) == CHAR_NEWLINE
-    elif anchor_type == AnchorKind.WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _sbt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _sbt_is_word_char(input.unsafe_get(pos))
-        return left_is_word != right_is_word
-    elif anchor_type == AnchorKind.NOT_WORD_BOUNDARY:
-        var left_is_word = False
-        var right_is_word = False
-        if pos > 0:
-            left_is_word = _sbt_is_word_char(input.unsafe_get(pos - 1))
-        if pos < input_len:
-            right_is_word = _sbt_is_word_char(input.unsafe_get(pos))
-        return left_is_word == right_is_word
+    elif (
+        anchor_type == AnchorKind.WORD_BOUNDARY
+        or anchor_type == AnchorKind.NOT_WORD_BOUNDARY
+    ):
+        var left = pos > 0 and is_word_byte(input.unsafe_get(pos - 1))
+        var right = pos < input_len and is_word_byte(input.unsafe_get(pos))
+        return (left != right) == (anchor_type == AnchorKind.WORD_BOUNDARY)
     return False
 
 
@@ -192,6 +160,7 @@ comptime SBT_GIVEBACK_POSSESSIVE = 2
 body consumed can ever start it: the loop never gives anything back."""
 
 
+@fieldwise_init
 struct SbtLoopFilter(Copyable, Movable):
     """Comptime analysis of one simple loop: how far its giveback can be
     skipped, and the byte sets the walkers test against."""
@@ -202,16 +171,6 @@ struct SbtLoopFilter(Copyable, Movable):
     var stop_bits: SIMD[DType.uint8, BITMAP_WIDTH]
     """`exit_bits | ~body`: bytes at which a lazy loop must stop scanning —
     either the exit could start there or the body can no longer consume."""
-
-    def __init__(
-        out self,
-        mode: Int,
-        exit_bits: SIMD[DType.uint8, BITMAP_WIDTH],
-        stop_bits: SIMD[DType.uint8, BITMAP_WIDTH],
-    ):
-        self.mode = mode
-        self.exit_bits = exit_bits
-        self.stop_bits = stop_bits
 
 
 def _sbt_loop_filter(nfa: NFA, body_idx: Int, exit_idx: Int) -> SbtLoopFilter:
@@ -269,6 +228,7 @@ def sbt_loop_modes(nfa: NFA) -> List[Int]:
     return modes^
 
 
+@fieldwise_init
 struct SbtCounted(Copyable, Movable):
     """Comptime description of a counted repetition (`x{n,m}`) whose body is
     a single consuming state, rooted at one NFA state.
@@ -287,22 +247,6 @@ struct SbtCounted(Copyable, Movable):
     var body: Int
     var exit: Int
     var greedy: Bool
-
-    def __init__(
-        out self,
-        ok: Bool,
-        lo: Int,
-        hi: Int,
-        body: Int,
-        exit: Int,
-        greedy: Bool,
-    ):
-        self.ok = ok
-        self.lo = lo
-        self.hi = hi
-        self.body = body
-        self.exit = exit
-        self.greedy = greedy
 
 
 def _sbt_is_body_state(nfa: NFA, idx: Int) -> Bool:
@@ -724,16 +668,13 @@ comptime SBT_STACK_BUDGET = 4 * 1024 * 1024
 comptime SBT_STACK_RESERVE = 512 * 1024
 
 
+@fieldwise_init
 struct SbtStackBounds(Copyable, Movable):
     """This thread's stack, low and high address. `low == 0` means the
     platform could not be asked."""
 
     var low: Int
     var high: Int
-
-    def __init__(out self, low: Int, high: Int):
-        self.low = low
-        self.high = high
 
 
 @no_inline
@@ -879,6 +820,7 @@ def sbt_stack_floor[
         return 0
 
 
+@fieldwise_init
 struct SbtDepthPlan(Copyable, Movable):
     """Where the walker has to watch the stack, decided at compile time."""
 
@@ -891,10 +833,6 @@ struct SbtDepthPlan(Copyable, Movable):
     check may live in that one branch. When False the walker checks on
     entry to EVERY state instead: correct, and measurably slower, which
     is why it is computed rather than assumed."""
-
-    def __init__(out self, needs_guard: Bool, splits_are_fvs: Bool):
-        self.needs_guard = needs_guard
-        self.splits_are_fvs = splits_are_fvs
 
 
 def _sbt_depth_plan_list(nfa: NFA, cyclic: List[Bool]) -> SbtDepthPlan:
@@ -1337,6 +1275,154 @@ def sbt_memo_rows_of(nfa: NFA) -> Int:
     return sbt_memo_rows(nfa, _sbt_needs_depth_guard(nfa))
 
 
+@always_inline
+def _sbt_giveback[
+    origin: Origin,
+    //,
+    pattern: String,
+    body_idx: Int,
+    exit_idx: Int,
+    num_slots: Int,
+    anchored_end: Bool,
+    memo_on: Bool,
+](
+    input: Span[Byte, origin],
+    lo_pos: Int,
+    max_pos: Int,
+    mut slots: Array[Int, num_slots],
+    mut budget: Int,
+    memo_addr: Int,
+    stack_floor: Int,
+    end_at: Int,
+) -> Int:
+    """A greedy loop's exit (`exit_idx`), tried from `max_pos` back down to
+    `lo_pos` once the body (`body_idx`, one consuming state) has eaten
+    everything it can. Shared by the simple loop (`lo_pos` = its entry)
+    and the counted greedy chain (`lo_pos` = past its required copies).
+
+    `@always_inline` is load-bearing: this is the body of the one
+    `_sbt_try_match` state that owns the loop, split out only so both
+    loop forms share it — it must add no frame and no call to a walk
+    that can recurse per input byte (see `_sbt_needs_depth_guard`).
+
+    Trivial exits — MATCH directly, or ANCHOR(EOL/EOL_MULTILINE) → MATCH
+    — are folded in, skipping the recursive call on the success path."""
+    comptime nfa = _build_static_nfa(pattern)
+    comptime exit_is_match = _exit_is_match(nfa, exit_idx)
+    comptime exit_is_eol_then_match = _exit_is_eol_then_match(nfa, exit_idx)
+    var input_len = len(input)
+    comptime if exit_is_match and anchored_end:
+        # Anchored MATCH accepts only at the target position
+        # (`end_at`, else end of input); the loop can stop
+        # anywhere in [lo_pos, max_pos].
+        var target = end_at if end_at >= 0 else input_len
+        if lo_pos <= target and target <= max_pos:
+            return target
+        return -1
+    elif exit_is_match:
+        # Greedy `body* MATCH` — max_pos is the longest match.
+        return max_pos
+    elif exit_is_eol_then_match and anchored_end:
+        # With MATCH anchored to the target, success reduces to
+        # the loop reaching it AND the EOL anchor holding there.
+        # At end of input the anchor is trivially true, which is
+        # the only case when `end_at` is unset.
+        comptime anchored_eol_ml = (
+            nfa.states[exit_idx].anchor_type == AnchorKind.EOL_MULTILINE
+        )
+        var target = end_at if end_at >= 0 else input_len
+        if lo_pos <= target and target <= max_pos:
+            if target == input_len:
+                return target
+            comptime if anchored_eol_ml:
+                if input.unsafe_get(target) == CHAR_NEWLINE:
+                    return target
+        return -1
+    elif exit_is_eol_then_match:
+        # Greedy `body* ANCHOR(EOL/EOL_MULTILINE) MATCH` — fold
+        # the anchor check into the loop so we don't recurse for
+        # every position checked.
+        comptime is_multiline_eol = (
+            nfa.states[exit_idx].anchor_type == AnchorKind.EOL_MULTILINE
+        )
+        var p = max_pos
+        while p >= lo_pos:
+            comptime if is_multiline_eol:
+                if p == input_len or input.unsafe_get(p) == CHAR_NEWLINE:
+                    return p
+            else:
+                if p == input_len:
+                    return p
+            p -= 1
+        return -1
+    else:
+        # General exit: hand bytes back one at a time. Every
+        # position in [lo_pos, max_pos) holds a byte the body ate,
+        # so an exit that cannot START on such a byte fails
+        # there without being run (auto-possessification). Scoped to
+        # this arm: `_sbt_loop_filter` walks the NFA through
+        # `first_byte_bitmap_of`, and the folded forms never read it.
+        comptime lf = _sbt_loop_filter(nfa, body_idx, exit_idx)
+        comptime mode = lf.mode
+        comptime exit_bits = lf.exit_bits
+        comptime exit_byte = _sbt_single_byte(exit_bits)
+        comptime if mode == SBT_GIVEBACK_POSSESSIVE:
+            # Only max_pos can start the exit — and the mode
+            # also proves the exit consumes a byte, so end of
+            # input cannot match either. No first-byte test
+            # here: the exit's own first state runs exactly
+            # that test, specialized, one call deeper.
+            if max_pos < input_len:
+                return _sbt_try_match[
+                    pattern=pattern,
+                    state_idx=exit_idx,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                    memo_on=memo_on,
+                ](
+                    input,
+                    max_pos,
+                    slots,
+                    budget,
+                    memo_addr,
+                    stack_floor,
+                    end_at,
+                )
+            return -1
+        else:
+            var p = max_pos
+            while p >= lo_pos:
+                if budget < 0:
+                    return -1
+                comptime if mode == SBT_GIVEBACK_FILTER:
+                    # p == input_len is skipped too: the exit
+                    # needs a byte and there is none left.
+                    if p >= input_len or not _sbt_first_byte_test[
+                        exit_bits, exit_byte
+                    ](input.unsafe_get(p)):
+                        p -= 1
+                        continue
+                var result = _sbt_try_match[
+                    pattern=pattern,
+                    state_idx=exit_idx,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                    memo_on=memo_on,
+                ](
+                    input,
+                    p,
+                    slots,
+                    budget,
+                    memo_addr,
+                    stack_floor,
+                    end_at,
+                )
+                if result >= 0:
+                    return result
+                p -= 1
+            return -1
+
+
 def _sbt_try_match[
     origin: Origin,
     //,
@@ -1480,110 +1566,25 @@ def _sbt_try_match[
                     max_pos += 1
                 if max_pos < min_pos:
                     return -1
-                # The folded-exit forms below are the simple loop's, with
-                # `pos` replaced by `min_pos`: the chain may not hand back
-                # past its required copies.
-                comptime exit_is_match = _exit_is_match(nfa, cexit)
-                comptime exit_is_eol_then_match = _exit_is_eol_then_match(
-                    nfa, cexit
+                # The simple loop's giveback, floored at `min_pos`: the
+                # chain may not hand back past its required copies.
+                return _sbt_giveback[
+                    pattern=pattern,
+                    body_idx=counted.body,
+                    exit_idx=cexit,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                    memo_on=memo_on,
+                ](
+                    input,
+                    min_pos,
+                    max_pos,
+                    slots,
+                    budget,
+                    memo_addr,
+                    stack_floor,
+                    end_at,
                 )
-                comptime if exit_is_match and anchored_end:
-                    var target = end_at if end_at >= 0 else input_len
-                    if min_pos <= target and target <= max_pos:
-                        return target
-                    return -1
-                elif exit_is_match:
-                    return max_pos
-                elif exit_is_eol_then_match and anchored_end:
-                    comptime a_eol_ml = (
-                        nfa.states[cexit].anchor_type
-                        == AnchorKind.EOL_MULTILINE
-                    )
-                    var target = end_at if end_at >= 0 else input_len
-                    if min_pos <= target and target <= max_pos:
-                        if target == input_len:
-                            return target
-                        comptime if a_eol_ml:
-                            if input.unsafe_get(target) == CHAR_NEWLINE:
-                                return target
-                    return -1
-                elif exit_is_eol_then_match:
-                    comptime is_ml_eol = (
-                        nfa.states[cexit].anchor_type
-                        == AnchorKind.EOL_MULTILINE
-                    )
-                    var p = max_pos
-                    while p >= min_pos:
-                        comptime if is_ml_eol:
-                            if (
-                                p == input_len
-                                or input.unsafe_get(p) == CHAR_NEWLINE
-                            ):
-                                return p
-                        else:
-                            if p == input_len:
-                                return p
-                        p -= 1
-                    return -1
-                else:
-                    # Scoped here, not above: `_sbt_loop_filter` walks the
-                    # NFA through `first_byte_bitmap_of`, and the folded
-                    # forms above never read it.
-                    comptime lf = _sbt_loop_filter(nfa, counted.body, cexit)
-                    comptime mode = lf.mode
-                    comptime exit_bits = lf.exit_bits
-                    comptime exit_byte = _sbt_single_byte(exit_bits)
-                    comptime if mode == SBT_GIVEBACK_POSSESSIVE:
-                        # Nothing in [min_pos, max_pos) can start the exit,
-                        # and the mode also proves the exit consumes a
-                        # byte, so end of input cannot match either.
-                        if max_pos < input_len:
-                            return _sbt_try_match[
-                                pattern=pattern,
-                                state_idx=cexit,
-                                num_slots=num_slots,
-                                anchored_end=anchored_end,
-                                memo_on=memo_on,
-                            ](
-                                input,
-                                max_pos,
-                                slots,
-                                budget,
-                                memo_addr,
-                                stack_floor,
-                                end_at,
-                            )
-                        return -1
-                    else:
-                        var p = max_pos
-                        while p >= min_pos:
-                            if budget < 0:
-                                return -1
-                            comptime if mode == SBT_GIVEBACK_FILTER:
-                                if p >= input_len or not _sbt_first_byte_test[
-                                    exit_bits, exit_byte
-                                ](input.unsafe_get(p)):
-                                    p -= 1
-                                    continue
-                            var result = _sbt_try_match[
-                                pattern=pattern,
-                                state_idx=cexit,
-                                num_slots=num_slots,
-                                anchored_end=anchored_end,
-                                memo_on=memo_on,
-                            ](
-                                input,
-                                p,
-                                slots,
-                                budget,
-                                memo_addr,
-                                stack_floor,
-                                end_at,
-                            )
-                            if result >= 0:
-                                return result
-                            p -= 1
-                        return -1
             else:
                 # Lazy: take the required copies, then try the exit after
                 # each further copy — shortest count first, the mirror of
@@ -1736,14 +1737,6 @@ def _sbt_try_match[
                 # Greedy: scan forward consuming as many chars as possible,
                 # then try the exit (out2) from rightmost to leftmost position.
                 comptime body = nfa.states[out1]
-                # Detect trivial exits — out2 is MATCH directly or
-                # ANCHOR(EOL/EOL_MULTILINE) → MATCH. In both cases the loop
-                # body can fold the exit check inline and skip the recursive
-                # _sbt_try_match call entirely on the success path.
-                comptime exit_is_match = _exit_is_match(nfa, out2)
-                comptime exit_is_eol_then_match = _exit_is_eol_then_match(
-                    nfa, out2
-                )
                 var input_len = len(input)
                 var max_pos = pos
                 comptime if body.kind == NFAStateKind.ANY:
@@ -1767,117 +1760,23 @@ def _sbt_try_match[
                         bitmap, negated, UInt32(input.unsafe_get(max_pos))
                     ):
                         max_pos += 1
-                comptime if exit_is_match and anchored_end:
-                    # Anchored MATCH accepts only at the target position
-                    # (`end_at`, else end of input); the loop can stop
-                    # anywhere in [pos, max_pos].
-                    var target = end_at if end_at >= 0 else input_len
-                    if pos <= target and target <= max_pos:
-                        return target
-                    return -1
-                elif exit_is_match:
-                    # Greedy `body* MATCH` — max_pos is the longest match.
-                    return max_pos
-                elif exit_is_eol_then_match and anchored_end:
-                    # With MATCH anchored to the target, success reduces to
-                    # the loop reaching it AND the EOL anchor holding there.
-                    # At end of input the anchor is trivially true, which is
-                    # the only case when `end_at` is unset.
-                    comptime anchored_eol_ml = (
-                        nfa.states[out2].anchor_type == AnchorKind.EOL_MULTILINE
-                    )
-                    var target = end_at if end_at >= 0 else input_len
-                    if pos <= target and target <= max_pos:
-                        if target == input_len:
-                            return target
-                        comptime if anchored_eol_ml:
-                            if input.unsafe_get(target) == CHAR_NEWLINE:
-                                return target
-                    return -1
-                elif exit_is_eol_then_match:
-                    # Greedy `body* ANCHOR(EOL/EOL_MULTILINE) MATCH` — fold
-                    # the anchor check into the loop so we don't recurse for
-                    # every position checked.
-                    comptime is_multiline_eol = (
-                        nfa.states[out2].anchor_type == AnchorKind.EOL_MULTILINE
-                    )
-                    var p = max_pos
-                    while p >= pos:
-                        comptime if is_multiline_eol:
-                            if (
-                                p == input_len
-                                or input.unsafe_get(p) == CHAR_NEWLINE
-                            ):
-                                return p
-                        else:
-                            if p == input_len:
-                                return p
-                        p -= 1
-                    return -1
-                else:
-                    # General exit: hand bytes back one at a time. Every
-                    # position in [pos, max_pos) holds a byte the body ate,
-                    # so an exit that cannot START on such a byte fails
-                    # there without being run (auto-possessification).
-                    comptime lf = _sbt_loop_filter(nfa, out1, out2)
-                    comptime mode = lf.mode
-                    comptime exit_bits = lf.exit_bits
-                    comptime exit_byte = _sbt_single_byte(exit_bits)
-                    comptime if mode == SBT_GIVEBACK_POSSESSIVE:
-                        # Only max_pos can start the exit — and the mode
-                        # also proves the exit consumes a byte, so end of
-                        # input cannot match either. No first-byte test
-                        # here: the exit's own first state runs exactly
-                        # that test, specialized, one call deeper.
-                        if max_pos < input_len:
-                            return _sbt_try_match[
-                                pattern=pattern,
-                                state_idx=out2,
-                                num_slots=num_slots,
-                                anchored_end=anchored_end,
-                                memo_on=memo_on,
-                            ](
-                                input,
-                                max_pos,
-                                slots,
-                                budget,
-                                memo_addr,
-                                stack_floor,
-                                end_at,
-                            )
-                        return -1
-                    else:
-                        var p = max_pos
-                        while p >= pos:
-                            if budget < 0:
-                                return -1
-                            comptime if mode == SBT_GIVEBACK_FILTER:
-                                # p == input_len is skipped too: the exit
-                                # needs a byte and there is none left.
-                                if p >= input_len or not _sbt_first_byte_test[
-                                    exit_bits, exit_byte
-                                ](input.unsafe_get(p)):
-                                    p -= 1
-                                    continue
-                            var result = _sbt_try_match[
-                                pattern=pattern,
-                                state_idx=out2,
-                                num_slots=num_slots,
-                                anchored_end=anchored_end,
-                                memo_on=memo_on,
-                            ](
-                                input,
-                                p,
-                                slots,
-                                budget,
-                                memo_addr,
-                                stack_floor,
-                                end_at,
-                            )
-                            if result >= 0:
-                                return result
-                            p -= 1
-                        return -1
+                return _sbt_giveback[
+                    pattern=pattern,
+                    body_idx=out1,
+                    exit_idx=out2,
+                    num_slots=num_slots,
+                    anchored_end=anchored_end,
+                    memo_on=memo_on,
+                ](
+                    input,
+                    pos,
+                    max_pos,
+                    slots,
+                    budget,
+                    memo_addr,
+                    stack_floor,
+                    end_at,
+                )
             elif is_simple_lazy:
                 # Lazy: try the exit (out1 — lazy splits prefer it) first,
                 # then consume one body char (out2) and repeat. This is
@@ -2107,16 +2006,39 @@ def _sbt_try_match[
                 ](input, pos, slots, budget, memo_addr, stack_floor, end_at)
             return -1
 
-        elif kind == NFAStateKind.LOOKAHEAD:
+        elif (
+            kind == NFAStateKind.LOOKAHEAD or kind == NFAStateKind.LOOKBEHIND
+        ):
+            var matched = False
             var sub_slots = slots.copy()
-            var sub_result = _sbt_try_match[
-                pattern=pattern,
-                state_idx=state.sub_start,
-                num_slots=num_slots,
-                anchored_end=False,
-                memo_on=memo_on,
-            ](input, pos, sub_slots, budget, memo_addr, stack_floor, end_at)
-            var matched = sub_result >= 0
+            comptime if kind == NFAStateKind.LOOKAHEAD:
+                var sub_result = _sbt_try_match[
+                    pattern=pattern,
+                    state_idx=state.sub_start,
+                    num_slots=num_slots,
+                    anchored_end=False,
+                    memo_on=memo_on,
+                ](input, pos, sub_slots, budget, memo_addr, stack_floor, end_at)
+                matched = sub_result >= 0
+            else:
+                comptime lb_len = state.lookbehind_len
+                if pos >= lb_len:
+                    var sub_result = _sbt_try_match[
+                        pattern=pattern,
+                        state_idx=state.sub_start,
+                        num_slots=num_slots,
+                        anchored_end=False,
+                        memo_on=memo_on,
+                    ](
+                        input,
+                        pos - lb_len,
+                        sub_slots,
+                        budget,
+                        memo_addr,
+                        stack_floor,
+                        end_at,
+                    )
+                    matched = sub_result >= 0 and sub_result == pos
             comptime if state.negated:
                 if not matched:
                     return _sbt_try_match[
@@ -2163,70 +2085,6 @@ def _sbt_try_match[
                     return cont
                 return -1
 
-        elif kind == NFAStateKind.LOOKBEHIND:
-            comptime lb_len = state.lookbehind_len
-            var matched = False
-            var sub_slots = slots.copy()
-            if pos >= lb_len:
-                var sub_result = _sbt_try_match[
-                    pattern=pattern,
-                    state_idx=state.sub_start,
-                    num_slots=num_slots,
-                    anchored_end=False,
-                    memo_on=memo_on,
-                ](
-                    input,
-                    pos - lb_len,
-                    sub_slots,
-                    budget,
-                    memo_addr,
-                    stack_floor,
-                    end_at,
-                )
-                matched = sub_result >= 0 and sub_result == pos
-            comptime if state.negated:
-                if not matched:
-                    return _sbt_try_match[
-                        pattern=pattern,
-                        state_idx=state.out1,
-                        num_slots=num_slots,
-                        anchored_end=anchored_end,
-                        memo_on=memo_on,
-                    ](
-                        input,
-                        pos,
-                        slots,
-                        budget,
-                        memo_addr,
-                        stack_floor,
-                        end_at,
-                    )
-                return -1
-            else:
-                if matched:
-                    # Same keep/restore rule as LOOKAHEAD above.
-                    var saved_slots = slots.copy()
-                    slots = sub_slots^
-                    var cont = _sbt_try_match[
-                        pattern=pattern,
-                        state_idx=state.out1,
-                        num_slots=num_slots,
-                        anchored_end=anchored_end,
-                        memo_on=memo_on,
-                    ](
-                        input,
-                        pos,
-                        slots,
-                        budget,
-                        memo_addr,
-                        stack_floor,
-                        end_at,
-                    )
-                    if cont < 0:
-                        slots = saved_slots^
-                    return cont
-                return -1
-
         elif kind == NFAStateKind.BACKREF:
             comptime group = state.backref_group
             comptime slot_start = 2 * group - 2
@@ -2240,9 +2098,9 @@ def _sbt_try_match[
                 return -1
             comptime if state.icase:
                 for i in range(ref_len):
-                    if _sbt_to_lower(input.unsafe_get(gs + i)) != _sbt_to_lower(
-                        input.unsafe_get(pos + i)
-                    ):
+                    if ascii_to_lower(
+                        input.unsafe_get(gs + i)
+                    ) != ascii_to_lower(input.unsafe_get(pos + i)):
                         return -1
             else:
                 for i in range(ref_len):

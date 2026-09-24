@@ -5,8 +5,8 @@ of any match of `id` ending at `end`. Two independent implementations
 back it — a determinized reverse automaton walked leftward, and
 per-thread start slots in the Pike VM — so most of the confidence here
 comes from differentials between them, on top of expectations derived
-from CPython (`tools/set_oracle.py::sweep_som`, the O(n²) sweep, which is
-sound only for anchor-free patterns; anchored cases are hand-derived).
+from CPython (`tools/set_oracle.py::sweep_ctx_som`, the O(n²) sweep;
+anchored cases here are hand-derived).
 
 `scan_spans` filters that stream to per-id leftmost non-overlapping
 spans. It is leftmost-LONGEST, not CPython's leftmost-first; the tests

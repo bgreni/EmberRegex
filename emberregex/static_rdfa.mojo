@@ -48,22 +48,17 @@ from std.collections import Array
 from std.sys import simd_width_of
 
 from .ast import AnchorKind
-from .constants import CHAR_NEWLINE
+from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .set_reverse import _reverse_edges, _rev_flat_closure
 from .simd_kernels import (
-    ACCEL_SHUFTI,
-    ACCEL_TRUFFLE,
-    HAS_FAST_BYTE_SHUFFLE,
+    AccelSet,
     _class_contains,
-    build_shufti_masks,
-    build_truffle_masks,
+    accel_exits,
     nibble_table_from,
     rfind_in_class,
-    shufti_encodable,
 )
 from .simd_scan import lane_bits, last_lane_index
-from .static_bytes import table_bytes
 from .static_dfa import (
     edfa_id_dtype,
     EDFA_DEAD,
@@ -75,16 +70,15 @@ from .static_dfa import (
     _bs_eq,
     _bs_hash,
     _bs_set,
-    _byte_classes,
-    _flatten_nfa,
-    _is_word_byte,
+    _FlatNFA,
+    _class_ranges,
+    _word_classes,
     _minimize,
     _nfa_has_word_anchor,
     _wb_holds,
     _word_anchor_bits,
     WB_PENDING,
     WB_RESOLVE,
-    edfa_is_word,
 )
 
 # Per-state accept bits.
@@ -104,7 +98,8 @@ comptime RDFA_STATE_CAP = _MIN_CAP
 
 struct RDFA(Copyable, Movable):
     """Comptime-computed reverse DFA. Only ever exists as a comptime
-    value; the walker reads the materialized Array forms."""
+    value; the walker reads the materialized forms (`table_bytes` /
+    `int_arr` of its table and flags)."""
 
     var valid: Bool
     var num_states: Int
@@ -121,13 +116,7 @@ struct RDFA(Copyable, Movable):
     # or on a nibble-encodable set — the same two flavours as EagerDFA,
     # scanning backward. Every reverse self-loop is a genuine one (there
     # is no restart here), so none is vetoed.
-    var accel_states: List[Int]
-    var accel_exit1: List[Int]
-    var accel_exit2: List[Int]  # or -1
-    var accel_nib_states: List[Int]
-    var accel_nib_kind: List[Int]
-    var accel_nib_t0: List[Int]
-    var accel_nib_t1: List[Int]
+    var accel: AccelSet
 
     def __init__(out self):
         self.valid = False
@@ -141,13 +130,7 @@ struct RDFA(Copyable, Movable):
         self.any_bol0 = False
         self.any_bolnl = False
         self.any_wb = False
-        self.accel_states = List[Int]()
-        self.accel_exit1 = List[Int]()
-        self.accel_exit2 = List[Int]()
-        self.accel_nib_states = List[Int]()
-        self.accel_nib_kind = List[Int]()
-        self.accel_nib_t0 = List[Int]()
-        self.accel_nib_t1 = List[Int]()
+        self.accel = AccelSet()
 
 
 def _rev_bol_reaches_start(
@@ -288,42 +271,17 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
         return result^
     var preds = _reverse_edges(nfa)
 
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref eol_bits = flat.eol_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     var pred_data = List[Int]()
     var pred_off = List[Int]()
@@ -427,12 +385,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     var gval_n = List[_StateBits]()
     var one_seed = List[Int](fill=0, length=1)
     var need_nl_variant = has_bol_ml or _bs_any(eol_bits)
-    var word_cls = SIMD[DType.uint64, 4](0)
-    for ci in range(nclasses):
-        if _is_word_byte(Int(rep_lo[ci])):
-            word_cls[ci >> 6] = word_cls[ci >> 6] | (
-                UInt64(1) << UInt64(ci & 63)
-            )
+    var word_cls = _word_classes(rep_lo, nclasses)
 
     var rows = List[SIMD[DType.int32, 256]]()
     var cur = 0
@@ -706,33 +659,11 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
             != 0
         ):
             continue
-        var row = rows.unsafe_get(si)
-        var exit_count = 0
-        for byte in range(256):
-            if Int(row[byte]) != si:
-                exit_count += 1
-        if exit_count == 0 or exit_count == 256:
-            continue  # never exits / never self-loops: nothing to skip
-        var exits = List[Int]()
-        for byte in range(256):
-            if Int(row[byte]) != si:
-                exits.append(byte)
-        if len(exits) <= 2:
-            result.accel_states.append(si)
-            result.accel_exit1.append(exits[0])
-            result.accel_exit2.append(exits[1] if len(exits) == 2 else -1)
-        elif HAS_FAST_BYTE_SHUFFLE:
-            var t0 = List[Int]()
-            var t1 = List[Int]()
-            if shufti_encodable(exits):
-                build_shufti_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_SHUFTI)
-            else:
-                build_truffle_masks(exits, t0, t1)
-                result.accel_nib_kind.append(ACCEL_TRUFFLE)
-            result.accel_nib_states.append(si)
-            result.accel_nib_t0.extend(t0^)
-            result.accel_nib_t1.extend(t1^)
+        var exits = accel_exits(
+            rows.unsafe_get(si).ne(SIMD[DType.int32, 256](Int32(si)))
+        )
+        if len(exits) > 0:
+            result.accel.add(si, exits)
     result.valid = True
     result.num_states = nfinal
     result.table = table^
@@ -742,21 +673,6 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> RDFA:
     result.seed_at_end = starts[2]
     result.seed_other_word = starts[3] if has_wb else starts[0]
     return result^
-
-
-def rdfa_table_str[n: Int, dt: DType](d: RDFA) -> String:
-    """Comptime: the flat table as `n` little-endian `dt` entries (narrow id
-    type from `edfa_id_dtype`, `n` from `edfa_table_len`; EDFA_DEAD
-    survives). See static_bytes.mojo for why a string."""
-    assert n == 0 or n >= len(d.table), "table string shorter than the table"
-    return table_bytes[dt](d.table, n)
-
-
-def rdfa_flags_arr[n: Int](d: RDFA) -> Array[UInt8, n]:
-    var arr = Array[UInt8, n](fill=0)
-    for i in range(n):
-        arr[i] = UInt8(d.flags[i])
-    return arr^
 
 
 @always_inline
@@ -782,21 +698,6 @@ def _rfind_exit2[
     return floor
 
 
-def _rdfa_accel_mask_word(d: RDFA, word: Int) -> UInt64:
-    var m = UInt64(0)
-    for s in d.accel_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    for s in d.accel_nib_states:
-        if s >> 6 == word:
-            m |= UInt64(1) << UInt64(s & 63)
-    return m
-
-
-def _rdfa_has_accel(d: RDFA) -> Bool:
-    return len(d.accel_states) > 0 or len(d.accel_nib_states) > 0
-
-
 @always_inline
 def _rdfa_accel_skip[
     origin: Origin, //, d: RDFA
@@ -807,8 +708,8 @@ def _rdfa_accel_skip[
     comptime W = simd_width_of[DType.uint8]()
     if pos - floor < W:
         return pos
-    comptime m0 = _rdfa_accel_mask_word(d, 0)
-    comptime m1 = _rdfa_accel_mask_word(d, 1)
+    comptime m0 = d.accel.mask_word(0)
+    comptime m1 = d.accel.mask_word(1)
     comptime if d.num_states <= 64:
         if (m0 >> UInt64(cur)) & 1 == 0:
             return pos
@@ -817,19 +718,19 @@ def _rdfa_accel_skip[
         if (m >> UInt64(cur & 63)) & 1 == 0:
             return pos
     var p = pos
-    comptime for ai in range(len(d.accel_states)):
-        comptime a_state = d.accel_states[ai]
-        comptime a_e1 = UInt8(d.accel_exit1[ai])
+    comptime for ai in range(len(d.accel.states)):
+        comptime a_state = d.accel.states[ai]
+        comptime a_e1 = UInt8(d.accel.exit1[ai])
         comptime a_e2 = UInt8(
-            d.accel_exit2[ai] if d.accel_exit2[ai] >= 0 else d.accel_exit1[ai]
+            d.accel.exit2[ai] if d.accel.exit2[ai] >= 0 else d.accel.exit1[ai]
         )
         if cur == a_state:
             p = _rfind_exit2[e1=a_e1, e2=a_e2](input, p, floor)
-    comptime for ai in range(len(d.accel_nib_states)):
-        comptime a_state = d.accel_nib_states[ai]
-        comptime a_kind = d.accel_nib_kind[ai]
-        comptime a_t0 = nibble_table_from(d.accel_nib_t0, ai)
-        comptime a_t1 = nibble_table_from(d.accel_nib_t1, ai)
+    comptime for ai in range(len(d.accel.nib_states)):
+        comptime a_state = d.accel.nib_states[ai]
+        comptime a_kind = d.accel.nib_kind[ai]
+        comptime a_t0 = nibble_table_from(d.accel.nib_t0, ai)
+        comptime a_t1 = nibble_table_from(d.accel.nib_t1, ai)
         if cur == a_state:
             # Scalar peek at the byte about to be consumed: only
             # vectorize when it actually self-loops.
@@ -870,7 +771,7 @@ def rdfa_find_start[
         cur = d.seed_at_nl
     else:
         comptime if d.seed_other_word != d.seed_other:
-            cur = d.seed_other_word if edfa_is_word(
+            cur = d.seed_other_word if is_word_byte(
                 input.unsafe_get(end)
             ) else d.seed_other
         else:
@@ -879,7 +780,7 @@ def rdfa_find_start[
     var best = -1
     while True:
         var f = flg.unsafe_get(cur)
-        comptime if _rdfa_has_accel(d):
+        comptime if d.accel.any():
             pos = _rdfa_accel_skip[d=d](input, cur, pos, floor)
         if (f & RDFA_NORM) != 0:
             best = pos
@@ -897,7 +798,7 @@ def rdfa_find_start[
                 best = pos
         comptime if d.any_wb:
             if (f & (RDFA_WB_LEFT_WORD | RDFA_WB_LEFT_NONWORD)) != 0:
-                if ((f & RDFA_WB_LEFT_WORD) != 0) == edfa_is_word(b):
+                if ((f & RDFA_WB_LEFT_WORD) != 0) == is_word_byte(b):
                     best = pos
         if pos <= floor:
             return best

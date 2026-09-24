@@ -26,10 +26,8 @@ requires HAS_FAST_BYTE_SHUFFLE (see simd_kernels.mojo).
 from std.sys import simd_width_of
 
 from .optimize import LiteralAlt
-from .simd_kernels import NIBBLE_TABLE_SIZE, nibble_lookup
+from .simd_kernels import _NibbleTable, nibble_lookup
 from .simd_scan import clear_first_lane, first_lane_index, lane_bits
-
-comptime _NibbleTable = SIMD[DType.uint8, NIBBLE_TABLE_SIZE]
 
 
 def _teddy_pos_masks(
@@ -105,63 +103,17 @@ def teddy_full_match[
 
 
 @always_inline
-def teddy_find_prefix[
-    origin: Origin, //, alt: LiteralAlt
-](input: Span[Byte, origin], start: Int) -> Int:
-    """First position >= start where any of the alternation's literal
-    chains occurs, or -1. Prefilter twin of teddy_search_forward for
-    patterns whose *required prefix* is a literal alternation
-    (`(?:GET|POST|PUT) /...`): the caller runs the real engine at each
-    returned candidate."""
-    comptime W = simd_width_of[DType.uint8]()
-    comptime k = min(3, alt.min_len)
-    comptime m0 = _teddy_pos_masks(alt, 0)
-    comptime m1 = _teddy_pos_masks(alt, 1 if k > 1 else 0)
-    comptime m2 = _teddy_pos_masks(alt, 2 if k > 2 else 0)
-
-    var input_len = len(input)
-    var pos = start
-    var ptr = Pointer(input.unsafe_ptr())
-
-    while pos + W <= input_len:
-        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
-        var lo = v & 0x0F
-        var hi = v >> 4
-        var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
-        comptime if k > 1:
-            var c1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
-            cand &= c1.shift_left[1]()
-        comptime if k > 2:
-            var c2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
-            cand &= c2.shift_left[2]()
-        var bits = lane_bits(cand.ne(0))
-        while bits != 0:
-            var at = pos + first_lane_index(bits)
-            comptime for i in range(len(alt.lits)):
-                comptime lit = alt.lits[i].copy()
-                comptime cli = alt.caseless[i].copy()
-                if _lit_at[lit=lit, cl=cli](input, at):
-                    return at
-            bits = clear_first_lane(bits)
-        pos += W - (k - 1)
-
-    while pos + alt.min_len <= input_len:
-        comptime for i in range(len(alt.lits)):
-            comptime lit = alt.lits[i].copy()
-            comptime cli = alt.caseless[i].copy()
-            if _lit_at[lit=lit, cl=cli](input, pos):
-                return pos
-        pos += 1
-
-    return -1
-
-
-@always_inline
 def teddy_search_forward[
-    origin: Origin, //, alt: LiteralAlt
+    origin: Origin, //, alt: LiteralAlt, want_end: Bool = True
 ](input: Span[Byte, origin], start: Int) -> Tuple[Int, Int]:
     """First match from `start` as (start, leftmost-longest end), or
-    (-1, -1) (mirrors the DFA-lane search_forward contract)."""
+    (-1, -1) (mirrors the DFA-lane search_forward contract).
+
+    `want_end=False` is the prefilter form, for patterns whose *required
+    prefix* is a literal alternation (`(?:GET|POST|PUT) /...`): the first
+    position where any literal occurs, verified by the first literal that
+    fits rather than all of them, with the end left at -1 — the caller
+    runs the real engine at each returned candidate."""
     comptime W = simd_width_of[DType.uint8]()
     comptime k = min(3, alt.min_len)
     comptime m0 = _teddy_pos_masks(alt, 0)
@@ -186,18 +138,32 @@ def teddy_search_forward[
         var bits = lane_bits(cand.ne(0))
         while bits != 0:
             var at = pos + first_lane_index(bits)
-            var end = teddy_match_at[alt=alt](input, at)
-            if end >= 0:
-                return (at, end)
+            comptime if want_end:
+                var end = teddy_match_at[alt=alt](input, at)
+                if end >= 0:
+                    return (at, end)
+            else:
+                comptime for i in range(len(alt.lits)):
+                    comptime lit = alt.lits[i].copy()
+                    comptime cli = alt.caseless[i].copy()
+                    if _lit_at[lit=lit, cl=cli](input, at):
+                        return (at, -1)
             bits = clear_first_lane(bits)
         # The last k-1 lanes were masked off by the zero-filling lane
         # shifts; rescan them as the head of the next chunk.
         pos += W - (k - 1)
 
     while pos + alt.min_len <= input_len:
-        var end = teddy_match_at[alt=alt](input, pos)
-        if end >= 0:
-            return (pos, end)
+        comptime if want_end:
+            var end = teddy_match_at[alt=alt](input, pos)
+            if end >= 0:
+                return (pos, end)
+        else:
+            comptime for i in range(len(alt.lits)):
+                comptime lit = alt.lits[i].copy()
+                comptime cli = alt.caseless[i].copy()
+                if _lit_at[lit=lit, cl=cli](input, pos):
+                    return (pos, -1)
         pos += 1
 
     return (-1, -1)

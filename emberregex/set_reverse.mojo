@@ -56,14 +56,15 @@ from .set_dfa import (
     new_set_index,
 )
 from .set_pike import SetSpan
-from .static_bytes import table_bytes
 from .static_dfa import (
     EDFA_NFA_CAP,
+    _FlatNFA,
     _StateBits,
     _bs_any,
+    _bs_members,
     _bs_set,
     _byte_classes,
-    _flatten_nfa,
+    _class_ranges,
     _wb_holds,
     WB_DROP,
     WB_PENDING,
@@ -190,41 +191,22 @@ def _rev_closure(
     sort(out)
 
 
-def _start_ids(nfa: NFA, states: List[Int]) -> List[Int]:
-    """Comptime: ids whose fragment entry is live in this set."""
-    var ids = List[Int]()
-    for i in range(len(nfa.pattern_starts)):
-        var st = nfa.pattern_starts[i]
-        if st < 0:
-            continue
-        for s in states:
-            if s == st:
-                ids.append(i)
-                break
-    return _sorted_dedup(ids^)
-
-
 def _start_id_map(nfa: NFA) -> List[Int]:
     """Comptime: NFA state -> the pattern id whose fragment entry it is,
-    -1 elsewhere; -2 in slot 0 when two patterns share an entry state
-    (then `_start_ids` must do the exact scan)."""
+    -1 elsewhere. One id per state suffices: the union builders
+    (`build_union_subset_nfa`, `splice_nfa`) give every pattern a fresh
+    entry state."""
     var m = List[Int](fill=-1, length=len(nfa.states))
-    var dup = False
     for i in range(len(nfa.pattern_starts)):
         var st = nfa.pattern_starts[i]
-        if st < 0:
-            continue
-        if m[st] >= 0:
-            dup = True
-        m[st] = i
-    if dup and len(m) > 0:
-        m[0] = -2
+        if st >= 0:
+            m[st] = i
     return m^
 
 
 def _start_ids_mapped(start_id_of: List[Int], states: List[Int]) -> List[Int]:
-    """`_start_ids` in O(members): one map read per member. Same ids in
-    the same (sorted, deduplicated) order."""
+    """Comptime: ids whose fragment entry is live in this set, sorted and
+    deduplicated — one map read per member."""
     var ids = List[Int]()
     for s in states:
         var i = start_id_of[s]
@@ -452,42 +434,17 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
     var preds = _reverse_edges(nfa)
 
     # --- Byte classes + flat views (shared with the forward builders). ---
-    var class_of = List[Int](fill=-1, length=256)
-    var reps = _byte_classes(nfa, class_of)
-    var nclasses = len(reps)
+    var flat = _FlatNFA(nfa)
+    var nclasses = flat.nclasses
+    var nl_class = flat.nl_class
+    ref kinds = flat.kinds
+    ref anchors = flat.anchors
+    ref cls_mask = flat.cls_mask
+    ref eol_bits = flat.eol_bits
+    var has_bol_ml = flat.has_bol_ml
     var rep_lo = SIMD[DType.int32, 256](0)
     var rep_hi = SIMD[DType.int32, 256](0)
-    for ci in range(nclasses):
-        rep_lo[ci] = Int32(reps[ci])
-        rep_hi[ci] = Int32(reps[ci + 1] - 1) if ci + 1 < nclasses else Int32(
-            255
-        )
-    var nl_class = class_of[Int(CHAR_NEWLINE)]
-
-    var kinds = List[Int]()
-    var out1s = List[Int]()
-    var out2s = List[Int]()
-    var anchors = List[Int]()
-    var cls_mask = List[SIMD[DType.uint64, 4]]()
-    var consuming_bits = _StateBits(0)
-    var match_bits = _StateBits(0)
-    var eol_bits = _StateBits(0)
-    var has_bol_ml = False
-    _flatten_nfa(
-        nfa,
-        class_of,
-        nclasses,
-        nl_class,
-        kinds,
-        out1s,
-        out2s,
-        anchors,
-        cls_mask,
-        consuming_bits,
-        match_bits,
-        eol_bits,
-        has_bol_ml,
-    )
+    _class_ranges(flat.reps, rep_lo, rep_hi)
 
     # Predecessors, flattened, plus a predecessor bitset per state (the
     # raw reverse step is then a union of per-member bitsets filtered by
@@ -671,14 +628,7 @@ def build_reverse_dfa(nfa: NFA, enabled: Bool) -> ReverseDFA:
     var n_sets = len(sets_bits)
     var sets = List[List[Int]]()
     for si in range(n_sets):
-        var bits = sets_bits.unsafe_get(si)
-        var members = List[Int]()
-        for l in range(64):
-            var w = bits[l]
-            while w != 0:
-                members.append(64 * l + Int(count_trailing_zeros(w)))
-                w &= w - 1
-        sets.append(members^)
+        sets.append(_bs_members(sets_bits.unsafe_get(si)))
     # One 256-lane vector store per row (see static_dfa `_edfa_finish`).
     var table = List[Int](fill=-1, length=n_sets * 256)
     for si in range(n_sets):
@@ -780,22 +730,18 @@ def _rdfa_finish(
     result.bol0_len = List[Int](fill=0, length=n)
     result.bolnl_off = List[Int](fill=0, length=n)
     result.bolnl_len = List[Int](fill=0, length=n)
-    # One NFA-state -> pattern-id map for the whole finish: `_start_ids`
-    # scanned every pattern against every member per state, O(patterns x
-    # members) List reads — ~17 s for a 456-state reverse DFA over 100
-    # literals. The BOL walks are skipped outright when the union has no
-    # BOL anchor (they return empty then): they allocate a visited array
-    # per member anchor and walk the predecessor lists.
+    # One NFA-state -> pattern-id map for the whole finish: scanning every
+    # pattern against every member per state was O(patterns x members)
+    # List reads — ~17 s for a 456-state reverse DFA over 100 literals.
+    # The BOL walks are skipped outright when the union has no BOL anchor
+    # (they return empty then): they allocate a visited array per member
+    # anchor and walk the predecessor lists.
     var start_id_of = _start_id_map(nfa)
-    var exact_starts = len(start_id_of) > 0 and start_id_of[0] == -2
     var has_bol = _nfa_has_bol(nfa)
     for s in range(n):
-        var ids: List[Int]
-        if exact_starts:
-            ids = _start_ids(nfa, sets[s])
-        else:
-            ids = _start_ids_mapped(start_id_of, sets[s])
-        var sn = _pool_slice(result.pool, ids)
+        var sn = _pool_slice(
+            result.pool, _start_ids_mapped(start_id_of, sets[s])
+        )
         result.norm_off[s] = sn[0]
         result.norm_len[s] = sn[1]
         var s0 = _pool_slice(
@@ -827,19 +773,6 @@ def _rdfa_finish(
 
 
 # --- Comptime materialization helpers ---------------------------------------
-
-
-def rdfa_table_str[n: Int](d: ReverseDFA) -> String:
-    """The flat table as `n` little-endian Int32 entries; see
-    static_bytes.mojo for why a string."""
-    return table_bytes[DType.int32](d.table, n)
-
-
-def rdfa_pool_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:
-    var arr = Array[Int32, n](fill=0)
-    for i in range(n):
-        arr[i] = Int32(d.pool[i])
-    return arr^
 
 
 def rdfa_slices_arr[n: Int](d: ReverseDFA) -> Array[Int32, n]:
@@ -905,6 +838,17 @@ def leftmost_nonoverlapping(
 
     Output is ordered by (start, id).
     """
+
+    # Both orders are total over their inputs: one id reports each end
+    # once, and one id's survivors have strictly increasing starts.
+    @always_inline
+    def start_then_longest(a: SetSpan, b: SetSpan) -> Bool:
+        return a.start < b.start or (a.start == b.start and a.end > b.end)
+
+    @always_inline
+    def start_then_id(a: SetSpan, b: SetSpan) -> Bool:
+        return a.start < b.start or (a.start == b.start and a.id < b.id)
+
     var out = List[SetSpan]()
     for id in range(num_patterns):
         # (start asc, end desc) so the first survivor at a start is the
@@ -913,16 +857,7 @@ def leftmost_nonoverlapping(
         for s in spans:
             if s.id == id and s.start >= 0:
                 mine.append(s)
-        for i in range(1, len(mine)):
-            var key = mine[i]
-            var j = i - 1
-            while j >= 0 and (
-                mine[j].start > key.start
-                or (mine[j].start == key.start and mine[j].end < key.end)
-            ):
-                mine[j + 1] = mine[j]
-                j -= 1
-            mine[j + 1] = key
+        sort(mine, start_then_longest)
         var next_allowed = 0
         for s in mine:
             if s.start < next_allowed:
@@ -931,16 +866,7 @@ def leftmost_nonoverlapping(
             # An empty match must still advance, or iteration stalls.
             next_allowed = s.end if s.end > s.start else s.start + 1
     # (start, id) order across ids.
-    for i in range(1, len(out)):
-        var key = out[i]
-        var j = i - 1
-        while j >= 0 and (
-            out[j].start > key.start
-            or (out[j].start == key.start and out[j].id > key.id)
-        ):
-            out[j + 1] = out[j]
-            j -= 1
-        out[j + 1] = key
+    sort(out, start_then_id)
     return out^
 
 

@@ -14,24 +14,12 @@ import sys
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bench_compare import run_mojo_static_benchmarks, _ratio_str as ratio_str
+from bench_compare import run_mojo_static_benchmarks, print_comparison
 
 try:
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
     import gen_pdf
 except ImportError:
     pass
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-BAR_COLS = 16   # width of the speedup bar
 
 # ---------------------------------------------------------------------------
 # Paths (repo-relative, resolved from this file's location)
@@ -118,214 +106,6 @@ def run_pcre2_benchmarks() -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
-
-def speedup_bar(ratio: float) -> str:
-    """Coloured █/░ bar: full at ratio=10."""
-    filled = min(int(ratio / 10.0 * BAR_COLS), BAR_COLS) if ratio <= 10 else BAR_COLS
-    bar = "█" * filled + "░" * (BAR_COLS - filled)
-    color = "\033[32m" if ratio >= 1.0 else "\033[31m"
-    return f"{color}{bar}\033[0m"
-
-
-
-
-def print_comparison(
-    pcre2: dict[str, float],
-    static: dict[str, float],
-) -> None:
-    """Print a two-column comparison: PCRE2 JIT | Regex | ratio | bar.
-
-    Ratio = PCRE2 time / Static time.
-    >1x means Regex is faster than PCRE2 JIT.
-    """
-    # Use PCRE2 results as the canonical name list (it runs first/fully)
-    all_names = list(pcre2.keys())
-    if not all_names:
-        print("  No PCRE2 results collected.")
-        return
-
-    col_name = max(max(len(n) for n in all_names), 34)
-
-    header = (
-        f"  {'Benchmark':<{col_name}}  {'PCRE2 JIT':>10}  "
-        f"{'Regex':>11}  {'PCRE2/Stat':>10}  Bar (PCRE2÷Static, 10x=full)"
-    )
-    sep = "  " + "─" * (col_name + 65)
-
-    print()
-    print(header)
-    print(sep)
-
-    faster = slower = missing = 0
-
-    for name in all_names:
-        pcre2_us = pcre2[name]
-        stat_us  = static.get(name)
-
-        pcre2_str = f"{pcre2_us:>10.3f}"
-        stat_str  = f"{stat_us:>11.3f}" if stat_us is not None else f"{'—':>11}"
-
-        if stat_us is not None and stat_us > 0:
-            ratio = pcre2_us / stat_us
-            r_str = ratio_str(ratio)
-            bar   = speedup_bar(ratio)
-            if ratio >= 1.0:
-                faster += 1
-            else:
-                slower += 1
-        else:
-            r_str = f"{'—':>13}"
-            bar   = speedup_bar(0)
-            missing += 1
-
-        print(f"  {name:<{col_name}}  {pcre2_str}  {stat_str}  {r_str}  {bar}")
-
-    print(sep)
-    print(
-        f"  Regex faster: {faster}  |  slower: {slower}"
-        + (f"  |  no data: {missing}" if missing else "")
-    )
-
-
-# ---------------------------------------------------------------------------
-# PDF Generation
-# ---------------------------------------------------------------------------
-
-def build_pdf_table_data(pcre2: dict[str, float], static: dict[str, float]) -> tuple[list, list]:
-    """Build reportlab table and styles for PCRE2 vs Regex."""
-    rows = [["Benchmark", "Regex (µs)", "PCRE2 JIT (µs)", "Ratio"]]
-    styles = [
-        ("BACKGROUND", (0, 0), (-1, 0), gen_pdf.HEADER_BG),
-        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",   (0, 0), (-1, 0), 9),
-        ("ALIGN",      (0, 0), (-1, 0), "CENTER"),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
-        ("TOPPADDING",    (0, 0), (-1, 0), 6),
-        ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE",   (0, 1), (-1, -1), 8),
-        ("ALIGN",      (1, 1), (-1, -1), "RIGHT"),
-        ("ALIGN",      (0, 1), (0, -1),  "LEFT"),
-        ("TOPPADDING",    (0, 1), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafafa")]),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cfd8dc")),
-    ]
-
-    names = list(pcre2.keys())
-    assignment = gen_pdf.assign_sections(names)
-    last_section = None
-    row_idx = 1
-    faster = slower = 0
-
-    for name in names:
-        section = assignment[name]
-        if section != last_section:
-            rows.append([section, "", "", ""])
-            styles += [
-                ("BACKGROUND", (0, row_idx), (-1, row_idx), gen_pdf.SECTION_BG),
-                ("FONTNAME",   (0, row_idx), (-1, row_idx), "Helvetica-Bold"),
-                ("FONTSIZE",   (0, row_idx), (-1, row_idx), 8),
-                ("SPAN",       (0, row_idx), (-1, row_idx)),
-                ("TOPPADDING",    (0, row_idx), (-1, row_idx), 4),
-                ("BOTTOMPADDING", (0, row_idx), (-1, row_idx), 4),
-            ]
-            row_idx += 1
-            last_section = section
-
-        pcre_us = pcre2[name]
-        stat_us = static.get(name)
-
-        if stat_us is None:
-            rows.append([name, "—", f"{pcre_us:.3f}", "—"])
-        else:
-            ratio = pcre_us / stat_us
-            ratio_str = f"{ratio:.1f}x"
-            rows.append([name, f"{stat_us:.3f}", f"{pcre_us:.3f}", ratio_str])
-
-            if ratio >= 1.0:
-                faster += 1
-                styles += [
-                    ("TEXTCOLOR", (3, row_idx), (3, row_idx), gen_pdf.GREEN),
-                    ("FONTNAME",  (3, row_idx), (3, row_idx), "Helvetica-Bold"),
-                ]
-            else:
-                slower += 1
-                styles += [
-                    ("BACKGROUND", (0, row_idx), (-1, row_idx), gen_pdf.LIGHT_RED),
-                    ("TEXTCOLOR",  (3, row_idx), (3, row_idx), gen_pdf.RED),
-                    ("FONTNAME",   (3, row_idx), (3, row_idx), "Helvetica-Bold"),
-                ]
-
-        row_idx += 1
-
-    rows.append([f"Regex faster: {faster}  |  slower: {slower}", "", "", ""])
-    styles += [
-        ("BACKGROUND", (0, row_idx), (-1, row_idx), gen_pdf.HEADER_BG),
-        ("TEXTCOLOR",  (0, row_idx), (-1, row_idx), colors.white),
-        ("FONTNAME",   (0, row_idx), (-1, row_idx), "Helvetica-Bold"),
-        ("FONTSIZE",   (0, row_idx), (-1, row_idx), 8),
-        ("SPAN",       (0, row_idx), (-1, row_idx)),
-        ("ALIGN",      (0, row_idx), (-1, row_idx), "CENTER"),
-        ("TOPPADDING",    (0, row_idx), (-1, row_idx), 5),
-        ("BOTTOMPADDING", (0, row_idx), (-1, row_idx), 5),
-    ]
-    return rows, styles
-
-
-def generate_pdf(pcre2: dict[str, float], static: dict[str, float], output_path: str):
-    print(f"\n  [pdf] Generating PDF → {output_path}...")
-    specs = gen_pdf.get_machine_specs()
-
-    doc = SimpleDocTemplate(
-        output_path, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm,
-        topMargin=1.5*cm, bottomMargin=1.5*cm
-    )
-
-    style_sheet = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "Title", parent=style_sheet["Normal"], fontName="Helvetica-Bold", fontSize=16,
-        textColor=gen_pdf.HEADER_BG, spaceAfter=6
-    )
-    subtitle_style = ParagraphStyle(
-        "Subtitle", parent=style_sheet["Normal"], fontName="Helvetica", fontSize=10,
-        textColor=colors.HexColor("#546e7a"), spaceAfter=12
-    )
-    spec_style = ParagraphStyle(
-        "Spec", parent=style_sheet["Normal"], fontName="Helvetica", fontSize=8.5,
-        textColor=colors.HexColor("#37474f"), spaceAfter=2
-    )
-
-    elements = []
-    elements.append(Paragraph("Regex vs PCRE2 JIT — Benchmark Results", title_style))
-    elements.append(Paragraph("Ratio = PCRE2 JIT ÷ Regex. &gt;1x = Regex faster. JIT compile time excluded.", subtitle_style))
-
-    spec_rows = [[Paragraph(f"<b>{k}</b>", spec_style), Paragraph(v, spec_style)] for k, v in specs]
-    spec_table = Table(spec_rows, colWidths=[2.5*cm, 14*cm])
-    spec_table.setStyle(TableStyle([
-        ("FONTNAME",   (0, 0), (-1, -1), "Helvetica"),
-        ("FONTSIZE",   (0, 0), (-1, -1), 8.5),
-        ("TOPPADDING",    (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f5f5")),
-        ("GRID",       (0, 0), (-1, -1), 0.25, colors.HexColor("#cfd8dc")),
-    ]))
-    elements.append(spec_table)
-    elements.append(Spacer(1, 0.4*cm))
-
-    table_rows, table_styles = build_pdf_table_data(pcre2, static)
-    table = Table(table_rows, colWidths=[7.5*cm, 2.8*cm, 2.8*cm, 2.0*cm], repeatRows=1)
-    table.setStyle(TableStyle(table_styles))
-    elements.append(table)
-
-    doc.build(elements)
-    print("  [pdf] PDF generation complete.")
-
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -365,19 +145,32 @@ def main() -> None:
     print(f"\n{'═' * width}")
     print(f"  Results  (µs per operation)")
     print(f"{'═' * width}")
-    print_comparison(pcre2, static)
+    # Ratio = PCRE2 time / Regex time; >1x means Regex is faster than PCRE2 JIT.
+    print_comparison(
+        pcre2, static,
+        labels=("PCRE2 JIT", "Regex", "PCRE2/Stat  Bar (PCRE2÷Static, 10x=full)"),
+        widths=(10, 11, 13, 65),
+        summary="Regex faster",
+        bar_cols=16,
+    )
 
     if not pcre2:
         print("\n  [note] PCRE2 data unavailable.")
     if not static:
-        print("\n  [note] Regex data unavailable (pixi run bench_static failed).")
+        print("\n  [note] Regex data unavailable (pixi run bench failed).")
 
     if args.pdf:
         if "reportlab" not in sys.modules:
             print("\n  [error] Cannot generate PDF: reportlab not installed.\n  Try `pixi add reportlab` or similar.")
         else:
             output_pdf = os.path.join(REPO_ROOT, "bench_pcre2_results.pdf")
-            generate_pdf(pcre2, static, output_pdf)
+            print(f"\n  [pdf] Generating PDF → {output_pdf}...")
+            gen_pdf.generate_pdf(
+                output_pdf, pcre2, static, "PCRE2 JIT",
+                "Regex vs PCRE2 JIT — Benchmark Results",
+                "Ratio = PCRE2 JIT ÷ Regex. &gt;1x = Regex faster. JIT compile time excluded.",
+            )
+            print("  [pdf] PDF generation complete.")
 
     print(f"\n{'═' * width}\n")
 

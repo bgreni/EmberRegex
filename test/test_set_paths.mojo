@@ -18,11 +18,9 @@ that must treat SAVE as epsilon and BACKREF as unrunnable get pinned too.
 from emberregex import RegexSet
 from emberregex.nfa import build_nfa, NFA, NFAStateKind
 from emberregex.parser import parse
+from emberregex.static_bytes import int_arr, list_arr
 from emberregex.set_bitnfa import (
-    bitnfa_ex_idx_arr,
-    bitnfa_i32_arr,
     bitnfa_scan,
-    bitnfa_u64_arr,
     build_bitnfa,
     BITNFA_POS_CAP,
 )
@@ -114,11 +112,11 @@ def _bitnfa_scan_direct[
     """Scan on the bit-parallel NFA, bypassing engine selection."""
     comptime S = RegexSet[patterns]
     comptime BN = build_bitnfa(S.nfa, S.nfa.can_use_dfa)
-    comptime REACH = bitnfa_u64_arr[256 * BN.lanes](BN.reach)
-    comptime EX = bitnfa_u64_arr[len(BN.ex_data)](BN.ex_data)
-    comptime EXIDX = bitnfa_ex_idx_arr[BN.num_positions](BN)
-    comptime POOL = bitnfa_i32_arr[len(BN.pool)](BN.pool)
-    comptime SLICES = bitnfa_i32_arr[12 * BN.num_positions](BN.slices)
+    comptime REACH = list_arr[UInt64, 256 * BN.lanes](BN.reach, 0)
+    comptime EX = list_arr[UInt64, len(BN.ex_data)](BN.ex_data, 0)
+    comptime EXIDX = int_arr[DType.int16, BN.num_positions](BN.ex_index, -1)
+    comptime POOL = int_arr[DType.int32, len(BN.pool)](BN.pool, 0)
+    comptime SLICES = int_arr[DType.int32, 12 * BN.num_positions](BN.slices, 0)
     return bitnfa_scan[
         d=BN,
         reach=REACH,
@@ -438,22 +436,6 @@ def test_reverse_dfa_bol_slices() raises:
     assert_equal(never.norm_len[0], 0)
     assert_equal(never.bol0_len[0], 0)
     assert_equal(len(never.pool), 1)
-
-
-def test_reverse_dfa_shared_entry_uses_exact_start_scan() raises:
-    # Two ids whose fragments share an entry state defeat the one-id-per-
-    # state map, so the finish falls back to the exact per-pattern scan
-    # and the shared state's norm slice carries BOTH ids.
-    var nfa = build_union_nfa(["ab", "cd"])
-    nfa.pattern_starts[1] = nfa.pattern_starts[0]
-    var rd = build_reverse_dfa(nfa, True)
-    assert_true(rd.valid)
-    var shared = 0
-    for s in range(rd.num_states):
-        if rd.norm_len[s] == 2:
-            shared += 1
-            assert_equal(_ids(rd.pool, rd.norm_off[s], 2), [0, 1])
-    assert_equal(shared, 1)
 
 
 def test_reverse_dfa_caps() raises:

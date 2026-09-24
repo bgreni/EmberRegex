@@ -418,7 +418,7 @@ def test_unicode_negated_class_complements_codepoints() raises:
     assert_false(one.charsets[1].negated)
 
     # Out-of-order members (`x` before `a`) go through the insertion
-    # sort in `_negate_cp`; the complement is still ascending.
+    # sort in `negate_ranges`; the complement is still ascending.
     var two = _nfa("(?u)[^xa]")
     assert_equal(len(two.states), 41)
     assert_equal(len(two.charsets), 17)

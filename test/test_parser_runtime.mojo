@@ -418,12 +418,10 @@ def test_parse_anchors() raises:
 
 def test_parse_escape_classes() raises:
     # \h \H \v \V (PCRE classes) and \d \D \w \W \s \S: the negated forms
-    # negate the CharSet itself (which is what the NFA builder reads) and
-    # mirror it on the node.
+    # negate the CharSet itself (which is what the NFA builder reads).
     def cls(pattern: String, negated: Bool) raises -> AST:
         var a = parse(pattern)
         assert_equal(_kind(a, a.root), ASTNodeKind.CHAR_CLASS)
-        assert_equal(a.nodes[a.root].negated, negated)
         assert_equal(a.charsets[a.nodes[a.root].charset_index].negated, negated)
         return a^
 
@@ -466,13 +464,11 @@ def test_parse_literal_escapes() raises:
 def test_parse_unicode_property() raises:
     var a = parse("\\p{Nd}")
     assert_equal(_kind(a, a.root), ASTNodeKind.CHAR_CLASS)
-    assert_false(a.nodes[a.root].negated)
     assert_false(a.charsets[0].negated)
     # ASCII digits, an Arabic-Indic digit (above the bitmap), no letters.
     _assert_class(a, a.root, [48, 57, 0x663], [47, 58, 97, 0x3B1])
     # \P{...} negates the RANGES (a positive charset), not the flag.
     var n = parse("\\P{Nd}")
-    assert_false(n.nodes[n.root].negated)
     assert_false(n.charsets[0].negated)
     _assert_class(n, n.root, [47, 58, 97, 0x3B1], [48, 57, 0x663])
     assert_equal(
@@ -757,7 +753,6 @@ def test_parse_class_items() raises:
     assert_equal(_nranges(a, a.root), 1)
     _assert_class(a, a.root, [97, 98, 99], [96, 100])
     a = parse("[^a]")
-    assert_true(a.nodes[a.root].negated)
     assert_true(a.charsets[0].negated)
     _assert_class(a, a.root, [98, 0x100], [97])
     assert_equal(
@@ -795,7 +790,6 @@ def test_parse_class_shorthands() raises:
     def cls(pattern: String) raises -> AST:
         var a = parse(pattern)
         assert_equal(_kind(a, a.root), ASTNodeKind.CHAR_CLASS)
-        assert_false(a.nodes[a.root].negated)
         assert_false(a.charsets[0].negated)
         return a^
 

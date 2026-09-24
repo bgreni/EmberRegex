@@ -2,8 +2,9 @@
 
 Two public entry points, one shared front end:
 
-- **`Regex[pattern]`** — a single pattern, matched with Python-style
-  leftmost-first semantics.
+- **`Regex[pattern, flags]`** — a single pattern, matched with Python-style
+  leftmost-first semantics (`flags` defaults to none; it is compiled as a
+  leading inline group, `Regex._pat`).
 - **`RegexSet[patterns]`** — a multi-pattern database in the shape of
   Intel Hyperscan: scan once, report every pattern that matches and where.
 
@@ -573,9 +574,9 @@ Three constraints shape the code more than anything else:
 Every engine is differentially tested against the tagged Pike reference
 across LCG-generated inputs at chunk-boundary-adjacent lengths, including
 bytes ≥ 0x80. Set semantics are ground-truthed against CPython via
-`tools/set_oracle.py` — including `sweep_ctx`, a context-preserving variant
-that is sound for anchors and lookaround where the naive region-bounded
-sweep is not. Streaming is checked by exhaustive block/stream equivalence
+`tools/set_oracle.py` — `sweep_ctx`, a context-preserving sweep that is
+sound for anchors and lookaround where a naive region-bounded sweep is
+not. Streaming is checked by exhaustive block/stream equivalence
 over every 2- and 3-way chunk split.
 
 Benches live in `bench/bench.mojo` (single pattern) and

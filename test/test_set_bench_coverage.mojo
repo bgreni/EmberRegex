@@ -8,19 +8,14 @@ Keep the corpora builders in sync with bench_set.mojo.
 
 from emberregex import SetMatch, RegexSet
 from emberregex.set_bitnfa import (
-    bitnfa_ex_idx_arr,
-    bitnfa_i32_arr,
     bitnfa_scan,
-    bitnfa_u64_arr,
     build_bitnfa,
 )
-from emberregex.static_bytes import static_bytes
+from emberregex.static_bytes import int_arr, list_arr, static_bytes, table_bytes
 from emberregex.set_dfa import (
     build_multi_dfa,
-    mdfa_pool_arr,
     mdfa_scan,
     mdfa_slices_arr,
-    mdfa_table_str,
 )
 from emberregex.set_nfa import build_union_nfa
 from emberregex.set_pike import set_pike_scan
@@ -143,8 +138,10 @@ def mdfa_direct_scan[
     """Mirror of the bench's phase-2 baseline helper."""
     comptime S = RegexSet[patterns]
     comptime MD = build_multi_dfa(S.nfa, S.nfa.can_use_dfa)
-    comptime T = static_bytes[mdfa_table_str[MD.num_states * 256](MD)]()
-    comptime P = mdfa_pool_arr[len(MD.pool)](MD)
+    comptime T = static_bytes[
+        table_bytes[DType.int16](MD.table, MD.num_states * 256)
+    ]()
+    comptime P = int_arr[DType.int32, len(MD.pool)](MD.pool, 0)
     comptime SL = mdfa_slices_arr[6 * MD.num_states](MD)
     return mdfa_scan[d=MD, table=T, pool=P, slices=SL](input)
 
@@ -448,11 +445,11 @@ def test_bench_bitnfa_log_direct() raises:
     comptime BN = build_bitnfa(S.nfa, True)
     comptime bn_valid = BN.valid
     assert_true(bn_valid)
-    comptime REACH = bitnfa_u64_arr[256 * BN.lanes](BN.reach)
-    comptime EX = bitnfa_u64_arr[len(BN.ex_data)](BN.ex_data)
-    comptime EXIDX = bitnfa_ex_idx_arr[BN.num_positions](BN)
-    comptime POOL = bitnfa_i32_arr[len(BN.pool)](BN.pool)
-    comptime SLICES = bitnfa_i32_arr[12 * BN.num_positions](BN.slices)
+    comptime REACH = list_arr[UInt64, 256 * BN.lanes](BN.reach, 0)
+    comptime EX = list_arr[UInt64, len(BN.ex_data)](BN.ex_data, 0)
+    comptime EXIDX = int_arr[DType.int16, BN.num_positions](BN.ex_index, -1)
+    comptime POOL = int_arr[DType.int32, len(BN.pool)](BN.pool, 0)
+    comptime SLICES = int_arr[DType.int32, 12 * BN.num_positions](BN.slices, 0)
     var input = make_dense_haystack()
     var got = bitnfa_scan[
         d=BN,

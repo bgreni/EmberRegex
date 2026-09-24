@@ -13,26 +13,21 @@ shapes engine selection leaves on the backtracker.
 """
 
 from emberregex import Regex
-from emberregex.static_bytes import static_bytes
+from emberregex.static_bytes import int_arr, static_bytes, table_bytes
 from emberregex.static_dfa import (
     EDFA_MATCH_IF_NONWORD,
     EDFA_MATCH_IF_WORD,
     EagerDFA,
     _edfa_has_region,
-    _is_word_byte,
     build_eager_dfa,
-    edfa_flags_arr,
     edfa_full_match,
     edfa_id_dtype,
     edfa_match_at,
-    edfa_table_str,
 )
-from emberregex.static_lfdfa import LFDFA, build_lf_dfa, lfdfa_find_end
+from emberregex.static_lfdfa import build_lf_dfa
 from emberregex.static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
-    rdfa_flags_arr,
-    rdfa_table_str,
 )
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -70,7 +65,7 @@ def test_scanner_patterns_without_a_region_keep_the_backtracker() raises:
     assert_true(S._strategy.use_dfa)
     assert_true(S._strategy.use_eager_dfa)
     assert_true(S._use_scan_filter)
-    assert_false(comptime (_edfa_has_region(S._lfdfa.d)))
+    assert_false(comptime (_edfa_has_region(S._lfdfa)))
     assert_false(S._use_lf_dfa)
     assert_false(S._use_lazy_dfa)
     var re = S()
@@ -89,10 +84,10 @@ def test_scanner_patterns_without_a_region_keep_the_backtracker() raises:
     # 'f'.
     comptime T = Regex["\\bfoo(?:bar|baz)\\b"]
     assert_true(T._use_scan_filter)
-    assert_true(comptime (_edfa_has_region(T._lfdfa.d)))
+    assert_true(comptime (_edfa_has_region(T._lfdfa)))
     assert_true(T._use_lf_dfa)
     comptime U = Regex["\\b(?:foo|bar)\\b"]
-    assert_true(comptime (_edfa_has_region(U._lfdfa.d)))
+    assert_true(comptime (_edfa_has_region(U._lfdfa)))
     assert_true(U._use_lf_dfa)
 
 
@@ -128,19 +123,19 @@ def test_classic_tables_unchanged_for_anchor_free_patterns() raises:
     # word anchor exists.
     comptime A = Regex["[a-z]+://[a-z.]+"]
     assert_equal(A._edfa.num_states, 6)
-    assert_equal(A._lfdfa.d.num_states, 6)
+    assert_equal(A._lfdfa.num_states, 6)
     assert_equal(A._rdfa.num_states, 6)
     comptime B = Regex["(?:foo|bar|ba+z)+"]
     assert_equal(B._edfa.num_states, 7)
-    assert_equal(B._lfdfa.d.num_states, 12)
+    assert_equal(B._lfdfa.num_states, 12)
     assert_equal(B._rdfa.num_states, 8)
     comptime C = Regex["(?m)^(?:ab|cd)$"]
     assert_equal(C._edfa.num_states, 5)
-    assert_equal(C._lfdfa.d.num_states, 5)
+    assert_equal(C._lfdfa.num_states, 5)
     assert_equal(C._rdfa.num_states, 5)
     # ...and their mid-line start states do not split by word class.
     assert_equal(A._edfa.start_other_word, A._edfa.start_other)
-    assert_equal(B._lfdfa.d.start_other_word, B._lfdfa.d.start_other)
+    assert_equal(B._lfdfa.start_other_word, B._lfdfa.start_other)
     assert_equal(C._rdfa.seed_other_word, C._rdfa.seed_other)
     assert_false(A._edfa.any_wb)
 
@@ -191,41 +186,6 @@ def test_both_classes_fold_into_a_plain_match() raises:
     assert_false(d.any_wb)
 
 
-def _prev_states_entered_on_word_bytes(lf: LFDFA) -> Bool:
-    """Comptime: the table has look-behind-"word" states and every
-    transition INTO one is on a word byte (built unminimized, so the ids
-    are exact)."""
-    if not lf.valid or len(lf.prev_ids) == 0:
-        return False
-    var n = lf.d.num_states
-    for t in lf.prev_ids:
-        for s in range(n):
-            for b in range(256):
-                if lf.d.table[s * 256 + b] == t and not _is_word_byte(b):
-                    return False
-    return True
-
-
-def _lf_prev_invariant[p: StaticString]() -> Bool:
-    comptime nfa = Regex[p].nfa
-    comptime lf = build_lf_dfa(nfa, True, minimize=False)
-    comptime ok = _prev_states_entered_on_word_bytes(lf)
-    return ok
-
-
-def test_lf_prev_states_entered_on_word_bytes_only() raises:
-    # Structural form of the look-behind invariant, on the patterns whose
-    # pending anchor follows a both-class atom and on the simple shapes.
-    assert_true(_lf_prev_invariant["\\bfoo\\b"]())
-    assert_true(_lf_prev_invariant[".\\b.|q"]())
-    assert_true(_lf_prev_invariant["\\S+\\bing\\b|q"]())
-    assert_true(_lf_prev_invariant["[\\w.-]+\\bfoo|q"]())
-    assert_true(_lf_prev_invariant["(?s)[a-z .]\\b\\w+|q"]())
-    assert_true(_lf_prev_invariant["\\b(?:foo|bar)\\b"]())
-    assert_true(_lf_prev_invariant["\\w+\\b|q"]())
-    assert_true(_lf_prev_invariant["(?:ab\\B)+c"]())
-
-
 # --- Direct table harness ---------------------------------------------------
 
 
@@ -239,20 +199,20 @@ def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     comptime assert ed.valid
     comptime ETN = ed.num_states * 256
     comptime EDT = edfa_id_dtype(ed.num_states)
-    comptime etbl = static_bytes[edfa_table_str[ETN, EDT](ed)]()
-    comptime efl = edfa_flags_arr[ed.num_states](ed)
+    comptime etbl = static_bytes[table_bytes[EDT](ed.table, ETN)]()
+    comptime efl = int_arr[DType.uint8, ed.num_states](ed.flags, 0)
     comptime lf = build_lf_dfa(nfa, True)
     comptime assert lf.valid
-    comptime LTN = lf.d.num_states * 256
-    comptime LDT = edfa_id_dtype(lf.d.num_states)
-    comptime ltbl = static_bytes[edfa_table_str[LTN, LDT](lf.d)]()
-    comptime lfl = edfa_flags_arr[lf.d.num_states](lf.d)
+    comptime LTN = lf.num_states * 256
+    comptime LDT = edfa_id_dtype(lf.num_states)
+    comptime ltbl = static_bytes[table_bytes[LDT](lf.table, LTN)]()
+    comptime lfl = int_arr[DType.uint8, lf.num_states](lf.flags, 0)
     comptime rd = build_reverse_dfa(nfa, True)
     comptime assert rd.valid
     comptime RTN = rd.num_states * 256
     comptime RDT = edfa_id_dtype(rd.num_states)
-    comptime rtbl = static_bytes[rdfa_table_str[RTN, RDT](rd)]()
-    comptime rfl = rdfa_flags_arr[rd.num_states](rd)
+    comptime rtbl = static_bytes[table_bytes[RDT](rd.table, RTN)]()
+    comptime rfl = int_arr[DType.uint8, rd.num_states](rd.flags, 0)
 
     var re = Regex[p]()
     var bytes = input.as_bytes()
@@ -274,7 +234,7 @@ def _forced_lane_check[p: StaticString](input: String, label: String) raises:
     var pos = 0
     var i = 0
     while pos <= n:
-        var end = lfdfa_find_end[lf=lf, table=ltbl, flags=lfl](bytes, pos)
+        var end = edfa_match_at[d=lf, table=ltbl, flags=lfl](bytes, pos)
         if end < 0:
             break
         var start = rdfa_find_start[d=rd, table=rtbl, flags=rfl](

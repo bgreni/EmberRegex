@@ -186,16 +186,6 @@ def slowest(paths, results, n=5):
     return sorted(paths, key=lambda p: (-wall(p), p))[:n]
 
 
-def prune_results(results, live_paths):
-    """Drop recorded entries for files no longer present, so the store
-    does not accumulate stale durations for deleted tests."""
-    return {p: v for p, v in results.items() if p in live_paths}
-
-
-def needs_pkg_rebuild(stored_fp, current_fp):
-    return stored_fp != current_fp
-
-
 # --- File collection --------------------------------------------------------
 
 
@@ -207,8 +197,6 @@ def collect_files(test_dir="test"):
     every record and exit green."""
     normal, cfail = [], []
     for root, _, files in sorted(os.walk(os.path.join(ROOT, test_dir))):
-        if "bench" in root:
-            continue
         for file in sorted(files):
             if file.endswith(".mojo"):
                 path = os.path.relpath(os.path.join(root, file), ROOT)
@@ -243,7 +231,7 @@ def ensure_package(fp):
                 stored = json.load(f).get("fingerprint")
         except (json.JSONDecodeError, OSError):
             stored = None
-    if not needs_pkg_rebuild(stored, fp):
+    if stored == fp:
         return True
     os.makedirs(CACHE_DIR, exist_ok=True)
     t0 = time.monotonic()
@@ -496,7 +484,8 @@ if __name__ == "__main__":
     # filtered (--only) run has not looked at the other files and must
     # not evict their records.
     if not args.only:
-        results = prune_results(results, set(normal) | set(cfail))
+        live = set(normal) | set(cfail)
+        results = {p: v for p, v in results.items() if p in live}
     save_results(results)
 
     if skipped:

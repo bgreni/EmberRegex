@@ -20,11 +20,10 @@ from .constants import (
     CHAR_ONE,
     CHAR_ZERO,
 )
-from .parser import parse
 from .nfa import (
+    apply_flags,
     _build_static_nfa,
     _nfa_has_backref,
-    build_nfa,
     split_cycle_flags,
     NFA,
     NFAStateKind,
@@ -43,21 +42,14 @@ from .optimize import (
     extract_required_byte,
     extract_match_sandwich,
     is_pure_literal,
-    lit_bytes_arr,
-    lit_flags_arr,
     select_probe_offsets,
-    FilterPrefix,
-    InnerLiteral,
-    LiteralAlt,
 )
 from .teddy import (
-    teddy_find_prefix,
     teddy_full_match,
     teddy_match_at,
     teddy_search_forward,
 )
 from .simd_scan import (
-    clear_first_lane,
     first_lane_index,
     lane_bits,
     simd_find_byte,
@@ -86,26 +78,18 @@ from .static_dfa import (
     _wb_cont_reaches_bol,
     _pivot_prefilter,
     build_eager_dfa,
-    edfa_table_str,
     edfa_table_len,
-    edfa_flags_arr,
     edfa_id_dtype,
     edfa_full_match,
     edfa_match_at,
     pivot_first_candidate,
 )
-from .static_lfdfa import (
-    build_lf_dfa,
-    lfdfa_find_end,
-    sheng_lfdfa_find_end,
-)
+from .static_lfdfa import build_lf_dfa
 from .static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
-    rdfa_flags_arr,
-    rdfa_table_str,
 )
-from .static_bytes import static_bytes
+from .static_bytes import int_arr, list_arr, static_bytes, table_bytes
 from .sheng import (
     sheng_cap_for,
     sheng_full_match,
@@ -122,11 +106,9 @@ from .simd_kernels import (
 )
 from .executor import PikeVM, _VMBuffers, heapbt_match
 from .onepass import (
-    OnePass,
+    ONEPASS_CLASS_LEN,
     build_onepass,
     onepass_shape,
-    onepass_class_arr,
-    onepass_eps_arr,
     onepass_eps_len,
     onepass_match,
     onepass_state_arr,
@@ -669,10 +651,6 @@ def _lf_end_deterministic_list(nfa: NFA) -> Bool:
     return True
 
 
-# Sometimes this produces better IR since the __init__ gets folded into
-# a constant.
-
-
 @always_inline
 def _bm_word(bm: SIMD[DType.uint8, BITMAP_WIDTH], k: Int) -> UInt64:
     """Bytes [8k, 8k+8) of a charset bitmap as one little-endian word."""
@@ -859,6 +837,8 @@ def _lf_end_deterministic[fast: Bool = True](nfa: NFA) -> Bool:
         return _lf_end_deterministic_list(nfa)
 
 
+# Fresh capture slots: `materialize[ALL_NEG_ONES[n]]()` sometimes gives
+# better IR than `Array(fill=-1)`, the initializer folding to a constant.
 comptime ALL_NEG_ONES[Size: Int] = Array[Int, Size](fill=-1)
 
 # Steps the leftmost-first lane's speculative backtracker attempt may
@@ -907,12 +887,6 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 
 
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
-
-
-# The probe compares (_probe_eq/_probe_eq1) live in simd_scan.mojo as
-# probe_eq/probe_eq1, next to simd_find_literal_rare — the lifted Mula
-# memmem both the filter-prefix scanner and the inner-literal strategy
-# call.
 
 
 def _dfa_candidate(nfa: NFA, cyclic: List[Bool]) -> Bool:
@@ -1179,9 +1153,14 @@ struct _LFWalk[num_slots: Int, span: Bool, origin: MutOrigin](
         self.pike = pike
 
 
-struct Regex[pattern: String](Copyable, Movable):
+struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
+    Copyable, Movable
+):
     """A compile-time regex where parsing and NFA construction happen during
     compilation.
+
+    `flags` is the same as writing them inline: `Regex["ab", RegexFlags(
+    RegexFlags.IGNORECASE)]` compiles `(?i)ab`.
 
     The backtracking engine is specialized per-NFA-state via comptime
     parameters. Each NFA state becomes a distinct function instantiation that
@@ -1190,7 +1169,18 @@ struct Regex[pattern: String](Copyable, Movable):
     recurse — see backtrack.mojo.
     """
 
-    comptime nfa = _build_static_nfa(Self.pattern)
+    # The pattern the backtracker re-derives its NFA from: exactly
+    # `pattern` for the default flags, so its per-state symbols and NFA
+    # memo entry are the flag-free ones. The ternary is load-bearing: a
+    # String RETURNED by a comptime call is a different interpreter value
+    # (and symbol mangling) even when equal. `nfa` takes the flags as an
+    # operand instead of going through `_pat`: every lane method's type
+    # mentions `nfa` (via `_num_slots`), and routing it through the
+    # ternary cost ~20% of compile time on bench.mojo.
+    comptime _pat = Self.pattern if Self.flags.value == 0 else apply_flags(
+        Self.pattern, Self.flags.value
+    )
+    comptime nfa = _build_static_nfa(Self.pattern, Self.flags.value)
     # One Tarjan pass and one depth plan per pattern: the selection
     # predicates below used to each call `split_cycle_flags(Self.nfa)`
     # inside their own bodies, and calls made inside interpreted bodies
@@ -1300,7 +1290,7 @@ struct Regex[pattern: String](Copyable, Movable):
         and not (
             Self.nfa.has_word_boundary
             and Self._use_scan_filter
-            and not _edfa_has_region(Self._lfdfa.d)
+            and not _edfa_has_region(Self._lfdfa)
         )
     )
     # The DFA-bounded capture lane (Rust regex's meta "Core" strategy):
@@ -1317,7 +1307,7 @@ struct Regex[pattern: String](Copyable, Movable):
         and not (
             Self.nfa.has_word_boundary
             and Self._use_scan_filter
-            and not _edfa_has_region(Self._lfdfa.d)
+            and not _edfa_has_region(Self._lfdfa)
         )
     )
     comptime _use_lf_lane = Self._use_lf_dfa or Self._use_dfa_span
@@ -1334,7 +1324,7 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _span_lane = Self._group_count > 0
     comptime _use_lf_sheng = (
         Self._use_lf_lane
-        and sheng_viable(Self._lfdfa.d)
+        and sheng_viable(Self._lfdfa)
         and HAS_FAST_BYTE_SHUFFLE
     )
     # LazyDFA only backs DFA patterns whose CLASSIC comptime
@@ -1355,10 +1345,12 @@ struct Regex[pattern: String](Copyable, Movable):
     # of a per-call stack copy (see edfa_table_len).
     comptime _EDFA_TN = edfa_table_len(Self._edfa.num_states)
     comptime _EDFA_DT = edfa_id_dtype(Self._edfa.num_states)
-    comptime _EDFA_TABLE_S = edfa_table_str[Self._EDFA_TN, Self._EDFA_DT](
-        Self._edfa
+    comptime _EDFA_TABLE_S = table_bytes[Self._EDFA_DT](
+        Self._edfa.table, Self._EDFA_TN
     )
-    comptime _EDFA_FLAGS = edfa_flags_arr[Self._edfa.num_states](Self._edfa)
+    comptime _EDFA_FLAGS = int_arr[DType.uint8, Self._edfa.num_states](
+        Self._edfa.flags, 0
+    )
     comptime _EDFA_TABLE = static_bytes[Self._EDFA_TABLE_S]()
     # Narrowest tbl tier that holds this DFA: a 6-state DFA keeps 16-lane
     # masks even where 64 lanes are available (see sheng.mojo).
@@ -1368,26 +1360,28 @@ struct Regex[pattern: String](Copyable, Movable):
     )
     # Leftmost-first lane tables (same materialization rules as above).
     comptime _SHENG_MASKS = static_bytes[Self._SHENG_MASKS_S]()
-    comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.d.num_states)
-    comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.d.num_states)
-    comptime _LFDFA_TABLE_S = edfa_table_str[Self._LFDFA_TN, Self._LFDFA_DT](
-        Self._lfdfa.d
+    comptime _LFDFA_TN = edfa_table_len(Self._lfdfa.num_states)
+    comptime _LFDFA_DT = edfa_id_dtype(Self._lfdfa.num_states)
+    comptime _LFDFA_TABLE_S = table_bytes[Self._LFDFA_DT](
+        Self._lfdfa.table, Self._LFDFA_TN
     )
-    comptime _LFDFA_FLAGS = edfa_flags_arr[Self._lfdfa.d.num_states](
-        Self._lfdfa.d
+    comptime _LFDFA_FLAGS = int_arr[DType.uint8, Self._lfdfa.num_states](
+        Self._lfdfa.flags, 0
     )
-    comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa.d, Self._use_lf_sheng)
+    comptime _LF_SHENG_CAP = sheng_cap_for(Self._lfdfa, Self._use_lf_sheng)
     comptime _LF_SHENG_MASKS_S = sheng_masks_str[Self._LF_SHENG_CAP](
-        Self._lfdfa.d, Self._use_lf_sheng
+        Self._lfdfa, Self._use_lf_sheng
     )
     comptime _LFDFA_TABLE = static_bytes[Self._LFDFA_TABLE_S]()
     comptime _LF_SHENG_MASKS = static_bytes[Self._LF_SHENG_MASKS_S]()
     comptime _RDFA_TN = edfa_table_len(Self._rdfa.num_states)
     comptime _RDFA_DT = edfa_id_dtype(Self._rdfa.num_states)
-    comptime _RDFA_TABLE_S = rdfa_table_str[Self._RDFA_TN, Self._RDFA_DT](
-        Self._rdfa
+    comptime _RDFA_TABLE_S = table_bytes[Self._RDFA_DT](
+        Self._rdfa.table, Self._RDFA_TN
     )
-    comptime _RDFA_FLAGS = rdfa_flags_arr[Self._rdfa.num_states](Self._rdfa)
+    comptime _RDFA_FLAGS = int_arr[DType.uint8, Self._rdfa.num_states](
+        Self._rdfa.flags, 0
+    )
     comptime _RDFA_TABLE = static_bytes[Self._RDFA_TABLE_S]()
     # Pivot-anchored prefilter shape (the `[class]+ P …` family), read off
     # the classic table; the leftmost-first scan starts at its candidate.
@@ -1407,11 +1401,11 @@ struct Regex[pattern: String](Copyable, Movable):
     # _find_prefix_candidate's delegation to simd_find_literal_rare
     # (List-bearing values must not ride as comptime parameters).
     # Referenced only when fprefix_len >= 2.
-    comptime _FPRE_LIT = lit_bytes_arr[Self._strategy.fprefix_len](
-        Self._fpre.bytes
+    comptime _FPRE_LIT = list_arr[UInt8, Self._strategy.fprefix_len](
+        Self._fpre.bytes, 0
     )
-    comptime _FPRE_CL = lit_flags_arr[Self._strategy.fprefix_len](
-        Self._fpre.caseless
+    comptime _FPRE_CL = list_arr[Bool, Self._strategy.fprefix_len](
+        Self._fpre.caseless, False
     )
     # Reverse-suffix / reverse-inner required literal (Rust regex's
     # ReverseSuffix/ReverseInner, effects (a)+(b) — see _lf_next_match's
@@ -1435,8 +1429,10 @@ struct Regex[pattern: String](Copyable, Movable):
     # where _use_rev_literal holds, so the invalid case (length 0) never
     # elaborates.
     comptime _IL_N = len(Self._inner_lit.bytes)
-    comptime _IL_LIT = lit_bytes_arr[Self._IL_N](Self._inner_lit.bytes)
-    comptime _IL_CL = lit_flags_arr[Self._IL_N](Self._inner_lit.caseless)
+    comptime _IL_LIT = list_arr[UInt8, Self._IL_N](Self._inner_lit.bytes, 0)
+    comptime _IL_CL = list_arr[Bool, Self._IL_N](
+        Self._inner_lit.caseless, False
+    )
     comptime _IL_PROBES = select_probe_offsets(
         Self._inner_lit.bytes, Self._inner_lit.caseless
     )
@@ -1513,9 +1509,11 @@ struct Regex[pattern: String](Copyable, Movable):
     comptime _OP_TN = onepass_table_len(Self._onepass)
     comptime _OP_TABLE_S = onepass_table_str[Self._OP_TN](Self._onepass)
     comptime _OP_TABLE = static_bytes[Self._OP_TABLE_S]()
-    comptime _OP_CLASSES = onepass_class_arr(Self._onepass)
+    comptime _OP_CLASSES = int_arr[DType.uint8, ONEPASS_CLASS_LEN](
+        Self._onepass.class_of, 0
+    )
     comptime _OP_NE = onepass_eps_len(Self._onepass)
-    comptime _OP_EPS = onepass_eps_arr[Self._OP_NE](Self._onepass)
+    comptime _OP_EPS = list_arr[UInt64, Self._OP_NE](Self._onepass.eps_sets, 0)
     comptime _OP_NS = onepass_state_len(Self._onepass)
     comptime _OP_STATES = onepass_state_arr[Self._OP_NS](Self._onepass)
 
@@ -1545,7 +1543,6 @@ struct Regex[pattern: String](Copyable, Movable):
         comptime if Self._use_lazy_dfa:
             var nfa = materialize[Self.nfa]()
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](nfa^)
-            # self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](materialize[_build_static_nfa(Self.pattern)]())
             var dfa = LazyDFA()
             self._dfa = rebind_var[type_of(self._dfa)](dfa^)
         else:
@@ -1628,15 +1625,15 @@ struct Regex[pattern: String](Copyable, Movable):
     ](self, input: Span[Byte, origin], pos: Int) -> Int:
         """Leftmost-first match END at or after `pos`, or -1."""
         comptime if Self._use_lf_sheng:
-            return sheng_lfdfa_find_end[
-                lf=Self._lfdfa,
+            return sheng_match_at[
+                d=Self._lfdfa,
                 cap=Self._LF_SHENG_CAP,
                 masks=Self._LF_SHENG_MASKS,
                 flags=Self._LFDFA_FLAGS,
             ](input, pos)
         else:
-            return lfdfa_find_end[
-                lf=Self._lfdfa,
+            return edfa_match_at[
+                d=Self._lfdfa,
                 table=Self._LFDFA_TABLE,
                 flags=Self._LFDFA_FLAGS,
             ](input, pos)
@@ -1663,23 +1660,34 @@ struct Regex[pattern: String](Copyable, Movable):
             ](input, start)
 
     @always_inline
-    def _sbt_match_at[
-        origin: Origin, //
-    ](self, input: Span[Byte, origin], start: Int) -> Int:
-        """`_sbt_match_at` discarding the capture slots."""
-        var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-        return self._sbt_match_at(input, start, slots)
+    def _bt[
+        origin: Origin,
+        //,
+        state_idx: Int = Self._start,
+        anchored_end: Bool = False,
+    ](
+        self,
+        input: Span[Byte, origin],
+        pos: Int,
+        mut slots: Array[Int, Self._num_slots],
+        mut memo: List[UInt64],
+        end_at: Int = -1,
+    ) raises -> Int:
+        """`_sbt_run` on this pattern with this Regex's cached stack range."""
+        return _sbt_run[
+            pattern=Self._pat,
+            state_idx=state_idx,
+            num_slots=Self._num_slots,
+            anchored_end=anchored_end,
+        ](input, pos, slots, memo, end_at, self._stack_lo, self._stack_hi)
 
     @always_inline
     def _sbt_match_at[
         origin: Origin, //
-    ](
-        self,
-        input: Span[Byte, origin],
-        start: Int,
-        mut slots: Array[Int, Self._num_slots],
-    ) -> Int:
-        """`_sbt_match_at` with a fresh LF_SBT_ATTEMPT_BUDGET."""
+    ](self, input: Span[Byte, origin], start: Int) -> Int:
+        """`_sbt_match_at` discarding the capture slots, with a fresh
+        LF_SBT_ATTEMPT_BUDGET."""
+        var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
         var budget = LF_SBT_ATTEMPT_BUDGET
         return self._sbt_match_at(input, start, slots, budget)
 
@@ -1713,7 +1721,7 @@ struct Regex[pattern: String](Copyable, Movable):
         left of it on return (negative after a -2).
         """
         var end = _sbt_try_match[
-            pattern=Self.pattern,
+            pattern=Self._pat,
             state_idx=Self._start,
             num_slots=Self._num_slots,
             anchored_end=False,
@@ -2032,19 +2040,8 @@ struct Regex[pattern: String](Copyable, Movable):
             if pike[].sbt_ok:
                 try:
                     var memo = List[UInt64]()
-                    var got = _sbt_run[
-                        pattern=Self.pattern,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                        anchored_end=True,
-                    ](
-                        input,
-                        start,
-                        slots,
-                        memo,
-                        end_at=end,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
+                    var got = self._bt[anchored_end=True](
+                        input, start, slots, memo, end_at=end
                     )
                     if got == end:
                         return
@@ -2158,12 +2155,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime sb = Self._sandwich.suffix[i]
                 if ptr[unsafe_offset=input_len - suffix_len + i] != sb:
                     return MatchResult[Self._num_slots].no_match()
-            return MatchResult[Self._num_slots](
-                matched=True,
-                start=0,
-                end=input_len,
-                slots=Array[Int, Self._num_slots](fill=-1),
-            )
+            return Self._span_result(0, input_len)
         elif Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2173,22 +2165,12 @@ struct Regex[pattern: String](Copyable, Movable):
                     width=Self._strategy.prefix_len
                 ]()
                 if chunk == lit:
-                    return MatchResult[Self._num_slots](
-                        matched=True,
-                        start=0,
-                        end=Self._strategy.prefix_len,
-                        slots=Array[Int, Self._num_slots](fill=-1),
-                    )
+                    return Self._span_result(0, Self._strategy.prefix_len)
             return MatchResult[Self._num_slots].no_match()
         elif Self._strategy.use_dfa:
             try:
                 if self._dfa_full_match(input):
-                    return MatchResult[Self._num_slots](
-                        matched=True,
-                        start=0,
-                        end=input.byte_length(),
-                        slots=Array[Int, Self._num_slots](fill=-1),
-                    )
+                    return Self._span_result(0, input.byte_length())
                 return MatchResult[Self._num_slots].no_match()
             except:
                 # Only the lazy DFA can raise here (DFA_STATE_CAP): for
@@ -2229,18 +2211,8 @@ struct Regex[pattern: String](Copyable, Movable):
                 # anchored_end: MATCH only accepts at end of input, so
                 # alternatives that prefer a shorter match (e.g. `(a|ab)`
                 # on "ab") can't mask a valid full match.
-                var end = _sbt_run[
-                    pattern=Self.pattern,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                    anchored_end=True,
-                ](
-                    input.as_bytes(),
-                    0,
-                    slots,
-                    sbt_memo,
-                    stack_lo=self._stack_lo,
-                    stack_hi=self._stack_hi,
+                var end = self._bt[anchored_end=True](
+                    input.as_bytes(), 0, slots, sbt_memo
                 )
                 if end >= 0:
                     return MatchResult[Self._num_slots](
@@ -2265,16 +2237,8 @@ struct Regex[pattern: String](Copyable, Movable):
 
     def search(mut self, input: String) -> MatchResult[Self._num_slots]:
         """Search for the first occurrence of the pattern in the input."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return MatchResult[Self._num_slots].no_match()
+        if self._required_byte_absent(input):
+            return MatchResult[Self._num_slots].no_match()
         comptime if Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2283,12 +2247,7 @@ struct Regex[pattern: String](Copyable, Movable):
             var pos = simd_find_literal(input_bytes, lit, 0)
             if pos < 0:
                 return MatchResult[Self._num_slots].no_match()
-            return MatchResult[Self._num_slots](
-                matched=True,
-                start=pos,
-                end=pos + Self._strategy.prefix_len,
-                slots=Array[Int, Self._num_slots](fill=-1),
-            )
+            return Self._span_result(pos, pos + Self._strategy.prefix_len)
         elif Self._use_lf_lane:
             # The same two-line prologue opens every leftmost-first lane
             # verb: the walk's state lives in the verb's frame and the
@@ -2315,11 +2274,8 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._strategy.start_anchor == AnchorKind.BOL:
                     var match_end = self._dfa_match_at(input_bytes, 0)
                     if match_end >= 0:
-                        return MatchResult[Self._num_slots](
-                            matched=True,
-                            start=0,
-                            end=self._lf_end_at(input_bytes, 0, match_end),
-                            slots=Array[Int, Self._num_slots](fill=-1),
+                        return Self._span_result(
+                            0, self._lf_end_at(input_bytes, 0, match_end)
                         )
                     return MatchResult[Self._num_slots].no_match()
 
@@ -2330,15 +2286,9 @@ struct Regex[pattern: String](Copyable, Movable):
                     while pos <= input_len:
                         var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
-                            return MatchResult[Self._num_slots](
-                                matched=True,
-                                start=pos,
-                                end=self._lf_end_at(
-                                    input_bytes, pos, match_end
-                                ),
-                                slots=Array[Int, Self._num_slots](
-                                    fill=-1
-                                ),
+                            return Self._span_result(
+                                pos,
+                                self._lf_end_at(input_bytes, pos, match_end),
                             )
                         var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                         if nl < 0:
@@ -2357,14 +2307,10 @@ struct Regex[pattern: String](Copyable, Movable):
                                 return MatchResult[Self._num_slots].no_match()
                             var match_end = self._dfa_match_at(input_bytes, pos)
                             if match_end >= 0:
-                                return MatchResult[Self._num_slots](
-                                    matched=True,
-                                    start=pos,
-                                    end=self._lf_end_at(
+                                return Self._span_result(
+                                    pos,
+                                    self._lf_end_at(
                                         input_bytes, pos, match_end
-                                    ),
-                                    slots=Array[Int, Self._num_slots](
-                                        fill=-1
                                     ),
                                 )
                             pos = _scan_bump[Self._is_unicode](input_bytes, pos)
@@ -2373,25 +2319,16 @@ struct Regex[pattern: String](Copyable, Movable):
                                 input_bytes, pos
                             )
                             if range[0] >= 0:
-                                return MatchResult[Self._num_slots](
-                                    matched=True,
-                                    start=range[0],
-                                    end=self._lf_end_at(
+                                return Self._span_result(
+                                    range[0],
+                                    self._lf_end_at(
                                         input_bytes, range[0], range[1]
-                                    ),
-                                    slots=Array[Int, Self._num_slots](
-                                        fill=-1
                                     ),
                                 )
                             return MatchResult[Self._num_slots].no_match()
                     return MatchResult[Self._num_slots].no_match()
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_search(input)
                 else:
@@ -2424,18 +2361,7 @@ struct Regex[pattern: String](Copyable, Movable):
             # other two branches own theirs.
             var sbt_memo = List[UInt64]()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                0,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -2470,18 +2396,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input, pos, slots, sbt_memo)
             if end >= 0:
                 return MatchResult[Self._num_slots](
                     matched=True,
@@ -2526,17 +2441,8 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos = nl + 1
                     continue
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=entry_state,
-                num_slots=Self._num_slots,
-            ](
-                input,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
+            var end = self._bt[state_idx=entry_state](
+                input, pos, slots, sbt_memo
             )
             if end >= 0:
                 return MatchResult[Self._num_slots](
@@ -2569,16 +2475,8 @@ struct Regex[pattern: String](Copyable, Movable):
 
         No per-match String allocation: slice lazily via span() /
         group_str(). findall() is a wrapper over this."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return List[MatchResult[Self._num_slots]]()
+        if self._required_byte_absent(input):
+            return List[MatchResult[Self._num_slots]]()
         comptime if Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2713,12 +2611,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 )
                     return results^
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_finditer(input)
                 else:
@@ -2747,16 +2640,8 @@ struct Regex[pattern: String](Copyable, Movable):
         wrapper over it: materializing the intermediate MatchResult list
         measured 1.3-1.9x on findall-heavy rows. Keep the iteration
         structure of the two in sync."""
-        comptime if Self._strategy.required_byte >= 0:
-            if (
-                simd_find_byte(
-                    input.as_bytes(),
-                    UInt8(Self._strategy.required_byte),
-                    0,
-                )
-                < 0
-            ):
-                return List[String]()
+        if self._required_byte_absent(input):
+            return List[String]()
         comptime if Self._strategy.use_simd_literal:
             var lit = rebind[TypeForPrefixLength[Self._strategy.prefix_len]](
                 self._simd_lit
@@ -2906,12 +2791,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 )
                     return results^
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_findall(input)
                 else:
@@ -2941,18 +2821,7 @@ struct Regex[pattern: String](Copyable, Movable):
         # BOL anchor: only position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                0,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 self._findall_append(results, input, 0, end, slots)
             return results^
@@ -2963,18 +2832,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 var pos = 0
                 while pos <= input_len:
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self.pattern,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end >= 0:
                         self._findall_append(results, input, pos, end, slots)
                         if end > pos:
@@ -2988,12 +2846,6 @@ struct Regex[pattern: String](Copyable, Movable):
                             and input_bytes.unsafe_get(pos - 1) == CHAR_NEWLINE
                         ):
                             continue
-                        # Otherwise skip to the next BOL
-                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
-                        if nl < 0:
-                            break
-                        pos = nl + 1
-                        continue
                     # Skip to next BOL position
                     var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                     if nl < 0:
@@ -3001,7 +2853,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos = nl + 1
                 return results^
 
-            elif Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+            else:
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
@@ -3014,18 +2866,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 input_bytes, input_len, pos
                             )
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self.pattern,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end < 0:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         continue
@@ -3035,22 +2876,21 @@ struct Regex[pattern: String](Copyable, Movable):
                     else:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 return results^
-        return results^
 
     @always_inline
-    def _findall_append[
-        n: Int
-    ](
+    def _findall_append(
         self,
         mut results: List[String],
         input: String,
         pos: Int,
         end: Int,
-        slots: Array[Int, n],
+        slots: Array[Int, Self._num_slots],
     ):
+        """findall's per-match string: group 1 when it participated, else
+        the whole span."""
         var input_bytes = input.as_bytes()
         comptime if Self._num_slots >= 2:
-            if Self._group_count > 0 and slots[0] >= 0 and slots[1] >= 0:
+            if slots[0] >= 0 and slots[1] >= 0:
                 results.append(
                     String(unsafe_from_utf8=input_bytes[slots[0] : slots[1]])
                 )
@@ -3076,23 +2916,9 @@ struct Regex[pattern: String](Copyable, Movable):
             if not result.matched:
                 # Unanchored: a miss covers every start >= pos.
                 break
-            comptime if Self._group_count > 0:
-                if result.group_matched(1):
-                    results.append(result.group_str(input_bytes, 1))
-                else:
-                    results.append(
-                        String(
-                            unsafe_from_utf8=input_bytes[
-                                result.start : result.end
-                            ]
-                        )
-                    )
-            else:
-                results.append(
-                    String(
-                        unsafe_from_utf8=input_bytes[result.start : result.end]
-                    )
-                )
+            self._findall_append(
+                results, input, result.start, result.end, result.slots
+            )
             if result.end > result.start:
                 pos = result.end
             else:
@@ -3113,18 +2939,7 @@ struct Regex[pattern: String](Copyable, Movable):
         # BOL anchor: only position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                0,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, 0, slots, sbt_memo)
             if end >= 0:
                 results.append(
                     MatchResult[Self._num_slots](
@@ -3139,18 +2954,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 var pos = 0
                 while pos <= input_len:
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self.pattern,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end >= 0:
                         results.append(
                             MatchResult[Self._num_slots](
@@ -3168,12 +2972,6 @@ struct Regex[pattern: String](Copyable, Movable):
                             and input_bytes.unsafe_get(pos - 1) == CHAR_NEWLINE
                         ):
                             continue
-                        # Otherwise skip to the next BOL
-                        var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
-                        if nl < 0:
-                            break
-                        pos = nl + 1
-                        continue
                     # Skip to next BOL position
                     var nl = simd_find_byte(input_bytes, CHAR_NEWLINE, pos)
                     if nl < 0:
@@ -3181,7 +2979,7 @@ struct Regex[pattern: String](Copyable, Movable):
                     pos = nl + 1
                 return results^
 
-            elif Self._strategy.start_anchor != AnchorKind.BOL_MULTILINE:
+            else:
                 var pos = 0
                 while pos <= input_len:
                     comptime if Self._use_scan_filter:
@@ -3194,18 +2992,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 input_bytes, input_len, pos
                             )
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                    var end = _sbt_run[
-                        pattern=Self.pattern,
-                        state_idx=Self._start,
-                        num_slots=Self._num_slots,
-                    ](
-                        input_bytes,
-                        pos,
-                        slots,
-                        sbt_memo,
-                        stack_lo=self._stack_lo,
-                        stack_hi=self._stack_hi,
-                    )
+                    var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end < 0:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                         continue
@@ -3219,7 +3006,6 @@ struct Regex[pattern: String](Copyable, Movable):
                     else:
                         pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 return results^
-        return results^
 
     def replace(mut self, input: String, replacement: String) -> String:
         """Replace all non-overlapping matches with replacement string.
@@ -3247,11 +3033,8 @@ struct Regex[pattern: String](Copyable, Movable):
                 if literal_replacement:
                     output += replacement
                 else:
-                    var match_result = MatchResult[Self._num_slots](
-                        matched=True,
-                        start=pos,
-                        end=pos + Self._strategy.prefix_len,
-                        slots=Array[Int, Self._num_slots](fill=-1),
+                    var match_result = Self._span_result(
+                        pos, pos + Self._strategy.prefix_len
                     )
                     output += self._expand_replacement(
                         input_bytes, match_result, replacement
@@ -3268,12 +3051,7 @@ struct Regex[pattern: String](Copyable, Movable):
             try:
                 return self._replace_dfa(input, replacement)
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_replace(input, replacement)
                 else:
@@ -3380,12 +3158,7 @@ struct Regex[pattern: String](Copyable, Movable):
             if literal_replacement:
                 output += replacement
             else:
-                var match_result = MatchResult[Self._num_slots](
-                    matched=True,
-                    start=start,
-                    end=end,
-                    slots=Array[Int, Self._num_slots](fill=-1),
-                )
+                var match_result = Self._span_result(start, end)
                 output += self._expand_replacement(
                     input_bytes, match_result, replacement
                 )
@@ -3426,18 +3199,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, pos, slots, sbt_memo)
             if end < 0:
                 pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 continue
@@ -3561,12 +3323,7 @@ struct Regex[pattern: String](Copyable, Movable):
                                 input_bytes, start
                             )
             except:
-                # Only the lazy DFA can raise here (DFA_STATE_CAP): for
-                # eager/Sheng/Teddy tables the handler is dead, yet an
-                # unreachable `except` body still ELABORATES, and naming
-                # `_pike_*` drags the runtime parser + NFA builder + Pike
-                # VM into every binary. Gate the body on the lane that can
-                # actually raise.
+                # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
                     return self._pike_split(input)
                 else:
@@ -3608,18 +3365,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 comptime if Self._strategy.first_byte_useful:
                     pos = self._next_candidate_pos(input_bytes, input_len, pos)
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-            var end = _sbt_run[
-                pattern=Self.pattern,
-                state_idx=Self._start,
-                num_slots=Self._num_slots,
-            ](
-                input_bytes,
-                pos,
-                slots,
-                sbt_memo,
-                stack_lo=self._stack_lo,
-                stack_hi=self._stack_hi,
-            )
+            var end = self._bt(input_bytes, pos, slots, sbt_memo)
             if end < 0:
                 pos = _scan_bump[Self._is_unicode](input_bytes, pos)
                 continue
@@ -3650,7 +3396,9 @@ struct Regex[pattern: String](Copyable, Movable):
         comptime if Self._strategy.fprefix_len > 0:
             return self._find_prefix_candidate(input, input_len, pos)
         else:
-            return teddy_find_prefix[alt=Self._alt_prefix](input, pos)
+            return teddy_search_forward[alt=Self._alt_prefix, want_end=False](
+                input, pos
+            )[0]
 
     @always_inline
     def _find_prefix_candidate[
@@ -3708,6 +3456,21 @@ struct Regex[pattern: String](Copyable, Movable):
                 off_a=probes[0],
                 off_b=probes[1],
             ](input, start)
+
+    @always_inline
+    def _required_byte_absent(self, input: String) -> Bool:
+        """Required-byte fast-fail for the unanchored verbs (see
+        `_compute_strategy`): True when a byte every match contains is
+        missing from `input`. Always False, at comptime, without one."""
+        comptime if Self._strategy.required_byte >= 0:
+            return (
+                simd_find_byte(
+                    input.as_bytes(), UInt8(Self._strategy.required_byte), 0
+                )
+                < 0
+            )
+        else:
+            return False
 
     @always_inline
     def _first_byte_hit(self, b: Byte) -> Bool:
@@ -3831,18 +3594,7 @@ struct Regex[pattern: String](Copyable, Movable):
                 # and a destructor edge on a path that never uses it.
                 var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
-                var end = _sbt_run[
-                    pattern=Self.pattern,
-                    state_idx=Self._start,
-                    num_slots=Self._num_slots,
-                ](
-                    input,
-                    start,
-                    slots,
-                    sbt_memo,
-                    stack_lo=self._stack_lo,
-                    stack_hi=self._stack_hi,
-                )
+                var end = self._bt(input, start, slots, sbt_memo)
                 if end >= 0:
                     return end
             except:

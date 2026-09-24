@@ -142,7 +142,7 @@ def test_find_in_class_start_offset() raises:
 def test_email_pattern_gets_nibble_accel() raises:
     comptime E = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
-        comptime n_nib = len(E._edfa.accel_nib_states)
+        comptime n_nib = len(E._edfa.accel.nib_states)
         assert_true(n_nib >= 1)
     var re = E()
     var r = re.search("reach me at first.last@example.com or in person")
@@ -157,7 +157,7 @@ def test_nibble_accel_long_runs() raises:
     comptime W = simd_width_of[DType.uint8]()
     comptime S = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
-        comptime n_nib = len(S._edfa.accel_nib_states)
+        comptime n_nib = len(S._edfa.accel.nib_states)
         assert_true(n_nib >= 1)
     var re = S()
     var user = String("u") * (3 * W + 1)
@@ -173,7 +173,7 @@ def test_shufti_state_pattern() raises:
     # `[^a-z]*[a-z]+` self-loops exit on a-z (2 high nibbles): shufti.
     comptime E = Regex["[^a-z]*[a-z]+"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
-        comptime kinds = E._edfa.accel_nib_kind
+        comptime kinds = E._edfa.accel.nib_kind
         comptime has_shufti = ACCEL_SHUFTI in kinds
         assert_true(has_shufti)
     var re = E()
@@ -190,7 +190,7 @@ def test_nibble_accel_high_bytes() raises:
     # regions exercise the high-nibble table half.
     comptime S = Regex["[^a-z]*[a-z]+"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
-        comptime n_nib = len(S._edfa.accel_nib_states)
+        comptime n_nib = len(S._edfa.accel.nib_states)
         assert_true(n_nib >= 1)
     var re = S()
     var buf = List[Byte]()
@@ -210,7 +210,7 @@ def test_nibble_accel_high_bytes() raises:
 def test_dotstar_suffix_still_accelerated() raises:
     # `.*x` keeps its 2-exit-byte compare path alongside nibble accel.
     comptime E = Regex[".*x"]
-    comptime n_exit2 = len(E._edfa.accel_states)
+    comptime n_exit2 = len(E._edfa.accel.states)
     assert_true(n_exit2 >= 1)
     var re = E()
     comptime W = simd_width_of[DType.uint8]()
@@ -226,7 +226,7 @@ def test_nibble_accel_findall_multiline() raises:
     # Accel must not skip past '\n' boundaries that end matches.
     comptime S = Regex["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"]
     comptime if HAS_FAST_BYTE_SHUFFLE:
-        comptime n_nib = len(S._edfa.accel_nib_states)
+        comptime n_nib = len(S._edfa.accel.nib_states)
         assert_true(n_nib >= 1)
     var re = S()
     var text = "a@b.com\nnope\nlong.user@sub.host.org\n"
