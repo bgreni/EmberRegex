@@ -761,7 +761,7 @@ def rdfa_find_start[
     first and records its flags at the run's leftmost position.
     """
     comptime dt = edfa_id_dtype(d.num_states)
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    var tbl = table.ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var input_len = len(input)
     var cur: Int

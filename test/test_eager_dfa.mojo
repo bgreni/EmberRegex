@@ -42,7 +42,7 @@ def _table_roundtrips[
     and a dead cell must still read back as EDFA_DEAD so the walkers'
     `next < 0` test keeps working.
     """
-    var arr = lit.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    var arr = lit.ptr().unsafe_bitcast[Scalar[dt]]()
     for i in range(n):
         var want = d.table[i]
         if Int(arr[i]) != want:

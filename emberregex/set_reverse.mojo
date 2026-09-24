@@ -904,7 +904,7 @@ def reverse_som[
     `starts` must be `num_patterns` long; the caller resets it per end.
     """
     # Comptime arrays bound to the binary's constant data (no copy).
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
+    var tbl = table.ptr().unsafe_bitcast[Int32]()
     var sl = materialize[slices]()
     var input_len = len(input)
     var cur: Int

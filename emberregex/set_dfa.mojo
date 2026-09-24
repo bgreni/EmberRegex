@@ -754,7 +754,7 @@ def _mdfa_scan_impl[
     accel: Bool,
 ](input: Span[Byte, origin], mut out: List[SetMatch]):
     # Comptime arrays bound to the binary's constant data (no copy).
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Int16]()
+    var tbl = table.ptr().unsafe_bitcast[Int16]()
     var pl = materialize[pool]()
     var sl = materialize[slices]()
     var input_len = len(input)

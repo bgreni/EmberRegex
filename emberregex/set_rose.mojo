@@ -1288,7 +1288,7 @@ def _rose_walk[
     which is what keeps per-candidate cost near the match length.
     """
     # Comptime arrays bound to the binary's constant data (no copy).
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
+    var tbl = table.ptr().unsafe_bitcast[Int32]()
     var flg = materialize[flags]()
     var cur = start_state
     var pos = start_pos

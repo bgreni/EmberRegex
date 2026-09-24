@@ -538,7 +538,7 @@ def ac_scan[
     """
     comptime NC = v.num_classes
     var out = List[SetMatch]()
-    var tbl = table.unsafe_ptr().unsafe_bitcast[UInt16]()
+    var tbl = table.ptr().unsafe_bitcast[UInt16]()
     var cm = materialize[cls]()
     var rp = materialize[rep]()
     var input_len = len(input)

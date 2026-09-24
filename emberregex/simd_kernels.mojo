@@ -134,7 +134,7 @@ def _sheng_step[
     the tier this DFA needs is emitted, and the NEON-only tiers are never
     elaborated where cap is always NIBBLE_TABLE_SIZE.
     """
-    var p = Pointer(to=masks.unsafe_ptr()[unsafe_offset=Int(b) * cap])
+    var p = Pointer(to=masks.ptr()[unsafe_offset=Int(b) * cap])
     comptime if cap == NIBBLE_TABLE_SIZE:
         return nibble_lookup(
             p.unsafe_load[width=NIBBLE_TABLE_SIZE](), state_vec

@@ -2196,7 +2196,7 @@ def _edfa_full_match_impl[
     # the constant data emitted in the binary (no copy) so the walk can
     # index them.
     comptime dt = edfa_id_dtype(d.num_states)
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    var tbl = table.ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur = d.start_at_0
     var cur_vec = _ShuffleIndex(UInt8(cur))  # Sheng state (cap > 0 only)
@@ -2294,7 +2294,7 @@ def _edfa_walk_impl[
     """The walk behind `edfa_match_at` / `sheng_match_at`; `cap` picks the
     transition mechanism as in `_edfa_full_match_impl`."""
     comptime dt = edfa_id_dtype(d.num_states)
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()
+    var tbl = table.ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
     var cur: Int
     if start == 0:

@@ -1,6 +1,6 @@
 [workspace]
 authors = ["Brian Grenier <grenierb96@gmail.com>"]
-channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "emberregex"
 platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
@@ -21,10 +21,10 @@ backend = { name = "pixi-build-mojo", version = "0.*" }
 pkg = { name = "emberregex", path = "emberregex" }
 
 [package.build-dependencies]
-mojo-compiler = "==1.1.0rc0"
+mojo-compiler = "==1.1.0"
 
 [package.run-dependencies]
-mojo-compiler = "==1.1.0rc0"
+mojo-compiler = "==1.1.0"
 
 # `mojo format` (mblack) caches its parsed blib2to3 grammar under
 # platformdirs' user cache, keyed on mblack's version string -- which is the
@@ -50,7 +50,7 @@ compare_set = { cmd = "python3 bench/bench_compare_set.py" }
 format = "mojo format emberregex test bench"
 
 [dependencies]
-mojo = "==1.1.0rc0"
+mojo = "==1.1.0"
 
 [feature.cov.dependencies]
 # One LLVM for llc (llvm-tools), the link driver (clang), the builtins

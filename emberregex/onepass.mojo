@@ -774,7 +774,7 @@ def _onepass_match_impl[
     end_pin: Int,
     mut slots: Array[Int, num_slots],
 ) -> Int:
-    var tbl = table.unsafe_ptr().unsafe_bitcast[Int32]()
+    var tbl = table.ptr().unsafe_bitcast[Int32]()
     var cls = materialize[classes]()
     var ep = materialize[eps]()
     var st = materialize[states]()

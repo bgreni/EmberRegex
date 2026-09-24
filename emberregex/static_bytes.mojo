@@ -9,7 +9,7 @@ Sheng mask table (16 KB) ~1.5 s. A `!kgen.string` lowers to a single
 pointer is exactly the load the array walk did (measured: same IR, no
 per-call copy). So every transition table and mask table is packed into
 bytes at comptime (`table_bytes`), turned into a `StringLiteral` once per
-`Regex` (`static_bytes`), and read through `unsafe_ptr()` in the walkers.
+`Regex` (`static_bytes`), and read through `ptr()` in the walkers.
 """
 
 from std.collections import Array, List

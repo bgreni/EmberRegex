@@ -201,7 +201,7 @@ def _sheng_scalar_full_match[
     came from.
     """
     comptime dead = UInt8(d.num_states)
-    var msk = masks.unsafe_ptr()
+    var msk = masks.ptr()
     var flg = materialize[flags]()
     var cur = UInt8(d.start_at_0)
     var input_len = len(input)
