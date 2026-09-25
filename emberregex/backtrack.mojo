@@ -43,6 +43,7 @@ from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
 
 from .constants import CHAR_NEWLINE, ascii_to_lower, is_word_byte
+from .utf8 import backref_icase_unicode
 from .nfa import (
     _build_static_nfa,
     split_cycle_flags,
@@ -51,7 +52,7 @@ from .nfa import (
 )
 from .charset import BITMAP_WIDTH
 from .ast import AnchorKind
-from .optimize import first_byte_bitmap_of, loop_body_bitmap
+from .optimize import _state_bytes, first_byte_bitmap_of, loop_body_bitmap
 from .simd_kernels import (
     HAS_FAST_BYTE_SHUFFLE,
     build_class_masks,
@@ -426,6 +427,11 @@ def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
     var hi = lo
     var greedy = True
     var have_greedy = False
+    # Nested `{n,m}` chains (nfa.mojo `_build_repetition`): every skip
+    # edge reaches this one state and each body leads into the next
+    # copy's SPLIT. Written `?` runs (`a?a?`) chain instead — each skip
+    # into the next SPLIT — and either shape is one counted loop.
+    var exit = -1
     var steps = 0
     while (
         cur >= 0
@@ -458,16 +464,38 @@ def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
         if nfa.states[arm].out1 == cur:
             # Star loop over the same body: the tail is unbounded and this
             # SPLIT is the end of the chain.
+            if exit >= 0:
+                break
             greedy = sg
             hi = -1
             cur = nxt
             break
-        if nfa.states[arm].out1 != nxt:
+        if nfa.states[arm].out1 == nxt and exit < 0:
+            # Chained link: skipping this copy tries the next one. (A
+            # nested chain's LAST copy also has body and skip meeting —
+            # both at the exit — and is taken by the nested branch.)
+            greedy = sg
+            have_greedy = True
+            hi += 1
+            cur = nxt
+            continue
+        # Nested link: the skip is the shared exit, the body the next copy.
+        if exit < 0:
+            exit = nxt
+        elif nxt != exit:
             break
         greedy = sg
         have_greedy = True
         hi += 1
-        cur = nxt
+        cur = nfa.states[arm].out1
+        if cur == exit:
+            break
+
+    # A nested chain only collapses whole: its early copies skip straight
+    # to `exit`, so stopping part-way would send those skips to the wrong
+    # continuation.
+    if exit >= 0 and cur != exit:
+        return none^
 
     if body < 0 or cur < 0 or cur >= n:
         return none^
@@ -476,6 +504,99 @@ def _sbt_counted_shape(nfa: NFA, state_idx: Int) -> SbtCounted:
     if not (lo >= 2 or (hi >= 0 and hi > lo + 1)):
         return none^
     return SbtCounted(True, lo, hi, body, cur, greedy)
+
+
+struct SbtLastBytes(Copyable, Movable):
+    """Per state: the bytes that can be the LAST byte consumed on a path
+    from it to MATCH (`ne`, non-empty paths), whether it reaches MATCH
+    consuming nothing (`ep`), and whether that set can rule anything out
+    (`prunable`: `ne` is not every byte)."""
+
+    var ne: List[SIMD[DType.uint8, 32]]
+    var ep: List[Bool]
+    var prunable: List[Bool]
+
+    def __init__(out self, n: Int):
+        self.ne = List[SIMD[DType.uint8, 32]]()
+        self.ep = List[Bool](fill=False, length=n)
+        self.prunable = List[Bool](fill=False, length=n)
+        for _ in range(n):
+            self.ne.append(SIMD[DType.uint8, 32](0))
+
+
+# NFAs past this many states skip the last-byte analysis (no pruning).
+comptime SBT_LAST_BYTES_MAX_STATES = 2048
+
+
+def sbt_last_bytes(nfa: NFA) -> SbtLastBytes:
+    """Comptime: `SbtLastBytes` for every state, by a monotone backward
+    fixpoint. A pinned-end walk (`anchored_end`: match() and the capture
+    lane's span confirm) knows the byte before its end, so a SPLIT arm
+    whose paths can never consume that byte last is dead before it is
+    walked: `(a|aa)+c|a+b` confirming a span ending in `b` skips the
+    whole first alternative instead of exhausting it."""
+    var n = len(nfa.states)
+    var lb = SbtLastBytes(n)
+    if n > SBT_LAST_BYTES_MAX_STATES:
+        return lb^
+    comptime ALL = SIMD[DType.uint8, 32](0xFF)
+    var changed = True
+    var forward = True
+    while changed:
+        changed = False
+        for step in range(n):
+            var s = step if forward else n - 1 - step
+            ref st = nfa.states[s]
+            var ne = SIMD[DType.uint8, 32](0)
+            var ep = False
+            if st.kind == NFAStateKind.MATCH:
+                ep = True
+            elif st.kind == NFAStateKind.SPLIT:
+                for o in [st.out1, st.out2]:
+                    if o >= 0 and o < n:
+                        ne |= lb.ne[o]
+                        ep = ep or lb.ep[o]
+            elif st.kind == NFAStateKind.SAVE or st.kind == NFAStateKind.ANCHOR:
+                if st.out1 >= 0 and st.out1 < n:
+                    ne = lb.ne[st.out1]
+                    ep = lb.ep[st.out1]
+            elif (
+                st.kind == NFAStateKind.CHAR
+                or st.kind == NFAStateKind.CHARSET
+                or st.kind == NFAStateKind.ANY
+            ):
+                var o = st.out1
+                if o >= 0 and o < n:
+                    ne = lb.ne[o]
+                    if lb.ep[o]:
+                        ne |= _state_bytes(nfa, s)
+            else:
+                # Lookaround, backreference: unknown.
+                ne = ALL
+                ep = True
+            if ne.ne(lb.ne[s]).reduce_or() or ep != lb.ep[s]:
+                lb.ne[s] = ne | lb.ne[s]
+                lb.ep[s] = ep or lb.ep[s]
+                changed = True
+        forward = not forward
+    for s in range(n):
+        lb.prunable[s] = lb.ne[s].ne(ALL).reduce_or()
+    return lb^
+
+
+@always_inline
+def _sbt_arm_admits[
+    origin: Origin, //, ne: SIMD[DType.uint8, 32], ep: Bool
+](input: Span[Byte, origin], end: Int, pos: Int) -> Bool:
+    """Can a path from an arm with last-byte set `ne` (and `ep`: it can
+    end without consuming) end exactly at `end` from `pos`?"""
+    comptime if ep:
+        if pos == end:
+            return True
+    if end <= pos:
+        return False
+    var b = Int(input.unsafe_get(end - 1))
+    return ((ne[b >> 3] >> UInt8(b & 7)) & 1) != 0
 
 
 def sbt_counted_shapes(nfa: NFA) -> List[Int]:
@@ -1878,6 +1999,58 @@ def _sbt_try_match[
                 # second call in tail position. Reaching this block through
                 # `if len(memo) > 0` instead measured 1.6x on
                 # `((\w+)(-(\w+))*)@(\w+)`.
+                # Pinned end: an arm that cannot consume the byte before the
+                # end last is dead (see `sbt_last_bytes`).
+                comptime if anchored_end:
+                    comptime LB = sbt_last_bytes(nfa)
+                    comptime p1 = LB.prunable[out1] if out1 >= 0 else False
+                    comptime p2 = LB.prunable[out2] if out2 >= 0 else False
+                    comptime if p1 or p2:
+                        var e = end_at if end_at >= 0 else len(input)
+                        var ok1 = True
+                        var ok2 = True
+                        comptime if p1:
+                            ok1 = _sbt_arm_admits[
+                                ne=LB.ne[out1], ep=LB.ep[out1]
+                            ](input, e, pos)
+                        comptime if p2:
+                            ok2 = _sbt_arm_admits[
+                                ne=LB.ne[out2], ep=LB.ep[out2]
+                            ](input, e, pos)
+                        if not ok1:
+                            if not ok2:
+                                return -1
+                            return _sbt_try_match[
+                                pattern=pattern,
+                                state_idx=out2,
+                                num_slots=num_slots,
+                                anchored_end=anchored_end,
+                                memo_on=memo_on,
+                            ](
+                                input,
+                                pos,
+                                slots,
+                                budget,
+                                memo_addr,
+                                stack_floor,
+                                end_at,
+                            )
+                        if not ok2:
+                            return _sbt_try_match[
+                                pattern=pattern,
+                                state_idx=out1,
+                                num_slots=num_slots,
+                                anchored_end=anchored_end,
+                                memo_on=memo_on,
+                            ](
+                                input,
+                                pos,
+                                slots,
+                                budget,
+                                memo_addr,
+                                stack_floor,
+                                end_at,
+                            )
                 comptime if memo_on:
                     var memo_idx = state_idx * (len(input) + 1) + pos
                     # The bitset arrives as a bare address and is reached
@@ -2094,18 +2267,28 @@ def _sbt_try_match[
             if gs < 0 or ge < 0:
                 return -1
             var ref_len = ge - gs
-            if pos + ref_len > len(input):
-                return -1
-            comptime if state.icase:
-                for i in range(ref_len):
-                    if ascii_to_lower(
-                        input.unsafe_get(gs + i)
-                    ) != ascii_to_lower(input.unsafe_get(pos + i)):
-                        return -1
+            comptime if state.icase_unicode:
+                # Codepoint-wise: the matched length can differ from
+                # the group's, so the end comes back from the compare.
+                var bend = backref_icase_unicode(input, gs, ge, pos)
+                if bend < 0:
+                    return -1
+                ref_len = bend - pos
             else:
-                for i in range(ref_len):
-                    if input.unsafe_get(gs + i) != input.unsafe_get(pos + i):
-                        return -1
+                if pos + ref_len > len(input):
+                    return -1
+                comptime if state.icase:
+                    for i in range(ref_len):
+                        if ascii_to_lower(
+                            input.unsafe_get(gs + i)
+                        ) != ascii_to_lower(input.unsafe_get(pos + i)):
+                            return -1
+                else:
+                    for i in range(ref_len):
+                        if input.unsafe_get(gs + i) != input.unsafe_get(
+                            pos + i
+                        ):
+                            return -1
             return _sbt_try_match[
                 pattern=pattern,
                 state_idx=state.out1,

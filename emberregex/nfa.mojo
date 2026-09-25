@@ -22,7 +22,10 @@ from .charset import BITMAP_WIDTH, CharSet, CharRange
 from .utf8 import (
     UTF8_SEQ_LEN_SHIFT,
     UTF8_SEQ_WORDS,
+    case_fold_ranges,
+    case_orbit,
     negate_ranges,
+    normalize_ranges,
     utf8_seq_table,
 )
 from .flags import RegexFlags
@@ -70,6 +73,7 @@ struct NFAState(Copyable, Movable):
     var lookbehind_len: Int  # For LOOKBEHIND: fixed length to look back
     var backref_group: Int  # For BACKREF: group index (1-based)
     var icase: Bool  # For BACKREF: case-insensitive comparison (baked in at construction)
+    var icase_unicode: Bool  # For BACKREF under (?iu): codepoint-wise lowercase compare
     var report_id: Int  # For MATCH in union NFAs: pattern id (-1 = single-pattern)
 
     def __init__(out self, kind: Int):
@@ -86,6 +90,7 @@ struct NFAState(Copyable, Movable):
         self.lookbehind_len = -1
         self.backref_group = -1
         self.icase = False
+        self.icase_unicode = False
         self.report_id = -1
 
     @staticmethod
@@ -584,6 +589,7 @@ def _byte_range_charset(mut nfa: NFA, lo: Int, hi: Int) -> Int:
     return idx
 
 
+@no_inline
 def _utf8_class_fragment(mut nfa: NFA, ranges: List[Int]) raises -> NFAFragment:
     """Compile CODEPOINT ranges into an alternation of byte-sequence
     chains (utf8.mojo).
@@ -599,7 +605,7 @@ def _utf8_class_fragment(mut nfa: NFA, ranges: List[Int]) raises -> NFAFragment:
     # a position once per worklist task, so that read wants to be one
     # element access. The whole range set goes over in ONE call so the
     # bytes are written straight into their final buffer.
-    var tbl = utf8_seq_table(ranges)
+    var tbl = utf8_seq_table(normalize_ranges(ranges))
     if tbl.count == 0:
         # Matches nothing: a charset with no members is the honest
         # encoding, and the engines all treat it as a dead transition.
@@ -612,273 +618,179 @@ def _utf8_class_fragment(mut nfa: NFA, ranges: List[Int]) raises -> NFAFragment:
     return _utf8_trie_fragment(nfa, tbl.words, tbl.count)
 
 
-# Field width of the packed trie records and bucket descriptors built by
-# `_utf8_trie_fragment`. Four parallel `List[Int]`s cost four comptime
-# element accesses per record on write and four more on read, and an
-# access is ~60 us in the interpreter while a shift is ~1 us — so the
-# fields ride in one Int each. 20 bits holds any trie a determinizer
-# would accept (`\p{Word}`, the largest class in the tables, is ~2,700
-# states); overflow is checked, not assumed.
-comptime _TRIE_FIELD_BITS = 20
-comptime _TRIE_FIELD_MASK = (1 << _TRIE_FIELD_BITS) - 1
-comptime _TRIE_ID_LIMIT = 1 << _TRIE_FIELD_BITS
-
-
+@no_inline
 def _utf8_trie_fragment(
     mut nfa: NFA,
     seq_words: List[Int],
     count: Int,
 ) raises -> NFAFragment:
-    """Prefix-factored alternation over the `count` byte-range sequences
-    packed in `seq_words`.
+    """The MINIMAL byte automaton over the `count` byte-range sequences
+    packed in `seq_words` (ascending, from `utf8_seq_table` over sorted
+    disjoint codepoint ranges), as an NFA fragment.
 
-    Emitting one independent chain per sequence is correct but ruinous
-    for the big Unicode classes: `\\p{L}` is 805 sequences, so the naive
-    form is ~3500 states behind an 805-way SPLIT chain, and every epsilon
-    closure walks all 805. Factoring the shared leading byte-range —
-    `(a·X) | (a·Y)` becomes `a·(X|Y)` — cuts that to ~1200 states behind a
-    35-way split, which is the difference between a comptime
-    determinization that finishes and one that does not.
+    Three linear passes, all over flat Int lists (a comptime List access
+    is ~60 us, a shift ~1 us):
 
-    Grouping is by EXACT byte-range equality, which is always a valid
-    factoring. It is also the right one here: UTF-8 sequence sets from
-    `utf8_seq_table` share whole lead ranges rather than partially
-    overlapping them.
+    1. Prefix trie. Sorted input makes sharing a prefix the same as
+       matching the previous sequence's ranges: at each depth two
+       sequences' ranges are either equal (shared node) or disjoint and
+       ascending, so a sequence only needs comparing with its
+       predecessor. Anything else is a caller bug and raises.
+    2. Suffix merge. Trie nodes are created parents-first, so walking them
+       in reverse visits children first; a node's signature is its
+       (range, canonical child) list, and equal signatures are one state
+       (hash-consed). That is the minimal DFA of this acyclic language.
+       UTF-8 repeats itself in its tails (every final `80-BF` is the same
+       node), so `\\p{Ll}` goes from 1465 states to 246.
+    3. Emission. Each canonical node becomes one CHARSET state per
+       distinct TARGET — its ranges into that child merged into one
+       multi-range set — behind a SPLIT chain. The ranges of a node are
+       disjoint, so the alternatives' order is immaterial.
 
-    Built ITERATIVELY with an explicit worklist, recording states into
-    flat local lists that materialize into the NFA in one pass at the
-    end. The recursive form passed `mut nfa` through a helper call per
-    state, and the comptime interpreter copies aggregate arguments per
-    call — for `\\p{L}` (~2100 trie states) that alone cost seconds of
-    compile time. Bucketing is by contiguous RUN: utf8_seq_table emits
-    sequences in byte order, so equal byte-ranges at a position are
-    adjacent and successive keys strictly ascend, which makes a run and a
-    bucket the same thing (a first-seen scan plus a stable counting sort
-    backs the fast path up, so unsorted inputs still factor correctly).
+    Charset states whose target is the accept node dangle: they are the
+    fragment's outs.
     """
-    if count >= _TRIE_ID_LIMIT:
-        raise Error("utf8 trie: too many sequences")
-
-    # Local state records, one packed Int each; local ids materialize at
-    # `base` offset. Layout: kind at bit 60, `a` at bit 40, `b` at bit
-    # 20, `out + 1` at bit 0 (a dangling out is -1 and so stores as 0,
-    # which is also what an unpatched record starts as — the patch below
-    # is a plain OR). kind 0: charset over byte range [a, b], `out` its
-    # out1 target. kind 1: split with local targets a, b.
-    var rec = List[Int]()
-    var out_states = List[Int]()  # local ids of dangling-out charsets
-    var root_start = -1
-
-    # Worklist of subtrees: member indices, byte position, and the local
-    # charset state whose out1 the subtree start patches (-1 = root).
-    var all_idx = List[Int]()
+    # --- 1. prefix trie: edges (parent, packed range lo|hi<<8, child) ---
+    # child -1 is the accept node.
+    var e_parent = List[Int]()
+    var e_key = List[Int]()
+    var e_child = List[Int]()
+    var nnodes = 1  # node 0 is the root
+    var path = List[Int](fill=0, length=5)
+    var prev_keys = List[Int](fill=-1, length=4)
+    var prev_n = 0
     for i in range(count):
-        all_idx.append(i)
-    var task_idxs = List[List[Int]]()
-    var task_pos = List[Int]()
-    var task_patch = List[Int]()
-    task_idxs.append(all_idx^)
-    task_pos.append(0)
-    task_patch.append(-1)
+        var w0 = seq_words[UTF8_SEQ_WORDS * i]
+        var w1 = seq_words[UTF8_SEQ_WORDS * i + 1]
+        var n = (w0 >> UTF8_SEQ_LEN_SHIFT) & 7
+        var d = 0
+        while d < n and d < prev_n:
+            var wd = w0 if d < 2 else w1
+            var kd = (wd >> (16 * (d & 1))) & 0xFFFF
+            if kd != prev_keys[d]:
+                if (kd & 0xFF) <= (prev_keys[d] >> 8):
+                    raise Error(
+                        "utf8 trie: ranges not sorted and disjoint at position "
+                        + String(d)
+                    )
+                break
+            d += 1
+        if d == n or (d == prev_n and prev_n > 0):
+            # A repeat, or one sequence a prefix of another: UTF-8's
+            # length is fixed by the lead byte, so neither can occur.
+            raise Error("utf8 trie: duplicate or nested sequence")
+        for j in range(d, n):
+            var wj = w0 if j < 2 else w1
+            var kj = (wj >> (16 * (j & 1))) & 0xFFFF
+            var child = -1
+            if j < n - 1:
+                child = nnodes
+                nnodes += 1
+                path[j + 1] = child
+            e_parent.append(path[j])
+            e_key.append(kj)
+            e_child.append(child)
+            prev_keys[j] = kj
+        prev_n = n
 
-    var t = 0
-    while t < len(task_idxs):
-        var tpos = task_pos[t]
-        var tidx = task_idxs[t].copy()
-        var nm = len(tidx)
-        # Distinct byte-ranges at `tpos`, in first-seen order, each
-        # bucket a contiguous run of `tidx`, one packed Int apiece:
-        # key_lo at bit 0, key_hi at bit 8, member offset at bit 16,
-        # member count at bit 36.
-        #
-        # utf8_seq_table emits sequences in ascending byte order, so
-        # equal keys at `tpos` are ADJACENT and every new key starts
-        # strictly above the previous key's high byte. Under that
-        # invariant the run boundaries ARE the buckets: keys are strictly
-        # ascending and therefore all distinct, so no key can recur
-        # later, and a run is already the bucket's members in their
-        # original order. One pass then replaces the first-seen linear
-        # key scan, the per-member slot array and the three-pass
-        # counting-sort gather — the whole of which was ~36% of this NFA
-        # build's comptime List traffic.
-        #
-        # `lo <= cur_hi` is the guard that the invariant still holds.
-        # Inputs that break it fall back to the general first-seen scan +
-        # STABLE counting sort below, which produces the same buckets in
-        # the same order for any input. It is not hypothetical:
-        # `_add_case_folding` appends two ASCII ranges past the tail for
-        # `(?ui)\p{L}`, and hand-written classes like `[a-cA-C0-3]` are
-        # written out of order.
-        var bucket = List[Int]()
-        var monotone = True
-        var cur_lo = -1
-        var cur_hi = -1
-        var cur_start = 0
-        # Which of the sequence's two words holds byte position `tpos`,
-        # and where in it. Hoisted: they are the same for every member.
-        var wsel = tpos >> 1
-        var wsh = 16 * (tpos & 1)
-        for k in range(nm):
-            var i = tidx[k]
-            var w = seq_words[UTF8_SEQ_WORDS * i + wsel]
-            var lo = (w >> wsh) & 0xFF
-            var hi = (w >> (wsh + 8)) & 0xFF
-            if lo == cur_lo and hi == cur_hi:
-                continue
-            if cur_lo >= 0:
-                if lo <= cur_hi:
-                    monotone = False
+    # Edges grouped by parent (counting sort; a parent's edges keep their
+    # ascending range order).
+    var ne = len(e_key)
+    var first = List[Int](fill=0, length=nnodes + 1)
+    for e in range(ne):
+        first[e_parent[e] + 1] += 1
+    for v in range(nnodes):
+        first[v + 1] += first[v]
+    var cursor = first.copy()
+    var order = List[Int](fill=0, length=ne)
+    for e in range(ne):
+        var v = e_parent[e]
+        order[cursor[v]] = e
+        cursor[v] += 1
+
+    # --- 2. suffix merge: canonical id per node, children first ---------
+    # Canonical 0 is the accept node; real nodes are 1..ncanon. A
+    # canonical node's signature is `sig[sig_off[c] : sig_off[c + 1]]`,
+    # entries `key | target << 16`.
+    var canon = List[Int](fill=0, length=nnodes)
+    var sig = List[Int]()
+    var sig_off = List[Int](fill=0, length=2)  # [accept, node 1 start]
+    var tsize = 16
+    while tsize < 4 * nnodes:
+        tsize *= 2
+    var table = List[Int](fill=0, length=tsize)  # canonical id, 0 = empty
+    var buf = List[Int]()
+    for v in range(nnodes - 1, -1, -1):
+        buf.clear()
+        var h = 0x2545F4914F6CDD1D
+        for k in range(first[v], first[v + 1]):
+            var e = order[k]
+            var ch = e_child[e]
+            var t = 0 if ch < 0 else canon[ch]
+            var entry = e_key[e] | (t << 16)
+            buf.append(entry)
+            h = (h ^ entry) * 0x100000001B3
+        var slot = (h ^ (h >> 29)) & (tsize - 1)
+        var found = 0
+        while table[slot] != 0:
+            var c = table[slot]
+            var lo = sig_off[c]
+            var m = sig_off[c + 1] - lo
+            if m == len(buf):
+                var same = True
+                for q in range(m):
+                    if sig[lo + q] != buf[q]:
+                        same = False
+                        break
+                if same:
+                    found = c
                     break
-                bucket.append(
-                    cur_lo
-                    | (cur_hi << 8)
-                    | (cur_start << 16)
-                    | ((k - cur_start) << 36)
-                )
-            cur_lo = lo
-            cur_hi = hi
-            cur_start = k
-        if monotone:
-            if cur_lo >= 0:
-                bucket.append(
-                    cur_lo
-                    | (cur_hi << 8)
-                    | (cur_start << 16)
-                    | ((nm - cur_start) << 36)
-                )
-        else:
-            bucket = List[Int]()
-            var key_lo = List[Int]()
-            var key_hi = List[Int]()
-            var member_slot = List[Int]()
-            for k in range(nm):
-                var i = tidx[k]
-                var w = seq_words[UTF8_SEQ_WORDS * i + wsel]
-                var lo = (w >> wsh) & 0xFF
-                var hi = (w >> (wsh + 8)) & 0xFF
-                var slot = -1
-                var nb = len(key_lo)
-                if nb > 0 and key_lo[nb - 1] == lo and key_hi[nb - 1] == hi:
-                    slot = nb - 1
-                else:
-                    for b in range(nb):
-                        if key_lo[b] == lo and key_hi[b] == hi:
-                            slot = b
-                            break
-                if slot < 0:
-                    key_lo.append(lo)
-                    key_hi.append(hi)
-                    slot = len(key_lo) - 1
-                member_slot.append(slot)
-            # Gather bucket members into one flat array (counting sort
-            # keeps first-seen member order within each bucket), then use
-            # it AS the member array so the emission loop below reads one
-            # layout regardless of which path produced it.
-            var nbk = len(key_lo)
-            var bcount = List[Int](fill=0, length=nbk)
-            for k in range(nm):
-                bcount[member_slot[k]] += 1
-            var boff = List[Int](fill=0, length=nbk)
-            var acc = 0
-            for b in range(nbk):
-                boff[b] = acc
-                acc += bcount[b]
-            var bcursor = List[Int](fill=0, length=nbk)
-            var bmembers = List[Int](fill=0, length=nm)
-            for k in range(nm):
-                var slot = member_slot[k]
-                bmembers[boff[slot] + bcursor[slot]] = tidx[k]
-                bcursor[slot] += 1
-            tidx = bmembers^
-            for b in range(nbk):
-                bucket.append(
-                    key_lo[b]
-                    | (key_hi[b] << 8)
-                    | (boff[b] << 16)
-                    | (bcount[b] << 36)
-                )
+            slot = (slot + 1) & (tsize - 1)
+        if found == 0:
+            found = len(sig_off) - 1
+            for q in range(len(buf)):
+                sig.append(buf[q])
+            sig_off.append(len(sig))
+            table[slot] = found
+        canon[v] = found
+    var ncanon = len(sig_off) - 2
 
-        var nbuckets = len(bucket)
-
-        var heads = List[Int]()
-        for b in range(nbuckets):
-            var bk = bucket[b]
-            var bo = (bk >> 16) & _TRIE_FIELD_MASK
-            var bc = (bk >> 36) & _TRIE_FIELD_MASK
-            var st = len(rec)
-            if st >= _TRIE_ID_LIMIT:
-                raise Error("utf8 trie: too many states")
-            rec.append(((bk & 0xFF) << 40) | (((bk >> 8) & 0xFF) << 20))
-            heads.append(st)
-            # Every sequence in a bucket has the same length, so the bucket
-            # either all stops here or all continues. That is not a
-            # convenience assumption: UTF-8 encodes length in the lead byte,
-            # and the lead-byte ranges for lengths 1/2/3/4 (00-7F, C2-DF,
-            # E0-EF, F0-F4) are disjoint — so sharing a byte range at `tpos`
-            # forces the same length. A mixed bucket would need `st.out1` to
-            # be both patched to the sub-fragment and left dangling, which is
-            # unrepresentable; check rather than corrupt the NFA silently.
-            var deeper = List[Int]()
-            var stops = 0
-            for k in range(bc):
-                var i = tidx[bo + k]
-                var n = (
-                    seq_words[UTF8_SEQ_WORDS * i] >> UTF8_SEQ_LEN_SHIFT
-                ) & 7
-                if n > tpos + 1:
-                    deeper.append(i)
-                else:
-                    stops += 1
-            if stops > 0 and len(deeper) > 0:
-                raise Error(
-                    "utf8 trie: byte range shared by sequences of different"
-                    " lengths at position "
-                    + String(tpos)
-                )
-            if len(deeper) == 0:
-                out_states.append(st)
-            else:
-                task_idxs.append(deeper^)
-                task_pos.append(tpos + 1)
-                task_patch.append(st)
-
-        # Right-to-left SPLIT chain over the (now few) alternatives.
-        var start = heads[len(heads) - 1]
-        for i2 in range(len(heads) - 2, -1, -1):
-            var sp = len(rec)
-            if sp >= _TRIE_ID_LIMIT:
-                raise Error("utf8 trie: too many states")
-            rec.append((1 << 60) | (heads[i2] << 40) | (start << 20))
-            start = sp
-        var pt = task_patch[t]
-        if pt < 0:
-            root_start = start
-        else:
-            # The record's `out` field is still 0 (dangling), so the
-            # patch is an OR rather than a read-modify-write of the word.
-            rec[pt] = rec[pt] | (start + 1)
-        t += 1
-
-    # Materialize into the NFA in one pass. Trie byte-ranges repeat
-    # heavily (continuation ranges like 80-BF appear hundreds of times in
-    # `\p{L}`), so identical ranges share one pooled charset — safe
-    # because pool entries are never mutated after creation (case folding
-    # copies first). The bitmap builds inline and states append directly:
-    # CharSet/NFA method calls carry `mut self` across a call boundary,
-    # which the comptime interpreter copies per call.
-    var cs_memo = List[Int](fill=-1, length=65536)  # (lo << 8) | hi
-    var base = len(nfa.states)
-    for j in range(len(rec)):
-        var r = rec[j]
-        if (r >> 60) == 0:
-            var lo = (r >> 40) & _TRIE_FIELD_MASK
-            var hi = (r >> 20) & _TRIE_FIELD_MASK
-            var key = (lo << 8) | hi
-            var cidx = cs_memo[key]
-            if cidx < 0:
-                var cs = CharSet()
+    # --- 3. emission, targets before sources (canonical id order) -------
+    # Single-range charsets are pooled by (lo << 8) | hi; pool entries are
+    # never mutated after creation (case folding copies first).
+    var cs_memo = List[Int](fill=-1, length=65536)
+    var entry = List[Int](fill=-1, length=ncanon + 1)
+    var out_states = List[Int]()
+    var targets = List[Int]()
+    var heads = List[Int]()
+    for c in range(1, ncanon + 1):
+        var lo_e = sig_off[c]
+        var hi_e = sig_off[c + 1]
+        targets.clear()
+        for q in range(lo_e, hi_e):
+            var t = sig[q] >> 16
+            var seen = False
+            for x in targets:
+                if x == t:
+                    seen = True
+                    break
+            if not seen:
+                targets.append(t)
+        heads.clear()
+        for t in targets:
+            var cs = CharSet()
+            var bm = SIMD[DType.uint8, BITMAP_WIDTH](0)
+            var nr = 0
+            var one_key = 0
+            for q in range(lo_e, hi_e):
+                if (sig[q] >> 16) != t:
+                    continue
+                var key = sig[q] & 0xFFFF
+                var lo = key & 0xFF
+                var hi = key >> 8
                 cs.ranges.append(CharRange(UInt32(lo), UInt32(hi)))
-                var bm = SIMD[DType.uint8, BITMAP_WIDTH](0)
+                one_key = (lo << 8) | hi
+                nr += 1
                 var start_byte = lo >> 3
                 var end_byte = hi >> 3
                 var start_mask = UInt8(0xFF) << UInt8(lo & 7)
@@ -890,40 +802,34 @@ def _utf8_trie_fragment(
                     for bb in range(start_byte + 1, end_byte):
                         bm[bb] = 0xFF
                     bm[end_byte] = bm[end_byte] | end_mask
+            var cidx = cs_memo[one_key] if nr == 1 else -1
+            if cidx < 0:
                 cs.bitmap = bm
                 cs.bitmap_valid = True
                 cidx = len(nfa.charsets)
                 nfa.charsets.append(cs^)
-                cs_memo[key] = cidx
+                if nr == 1:
+                    cs_memo[one_key] = cidx
             var st = NFAState.charset_state(cidx)
-            var o = (r & _TRIE_FIELD_MASK) - 1
-            if o >= 0:
-                st.out1 = base + o
+            if t != 0:
+                st.out1 = entry[t]
+            var sidx = len(nfa.states)
             nfa.states.append(st^)
-        else:
-            nfa.states.append(
-                NFAState.split_state(
-                    base + ((r >> 40) & _TRIE_FIELD_MASK),
-                    base + ((r >> 20) & _TRIE_FIELD_MASK),
-                )
-            )
+            if t == 0:
+                out_states.append(sidx)
+            heads.append(sidx)
+        var start = heads[len(heads) - 1]
+        for i2 in range(len(heads) - 2, -1, -1):
+            var sp = len(nfa.states)
+            nfa.states.append(NFAState.split_state(heads[i2], start))
+            start = sp
+        entry[c] = start
 
-    var frag = NFAFragment(base + root_start)
+    var frag = NFAFragment(entry[canon[0]])
     for j in range(len(out_states)):
-        frag.outs.append(base + out_states[j])
+        frag.outs.append(out_states[j])
         frag.out_slots.append(1)
     return frag^
-
-
-def _charset_codepoint_ranges(cs: CharSet) -> List[Int]:
-    """Flat (lo, hi) codepoint pairs for a charset, honouring negation."""
-    var out = List[Int]()
-    for r in cs.ranges:
-        out.append(Int(r.lo))
-        out.append(Int(r.hi))
-    if cs.negated:
-        return negate_ranges(out)
-    return out^
 
 
 def _build_fragment(
@@ -934,6 +840,17 @@ def _build_fragment(
 
     if node.kind == ASTNodeKind.LITERAL:
         var ch = node.char_value
+        if flags.unicode() and flags.ignorecase():
+            # Python str-pattern IGNORECASE: the literal matches its whole
+            # case orbit (`Ш`/`ш`, and `k` also the Kelvin sign). An orbit
+            # that is all ASCII takes the byte-level fold below.
+            var orbit = case_orbit(Int(ch))
+            if orbit[len(orbit) - 1] > 0x7F and len(orbit) > 1:
+                var cp = List[Int]()
+                for m in orbit:
+                    cp.append(m)
+                    cp.append(m)
+                return _utf8_class_fragment(nfa, cp)
         if ch > 255 or (flags.unicode() and ch > 0x7F):
             # A codepoint literal has exactly one byte-level meaning: its
             # UTF-8 encoding. That includes U+0080..U+00FF under (?u) —
@@ -993,11 +910,17 @@ def _build_fragment(
         return frag^
 
     elif node.kind == ASTNodeKind.CHAR_CLASS and flags.unicode():
-        var ucs_idx = node.charset_index
-        var folded_u = nfa.charsets[ucs_idx].copy()
+        # Fold the positive ranges, then negate: Python's `(?i)[^...]`
+        # rejects every orbit member of every listed character.
+        ref ucs = nfa.charsets[node.charset_index]
+        var cp_ranges = List[Int]()
+        for r in ucs.ranges:
+            cp_ranges.append(Int(r.lo))
+            cp_ranges.append(Int(r.hi))
         if flags.ignorecase():
-            _add_case_folding(folded_u)
-        var cp_ranges = _charset_codepoint_ranges(folded_u)
+            cp_ranges = case_fold_ranges(cp_ranges)
+        if ucs.negated:
+            cp_ranges = negate_ranges(cp_ranges)
         return _utf8_class_fragment(nfa, cp_ranges)
 
     elif node.kind == ASTNodeKind.CHAR_CLASS:
@@ -1183,6 +1106,7 @@ def _build_fragment(
     elif node.kind == ASTNodeKind.BACKREFERENCE:
         var br_state = NFAState.backref_state(node.group_index)
         br_state.icase = flags.ignorecase()
+        br_state.icase_unicode = flags.ignorecase() and flags.unicode()
         var br_idx = nfa.add_state(br_state^)
         var frag = NFAFragment(br_idx)
         frag.add_out(br_idx, 1)
@@ -1287,6 +1211,13 @@ def _build_loop(
     one SPLIT whose other edge is the dangling exit; `+` enters at the
     body, `*` at the split."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
+    return _wrap_loop(nfa, body^, greedy, at_least_one)
+
+
+def _wrap_loop(
+    mut nfa: NFA, var body: NFAFragment, greedy: Bool, at_least_one: Bool
+) -> NFAFragment:
+    """`body*` (or `body+` with `at_least_one`) around a built body."""
     var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
 
     ref state = nfa.states.unsafe_get(split_idx)
@@ -1320,6 +1251,13 @@ def _build_question(
 ) raises -> NFAFragment:
     """Build NFA fragment for ? (zero or one)."""
     var body = _build_fragment(nfa, ast, child_idx, flags)
+    return _wrap_question(nfa, body^, greedy)
+
+
+def _wrap_question(
+    mut nfa: NFA, var body: NFAFragment, greedy: Bool
+) -> NFAFragment:
+    """`body?` around a built body."""
     var split_idx = nfa.add_state(NFAState(NFAStateKind.SPLIT))
 
     ref state = nfa.states.unsafe_get(split_idx)
@@ -1341,6 +1279,60 @@ def _build_question(
         frag.add_out(split_idx, 2)
     else:
         frag.add_out(split_idx, 1)
+    return frag^
+
+
+def _rep_copy(
+    mut nfa: NFA,
+    ast: AST,
+    child_idx: Int,
+    flags: RegexFlags,
+    mut tmpl: NFAFragment,
+    mut t0: Int,
+    mut t1: Int,
+) raises -> NFAFragment:
+    """The next copy of a repeated child. The first call builds it and
+    records it as the template — its fragment and its state block
+    `[t0, t1)`, which `_build_fragment` appends contiguously — and every
+    later call clones that block."""
+    if t0 < 0:
+        t0 = len(nfa.states)
+        var f = _build_fragment(nfa, ast, child_idx, flags)
+        t1 = len(nfa.states)
+        tmpl = NFAFragment(f.start)
+        tmpl.outs = f.outs.copy()
+        tmpl.out_slots = f.out_slots.copy()
+        return f^
+    return _clone_copy(nfa, tmpl, t0, t1)
+
+
+@no_inline
+def _clone_copy(
+    mut nfa: NFA, tmpl: NFAFragment, t0: Int, t1: Int
+) -> NFAFragment:
+    """A copy of the template block `[t0, t1)` appended at the end, its
+    internal edges shifted. The template's dangling outs may have been
+    patched into the chain since it was built, so the copy's are reset to
+    dangling; charset indices are shared (pool entries never mutate)."""
+    var delta = len(nfa.states) - t0
+    for i in range(t0, t1):
+        var st = nfa.states[i].copy()
+        if st.out1 >= t0 and st.out1 < t1:
+            st.out1 += delta
+        if st.out2 >= t0 and st.out2 < t1:
+            st.out2 += delta
+        if st.sub_start >= t0 and st.sub_start < t1:
+            st.sub_start += delta
+        nfa.states.append(st^)
+    var frag = NFAFragment(tmpl.start + delta)
+    for k in range(len(tmpl.outs)):
+        var o = tmpl.outs[k] + delta
+        if tmpl.out_slots[k] == 1:
+            nfa.states[o].out1 = -1
+        else:
+            nfa.states[o].out2 = -1
+        frag.outs.append(o)
+        frag.out_slots.append(tmpl.out_slots[k])
     return frag^
 
 
@@ -1368,6 +1360,14 @@ def _build_repetition(
         frag.add_out(state_idx, 1)
         return frag^
 
+    # Every copy after the first is a clone of the first one's state
+    # block (`_clone_copy`): rebuilding re-runs the whole child, and for a
+    # UTF-8 class that is the sequence table and the trie every time —
+    # `(?u)\p{L}{8,13}` built thirteen \p{L} automata from scratch.
+    var tmpl = NFAFragment(-1)
+    var t0 = -1
+    var t1 = -1
+
     # Track current fragment state without Optional
     var has_result = False
     var res_start = 0
@@ -1376,7 +1376,7 @@ def _build_repetition(
 
     # Build required copies (min_rep)
     for _i in range(min_rep):
-        var copy = _build_fragment(nfa, ast, child_idx, flags)
+        var copy = _rep_copy(nfa, ast, child_idx, flags, tmpl, t0, t1)
         if has_result:
             var patch_frag = NFAFragment(res_start)
             patch_frag.outs = res_outs.copy()
@@ -1398,8 +1398,11 @@ def _build_repetition(
         # arm of _build_fragment sends `{0,}` and `{1,}` to _build_loop,
         # so a required copy always exists to patch.
         assert has_result, "{n,} reached _build_repetition with n == 0"
-        var star = _build_loop(
-            nfa, ast, child_idx, greedy, flags, at_least_one=False
+        var star = _wrap_loop(
+            nfa,
+            _rep_copy(nfa, ast, child_idx, flags, tmpl, t0, t1),
+            greedy,
+            at_least_one=False,
         )
         var patch_frag = NFAFragment(res_start)
         patch_frag.outs = res_outs.copy()
@@ -1410,22 +1413,44 @@ def _build_repetition(
         new_frag.out_slots = star.out_slots.copy()
         return new_frag^
     else:
-        # {n,m} — required copies + (max-min) optional copies
+        # {n,m} — required copies + (max-min) optional copies, in Rust's
+        # nested shape: each optional copy is a SPLIT between its body and
+        # the EXIT, the body leads on to the next copy's SPLIT, and every
+        # skip edge stays dangling as an out of the whole fragment (so all
+        # of them reach the continuation directly). The chained form —
+        # skip into the NEXT optional copy — accepts the same strings with
+        # the same preference order, but every epsilon closure in the
+        # chain drags the whole remaining tail along: DFA states carried
+        # O(m) members and each closure cost O(m), where here both are
+        # O(1).
+        var skips = List[Int]()
+        var skip_slots = List[Int]()
         var optional_count = max_rep - min_rep
         for _ in range(optional_count):
-            var opt = _build_question(nfa, ast, child_idx, greedy, flags)
+            var body = _rep_copy(nfa, ast, child_idx, flags, tmpl, t0, t1)
+            var sp = nfa.add_state(NFAState(NFAStateKind.SPLIT))
+            ref sps = nfa.states.unsafe_get(sp)
+            sps.greedy = greedy
+            if greedy:
+                sps.out1 = body.start  # prefer another copy
+                sps.out2 = -1  # exit (dangling)
+                skips.append(sp)
+                skip_slots.append(2)
+            else:
+                sps.out1 = -1  # prefer the exit (dangling)
+                sps.out2 = body.start
+                skips.append(sp)
+                skip_slots.append(1)
             if has_result:
                 var patch_frag = NFAFragment(res_start)
                 patch_frag.outs = res_outs.copy()
                 patch_frag.out_slots = res_out_slots.copy()
-                nfa.patch(patch_frag, opt.start)
-                res_outs = opt.outs.copy()
-                res_out_slots = opt.out_slots.copy()
+                nfa.patch(patch_frag, sp)
             else:
-                res_start = opt.start
-                res_outs = opt.outs.copy()
-                res_out_slots = opt.out_slots.copy()
+                res_start = sp
                 has_result = True
+            res_outs = body.outs.copy()
+            res_out_slots = body.out_slots.copy()
 
         # At least one copy was built: `{0,0}` returned above, `{0,1}` is
         # _build_question's, and the parser rejects max < min.
@@ -1433,6 +1458,9 @@ def _build_repetition(
         var frag = NFAFragment(res_start)
         frag.outs = res_outs^
         frag.out_slots = res_out_slots^
+        for k in range(len(skips)):
+            frag.outs.append(skips[k])
+            frag.out_slots.append(skip_slots[k])
         return frag^
 
 
@@ -1501,6 +1529,66 @@ def apply_flags(pattern: String, flag_bits: Int) -> String:
         + ")"
         + String(unsafe_from_utf8=b[pos:])
     )
+
+
+def single_class_repeat(pattern: String, flags: Int = 0) -> Bool:
+    """Comptime: is the whole pattern one greedy repetition, at least
+    once, of a single character class, `.` or character (through
+    non-capturing groups)? `(?u)\\p{L}{8,13}` is. Then every thread of a
+    leftmost-first walk runs the same class automaton in step from a
+    codepoint boundary (valid UTF-8 — a `String`), so a byte that kills
+    the oldest live thread kills them all, and the oldest one's match
+    truncates the rest: the match starts where the walk last left its
+    bare restart state (`Regex._llf_start_from_walk`)."""
+    try:
+        var ast = parse(pattern if flags == 0 else apply_flags(pattern, flags))
+        var n = ast.root
+
+        @always_inline
+        def unwrap(ast: AST, var n: Int) -> Int:
+            # Non-capturing groups, and concatenations whose other parts
+            # are empty (a leading `(?u)` parses to one).
+            while True:
+                ref nd = ast.nodes[n]
+                if (
+                    nd.kind == ASTNodeKind.GROUP
+                    and nd.group_index < 0
+                    and len(nd.children) == 1
+                ):
+                    n = nd.children[0]
+                    continue
+                if nd.kind != ASTNodeKind.CONCAT:
+                    return n
+                var only = -1
+                var parts = 0
+                for c in nd.children:
+                    ref cn = ast.nodes[c]
+                    if cn.kind == ASTNodeKind.CONCAT and len(cn.children) == 0:
+                        continue
+                    only = c
+                    parts += 1
+                if parts != 1:
+                    return n
+                n = only
+
+        n = unwrap(ast, n)
+        ref q = ast.nodes[n]
+        if (
+            q.kind != ASTNodeKind.QUANTIFIER
+            or not q.greedy
+            or q.quantifier_min < 1
+            or len(q.children) != 1
+        ):
+            return False
+        var c = unwrap(ast, q.children[0])
+        var k = ast.nodes[c].kind
+        return (
+            k == ASTNodeKind.CHAR_CLASS
+            or k == ASTNodeKind.DOT
+            or k == ASTNodeKind.LITERAL
+        )
+    except:
+        return False
 
 
 def _build_static_nfa(pattern: String, flags: Int = 0) -> NFA:

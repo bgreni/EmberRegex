@@ -9,6 +9,7 @@ shared with the other DFA-lane engines.
 from emberregex import Regex
 from emberregex.optimize import extract_literal_alternation
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
+from emberregex.teddy import _alt_rare_plan, _teddy_offsets
 from std.sys import simd_width_of
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
@@ -202,6 +203,55 @@ def test_teddy_caseless_prefix_prefilter() raises:
     assert_equal(r2.end, 11)
     assert_equal(r2.group_str(input, 1), "pOsT")
     assert_equal(r2.group_str(input, 2), "data")
+
+
+def test_teddy_prefix_folds_cyrillic_case_pairs() raises:
+    # (?iu) Cyrillic: `и` is D0 {98, B8}, a one-bit pair the chain keeps;
+    # `р` is D0 A0 | D1 80, a SPLIT the prefilter chain crosses as two
+    # folded positions (admitting the cross product, e.g. `Ѐ` = D0 80,
+    # which the engine then rejects). Chains reach 4 bytes, and the
+    # fingerprint skips the D0/D1 lead byte at offset 2.
+    comptime R = Regex["(?iu)профессор|инспектор"]
+    assert_true(R._strategy.use_teddy_prefix)
+    assert_equal(R._alt_prefix.min_len, 4)
+    comptime offs = _teddy_offsets(R._alt_prefix, simd_width_of[DType.uint8]())
+    assert_equal(Int(offs[2]), 3)
+    # Python: [m.span() for m in re.finditer(...)] in UTF-8 bytes.
+    var re = R()
+    var ms = re.finditer("ПРОФЕССОР и Инспектор, пЀофессор инспекторы")
+    assert_equal(len(ms), 3)
+    assert_equal(ms[0].end, 18)
+    assert_equal(ms[1].start, 22)
+    assert_equal(ms[2].start, 61)
+
+
+def test_teddy_rare_byte_plan() raises:
+    # `Sherlock|Street`: both literals start with `S`, rare in prose, so
+    # the scan is a memchr on it (`_alt_rare_plan`) with each chunk's hits
+    # verified from its lane mask; the shared `S` must not also become a
+    # filter prefix in front of Teddy (one candidate per call). Lowercase
+    # literals are too common for a plan. Python spans below; the `S`
+    # false candidates span several 64-byte blocks.
+    comptime S = Regex["Sherlock|Street"]
+    comptime plan = _alt_rare_plan(S._lit_alt)
+    assert_true(plan.valid)
+    assert_equal(plan.offset, 0)
+    assert_equal(S._strategy.fprefix_len, 0)
+    comptime cd = _alt_rare_plan(Regex["cat|dog"]._lit_alt)
+    assert_false(cd.valid)
+    var re = S()
+    var t = (
+        String("Sherlock Street ")
+        + String("Some Stray Sentences Say So. ") * 3
+        + "Sherlocked Streets St Sherlock"
+    )
+    var ms = re.finditer(t)
+    assert_equal(len(ms), 5)
+    assert_equal(ms[1].start, 9)
+    assert_equal(ms[1].end, 15)
+    assert_equal(ms[2].start, 103)
+    assert_equal(ms[4].start, 125)
+    assert_equal(ms[4].end, 133)
 
 
 def main() raises:

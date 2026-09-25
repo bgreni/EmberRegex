@@ -24,6 +24,7 @@ widens is the table. AArch64 `tbl` takes a 1-4 register table operand
 HAS_WIDE_BYTE_SHUFFLE gates them and other targets stay at 16 entries.
 """
 
+from std.math import iota
 from std.sys import simd_width_of
 from std.sys.info import CompilationTarget
 from std.sys.intrinsics import llvm_intrinsic
@@ -357,8 +358,60 @@ def find_in_class[
         if bits != 0:
             return pos + first_lane_index(bits)
         pos += W
+    if pos < input_len and input_len >= W:
+        # The tail as one chunk overlapping the last, lanes before `pos`
+        # masked off.
+        var base = input_len - W
+        var v = ptr.unsafe_offset(base).unsafe_load[width=W]()
+        var bits = lane_bits(
+            _class_hit[kind=kind, t0=t0, t1=t1](v)
+            & iota[DType.uint8, W]().ge(UInt8(pos - base))
+        )
+        return base + first_lane_index(bits) if bits != 0 else input_len
     while pos < input_len:
         if _class_contains[kind, t0, t1](input.unsafe_get(pos)):
+            return pos
+        pos += 1
+    return input_len
+
+
+@always_inline
+def find_word_start[
+    origin: Origin,
+    //,
+    kind: Int,
+    t0: _NibbleTable,
+    t1: _NibbleTable,
+    wkind: Int,
+    w0: _NibbleTable,
+    w1: _NibbleTable,
+](input: Span[Byte, origin], start: Int) -> Int:
+    """First position p >= start whose byte is in the first set (kind, t0,
+    t1) and whose predecessor is not in the word set (wkind, w0, w1) — a
+    word start, when the first set holds only word bytes — else
+    len(input)."""
+    comptime W = simd_width_of[DType.uint8]()
+    var ptr = Pointer(input.unsafe_ptr())
+    var input_len = len(input)
+    var pos = start
+    if pos == 0:
+        if input_len > 0 and _class_contains[kind, t0, t1](input.unsafe_get(0)):
+            return 0
+        pos = 1
+    while pos + W <= input_len:
+        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
+        var u = ptr.unsafe_offset(pos - 1).unsafe_load[width=W]()
+        var hit = _class_hit[kind=kind, t0=t0, t1=t1](v) & ~_class_hit[
+            kind=wkind, t0=w0, t1=w1
+        ](u)
+        var bits = lane_bits(hit)
+        if bits != 0:
+            return pos + first_lane_index(bits)
+        pos += W
+    while pos < input_len:
+        if _class_contains[kind, t0, t1](
+            input.unsafe_get(pos)
+        ) and not _class_contains[wkind, w0, w1](input.unsafe_get(pos - 1)):
             return pos
         pos += 1
     return input_len

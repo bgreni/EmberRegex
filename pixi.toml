@@ -47,6 +47,8 @@ bench_set = { cmd = "mojo -I . bench/bench_set.mojo" }
 bench_all = {depends-on=["bench", "bench_set"]}
 compare = { cmd = "python3 bench/bench_compare.py" }
 compare_set = { cmd = "python3 bench/bench_compare_set.py" }
+# Needs a Rust toolchain on PATH (cargo); clones rebar on first run.
+compare_rust = { cmd = "python3 bench/bench_compare_rust.py" }
 format = "mojo format emberregex test bench"
 
 [dependencies]

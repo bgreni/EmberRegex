@@ -491,5 +491,25 @@ def test_differential_bare_anchors() raises:
     _differential["\\B"](_ALPHA_DENSE, "\\B")
 
 
+def test_long_word_match_rides_the_lf_lane() raises:
+    # A `\\b` pattern whose every match is >= WB_DFA_MIN_LEN bytes runs its
+    # search verbs on the table walk: the backtracker would re-check up to
+    # that many bytes per word it starts on (`\\b\\w+\\b`, a match per word,
+    # stays there — pinned in test_reverse_literal). Python spans below.
+    comptime L = Regex["\\b\\w{8,}\\b"]
+    assert_true(L._use_lf_dfa)
+    var re = L()
+    var ms = re.finditer(
+        "a longword x_12345678 short verylongwordhere! abcdefgh_"
+    )
+    assert_equal(len(ms), 4)
+    assert_equal(ms[0].start, 2)
+    assert_equal(ms[0].end, 10)
+    assert_equal(ms[2].start, 28)
+    assert_equal(ms[2].end, 44)
+    assert_equal(ms[3].start, 46)
+    assert_equal(ms[3].end, 55)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

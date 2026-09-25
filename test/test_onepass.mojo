@@ -512,7 +512,10 @@ def test_conditional_path_shadowing_rejected() raises:
 
 
 def test_utf8_mode() raises:
-    comptime S_re = Regex["(*UTF8)(\\w+)"]
+    # `[\\wé]`: é is a 2-byte arm beside the ASCII charset, so the loop
+    # body branches (plain `\\w` is one multi-range charset: a simple
+    # loop, which stays on the backtracker).
+    comptime S_re = Regex["(*UTF8)([\\wé]+)"]
     assert_true(S_re._use_onepass)
     var re = S_re()
     _assert_groups(re.match("héllo"), re._pike_match("héllo"), "utf8")

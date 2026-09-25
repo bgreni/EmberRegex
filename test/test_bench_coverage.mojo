@@ -7,7 +7,7 @@ meaningless numbers. When you add a new bench, add a corresponding test here.
 """
 
 from emberregex import Regex
-from emberregex.simd_kernels import HAS_WIDE_BYTE_SHUFFLE
+from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE, HAS_WIDE_BYTE_SHUFFLE
 from std.testing import assert_true, assert_false, assert_equal, TestSuite
 
 
@@ -390,7 +390,20 @@ def test_bench_pathological_nested_quantifier_miss() raises:
     assert_false(re.match(String("a1") * 800 + "ax").matched)
     # Same shape, but the group closes properly -> matches. Guards against the
     # bench input missing for some trivial reason (e.g. a botched suffix).
-    assert_true(re.match(String("a1") * 800 + "x").matched)
+    var hit = re.match(String("a1") * 800 + "x")
+    assert_true(hit.matched)
+    # The general loop sends long inputs through the two-ended DFA check
+    # before the backtracker (`_match_dfa_precheck`); the hit's slots are
+    # still the backtracker's: the last iteration, "a1" at 1598.
+    assert_true(Regex["([a-z]+[0-9]+)+x"]._match_dfa_precheck)
+    assert_equal(hit.slots[0], 1598)
+    assert_equal(hit.slots[1], 1600)
+    # Misses decided by the forward probe (start), the reverse walk (a
+    # break mid-input) — both before any backtracking.
+    assert_false(re.match("!" + String("a1") * 800 + "x").matched)
+    assert_false(
+        re.match(String("a1") * 400 + "!" + String("a1") * 400 + "x").matched
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +605,16 @@ def test_bench_word_boundary_findall() raises:
     # agreeing with the Pike VM, and the count pinned so a silent
     # no-match run cannot hide.
     comptime S = Regex["\\b\\w+\\b"]
+    # Backtracker candidates are word starts (`_use_word_start`): the
+    # Pike agreement below is its differential check.
+    comptime if HAS_FAST_BYTE_SHUFFLE:
+        assert_true(S._use_word_start)
+    else:
+        assert_false(S._use_word_start)
     var re = S()
+    # Python: re.compile(r'\b\w+\b').search('abc def', 1) -> (4, 7): pos
+    # 1 is mid-word, the byte before it still counts.
+    assert_equal(re.search("abc def", 1).start, 4)
     var input = _lcg_prose(64 * 1024)
     var all = re.findall(input)
     var exp = re._pike_findall(input)
@@ -617,7 +639,12 @@ def test_bench_memo_ambiguous_plus_miss() raises:
     # bench memo_ambiguous_plus_miss_1500: 1500 `a`s then `c`, so there is
     # no `b` anywhere and every candidate position fails — that is the
     # search the memo has to carry. Positive control with a `b` appended.
-    var re = Regex["(a|aa)+b"]()
+    comptime R = Regex["(a|aa)+b"]
+    # The filter prefix `a` does not cover the required `b`, so the miss
+    # fails fast on the `b` pre-scan.
+    assert_equal(R._strategy.fprefix_len, 1)
+    assert_equal(R._strategy.required_byte, 98)
+    var re = R()
     var miss = String("a") * 1500 + "c"
     assert_false(re.search(miss).matched)
     var hit = re.search(String("a") * 20 + "b")

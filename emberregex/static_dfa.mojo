@@ -20,7 +20,7 @@ from .ast import AnchorKind
 from .constants import CHAR_NEWLINE, is_word_byte
 from .nfa import NFA, NFAStateKind
 from .optimize import PROBE_RANKS
-from .static_bytes import int_arr
+from .static_bytes import filled_string, int_arr, static_bytes
 from .dfa import _reaches_match
 from .charset import BITMAP_WIDTH
 from .simd_scan import first_lane_index, lane_bits, simd_find_byte
@@ -30,6 +30,7 @@ from .simd_kernels import (
     _class_contains,
     _sheng_step,
     accel_exits,
+    build_class_masks,
     find_in_class,
     nibble_table_from,
 )
@@ -1903,6 +1904,36 @@ def _edfa_accel_skip[
 
 
 @always_inline
+def _edfa_skip_state[d: EagerDFA](cur: Int) -> Bool:
+    """Is `cur` an accelerated state or a region member — a state whose
+    visit runs a SIMD skip? The adaptive walkers count those visits."""
+    comptime m0 = d.accel.mask_word(0)
+    comptime m1 = d.accel.mask_word(1)
+    var hit: Bool
+    comptime if d.num_states <= 64:
+        hit = ((m0 >> UInt64(cur)) & 1) != 0
+    else:
+        var m = m0 if cur < 64 else m1
+        hit = ((m >> UInt64(cur & 63)) & 1) != 0
+    comptime for ri in range(len(d.region_states)):
+        comptime r_state = d.region_states[ri]
+        if cur == r_state:
+            hit = True
+    return hit
+
+
+# Adaptive acceleration: after ACCEL_PROBATION visits to skip states, a
+# walk whose skips averaged fewer than ACCEL_MIN_AVG bytes turns them off
+# for its remainder. On prose the restart state of `[a-zA-Z]+x` exits on
+# every letter, so each SIMD skip lands a byte or two later and costs more
+# than the table steps it replaces (measured 3.5x on a 600 KB scan); on
+# the long runs acceleration exists for (`.*x`, `[a-z]+x` over 20 KB of
+# one class) the first skip alone clears the bar.
+comptime ACCEL_PROBATION = 8
+comptime ACCEL_MIN_AVG = 16
+
+
+@always_inline
 def _edfa_region_skip[
     origin: Origin, //, d: EagerDFA
 ](input: Span[Byte, origin], mut cur: Int, pos: Int) -> Int:
@@ -1960,6 +1991,170 @@ def _edfa_region_skip[
 def _edfa_has_region(d: EagerDFA) -> Bool:
     """Comptime: does the table carry a region acceleration?"""
     return len(d.region_states) >= 2
+
+
+# A LADDER is a chain of states s_0 -> s_1 -> ... -> s_{L-1} that each
+# leave for the next on one byte class C, the same for the whole chain,
+# and elsewhere on the rest: the counting states of
+# `["'][^"']{0,30}[?!.]["']` after the opening quote. From s_i the next
+# byte outside C within L - i bytes decides the whole run, so the walker
+# finds it with one SIMD class scan instead of up to L - i table steps
+# (`_edfa_walk_from`). Chains shorter than LADDER_MIN are not worth the
+# scan; probe bytes pick which transition to follow (C must hold one).
+# 16: the 31 rungs of the quotes pattern's `{0,30}` scan 159 us vs 206
+# stepped on sherlock, while the 13 of `\\s[a-zA-Z]{0,12}ing\\s` exit
+# at a word's end, before a scan pays (146 -> 179 us).
+comptime LADDER_MIN = 16
+# A walk (one call — a search verb's walks restart at every stop) keeps
+# its ladder scans while they average this many bytes.
+comptime LADDER_MIN_AVG = 8
+comptime LADDER_PROBES = SIMD[DType.int32, 4](0x65, 0x20, 0x61, 0x30)
+
+
+@fieldwise_init
+struct EdfaLadders(Copyable, Movable):
+    """The table's ladders (see LADDER_MIN): `at[s]` is `chain << 8 |
+    index` for a member, else -1; `chains[c]` lists the members, then the
+    state (or -1, dead) the last one leaves for on C; `exits[c]` is the
+    bytes outside C."""
+
+    var at: List[Int]
+    var chains: List[List[Int]]
+    var exits: List[List[Int]]
+
+
+def edfa_ladders(d: EagerDFA) -> EdfaLadders:
+    """Comptime: the ladders of `d`'s final table. Members are plain
+    states — no acceleration, region, match or flag — so a skip over them
+    passes no match end and no per-byte check."""
+    var n = d.num_states
+    var res = EdfaLadders(
+        List[Int](length=n, fill=-1), List[List[Int]](), List[List[Int]]()
+    )
+    if not d.valid or n == 0:
+        return res^
+    var ok = List[Bool](length=n, fill=True)
+    for s in d.accel.states:
+        ok[s] = False
+    for s in d.accel.nib_states:
+        ok[s] = False
+    for s in d.region_states:
+        ok[s] = False
+    for s in range(n):
+        if s < d.num_match_states + d.num_cond_states or d.flags[s] != 0:
+            ok[s] = False
+    for pi in range(4):
+        var probe = Int(LADDER_PROBES[pi])
+        var nxt = List[Int](length=n, fill=-1)
+        var cls = List[SIMD[DType.bool, 256]]()
+        for s in range(n):
+            var row = (
+                Pointer(to=d.table[s * 256])
+                .unsafe_bitcast[Int64]()
+                .unsafe_load[width=256]()
+            )
+            var t = Int(row[probe])
+            nxt[s] = t
+            cls.append(row.eq(SIMD[DType.int64, 256](Int64(t))))
+        # A link s -> nxt[s] continues a chain through t when t is a
+        # free plain state leaving on the same class.
+        var linked = List[Bool](length=n, fill=False)
+        for s in range(n):
+            var t = nxt[s]
+            if (
+                ok[s]
+                and res.at[s] < 0
+                and t >= 0
+                and t != s
+                and ok[t]
+                and res.at[t] < 0
+                and cls[s].eq(cls[t]).reduce_and()
+            ):
+                linked[t] = True
+        for s0 in range(n):
+            if not ok[s0] or res.at[s0] >= 0 or linked[s0]:
+                continue
+            var chain: List[Int] = [s0]
+            var seen = List[Bool](length=n, fill=False)
+            seen[s0] = True
+            var cur = s0
+            while len(chain) < 255:
+                var t = nxt[cur]
+                if (
+                    t < 0
+                    or t == cur
+                    or seen[t]
+                    or not ok[t]
+                    or res.at[t] >= 0
+                    or not cls[cur].eq(cls[t]).reduce_and()
+                ):
+                    break
+                chain.append(t)
+                seen[t] = True
+                cur = t
+            if len(chain) < LADDER_MIN:
+                continue
+            var c = len(res.chains)
+            for i in range(len(chain)):
+                res.at[chain[i]] = (c << 8) | i
+            var exits = List[Int]()
+            for b in range(256):
+                if not cls[s0][b]:
+                    exits.append(b)
+            chain.append(nxt[cur])
+            res.chains.append(chain^)
+            res.exits.append(exits^)
+    return res^
+
+
+def _ladder_offset(lad: EdfaLadders, c: Int) -> Int:
+    """Comptime: chain `c`'s first cell after the `at` block of
+    `edfa_ladder_bytes`."""
+    var off = 0
+    for i in range(c):
+        off += len(lad.chains[i])
+    return off
+
+
+def edfa_ladder_bytes(d: EagerDFA) -> String:
+    """Comptime: the ladders as Int16 static data — `at` (num_states
+    entries), then each chain's members and end state in order."""
+    var lad = edfa_ladders(d)
+    var cells = List[Int]()
+    for v in lad.at:
+        cells.append(v)
+    for ch in lad.chains:
+        for v in ch:
+            cells.append(v)
+    var out = filled_string(len(cells) * 2, 0)
+    var p = out.unsafe_ptr_mut()
+    for i in range(len(cells)):
+        Pointer(to=p[unsafe_offset=i * 2]).unsafe_bitcast[Int16]().unsafe_store(
+            Int16(cells[i])
+        )
+    return out^
+
+
+def _edfa_accel_beyond(d: EagerDFA, stops: SIMD[DType.int32, 4]) -> Bool:
+    """Comptime: does the table accelerate some state a walk with these
+    `stops` can dwell in? A stop state ends the walk before its skip
+    would run, so a table whose only accelerated states are its stops
+    walks on the plain loop. Ladders (`edfa_ladders`) count: they run
+    in the accelerated loop too."""
+    return _edfa_skips_beyond(d, stops) or len(edfa_ladders(d).chains) > 0
+
+
+def _edfa_skips_beyond(d: EagerDFA, stops: SIMD[DType.int32, 4]) -> Bool:
+    """Comptime: `_edfa_accel_beyond` without the ladders."""
+    if len(d.region_states) > 0:
+        return True
+    for s in d.accel.states:
+        if not stops.eq(Int32(s)).reduce_or():
+            return True
+    for s in d.accel.nib_states:
+        if not stops.eq(Int32(s)).reduce_or():
+            return True
+    return False
 
 
 def _edfa_has_accel(d: EagerDFA) -> Bool:
@@ -2290,9 +2485,273 @@ def _edfa_walk_impl[
     flags: Array[UInt8, ns],
     accel: Bool,
     cap: Int,
-](input: Span[Byte, origin], start: Int) -> Int:
+    stops: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](-1),
+](input: Span[Byte, origin], start: Int, mut accel_ok: Bool) -> Int:
     """The walk behind `edfa_match_at` / `sheng_match_at`; `cap` picks the
-    transition mechanism as in `_edfa_full_match_impl`."""
+    transition mechanism as in `_edfa_full_match_impl`. `accel_ok` comes
+    back False when the walk found its acceleration not paying (see
+    `_edfa_walk_from`)."""
+    var cur: Int
+    if start == 0:
+        cur = d.start_at_0
+    elif input.unsafe_get(start - 1) == CHAR_NEWLINE:
+        cur = d.start_after_nl
+    else:
+        comptime if d.start_other_word != d.start_other:
+            cur = d.start_other_word if is_word_byte(
+                input.unsafe_get(start - 1)
+            ) else d.start_other
+        else:
+            cur = d.start_other
+    var last_match = -1
+    if cur < d.num_match_states:
+        last_match = start
+    return _edfa_walk_from[
+        d=d,
+        table=table,
+        flags=flags,
+        accel=accel,
+        cap=cap,
+        stops=stops,
+    ](input, start, cur, last_match, accel_ok)
+
+
+# Premultiplied walk table (`edfa_pm_bytes`): each entry is the target
+# row's BYTE offset, `id << EDFA_PM_SHIFT` (256 UInt16 entries per row),
+# and EDFA_PM_DEAD for a dead transition. The walker forms `row(byte) +
+# state` as one register-offset load, the byte half computed ahead from
+# the input alone, so the state chain is a bare load — not a shift-add
+# then a load (measured 1.5x on the lazy walker, which does the same).
+comptime EDFA_PM_SHIFT = 9
+comptime EDFA_PM_DEAD = 0xFFFF
+
+
+def edfa_pm_bytes(d: EagerDFA) -> String:
+    """Comptime: `d`'s transitions as the premultiplied walk table, one
+    256-lane vector op per row. Only for `d.num_states <= 128`, where
+    every offset fits UInt16 below EDFA_PM_DEAD."""
+    var out = filled_string(d.num_states * 512, 0xFF)
+    var p = out.unsafe_ptr_mut()
+    var zero = SIMD[DType.int64, 256](0)
+    var dead = SIMD[DType.int64, 256](EDFA_PM_DEAD)
+    for s in range(d.num_states):
+        var row = (
+            Pointer(to=d.table[s * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
+        )
+        var v = row.lt(zero).select(dead, row << EDFA_PM_SHIFT)
+        Pointer(to=p[unsafe_offset=s * 512]).unsafe_bitcast[
+            UInt16
+        ]().unsafe_store(v.cast[DType.uint16]())
+    return out^
+
+
+@always_inline
+def _edfa_walk_from[
+    origin: Origin,
+    ns: Int,
+    //,
+    d: EagerDFA,
+    table: StringLiteral,
+    flags: Array[UInt8, ns],
+    accel: Bool,
+    cap: Int,
+    stops: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](-1),
+](
+    input: Span[Byte, origin],
+    start: Int,
+    start_state: Int,
+    match0: Int,
+    mut accel_ok: Bool,
+) -> Int:
+    """`_edfa_walk_impl`'s loop from any (position, state, last match).
+
+    The accelerated form is adaptive: once ACCEL_PROBATION visits to skip
+    states have averaged under ACCEL_MIN_AVG bytes, it leaves its loop
+    (phase 0) for the plain one (phase 1) — a separate loop, since even a
+    disabled skip path in the same loop body measured 2x on the table
+    steps. One function, both loops unrolled from one body: calling the
+    plain instantiation instead read garbage flags when inlined under
+    -D ASSERT=all, and a shared out-of-line-shaped step helper measured
+    1.6x on the table walk.
+
+    The table walk (`cap == 0`) runs on the premultiplied table
+    (`edfa_pm_bytes`): `cur` then holds the state's row offset, and
+    `cur >> SH` its id wherever an id is needed off the state chain."""
+    comptime pm = cap == 0 and d.num_states <= 128
+    comptime SH = EDFA_PM_SHIFT if pm else 0
+    comptime dt = edfa_id_dtype(d.num_states)
+    var tbl = table.ptr().unsafe_bitcast[Scalar[dt]]()
+    var flg = materialize[flags]()
+    var cur = start_state << SH
+    var cur_vec = _ShuffleIndex(UInt8(start_state))  # Sheng (cap > 0)
+    var last_match = match0
+    var pos = start
+    var input_len = len(input)
+    var skips = 0
+    var skipped = 0
+    var lad_on = True
+    var lad_visits = 0
+    var lad_skipped = 0
+    comptime PM = static_bytes[edfa_pm_bytes(d) if pm else String()]()
+    var pmb = PM.ptr()
+    comptime LAD = edfa_ladders(d) if accel else EdfaLadders(
+        List[Int](), List[List[Int]](), List[List[Int]]()
+    )
+    comptime LADN = len(LAD.chains)
+    comptime LADT = static_bytes[
+        edfa_ladder_bytes(d) if LADN > 0 else String()
+    ]()
+    var ladp = LADT.ptr().unsafe_bitcast[Int16]()
+    comptime for phase in range(2):
+        comptime if phase == 1 or accel:
+            while pos < input_len:
+                comptime if phase == 0:
+                    var p0 = pos
+                    var id = cur >> SH
+                    var counted = _edfa_skip_state[d](id)
+                    pos = _edfa_accel_skip[d=d](input, id, pos, last_match)
+                    comptime if _edfa_has_region(d):
+                        var before = id
+                        pos = _edfa_region_skip[d=d](input, id, pos)
+                        if id != before:
+                            cur = id << SH
+                            comptime if cap > 0:
+                                cur_vec = _ShuffleIndex(UInt8(id))
+                    comptime if LADN > 0:
+                        # A ladder member: scan for the run's next exit
+                        # byte within the rungs left, land on the rung
+                        # (or the chain's end) it leaves from.
+                        var lp = Int(ladp[unsafe_offset=id]) if lad_on else -1
+                        if lp >= 0:
+                            lad_visits += 1
+                            lad_skipped -= pos
+                            var lidx = lp & 0xFF
+                            comptime base = d.num_states
+                            comptime for c in range(LADN):
+                                if (lp >> 8) == c:
+                                    comptime off = base + _ladder_offset(LAD, c)
+                                    comptime L = len(LAD.chains[c]) - 1
+                                    comptime km = build_class_masks(
+                                        LAD.exits[c]
+                                    )
+                                    var lim = min(pos + (L - lidx), input_len)
+                                    var q = find_in_class[
+                                        kind=km[0], t0=km[1], t1=km[2]
+                                    ](input[:lim], pos)
+                                    if q > pos:
+                                        var nid = Int(
+                                            ladp[
+                                                unsafe_offset=off
+                                                + lidx
+                                                + (q - pos)
+                                            ]
+                                        )
+                                        pos = q
+                                        if nid < 0:
+                                            return last_match
+                                        cur = nid << SH
+                                        comptime if cap > 0:
+                                            cur_vec = _ShuffleIndex(UInt8(nid))
+                                        if nid < d.num_match_states:
+                                            last_match = pos
+                                        comptime if stops[0] >= 0:
+                                            if last_match < 0:
+                                                comptime for k in range(4):
+                                                    comptime if stops[k] >= 0:
+                                                        if nid == Int(stops[k]):
+                                                            return -2 - pos
+                            lad_skipped += pos
+                            if (
+                                lad_visits >= ACCEL_PROBATION
+                                and lad_skipped < lad_visits * LADDER_MIN_AVG
+                            ):
+                                lad_on = False
+                    if counted:
+                        skips += 1
+                        skipped += pos - p0
+                        if (
+                            skips >= ACCEL_PROBATION
+                            and skipped < skips * ACCEL_MIN_AVG
+                        ):
+                            # Tell a caller that walks again (a findall's
+                            # next match) to start on the plain loop.
+                            accel_ok = False
+                            break
+                    if pos >= input_len:
+                        break
+                var b = input.unsafe_get(pos)
+                comptime if d.any_eol_nl:
+                    if (
+                        b == CHAR_NEWLINE
+                        and (flg.unsafe_get(cur >> SH) & EDFA_EOL_AT_NEWLINE)
+                        != 0
+                    ):
+                        last_match = pos
+                comptime if d.any_wb:
+                    # A pending word anchor resolves against this byte: the
+                    # state is a match end here iff the byte's class agrees.
+                    # Such states occupy one id range (see num_cond_states).
+                    var id = cur >> SH
+                    if UInt(id - d.num_match_states) < UInt(d.num_cond_states):
+                        var f = flg.unsafe_get(id)
+                        if ((f & EDFA_MATCH_IF_WORD) != 0) == is_word_byte(b):
+                            last_match = pos
+                # Died mid-input: EOL-at-end flags don't apply (mirrors the
+                # `current >= 0` guard in LazyDFA.match_at).
+                comptime if cap > 0:
+                    cur_vec = _sheng_step[cap](table, b, cur_vec)
+                    cur = Int(cur_vec[0])
+                    if cur == d.num_states:
+                        return last_match
+                elif pm:
+                    var nxt = Int(
+                        (pmb + (Int(b) << 1) + cur).unsafe_bitcast[UInt16]()[]
+                    )
+                    if nxt == EDFA_PM_DEAD:
+                        return last_match
+                    cur = nxt
+                else:
+                    var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
+                    if nxt < 0:
+                        return last_match
+                    cur = nxt
+                pos += 1
+                if cur < (d.num_match_states << SH):
+                    last_match = pos
+                comptime if stops[0] >= 0:
+                    # Back in a bare restart state with nothing matched: no
+                    # thread is live, so the caller's prefilter may jump
+                    # ahead.
+                    if last_match < 0:
+                        var at_stop = False
+                        comptime for k in range(4):
+                            comptime if stops[k] >= 0:
+                                if cur == Int(stops[k]) << SH:
+                                    at_stop = True
+                        if at_stop:
+                            return -2 - pos
+    comptime if d.any_eol_end:
+        if (flg.unsafe_get(cur >> SH) & EDFA_EOL_AT_END) != 0:
+            last_match = pos
+    return last_match
+
+
+@always_inline
+def edfa_anchored_probe[
+    origin: Origin,
+    ns: Int,
+    //,
+    d: EagerDFA,
+    table: StringLiteral,
+    flags: Array[UInt8, ns],
+](input: Span[Byte, origin], start: Int) -> Tuple[Int, Int]:
+    """`edfa_match_at` over the classic table (plain loop) that also says
+    where the walk stopped: (leftmost-longest end or -1, stop position).
+    The reverse-inner prefilter's forward check — a failed probe's stop
+    is a floor for the next candidate (Rust regex's `min_pre_start`),
+    which keeps a run of failed probes from rescanning the same bytes."""
     comptime dt = edfa_id_dtype(d.num_states)
     var tbl = table.ptr().unsafe_bitcast[Scalar[dt]]()
     var flg = materialize[flags]()
@@ -2308,25 +2767,12 @@ def _edfa_walk_impl[
             ) else d.start_other
         else:
             cur = d.start_other
-    var cur_vec = _ShuffleIndex(UInt8(cur))  # Sheng state (cap > 0 only)
-
     var last_match = -1
     if cur < d.num_match_states:
         last_match = start
-
     var pos = start
     var input_len = len(input)
     while pos < input_len:
-        comptime if accel:
-            pos = _edfa_accel_skip[d=d](input, cur, pos, last_match)
-            comptime if _edfa_has_region(d):
-                var before = cur
-                pos = _edfa_region_skip[d=d](input, cur, pos)
-                comptime if cap > 0:
-                    if cur != before:
-                        cur_vec = _ShuffleIndex(UInt8(cur))
-            if pos >= input_len:
-                break
         var b = input.unsafe_get(pos)
         comptime if d.any_eol_nl:
             if (
@@ -2335,32 +2781,21 @@ def _edfa_walk_impl[
             ):
                 last_match = pos
         comptime if d.any_wb:
-            # A pending word anchor resolves against this byte: the
-            # state is a match end here iff the byte's class agrees.
-            # Such states occupy one id range (see num_cond_states).
             if UInt(cur - d.num_match_states) < UInt(d.num_cond_states):
                 var f = flg.unsafe_get(cur)
                 if ((f & EDFA_MATCH_IF_WORD) != 0) == is_word_byte(b):
                     last_match = pos
-        # Died mid-input: EOL-at-end flags don't apply (mirrors the
-        # `current >= 0` guard in LazyDFA.match_at).
-        comptime if cap > 0:
-            cur_vec = _sheng_step[cap](table, b, cur_vec)
-            cur = Int(cur_vec[0])
-            if cur == d.num_states:
-                return last_match
-        else:
-            var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
-            if nxt < 0:
-                return last_match
-            cur = nxt
+        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
+        if nxt < 0:
+            return (last_match, pos)
+        cur = nxt
         pos += 1
         if cur < d.num_match_states:
             last_match = pos
     comptime if d.any_eol_end:
         if (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
             last_match = pos
-    return last_match
+    return (last_match, pos)
 
 
 @always_inline
@@ -2393,15 +2828,49 @@ def edfa_match_at[
     walks that can never reach a full vector chunk take the plain loop
     and pay no per-byte acceleration checks at all.
     """
-    comptime if _edfa_has_accel(d):
-        comptime W = simd_width_of[DType.uint8]()
-        if len(input) - start >= W:
-            return _edfa_walk_impl[
-                d=d, table=table, flags=flags, accel=True, cap=cap
-            ](input, start)
-    return _edfa_walk_impl[d=d, table=table, flags=flags, accel=False, cap=cap](
-        input, start
+    var accel_ok = True
+    return edfa_match_at_adaptive[d=d, table=table, flags=flags, cap=cap](
+        input, start, accel_ok
     )
+
+
+@always_inline
+def edfa_match_at_adaptive[
+    origin: Origin,
+    ns: Int,
+    //,
+    d: EagerDFA,
+    table: StringLiteral,
+    flags: Array[UInt8, ns],
+    cap: Int = 0,
+    stops: SIMD[DType.int32, 4] = SIMD[DType.int32, 4](-1),
+](input: Span[Byte, origin], start: Int, mut accel_ok: Bool) -> Int:
+    """`edfa_match_at` for a caller that walks repeatedly (a search verb's
+    loop): `accel_ok` False skips straight to the plain loop, and the walk
+    clears it when its acceleration stops paying (ACCEL_PROBATION).
+
+    With `stops` (the table's bare restart states, -1 padded) a walk that
+    returns to one of them before any match stops and answers `-2 - pos`,
+    so the caller can resume from its prefilter's next candidate."""
+    comptime if _edfa_accel_beyond(d, stops):
+        comptime W = simd_width_of[DType.uint8]()
+        if accel_ok and len(input) - start >= W:
+            return _edfa_walk_impl[
+                d=d,
+                table=table,
+                flags=flags,
+                accel=True,
+                cap=cap,
+                stops=stops,
+            ](input, start, accel_ok)
+    return _edfa_walk_impl[
+        d=d,
+        table=table,
+        flags=flags,
+        accel=False,
+        cap=cap,
+        stops=stops,
+    ](input, start, accel_ok)
 
 
 @always_inline

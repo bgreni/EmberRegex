@@ -63,21 +63,34 @@ that would happily match a lone continuation byte:
 
 Two things make this affordable for the large Unicode classes:
 
-- **Prefix factoring** (`_utf8_trie_fragment` in `nfa.mojo`). One chain per
-  sequence is the obvious construction and it does not scale: `\p{L}` is 836
-  sequences ≈ 3600 states behind an 836-way SPLIT chain, so every epsilon
-  closure walks all 836 alternatives. Factoring the shared leading byte
-  range (`a·X | a·Y` → `a·(X|Y)`) gives ~1240 states behind a 35-way split.
-  Grouping is by exact range equality — always a valid factoring, and the
-  right one here because UTF-8 sequence sets share whole lead ranges rather
-  than partially overlapping them. Within a bucket every sequence has the
-  same length, because UTF-8 encodes length in the lead byte and the
-  lead-byte ranges for lengths 1/2/3/4 are disjoint; the code checks that
-  invariant rather than silently corrupting the NFA if it ever breaks.
+- **The minimal byte automaton** (`_utf8_trie_fragment` in `nfa.mojo`).
+  One chain per sequence is the obvious construction and it does not
+  scale: `\p{L}` is 836 sequences ≈ 3600 states behind an 836-way SPLIT
+  chain, so every epsilon closure walks all 836 alternatives. The
+  sequences arrive sorted, so a prefix trie is built by comparing each
+  with its predecessor (at every depth two sequences' ranges are either
+  equal or disjoint and ascending); trie nodes are then hash-consed
+  children-first, merging equal suffixes — UTF-8 repeats itself in its
+  tails, every final `80-BF` is one node — which yields the minimal DFA
+  of that acyclic language; and each node emits one multi-range CHARSET
+  per distinct target. `\p{L}` is 968 states, `\p{Ll}` 246 (from 1465
+  with prefix factoring alone). A counted repeat multiplies the class,
+  so this is also what brought `(?u)\p{L}{8,13}` from 8.5 minutes of
+  compile time to about 2.5 (a from-source `-I .` build, 2026-09-25).
 - **Surrogates are excluded.** U+D800..U+DFFF are not Unicode scalar values
   and have no UTF-8 encoding, so `utf8_ranges` cuts the block out of any
   range that spans it (`\p{Any}`, `\p{C}`, `.` under DOTALL). Emitting them
   would build an automaton accepting `ED A0 80` — ill-formed UTF-8.
+
+**Case folding.** `(?iu)` is CPython's `str`-pattern IGNORECASE: a literal
+matches its whole case orbit (`s`/`S`/`ſ`, `k`/`K`/Kelvin sign, Cyrillic
+and Greek pairs), and a class is closed under orbits before any negation.
+The orbits are generated from CPython itself (`_sre.unicode_tolower` plus
+`re._casefix`) by `tools/gen_case_tables.py` into `case_tables.mojo`, and
+looked up at comptime through SIMD columns. Backreferences are the
+exception, as in Python: they compare by simple lowercase
+(`backref_icase_unicode`), so `ſ` does not repeat an `s`. Without `(?u)`
+only ASCII letters fold.
 
 Property tables are **generated** from the UCD (`tools/gen_unicode_tables.py`
 → `unicode_tables.mojo`, Unicode 17.0) and checked in, so a build needs no
@@ -88,8 +101,8 @@ are independent UCD copies on independent release cadences, and were 15.1.0
 vs 17.0 here, disagreeing on 24 ranges of `\p{L}` alone. The generator
 cross-checks each major category against the union of its subcategories.
 
-Big classes still cost real compile time (`\p{Lu}` ≈ 3 min), because all the
-automaton construction is comptime work. Lookbehind is refused in UTF-8
+Big classes still cost real compile time (tens of seconds for `\p{L}`),
+because all the automaton construction is comptime work. Lookbehind is refused in UTF-8
 mode: it needs a fixed byte width and a codepoint class spans 1-4.
 
 ---
@@ -106,7 +119,7 @@ Selected fastest-first at compile time:
 | DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng | `sheng.mojo` |
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` | eager comptime DFA (`match()`) | `static_dfa.mojo` |
 | same, search-family verbs | leftmost-first DFA + reverse DFA | `static_lfdfa.mojo`, `static_rdfa.mojo` |
-| `can_use_dfa`, CLASSIC table over `EDFA_STATE_CAP` (or the attempt past `EDFA_WORK_BUDGET` member-class visits) | lazy DFA | `dfa.mojo` |
+| `can_use_dfa`, CLASSIC table over `EDFA_STATE_CAP` (or the attempt past `EDFA_WORK_BUDGET` member-class visits) | lazy DFA for `match()`; its search verbs on the lazy leftmost-first DFA + lazy reverse DFA when the pattern has no anchors or lookaround | `dfa.mojo`, `lazy_lf.mojo` |
 | captures, one-pass NFA with an alternation loop | one-pass DFA: `match()`, and the span confirm of the lane below (`_use_onepass`) | `onepass.mojo` |
 | captures, same shape, search-family verbs | DFA-bounded span + backtracker on the span (`_use_dfa_span`) | `engine.mojo` |
 | backrefs / lookaround / captures (`match()`, not one-pass); also a greedy pattern whose classic table fits but whose leftmost-first table overflowed | specialized backtracker | `backtrack.mojo` |
@@ -127,6 +140,26 @@ an integer compare; and states that self-loop on all but a few bytes are
 stepping the table. Minimization comes first because the other two key off
 final state ids, and because a self-loop is often only visible once the
 duplicate states splitting it are merged.
+
+The walker itself (`_edfa_walk_from`) steps a second, **premultiplied**
+copy of the table (`edfa_pm_bytes`, tables up to 128 states): each entry
+is its target's row as a byte offset in `UInt16` (`id << 9`,
+`EDFA_PM_DEAD` for a dead transition), so a step is one register-offset
+load from `row(byte) + state` — the byte half is computed ahead from the
+input, and the state chain carries no shift-add (`sherlock/quotes`
+287 → 244 µs; the same encoding took a third off the lazy walker below). Two more skips ride the same walk. A **ladder**
+(`edfa_ladders`) is a chain of at least `LADDER_MIN` (16) plain states
+that each move to the next on one byte class and leave it on the rest —
+the counting states of `["'][^"']{0,30}[?!.]["']` after the opening
+quote — and from rung *i* one SIMD class scan of the next `L - i` bytes
+finds the exit byte, or proves the run outlasts the chain, in place of up
+to `L - i` table steps (`sherlock/quotes` 206 → 159 µs). And acceleration is **adaptive**: a walk whose
+skips average under `ACCEL_MIN_AVG` bytes after `ACCEL_PROBATION` visits
+(prose, where the restart state of `[a-zA-Z]+x` exits on every letter)
+leaves for the plain loop, and a caller that walks again starts there;
+ladder scans keep their own tally. The two loops are one function body
+unrolled twice by a `comptime for` over the phase, not a call from one
+instantiation to the other (see Comptime realities: a compiler bug).
 
 That table answers `match()` — Python's `fullmatch`, a language-membership
 question — and nothing else. Its states are *sets*, so a walk over it ends
@@ -172,6 +205,15 @@ lowers to one static `c"..."` global that the walkers read through a
 bitcast pointer — the same load, no per-call copy. `EDFA_TABLE_MIN_BYTES`
 (1 KB) still pads the element count.
 
+With a candidate scanner, the leftmost-first walk also **stops** when it
+falls back to a bare restart state with nothing matched
+(`Regex._lf_restart_stops`) and resumes from the scanner's next
+candidate — Rust regex's prefilter at the start state. The scanner is a
+literal filter, or a first-byte class rare enough in text
+(`LF_STOP_MAX_WEIGHT` by the rank table: quotes and whitespace, not
+letters) that stopping beats walking on; a letter-led class re-entered
+the walk at every word and measured 3.4x slower.
+
 A pattern with no start-anchored scanner may still carry a **required
 inner literal** — a byte run every match must contain, sitting after an
 unbounded loop where no prefix scanner can see it (`\w+\.txt` must
@@ -189,11 +231,36 @@ at or after `pos + min_offset` is proof of no match — one SIMD pass
 answers the call (the `reverse_suffix_search_64KB` /
 `reverse_inner_search_64KB` rows measure ~40x on miss-heavy 64 KB) — and
 when the pre-literal gap is comptime-bounded (`[ab]{0,3}foo`: at most 3 bytes)
-the candidate pipeline starts at `lit_pos - max_offset`. With an
-unbounded gap the scan still starts at `pos`: recovering a start by
-walking leftward from the literal is the quadratic trap Rust bounds with
-REV_INNER_MAX_BACKSCAN, and this design has no leftward walk at all. The
-pivot prefilter may coexist; the literal test simply runs first.
+the candidate pipeline starts at `lit_pos - max_offset`.
+
+With an unbounded gap (or a bounded one, when safe) the lane walks
+**leftward** from each occurrence over a reverse DFA of the pattern's part
+before the literal (`prefix_nfa` → `Regex._prdfa`, Rust regex's
+ReverseInner), and confirms the start it finds with an anchored probe on
+the classic table. Two guards keep that linear. `rev_inner_safe` (Rust's
+`has_no_earlier_match`) admits a pattern only when an earlier match
+cannot use a later occurrence as its literal: some literal byte is one
+no prefix state consumes (`[a-z]+://`), or a separator class disjoint
+from the literal and the rest of the prefix sits right before the
+literal (`\w+\s+Holmes`) or starts the match (`\s[a-zA-Z]{0,12}ing\s`).
+And a later occurrence's reverse walk stops at the previous occurrence,
+its probe must start past the last failed probe's end (Rust's
+`min_pre_start`), and an inconclusive walk hands the call to the plain
+scan. A confirmed start is the match start: when the classic table's end
+is provably the leftmost-first end it is returned as is, otherwise one
+forward leftmost-first walk from the start finds the end — no reverse
+walk. The pivot prefilter may coexist; the literal test simply runs first.
+
+A search also fails fast on a **required byte** — a byte every match
+contains — unless another scan already fails fast on it (the pure-literal
+scan, Teddy, the Teddy prefix, the pivot; a filter prefix only covers its
+own bytes, so `(a|aa)+b` still checks for `b`). Every CHAR state of that
+byte sits inside a forced chain of CHAR states, and the set of those
+chains is required too (`extract_required_literals`): for the AWS-key
+pattern that is `ASIA|AKIA|AROA|AIDA` rather than the `A` in every other
+line, checked with one Teddy scan. The upgrade is skipped for a single
+chain, and where the reverse-literal memmem runs anyway: a set scan over
+a miss would only repeat it.
 
 Capture groups do not keep a pattern off these tables — SAVE states are
 epsilon to every determinizer — only backreferences and lookaround do. A
@@ -291,6 +358,24 @@ otherwise; a word anchor whose continuation reaches a BOL kind (`\b^`)
 stays off the lanes, as does the runtime lazy DFA, which does not model
 the anchor. Sets keep word-boundary patterns off their DFA lanes.
 
+**Lazy leftmost-first DFA** (`lazy_lf.mojo`, `Regex._use_lazy_lf`). When
+the classic table overflows, `match()` keeps the lazy DFA of `dfa.mojo`,
+but the search verbs of an anchor- and lookaround-free pattern build the
+leftmost-first and reverse automata at runtime instead: the same ordered
+state lists, truncation and restart bit as the comptime table, interned
+in an open-addressing table, with transitions per byte class. A
+transition is stored as its target's row byte offset plus MATCH / START
+tag bits, so the walker's fast loop is one register-offset load and one
+unsigned compare per byte, four bytes at a time. On START (the bare
+restart state) the walk jumps to the next candidate unless those jumps
+average under `LLF_JUMP_MIN_AVG` bytes, when the tag is stripped. A
+single-class repeat (`(?u)\p{L}{8,13}`, `single_class_repeat`) skips the
+reverse walk entirely: every thread steps the same class in unison, so a
+byte that kills the oldest live thread kills them all and the oldest one's
+match truncates the rest — the match starts where the walk last left the
+bare restart state. A cache that stops paying raises, and the call re-runs
+on the Pike VM.
+
 The **specialized backtracker** is comptime-specialized per NFA state: each
 `_sbt_try_match[pattern, state_idx]` instantiation (the NFA is re-derived
 inside via the memoized `_build_static_nfa(pattern)`, so symbol names carry
@@ -369,8 +454,10 @@ state.
 
 A **counted repetition** over a single byte class gets the same treatment,
 one level up. `nfa.mojo` expands `x{n,m}` into `n` required copies plus
-either a star loop or `m-n` optional copies wrapped in `?` SPLITs — right
-for the DFA lanes (one byte class determinizes to `m+1` states, linear),
+either a star loop or `m-n` optional copies NESTED in `?` SPLITs
+(`x{2,4}` → `xx(x(x)?)?`, every skip leaving through one shared exit, as
+Rust's compiler does) — right for the DFA lanes (one byte class
+determinizes to `m+1` states, linear),
 ruinous for the backtracker, which pays a function instantiation and a
 stack frame per copy: `a{1,2000}` took ~12 minutes to compile.
 `_sbt_counted_shape` reads that chain back at compile time and the walker
@@ -386,10 +473,33 @@ SPLIT (its exit call is not in tail position, so collapsing free frames
 into real ones there deepens a walk that already recurses per byte —
 `(?:a|a{2,3})+b` on 2000 `a`s went from completing to overflowing).
 
-Search gets its own prefilters: literal prefixes drive `simd_find_prefix`,
-required-byte and first-byte bitmaps drive shufti/truffle skips, and the
-`[class]+ P …` shape gets a pivot-anchored search that hops between
-occurrences of a rare byte.
+Search gets its own prefilters: literal prefixes drive a two-rarest-probe
+memmem (it switches to testing both probe bytes per chunk when the rarer
+one turns out common in the input, memchr's packed pair), an alternation
+of literals at the start drives a Teddy scan, required-byte and
+first-byte bitmaps drive shufti/truffle skips, and the `[class]+ P …`
+shape gets a pivot-anchored search that hops between occurrences of a
+rare byte. On the backtracker lane three more apply. A required literal
+at a bounded offset narrows the candidates to a window before each
+occurrence (`_use_bt_window`). A pattern led by `\b` and a word byte only
+tries word starts (`_use_word_start`). And after a failed attempt, a
+pattern led by a greedy single-class loop with no backreference skips
+the rest of that class run (`_lead_loop_class`): a later start in the
+run reaches the same run end and only a subset of the continuation
+positions the failed attempt tried. Teddy itself fingerprints the rarest
+byte offsets of its literals, not the first ones (in Cyrillic every other
+byte is a D0/D1 lead), and when every literal has one of ≤ 3 rare bytes
+at one offset it scans for those instead (`Sherlock|Street`: a memchr on
+`S`).
+
+Two DFA-admission rules are worth knowing because they cut against the
+"no alternation, no suffix → backtracker" default. A word-boundary
+pattern whose every match is at least `WB_DFA_MIN_LEN` (8) bytes rides
+the leftmost-first lane (`\b\w{12,}\b`: the backtracker re-checked up to
+12 bytes per word it started on), while `\b\w+\b`, a match per word,
+stays put. And an unanchored loop whose exit reaches `$` / `(?m)$`
+counts as having a suffix: `(?m)\w+$` fails for every word that does not
+end a line, which the table decides in one pass.
 
 ---
 
@@ -565,6 +675,16 @@ Three constraints shape the code more than anything else:
   regardless of length; the same data as `Array` costs ~4 chars per
   element. Hence `RoseView` and `ReverseView`: POD scalars in the parameter,
   bulk data in separate `Array`s.
+- **Walkers that take a table as a comptime parameter are
+  `@always_inline`** for the same reason: out of line, `_edfa_walk_from`
+  printed its 1 MB table into its own symbol name and the link failed.
+  An inlined callee must not `materialize` a comptime value its caller
+  also materializes, either (a Mojo 1.1.0 bug, reproduced in
+  `tools/repro_inline_materialize_lifetime.mojo`): the two copies share
+  one stack slot whose lifetime ends at the caller's last use, and the
+  callee reads it anyway. The adaptive walker once handed off to its
+  plain instantiation that way and read garbage flags under
+  `-D ASSERT=all`.
 - **Baked lanes hold zero per-instance state**, so `scan` needs no `mut self`
   and no scratch object. Keeping the bit-parallel NFA as the always-builds
   fallback is partly what lets the API stay non-mutating and thread-safe.

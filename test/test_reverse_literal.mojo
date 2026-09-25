@@ -243,9 +243,10 @@ def test_memmem_basic() raises:
 def test_memmem_across_simd_boundaries() raises:
     # One hit at every offset around chunk boundaries of a 1100-byte
     # haystack; the filler carries probe-pair false positives (".qx") on
-    # every block, so from 0 the gate ('.') switches to `alt` ('t') at
-    # 512 — hits around there pin the resume point. Starts swept up to
-    # each hit exercise the masked overlapping tail chunk.
+    # every block, so from 0 the dense gate ('.') switches at 512 to the
+    # paired scan on `alt` ('t') and the gate — hits around there pin
+    # the resume point. Starts swept up to each hit exercise the masked
+    # overlapping tail chunk.
     comptime N = 1100
     for hit in [
         0,
@@ -364,6 +365,73 @@ def test_literal_occurrence_outside_any_match() raises:
     # shape, different engine, same answers.
     assert_false(Regex["(foo|bar)\\.txt"]._use_rev_literal)
     _agree["(foo|bar)\\.txt"]("xx.txt foo.txt", "control: early false literal")
+
+
+def test_reverse_inner_lane_and_safety() raises:
+    # Effect (c), an unbounded gap: the reverse walk over the prefix
+    # starts the scan. On when some literal byte is one the prefix never
+    # consumes, or when a disjoint separator class precedes the literal.
+    assert_true(Regex["\\w+\\.txt"]._use_rev_inner)
+    assert_true(Regex["[a-z]+://[^ ]+"]._use_rev_inner)
+    assert_true(Regex["(\\w+)@(\\w+)\\.com"]._use_rev_inner)
+    assert_true(Regex["\\w+\\s+Holmes"]._use_rev_inner)
+    # Off: the prefix can contain the literal and nothing separates them.
+    assert_false(Regex["\\w+Holmes"]._use_rev_inner)
+    assert_false(Regex[".*foo"]._use_rev_inner)
+    # Bounded gaps take it too when it is safe; the first-separator rule
+    # (Rust's `\\s[A-Za-z]{0,12}ing`) admits a class that starts the match.
+    assert_true(Regex["[0-9]{2,5}xy"]._use_rev_inner)
+    assert_true(Regex["\\s[a-zA-Z]{0,12}ing\\s"]._use_rev_inner)
+    # Its classic end is not provably the leftmost-first one, so a
+    # confirmed start takes the forward walk for the end — and keeps the
+    # start, with no reverse walk (the `_agree` sweep below checks it).
+    assert_false(Regex["\\s[a-zA-Z]{0,12}ing\\s"]._lf_anchored_classic)
+    # Unsafe bounded gaps keep effect (b), the scan-start skip.
+    assert_false(Regex["[a-z]{2,5}xy"]._use_rev_inner)
+    assert_true(Regex["[a-z]{2,5}xy"]._use_rev_literal)
+
+
+def test_reverse_inner_semantics() raises:
+    # The separator shape: an earlier occurrence inside a later match's
+    # prefix (the walk from the second "Holmes" runs into its floor
+    # alive, and the plain scan answers), adjacent matches, misses.
+    _agree["\\w+\\s+Holmes"]("Holmes Holmes", "occurrence in prefix")
+    _agree["\\w+\\s+Holmes"]("a Holmes b Holmes", "two matches")
+    _agree["\\w+\\s+Holmes"]("xHolmes  Holmes", "no separator first")
+    _agree["\\w+\\s+Holmes"]("Holmes", "literal alone")
+    # Inner literal: failed anchored probes ("Holmes." / "Holmes,") move
+    # on to the next occurrence; a probe that walks past the next
+    # occurrence hands the call to the plain scan.
+    _agree["\\w+\\s+Holmes\\s+\\w+"](
+        "a Holmes. b Holmes, c Holmes d", "failed probes then hit"
+    )
+    _agree["\\w+\\s+Holmes\\s+\\w+"](
+        "a Holmes Holmes. b", "probe runs over the next occurrence"
+    )
+    _agree["\\w+\\s+Holmes\\s+\\w+"]("x Holmes\ty z Holmes", "tab")
+    # First separator, bounded gap.
+    _agree["\\s[a-zA-Z]{0,12}ing\\s"](
+        " sing along ringing\nthings kingthing inging ", "ing words"
+    )
+
+
+def test_backtracker_literal_window() raises:
+    # Backtracker lane: a required literal at a small bounded offset
+    # window picks the start candidates (`_use_bt_window`). A single rare
+    # byte at a fixed offset — one candidate per `x`:
+    comptime S = Regex["[a-q][^u-z]{13}x"]
+    assert_true(S._use_bt_window)
+    _agree["[a-q][^u-z]{13}x"]("abcdefghijklmnx aqqqqqqqqqqqqqx", "fixed")
+    _agree["[a-q][^u-z]{13}x"](
+        String("x") * 20 + "a" + String("b") * 13 + "x", "x before starts"
+    )
+    _agree["[a-q][^u-z]{13}x"]("zzzzzzzzzzzzzzzzx", "no start class")
+    # A window [2, 4] whose literal also occurs inside the run before it
+    # (the lookahead keeps the pattern on the backtracker).
+    comptime T = Regex["(?=\\w)(\\w{2,4})ab"]
+    assert_true(T._use_bt_window)
+    _agree["(?=\\w)(\\w{2,4})ab"]("xxab abab ababab", "window")
+    _agree["(?=\\w)(\\w{2,4})ab"]("ab xab xxxxxab", "short and long runs")
 
 
 def test_matches_at_edges_and_adjacent() raises:
@@ -732,7 +800,8 @@ def test_early_no_match_is_fast() raises:
             keep(re.search(input).matched)
         var t1 = perf_counter_ns()
         for _ in range(CALLS):
-            keep(re._lf_find_end(bytes, 0))
+            var accel = True
+            keep(re._lf_find_end(bytes, 0, accel))
         var t2 = perf_counter_ns()
         if t1 - t0 < t_search:
             t_search = t1 - t0

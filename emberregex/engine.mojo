@@ -19,8 +19,10 @@ from .constants import (
     CHAR_NINE,
     CHAR_ONE,
     CHAR_ZERO,
+    is_word_byte,
 )
 from .nfa import (
+    single_class_repeat,
     apply_flags,
     _build_static_nfa,
     _nfa_has_backref,
@@ -40,9 +42,13 @@ from .optimize import (
     extract_literal_suffix,
     extract_first_byte_bitmap,
     extract_required_byte,
+    extract_required_literals,
     extract_match_sandwich,
     is_pure_literal,
+    prefix_nfa,
+    rev_inner_safe,
     select_probe_offsets,
+    PROBE_RANKS,
 )
 from .teddy import (
     teddy_full_match,
@@ -52,10 +58,12 @@ from .teddy import (
 from .simd_scan import (
     first_lane_index,
     lane_bits,
+    simd_find_any,
     simd_find_byte,
     simd_find_literal,
     simd_find_literal_rare,
 )
+from std.math import exp
 from std.sys import simd_width_of
 from .charset import BITMAP_WIDTH
 from .backtrack import (
@@ -70,6 +78,14 @@ from .backtrack import (
     sbt_memo_rows,
 )
 from .dfa import LazyDFA
+from .lazy_lf import (
+    LLF_ID_MASK,
+    LLF_MATCH_TAG,
+    LLF_ROW_BYTES,
+    LLF_START_TAG,
+    LazyLF,
+    lazy_lf_eligible,
+)
 from .static_dfa import (
     EagerDFA,
     _edfa_has_region,
@@ -80,14 +96,17 @@ from .static_dfa import (
     build_eager_dfa,
     edfa_table_len,
     edfa_id_dtype,
+    edfa_anchored_probe,
     edfa_full_match,
     edfa_match_at,
+    edfa_match_at_adaptive,
     pivot_first_candidate,
 )
 from .static_lfdfa import build_lf_dfa
 from .static_rdfa import (
     build_reverse_dfa,
     rdfa_find_start,
+    rdfa_find_start_lim,
 )
 from .static_bytes import int_arr, list_arr, static_bytes, table_bytes
 from .sheng import (
@@ -102,6 +121,7 @@ from .simd_kernels import (
     _class_contains,
     build_class_masks,
     find_in_class,
+    find_word_start,
     stops_from_bitmap,
 )
 from .executor import PikeVM, _VMBuffers, heapbt_match
@@ -380,6 +400,110 @@ def _sbt_run_memoized[
 
 
 @always_inline
+def _word_bytes() -> List[Int]:
+    """Comptime: the bytes `\\b` counts as word characters."""
+    var out = List[Int]()
+    for b in range(256):
+        if is_word_byte(Byte(b)):
+            out.append(b)
+    return out^
+
+
+def _leads_with_word_boundary(nfa: NFA) -> Bool:
+    """Comptime: the start reaches a `\\b` through SAVEs alone."""
+    var s = nfa.start
+    while s >= 0 and nfa.states[s].kind == NFAStateKind.SAVE:
+        s = nfa.states[s].out1
+    return (
+        s >= 0
+        and nfa.states[s].kind == NFAStateKind.ANCHOR
+        and nfa.states[s].anchor_type == AnchorKind.WORD_BOUNDARY
+    )
+
+
+def _bitmap_within_words(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Bool:
+    """Comptime: every byte of the (first-byte) bitmap is a word byte —
+    never true of a nullable pattern, whose bitmap is all ones."""
+    for b in range(256):
+        if (bitmap[b >> 3] >> UInt8(b & 7)) & 1 != 0 and not is_word_byte(
+            Byte(b)
+        ):
+            return False
+    return True
+
+
+def _lead_loop_class(
+    nfa: NFA,
+) -> Tuple[Bool, SIMD[DType.uint8, BITMAP_WIDTH]]:
+    """Comptime: (True, C) when every match opens (through SAVEs) with a
+    greedy loop over the one-byte class C — `C+` or `C*` — and no
+    backreference makes an attempt depend on where it started. Then an
+    attempt that fails at p fails from every later start inside p's run
+    of C bytes: the loop from there reaches the same run end and only a
+    subset of the continuation positions p's attempt tried."""
+    var none = (False, SIMD[DType.uint8, BITMAP_WIDTH](0))
+    if _nfa_has_backref(nfa):
+        return none
+    var n = len(nfa.states)
+    var s = nfa.start
+    while s >= 0 and s < n and nfa.states[s].kind == NFAStateKind.SAVE:
+        s = nfa.states[s].out1
+    if s < 0 or s >= n:
+        return none
+    var body = -1
+    if nfa.states[s].kind == NFAStateKind.SPLIT:
+        var b = nfa.states[s].out1
+        if nfa.states[s].greedy and b >= 0 and nfa.states[b].out1 == s:
+            body = b  # C*
+    else:
+        var sp = nfa.states[s].out1
+        if (
+            sp >= 0
+            and nfa.states[sp].kind == NFAStateKind.SPLIT
+            and nfa.states[sp].greedy
+            and nfa.states[sp].out1 == s
+        ):
+            body = s  # C+
+    if body < 0:
+        return none
+    var kind = nfa.states[body].kind
+    var c = SIMD[DType.uint8, BITMAP_WIDTH](0)
+    if kind == NFAStateKind.CHAR and nfa.states[body].char_value < 256:
+        var v = Int(nfa.states[body].char_value)
+        c[v >> 3] = UInt8(1) << UInt8(v & 7)
+    elif kind == NFAStateKind.CHARSET:
+        c = nfa.charsets[nfa.states[body].charset_index].bitmap
+        if nfa.charsets[nfa.states[body].charset_index].negated:
+            c = ~c
+    elif kind == NFAStateKind.ANY:
+        c = ~c
+        c[1] = c[1] & ~UInt8(1 << 2)  # not `\\n` (byte 10)
+    else:
+        return none
+    return (True, c)
+
+
+# A first-byte class resumes the leftmost-first walk from its scan (the
+# restart stops) only below this estimated frequency (`_byte_set_weight`;
+# `e` is ~0.8, whitespace ~1.8, ASCII letters ~5.7): quotes-led
+# `["'][^"']{0,30}[?!.]["']` 244 -> 205 us and `\\s`-led
+# `\\s[a-zA-Z]{0,12}ing\\s` 154 -> 139 us on sherlock, while the
+# letter-led `[a-zA-Z]+ing` went 468 -> 1586 us, re-entering the walk at
+# every word.
+comptime LF_STOP_MAX_WEIGHT = 3.0
+
+
+def _byte_set_weight(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Float64:
+    """Comptime: estimated frequency of the bitmap's bytes in text, the
+    sum of exp((rank - 255) / 25) over PROBE_RANKS (as Teddy's rare-byte
+    plan scores a byte set)."""
+    var t = 0.0
+    for b in range(256):
+        if (bitmap[b >> 3] >> UInt8(b & 7)) & 1 != 0:
+            t += exp((Float64(PROBE_RANKS[b]) - 255.0) / 25.0)
+    return t
+
+
 def _is_bitmap_useful(bitmap: SIMD[DType.uint8, BITMAP_WIDTH]) -> Bool:
     """Check if the first-byte bitmap filters any bytes (not all 0xFF)."""
     return bitmap.ne(UInt8(0xFF)).reduce_or()
@@ -469,6 +593,20 @@ def _reaches_consuming_before_match(nfa: NFA, start: Int) -> Bool:
             return True
         if kind == NFAStateKind.MATCH:
             continue  # reached MATCH without consuming — this path is fine
+        if (
+            kind == NFAStateKind.ANCHOR
+            and nfa.start_anchor < 0
+            and (
+                nfa.states[idx].anchor_type == AnchorKind.EOL
+                or nfa.states[idx].anchor_type == AnchorKind.EOL_MULTILINE
+            )
+        ):
+            # A line-end check after the loop fails for every run that
+            # does not end a line: unanchored `(?m)\\w+$` attempts each
+            # word and keeps one per line, where the table walk decides in
+            # one pass. (A `^`-led pattern is attempted once per line
+            # anyway.)
+            return True
         if kind == NFAStateKind.SPLIT:
             stack.append(nfa.states[idx].out1)
             stack.append(nfa.states[idx].out2)
@@ -853,6 +991,13 @@ comptime LF_SBT_ATTEMPT_BUDGET = 2048
 # Regex._lf_candidate).
 comptime LF_SHORT_INPUT = 16
 
+# Shortest input match() asks the classic table about first when the
+# backtracker would recurse per byte (`Regex._match_dfa_precheck`); below
+# it the table walk is overhead on a walk that is short either way.
+comptime MATCH_PRECHECK_MIN = 64
+# Bytes of the forward probe that precedes the reverse full-match walk.
+comptime MATCH_PRECHECK_HEAD = 16
+
 # Longest tail verified by the match() suffix fast-fail. The check is a
 # necessary condition only, so truncating to the last bytes stays sound.
 comptime MATCH_SUFFIX_CHECK_MAX = 8
@@ -889,6 +1034,49 @@ def __literal_can_be_optimized(width: Int) -> Bool:
 comptime TypeForPrefixLength[width: Int] = SIMD[Byte.dtype, width]
 
 
+# A word-boundary pattern whose every match is this long leaves the
+# backtracker re-checking up to this many bytes per word it starts on
+# (`\\b\\w{12,}\\b` in prose: 209 us backtracker, 70 us table walk on
+# rebar's long-english), while short ones (`\\b\\w+\\b`, a match per
+# word) are cheaper there than a forward + reverse walk per match (254
+# vs 481 us on all-english).
+comptime WB_DFA_MIN_LEN = 8
+
+
+def _min_match_len(nfa: NFA, cap: Int) -> Int:
+    """Comptime: the fewest bytes a match consumes, or `cap` when that is
+    at least `cap`. Breadth-first by bytes consumed; zero-width states
+    (anchors, lookaround, backreferences, SAVEs) cost nothing."""
+    var n = len(nfa.states)
+    var seen = List[Bool](length=n, fill=False)
+    var layer: List[Int] = [nfa.start]
+    for d in range(cap):
+        var nxt = List[Int]()
+        while len(layer) > 0:
+            var s = layer.pop()
+            if s < 0 or s >= n or seen[s]:
+                continue
+            seen[s] = True
+            var kind = nfa.states[s].kind
+            if kind == NFAStateKind.MATCH:
+                return d
+            if kind == NFAStateKind.SPLIT:
+                layer.append(nfa.states[s].out1)
+                layer.append(nfa.states[s].out2)
+            elif (
+                kind == NFAStateKind.CHAR
+                or kind == NFAStateKind.CHARSET
+                or kind == NFAStateKind.ANY
+            ):
+                nxt.append(nfa.states[s].out1)
+            else:
+                layer.append(nfa.states[s].out1)
+        if len(nxt) == 0:
+            return cap
+        layer = nxt^
+    return cap
+
+
 def _dfa_candidate(nfa: NFA, cyclic: List[Bool]) -> Bool:
     """True when the pattern's SHAPE should run on a DFA engine (eager or
     lazy): capture-free, this is the classic/leftmost-first lanes
@@ -909,8 +1097,9 @@ def _dfa_candidate(nfa: NFA, cyclic: List[Bool]) -> Bool:
     backtracker — the trap that motivated the old exclusion).
 
     Word boundaries ride the DFA lanes too (the tables carry the
-    look-behind byte class per state — static_dfa.mojo). They do not
-    change the shape heuristic below: `\\bfoo\\b` stays a SIMD literal
+    look-behind byte class per state — static_dfa.mojo). They add one
+    admission to the shape heuristic below, a match of at least
+    WB_DFA_MIN_LEN bytes; otherwise `\\bfoo\\b` stays a SIMD literal
     scan plus two byte compares on the backtracker, which measured
     several times faster than a forward + reverse table walk. The one
     shape kept off outright is a word anchor whose continuation reaches
@@ -936,6 +1125,10 @@ def _dfa_candidate(nfa: NFA, cyclic: List[Bool]) -> Bool:
     if not (
         _has_alternation_splits(nfa, cyclic)
         or _quantifier_has_suffix(nfa, cyclic)
+        or (
+            nfa.has_word_boundary
+            and _min_match_len(nfa, WB_DFA_MIN_LEN) >= WB_DFA_MIN_LEN
+        )
     ):
         return False
     return not _eol_ml_continuation_consumes(
@@ -1008,8 +1201,9 @@ def _compute_strategy(
     sheng_ok: Bool,
     lit_alt_valid: Bool,
     pivot_ok: Bool,
-    fprefix_len: Int,
+    fprefix: List[UInt8],
     alt_prefix_valid: Bool,
+    alt_prefix_min_len: Int,
     dfa_candidate: Bool,
     lazy_lf_valid: Bool,
 ) -> MatchStrategy:
@@ -1045,23 +1239,42 @@ def _compute_strategy(
     var use_teddy_prefix = (
         alt_prefix_valid and HAS_FAST_BYTE_SHUFFLE and not use_teddy
     )
+    # A Teddy prefix longer than the filter prefix (the shared `A` of
+    # `ASIA|AKIA|AROA|AIDA`) filters better: its candidates are checked by
+    # literal compares, the filter prefix's by the engine.
+    # And a whole-pattern Teddy search finds its literals itself: the
+    # shared `S` of `Sherlock|Street` as a filter prefix would hand it one
+    # candidate per call (19.7 vs 8.7 us on sherlock).
+    var fprefix_len = len(fprefix)
+    if use_teddy or (use_teddy_prefix and alt_prefix_min_len > fprefix_len):
+        fprefix_len = 0
     # Required-byte fast-fail: only useful when no other scan already
     # filters by some byte. The pure-literal scan, the filter-prefix scan,
-    # the Teddy-prefix scan, and the pivot prefilter all SIMD-scan for
+    # the Teddy scans (whole pattern or prefix — `alpha|beta|gamma|delta`
+    # requires `a`, and a pre-scan doubled its search), and the pivot
+    # prefilter all SIMD-scan for
     # known bytes and short-circuit on absence, so the redundant check
     # would just add work. BOL-anchored patterns skip it too: their search
     # attempts only position 0, so a whole-input pre-scan is pure overhead.
+    # A filter prefix short-circuits on the absence of its own bytes
+    # only, so a required byte outside it still earns the check:
+    # `(a|aa)+b` has prefix `a`, and without the `b` pre-scan a miss
+    # walks every `a` of the input.
     var required_byte: Int
     if (
         use_simd_literal
-        or fprefix_len > 0
         or nfa.start_anchor == AnchorKind.BOL
         or pivot_ok
+        or use_teddy
         or use_teddy_prefix
     ):
         required_byte = -1
     else:
-        required_byte = extract_required_byte(nfa)
+        var skip = SIMD[DType.uint8, BITMAP_WIDTH](0)
+        for b in fprefix:
+            for c in [Int(b), Int(b) & ~0x20]:
+                skip[c >> 3] = skip[c >> 3] | (UInt8(1) << UInt8(c & 7))
+        required_byte = extract_required_byte(nfa, skip)
     return MatchStrategy(
         use_simd_literal=use_simd_literal,
         use_dfa=use_dfa,
@@ -1078,6 +1291,24 @@ def _compute_strategy(
         required_byte=required_byte,
         post_leading_anchor_start=nfa.start_after_leading_anchor,
     )
+
+
+@always_inline
+def _llf_step[
+    origin: Origin, //
+](
+    tb: UnsafePointer[UInt8, _],
+    cls: UnsafePointer[UInt8, _],
+    input: Span[Byte, origin],
+    s: Int,
+    i: Int,
+) -> Int:
+    """The lazy leftmost-first transition from byte-offset state `s` on
+    input byte `i` (see LLF_ROW_BYTES): the class half depends on the
+    input alone, so the chain from one state to the next is a single
+    register-offset load."""
+    var c = Int(cls[unsafe_offset=Int(input.unsafe_get(i))]) << 2
+    return Int((tb + c + s).bitcast[Int32]()[])
 
 
 struct _SpanPike[num_slots: Int, span: Bool](Movable):
@@ -1143,6 +1374,11 @@ struct _LFWalk[num_slots: Int, span: Bool, origin: MutOrigin](
 
     var speculate: Bool
     var pike: Pointer[_SpanPike[Self.num_slots, Self.span], Self.origin]
+    # The forward walker's acceleration still pays on this input; the
+    # first walk that finds it does not clears it for the rest of the verb
+    # (`edfa_match_at_adaptive`), so a findall over prose stops re-probing
+    # its skip states at every match.
+    var accel: Bool
 
     @always_inline
     def __init__(
@@ -1151,6 +1387,7 @@ struct _LFWalk[num_slots: Int, span: Bool, origin: MutOrigin](
     ):
         self.speculate = True
         self.pike = pike
+        self.accel = True
 
 
 struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
@@ -1254,8 +1491,9 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         and HAS_FAST_BYTE_SHUFFLE,
         Self._lit_alt.valid,
         Self._group_count == 0 and _pivot_prefilter(Self._edfa)[0] >= 0,
-        len(Self._fpre.bytes),
+        Self._fpre.bytes,
         Self._alt_prefix.valid,
+        Self._alt_prefix.min_len,
         Self._use_dfa_candidate,
         # Comptime `and` short-circuits left to right: a greedy pattern's
         # strategy never touches the leftmost-first tables, and neither
@@ -1310,7 +1548,50 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             and not _edfa_has_region(Self._lfdfa)
         )
     )
-    comptime _use_lf_lane = Self._use_lf_dfa or Self._use_dfa_span
+    # The LazyDFA's search verbs run leftmost-first when the pattern has no
+    # anchors or lookaround (lazy_lf.mojo): one unanchored forward walk
+    # for the leftmost-first end and a reverse walk for the start, both
+    # built at runtime — no anchored walk per start position and no
+    # backtracker re-run per match (`_lf_end_at`). They ride the
+    # leftmost-first lane's verb loops; `_lf_next_match` dispatches.
+    comptime _use_lazy_lf = Self._use_lazy_dfa and lazy_lf_eligible(Self.nfa)
+    # ...and for a single-class repeat (`single_class_repeat`) the forward
+    # walk reports the start too, so no reverse walk runs: on
+    # `(?u)\\p{L}{8,13}` over Russian prose that walk was a fifth of the
+    # search, its 600-state cache spilling out of L1.
+    comptime _llf_start_from_walk = Self._use_lazy_lf and single_class_repeat(
+        Self.pattern, Self.flags.value
+    )
+    # The leftmost-first table's bare restart states — one per start
+    # context — when a candidate scanner exists (see `_lf_find_end`): a
+    # literal filter, or a first-byte class rare enough that stopping to
+    # scan for it beats the accelerated loop's per-byte checks; all -1
+    # otherwise, and for a `^`-anchored pattern, which has no restart.
+    comptime _lf_restart_stops = (
+        SIMD[DType.int32, 4](
+            Int32(Self._lfdfa.start_other),
+            Int32(Self._lfdfa.start_after_nl),
+            Int32(Self._lfdfa.start_at_0),
+            Int32(Self._lfdfa.start_other_word),
+        ) if (
+            (
+                Self._use_scan_filter
+                or (
+                    Self._strategy.first_byte_useful
+                    and _byte_set_weight(Self._first_byte_bitmap)
+                    < LF_STOP_MAX_WEIGHT
+                )
+            )
+            and Self._strategy.start_anchor != AnchorKind.BOL
+        ) else SIMD[
+            DType.int32, 4
+        ](
+            -1
+        )
+    )
+    comptime _use_lf_lane = (
+        Self._use_lf_dfa or Self._use_dfa_span or Self._use_lazy_lf
+    )
     # The `span` type parameter of the lane's per-walk state (`_SpanPike`
     # / `_LFWalk`): on the lane, "fills slots" is exactly "has captures"
     # (the two lanes are mutually exclusive on `_group_count`), and this
@@ -1436,6 +1717,64 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     comptime _IL_PROBES = select_probe_offsets(
         Self._inner_lit.bytes, Self._inner_lit.caseless
     )
+    # Reverse inner (effect (c)): with an UNBOUNDED gap before the literal,
+    # walk left from each occurrence over the reverse DFA of the part of
+    # the pattern before it (`prefix_nfa`); the leftmost start found is
+    # where the scan begins — the leftmost match start whenever
+    # `rev_inner_safe` rules out an earlier match spanning an earlier
+    # occurrence. `\\w+\\s+Holmes` scans from the word before each
+    # "Holmes" instead of from the top of a 600 KB text.
+    comptime _rev_inner_ok = (
+        Self._use_rev_literal and rev_inner_safe(Self.nfa, Self._inner_lit)
+    )
+    comptime _prdfa = build_reverse_dfa(
+        prefix_nfa(Self.nfa, Self._inner_lit.lit_state), Self._rev_inner_ok
+    )
+    comptime _use_rev_inner = Self._rev_inner_ok and Self._prdfa.valid
+    comptime _PRDFA_TN = edfa_table_len(Self._prdfa.num_states)
+    comptime _PRDFA_DT = edfa_id_dtype(Self._prdfa.num_states)
+    comptime _PRDFA_TABLE_S = table_bytes[Self._PRDFA_DT](
+        Self._prdfa.table, Self._PRDFA_TN
+    )
+    comptime _PRDFA_FLAGS = int_arr[DType.uint8, Self._prdfa.num_states](
+        Self._prdfa.flags, 0
+    )
+    comptime _PRDFA_TABLE = static_bytes[Self._PRDFA_TABLE_S]()
+    # Backtracker lane: a required literal at a SMALL bounded offset window
+    # [min, max] (a single rare byte counts: `[a-q][^u-z]{13}x`) makes the
+    # candidate starts `max(pos, L - max)` for each occurrence L — the
+    # first occurrence at or after `pos + min` rules out every earlier
+    # start — instead of every position whose byte can begin a match.
+    # Only elaborated where the backtracker's search loops are.
+    comptime _bt_lit = extract_inner_literal[min_len=1](Self.nfa, Self._cyclic)
+    # A leading `\b` whose first bytes are all word bytes: every match
+    # starts where a word does, so the candidates are word starts rather
+    # than every first-byte position (`\b\w{12,}\b` in prose: one
+    # attempt per word, not per letter).
+    comptime _use_word_start = (
+        HAS_FAST_BYTE_SHUFFLE
+        and _leads_with_word_boundary(Self.nfa)
+        and _bitmap_within_words(Self._first_byte_bitmap)
+    )
+    comptime _use_bt_window = (
+        not Self._use_scan_filter
+        and Self._bt_lit.valid
+        and Self._bt_lit.max_offset >= 0
+        and Self._bt_lit.max_offset - Self._bt_lit.min_offset <= 8
+        and (
+            len(Self._bt_lit.bytes) >= 2
+            or (
+                not Self._bt_lit.caseless[0]
+                and Int(PROBE_RANKS[Int(Self._bt_lit.bytes[0])]) <= 170
+            )
+        )
+    )
+    comptime _BTL_N = len(Self._bt_lit.bytes)
+    comptime _BTL_LIT = list_arr[UInt8, Self._BTL_N](Self._bt_lit.bytes, 0)
+    comptime _BTL_CL = list_arr[Bool, Self._BTL_N](Self._bt_lit.caseless, False)
+    comptime _BTL_PROBES = select_probe_offsets(
+        Self._bt_lit.bytes, Self._bt_lit.caseless
+    )
     # Field, not a per-method call: the check runs a cycle-flags pass over
     # the NFA, and comptime memoization covers field declarations only.
     # Consulted by the Teddy and LazyDFA search lanes (_lf_end_at) and
@@ -1466,6 +1805,21 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     # tracks the input, and so does its cost. Field, not a call: the
     # check walks the NFA, and two fields read it.
     comptime _sbt_general_loop = Self._sbt_plan.needs_guard
+    # match() on a capture pattern whose backtracker recurses per input
+    # byte (a general loop: `([a-z]+[0-9]+)+x`): a miss costs the
+    # backtracker its whole exploration, which even memoized is many
+    # steps per byte, while the classic table decides membership in one
+    # pass. So long inputs are asked there first (Rust regex's meta engine
+    # does the same: a DFA finds the match before any capture engine
+    # runs). Simple-loop capture shapes stay as they are — their walk is
+    # already about one step per byte — and the `_group_count > 0 and`
+    # guard keeps the table unelaborated for everything else.
+    comptime _match_dfa_precheck = (
+        Self._group_count > 0
+        and Self._sbt_general_loop
+        and Self._dfa_shape_ok
+        and Self._edfa.valid
+    )
     comptime _lf_anchored_sbt = Self._use_dfa_span or (
         Self.nfa.has_lazy and not Self._sbt_general_loop
     )
@@ -1519,6 +1873,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
 
     var _dfa_nfa: NFA if Self._use_lazy_dfa else NoneType
     var _dfa: LazyDFA if Self._use_lazy_dfa else NoneType
+    var _llf: LazyLF if Self._use_lazy_lf else NoneType
     var _simd_lit: TypeForPrefixLength[
         Self._strategy.prefix_len
     ] if Self._strategy.use_simd_literal else NoneType
@@ -1548,6 +1903,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         else:
             self._dfa_nfa = rebind_var[type_of(self._dfa_nfa)](None)
             self._dfa = rebind_var[type_of(self._dfa)](None)
+        comptime if Self._use_lazy_lf:
+            var llf = LazyLF()
+            self._llf = rebind_var[type_of(self._llf)](llf^)
+        else:
+            self._llf = rebind_var[type_of(self._llf)](None)
         comptime if Self._strategy.use_simd_literal:
             comptime vec = Pointer(Self._prefix.unsafe_ptr()).unsafe_load[
                 width=Self._strategy.prefix_len
@@ -1622,21 +1982,62 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     @always_inline
     def _lf_find_end[
         origin: Origin, //
-    ](self, input: Span[Byte, origin], pos: Int) -> Int:
-        """Leftmost-first match END at or after `pos`, or -1."""
-        comptime if Self._use_lf_sheng:
-            return sheng_match_at[
+    ](self, input: Span[Byte, origin], pos: Int, mut accel: Bool) -> Int:
+        """Leftmost-first match END at or after `pos`, or -1. `accel` is
+        the walk's acceleration verdict (see `_LFWalk.accel`).
+
+        With a candidate scanner, the walk stops each time it falls back to
+        a bare restart state (one per start context) with nothing live and
+        resumes from the scanner's next candidate: the scan then touches
+        only the neighbourhoods of candidates, as Rust regex's lazy DFA
+        does when it re-enters its start state (a `(?iu)` Cyrillic literal
+        otherwise walks every byte of the text — its start state exits on
+        the D0/D1 lead bytes, too dense to accelerate)."""
+        comptime if Self._lf_restart_stops[0] >= 0:
+            var s = pos
+            var n = len(input)
+            while True:
+                var r: Int
+                comptime if Self._use_lf_sheng:
+                    r = edfa_match_at_adaptive[
+                        d=Self._lfdfa,
+                        table=Self._LF_SHENG_MASKS,
+                        flags=Self._LFDFA_FLAGS,
+                        cap=Self._LF_SHENG_CAP,
+                        stops=Self._lf_restart_stops,
+                    ](input, s, accel)
+                else:
+                    r = edfa_match_at_adaptive[
+                        d=Self._lfdfa,
+                        table=Self._LFDFA_TABLE,
+                        flags=Self._LFDFA_FLAGS,
+                        stops=Self._lf_restart_stops,
+                    ](input, s, accel)
+                if r >= -1:
+                    return r
+                var c: Int
+                comptime if Self._use_scan_filter:
+                    c = self._scan_candidate(input, n, -2 - r)
+                else:
+                    c = self._next_candidate_pos(input, n, -2 - r)
+                    if c >= n:
+                        return -1
+                if c < 0:
+                    return -1
+                s = c
+        elif Self._use_lf_sheng:
+            return edfa_match_at_adaptive[
                 d=Self._lfdfa,
-                cap=Self._LF_SHENG_CAP,
-                masks=Self._LF_SHENG_MASKS,
+                table=Self._LF_SHENG_MASKS,
                 flags=Self._LFDFA_FLAGS,
-            ](input, pos)
+                cap=Self._LF_SHENG_CAP,
+            ](input, pos, accel)
         else:
-            return edfa_match_at[
+            return edfa_match_at_adaptive[
                 d=Self._lfdfa,
                 table=Self._LFDFA_TABLE,
                 flags=Self._LFDFA_FLAGS,
-            ](input, pos)
+            ](input, pos, accel)
 
     @always_inline
     def _edfa_match_at[
@@ -1789,7 +2190,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     def _lf_next_match[
         origin: Origin, wo: MutOrigin, //
     ](
-        self,
+        mut self,
         input: Span[Byte, origin],
         pos: Int,
         mut walk: _LFWalk[Self._num_slots, Self._span_lane, wo],
@@ -1854,10 +2255,28 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         every line); a failed (-1) attempt is bounded by the scan's walk
         as above.
         """
-        comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+        comptime if Self._use_lazy_lf:
+            return self._llf_next_match(input, pos)
+        elif Self._strategy.start_anchor == AnchorKind.BOL:
             if pos > 0:
                 return (-1, -1)
-            var end = self._lf_find_end(input, 0)
+            comptime if Self._use_dfa_span:
+                # One anchored attempt is the whole search here, so when
+                # slots are wanted the backtracker's attempt IS the
+                # answer: its end and slots in one pass, where the table
+                # walk would scan the match and the confirm scan it
+                # again. A -1 is final (nothing else can start); only an
+                # exhausted budget takes the two-pass route below.
+                if fill:
+                    var budget = LF_SBT_ATTEMPT_BUDGET
+                    var aend = self._sbt_match_at(input, 0, slots, budget)
+                    if aend >= 0:
+                        return (0, aend)
+                    if aend == -1:
+                        return (-1, -1)
+                    for k in range(Self._num_slots):
+                        slots[k] = -1
+            var end = self._lf_find_end(input, 0, walk.accel)
             if end < 0:
                 return (-1, -1)
             comptime if Self._use_dfa_span:
@@ -1890,10 +2309,76 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 ](input, p + Self._inner_lit.min_offset)
                 if lit_pos < 0:
                     return (-1, -1)
-                comptime if Self._inner_lit.max_offset >= 0:
+                comptime if Self._inner_lit.max_offset >= 0 and not (
+                    Self._use_rev_inner
+                ):
                     var lb = lit_pos - Self._inner_lit.max_offset
                     if lb > p:
                         p = lb
+                elif Self._use_rev_inner:
+                    # (c) Per occurrence: the prefix's leftmost start (the
+                    # reverse walk), confirmed by an anchored probe on the
+                    # classic table; the first confirmed start is where
+                    # the scan begins. A later occurrence's reverse walk
+                    # stops at the previous occurrence and its probe must
+                    # lie past the last failed probe's stop (Rust regex's
+                    # `min_pre_start`), so each byte is walked a bounded
+                    # number of times; an inconclusive walk (-2, alive at
+                    # its floor) or an overlapping probe hands the call to
+                    # the plain scan from `p`.
+                    var st = rdfa_find_start[
+                        d=Self._prdfa,
+                        table=Self._PRDFA_TABLE,
+                        flags=Self._PRDFA_FLAGS,
+                    ](input, lit_pos, p)
+                    var min_pre = p
+                    while True:
+                        if st >= 0:
+                            if st < min_pre:
+                                break
+                            var pr = edfa_anchored_probe[
+                                d=Self._edfa,
+                                table=Self._EDFA_TABLE,
+                                flags=Self._EDFA_FLAGS,
+                            ](input, st)
+                            if pr[0] >= 0:
+                                comptime if Self._lf_anchored_classic:
+                                    # Longest end == leftmost-first end.
+                                    return (st, pr[0])
+                                elif not Self._use_dfa_span:
+                                    # A match starts at `st` and none
+                                    # earlier: the unanchored walk from
+                                    # `st` ends the leftmost-first one
+                                    # there, and no reverse walk is needed
+                                    # to find its start again.
+                                    var e = self._lf_find_end(
+                                        input, st, walk.accel
+                                    )
+                                    if e >= 0:
+                                        return (st, e)
+                                    p = st
+                                    break
+                                else:
+                                    p = st
+                                    break
+                            min_pre = pr[1]
+                        elif st == -2:
+                            break
+                        var floor = lit_pos + 1
+                        lit_pos = simd_find_literal_rare[
+                            lit=Self._IL_LIT,
+                            cl=Self._IL_CL,
+                            off_a=Self._IL_PROBES[0],
+                            off_b=Self._IL_PROBES[1],
+                            alt=Self._IL_PROBES[2],
+                        ](input, floor)
+                        if lit_pos < 0:
+                            return (-1, -1)
+                        st = rdfa_find_start_lim[
+                            d=Self._prdfa,
+                            table=Self._PRDFA_TABLE,
+                            flags=Self._PRDFA_FLAGS,
+                        ](input, lit_pos, floor)
             var s0 = self._lf_candidate(input, input_len, p)
             if s0 < 0:
                 return (-1, -1)
@@ -1909,7 +2394,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 if s0 < 0:
                     return (-1, -1)
             elif Self._lf_anchored_sbt:
-                if walk.speculate:
+                # Capture lane without `fill` (spans): no slots to save, so
+                # the attempt could only replace the reverse walk, and a
+                # quadratic shape (`.*(?:.*=.*)`) spends the whole budget
+                # doing it on every call.
+                if walk.speculate and (fill or not Self._use_dfa_span):
                     # The attempt IS the backtracker's first success from
                     # s0, so its slots are the answer — no confirm.
                     #
@@ -1947,7 +2436,137 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                             if spent < LF_SBT_ATTEMPT_BUDGET:
                                 continue
                         break
-            return self._lf_scan_match(input, s0, walk.pike, slots, fill)
+            return self._lf_scan_match(
+                input, s0, walk.pike, slots, fill, walk.accel
+            )
+
+    @no_inline
+    def _llf_next_match[
+        origin: Origin, //
+    ](mut self, input: Span[Byte, origin], pos: Int) -> Tuple[Int, Int]:
+        """`_lf_next_match` on the lazy leftmost-first engine
+        (`_use_lazy_lf`): the forward walk from the first candidate for
+        the end, the reverse walk back to `pos` for the start. A cache
+        that stops paying raises out of either walk, and the call is
+        re-run on the Pike VM from `pos`."""
+        var input_len = len(input)
+        var p = self._llf_candidate(input, input_len, pos)
+        if p < 0:
+            return (-1, -1)
+        try:
+            var fe = self._llf_find_end(input, p)
+            var end = fe[0]
+            if end < 0:
+                return (-1, -1)
+            comptime if Self._llf_start_from_walk:
+                return (fe[1], end)
+            ref nfa = rebind[NFA](self._dfa_nfa)
+            ref llf = rebind[LazyLF](self._llf)
+            var start = llf.rev_find_start(nfa, input, end, p)
+            assert start >= 0, "lazy reverse DFA lost the match start"
+            return (start, end)
+        except:
+            var nfa = materialize[Self.nfa]()
+            var num_states = len(nfa.states)
+            var vm = PikeVM[Self._num_slots](nfa^)
+            var bufs = _VMBuffers(num_states, Self._num_slots)
+            var r = vm._execute_with_bufs(input, pos, bufs, unanchored=True)
+            if not r.matched:
+                return (-1, -1)
+            return (r.start, r.end)
+
+    @always_inline
+    def _llf_candidate[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
+        """First position >= `pos` where a match can begin (filter prefix
+        / Teddy alternation prefix, else the first-byte class), `pos`
+        itself when there is no prefilter; -1 when none remains."""
+        comptime if Self._use_scan_filter:
+            return self._scan_candidate(input, input_len, pos)
+        elif Self._strategy.first_byte_useful:
+            return self._next_candidate_pos(input, input_len, pos)
+        else:
+            return pos
+
+    def _llf_find_end[
+        origin: Origin, //
+    ](mut self, input: Span[Byte, origin], p: Int) raises -> Tuple[Int, Int]:
+        """Leftmost-first end of the first match starting at or after `p`
+        (a candidate), or -1: one unanchored walk of the forward lazy
+        DFA. In the bare restart state nothing is live, so the walk jumps
+        to the next candidate instead of stepping the bytes between.
+        Second: where the walk last left that state (from `p`) — the
+        match start under `_llf_start_from_walk`, whose walks keep the
+        start tag for it."""
+        ref nfa = rebind[NFA](self._dfa_nfa)
+        ref llf = rebind[LazyLF](self._llf)
+        llf.ensure_init(nfa)
+        var input_len = len(input)
+        var row = llf.ncls * LLF_ROW_BYTES
+        var cur = llf.f_start * row
+        var last = p if llf.f_is_match(llf.f_start) else -1
+        var tb = llf.fwd.trans.unsafe_ptr().bitcast[UInt8]()
+        var cls = llf.cls.unsafe_ptr()
+
+        var q = p
+        var tstart = p
+        llf.f_begin(q)
+        while q < input_len:
+            # Plain transitions (no tag, not unknown/dead) four at a time:
+            # one unsigned compare per byte, the walk's only branch.
+            while q + 4 <= input_len:
+                var a = _llf_step(tb, cls, input, cur, q)
+                if UInt(a) > UInt(LLF_ID_MASK):
+                    break
+                var a2 = _llf_step(tb, cls, input, a, q + 1)
+                if UInt(a2) > UInt(LLF_ID_MASK):
+                    cur = a
+                    q += 1
+                    break
+                var a3 = _llf_step(tb, cls, input, a2, q + 2)
+                if UInt(a3) > UInt(LLF_ID_MASK):
+                    cur = a2
+                    q += 2
+                    break
+                var a4 = _llf_step(tb, cls, input, a3, q + 3)
+                if UInt(a4) > UInt(LLF_ID_MASK):
+                    cur = a3
+                    q += 3
+                    break
+                cur = a4
+                q += 4
+            if q >= input_len:
+                break
+            var t = _llf_step(tb, cls, input, cur, q)
+            if t < 0:
+                t = llf.f_step(nfa, cur // row, input.unsafe_get(q), q)
+                if t < 0:
+                    break
+                tb = llf.fwd.trans.unsafe_ptr().bitcast[UInt8]()
+            q += 1
+            cur = t & LLF_ID_MASK
+            if t > LLF_ID_MASK:
+                if (t & LLF_MATCH_TAG) != 0:
+                    last = q
+                comptime if Self._llf_start_from_walk:
+                    if (t & LLF_START_TAG) != 0:
+                        tstart = q
+                comptime if Self._use_scan_filter or Self._strategy.first_byte_useful:
+                    if (t & LLF_START_TAG) != 0:
+                        # Bare restart state: nothing live, so no match
+                        # can begin before the next candidate.
+                        llf.f_end(q)
+                        var c = self._llf_candidate(input, input_len, q)
+                        if c < 0 or c >= input_len:
+                            return (last, tstart)
+                        comptime if not Self._llf_start_from_walk:
+                            llf.f_jump_skipped(c - q)
+                        q = c
+                        tstart = c
+                        llf.f_begin(q)
+        llf.f_end(q)
+        return (last, tstart)
 
     @no_inline
     def _lf_scan_match[
@@ -1959,13 +2578,14 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         pike: Pointer[_SpanPike[Self._num_slots, Self._span_lane], wo],
         mut slots: Array[Int, Self._num_slots],
         fill: Bool,
+        mut accel: Bool,
     ) -> Tuple[Int, Int]:
         """The unanchored scan from `s0` for the end, the reverse walk for
         the start, and (capture lane, `fill`) the span confirm — the tail
         of `_lf_next_match` after its anchored-first attempt. Out of line
         so the walkers' bodies stay out of the verbs' loops, and handed
         the `_SpanPike` pointer by value (see `_LFWalk`)."""
-        var end = self._lf_find_end(input, s0)
+        var end = self._lf_find_end(input, s0, accel)
         if end < 0:
             return (-1, -1)
         var start = rdfa_find_start[
@@ -2206,6 +2826,39 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             # (e.g. a `(?u)\p{L}+` trie's ~2100 states). As `else` it is
             # elaborated only for patterns that actually reach the
             # backtracker (lookaround, backrefs, general shapes).
+            comptime if Self._match_dfa_precheck:
+                if input.byte_length() >= MATCH_PRECHECK_MIN:
+                    var ib = input.as_bytes()
+                    comptime if Self._rdfa.valid:
+                        # Both ends: a short forward probe (a dead walk is
+                        # final whatever follows), then the reverse DFA
+                        # from the end, which decides fullmatch on its own
+                        # — a match `[0, len)` exists iff position 0 is
+                        # its leftmost accepting start. Misses near either
+                        # end die in a few steps.
+                        var head = edfa_anchored_probe[
+                            d=Self._edfa,
+                            table=Self._EDFA_TABLE,
+                            flags=Self._EDFA_FLAGS,
+                        ](ib[:MATCH_PRECHECK_HEAD], 0)
+                        if head[1] < MATCH_PRECHECK_HEAD:
+                            return MatchResult[Self._num_slots].no_match()
+                        if (
+                            rdfa_find_start[
+                                d=Self._rdfa,
+                                table=Self._RDFA_TABLE,
+                                flags=Self._RDFA_FLAGS,
+                            ](ib, len(ib), 0)
+                            != 0
+                        ):
+                            return MatchResult[Self._num_slots].no_match()
+                    else:
+                        if not edfa_full_match[
+                            d=Self._edfa,
+                            table=Self._EDFA_TABLE,
+                            flags=Self._EDFA_FLAGS,
+                        ](ib):
+                            return MatchResult[Self._num_slots].no_match()
             try:
                 var sbt_memo = List[UInt64]()
                 var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
@@ -2236,8 +2889,15 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 else:
                     return self._pike_match(input)
 
-    def search(mut self, input: String) -> MatchResult[Self._num_slots]:
-        """Search for the first occurrence of the pattern in the input."""
+    def search(
+        mut self, input: String, pos: Int = 0
+    ) -> MatchResult[Self._num_slots]:
+        """Search for the first occurrence of the pattern in the input at
+        or after byte offset `pos` (Python's `Pattern.search(string,
+        pos)`: the rest of the input is still context — lookbehind and
+        `\\b` see the bytes before `pos` — while `^` without (?m) still
+        only matches at the real start)."""
+        var start_pos = min(max(pos, 0), input.byte_length())
         if self._required_byte_absent(input):
             return MatchResult[Self._num_slots].no_match()
         comptime if Self._strategy.use_simd_literal:
@@ -2245,10 +2905,10 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 self._simd_lit
             )
             var input_bytes = input.as_bytes()
-            var pos = simd_find_literal(input_bytes, lit, 0)
-            if pos < 0:
+            var at = self._lit_find(input_bytes, lit, start_pos)
+            if at < 0:
                 return MatchResult[Self._num_slots].no_match()
-            return Self._span_result(pos, pos + Self._strategy.prefix_len)
+            return Self._span_result(at, at + Self._strategy.prefix_len)
         elif Self._use_lf_lane:
             # The same two-line prologue opens every leftmost-first lane
             # verb: the walk's state lives in the verb's frame and the
@@ -2258,7 +2918,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             var walk = _LFWalk(Pointer(to=pike))
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var rng = self._lf_next_match(
-                input.as_bytes(), 0, walk, slots, fill=True
+                input.as_bytes(), start_pos, walk, slots, fill=True
             )
             if rng[0] < 0:
                 return MatchResult[Self._num_slots].no_match()
@@ -2273,6 +2933,8 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 # anchored attempt replaces the whole scan (mirrors the
                 # backtracker lane and the findall() DFA lane).
                 comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+                    if start_pos > 0:
+                        return MatchResult[Self._num_slots].no_match()
                     var match_end = self._dfa_match_at(input_bytes, 0)
                     if match_end >= 0:
                         return Self._span_result(
@@ -2283,7 +2945,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 # BOL_MULTILINE: matches start only at position 0 or right
                 # after a newline — attempt those and SIMD-skip between them.
                 elif Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
-                    var pos = 0
+                    var pos = start_pos
                     while pos <= input_len:
                         var match_end = self._dfa_match_at(input_bytes, pos)
                         if match_end >= 0:
@@ -2298,7 +2960,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     return MatchResult[Self._num_slots].no_match()
 
                 else:
-                    var pos = 0
+                    var pos = start_pos
                     while pos <= input_len:
                         comptime if Self._use_scan_filter:
                             pos = self._scan_candidate(
@@ -2331,7 +2993,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             except:
                 # See match(): only the lazy DFA can raise here.
                 comptime if Self._use_lazy_dfa:
-                    return self._pike_search(input)
+                    return self._pike_search(input, start_pos)
                 else:
                     assert False, "eager DFA walker raised"
                     return MatchResult[Self._num_slots].no_match()
@@ -2340,7 +3002,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             # comptime if/elif chain elaborates even for patterns whose
             # arm returned above (see match()).
             try:
-                return self._search_impl(input)
+                return self._search_impl(input, start_pos)
             except:
                 # See match(): dead for a backreference pattern, gated so
                 # the Pike VM is not elaborated into its binary.
@@ -2348,16 +3010,18 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     assert False, "backref lane raised"
                     return MatchResult[Self._num_slots].no_match()
                 else:
-                    return self._pike_search(input)
+                    return self._pike_search(input, start_pos)
 
     def _search_impl(
-        mut self, input: String
+        mut self, input: String, start_pos: Int = 0
     ) raises -> MatchResult[Self._num_slots]:
         var input_bytes = input.as_bytes()
         var input_len = input.byte_length()
 
         # BOL anchor: only try position 0
         comptime if Self._strategy.start_anchor == AnchorKind.BOL:
+            if start_pos > 0:
+                return MatchResult[Self._num_slots].no_match()
             # One attempt, so the buffer lives in this branch alone; the
             # other two branches own theirs.
             var sbt_memo = List[UInt64]()
@@ -2374,28 +3038,26 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
 
         else:
             comptime if Self._strategy.start_anchor == AnchorKind.BOL_MULTILINE:
-                return self._search_bol_multiline(input_bytes, input_len)
+                return self._search_bol_multiline(
+                    input_bytes, input_len, start_pos
+                )
             else:
-                return self._search_general(input_bytes, input_len)
+                return self._search_general(input_bytes, input_len, start_pos)
 
     def _search_general[
         origin: Origin, //
     ](
-        mut self, input: Span[Byte, origin], input_len: Int
+        mut self, input: Span[Byte, origin], input_len: Int, start_pos: Int
     ) raises -> MatchResult[Self._num_slots]:
         """General search, accelerated by SIMD prefix scan or first-byte bitmap.
         """
         # One (state, pos) memo for this whole walk — see _sbt_run.
         var sbt_memo = List[UInt64]()
-        var pos = 0
+        var pos = start_pos
         while pos <= input_len:
-            comptime if Self._use_scan_filter:
-                pos = self._scan_candidate(input, input_len, pos)
-                if pos < 0:
-                    return MatchResult[Self._num_slots].no_match()
-            else:
-                comptime if Self._strategy.first_byte_useful:
-                    pos = self._next_candidate_pos(input, input_len, pos)
+            pos = self._bt_candidate(input, input_len, pos)
+            if pos < 0:
+                return MatchResult[Self._num_slots].no_match()
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = self._bt(input, pos, slots, sbt_memo)
             if end >= 0:
@@ -2405,13 +3067,13 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     end=end,
                     slots=slots^,
                 )
-            pos = _scan_bump[Self._is_unicode](input, pos)
+            pos = self._bt_fail_next(input, pos)
         return MatchResult[Self._num_slots].no_match()
 
     def _search_bol_multiline[
         origin: Origin, //
     ](
-        mut self, input: Span[Byte, origin], input_len: Int
+        mut self, input: Span[Byte, origin], input_len: Int, start_pos: Int
     ) raises -> MatchResult[Self._num_slots]:
         """Search skipping to valid BOL_MULTILINE positions.
 
@@ -2425,7 +3087,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         # backtracker is specialized to it.
         comptime entry_state = Self._strategy.post_leading_anchor_start if Self._strategy.post_leading_anchor_start >= 0 else Self._start
         comptime skip_anchor = Self._strategy.post_leading_anchor_start >= 0
-        var pos = 0
+        var pos = start_pos
         while pos <= input_len:
             comptime if Self._use_scan_filter:
                 pos = self._scan_candidate(input, input_len, pos)
@@ -2486,7 +3148,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             var input_bytes = input.as_bytes()
             var pos = 0
             while True:
-                pos = simd_find_literal(input_bytes, lit, pos)
+                pos = self._lit_find(input_bytes, lit, pos)
                 if pos < 0:
                     break
                 results.append(
@@ -2631,6 +3293,39 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 else:
                     return self._pike_finditer(input)
 
+    def spans(mut self, input: String) -> List[Tuple[Int, Int]]:
+        """All non-overlapping match spans `(start, end)`, leftmost-first
+        — `finditer` without the capture slots. On the leftmost-first
+        lane the slots are never computed (the span confirm is the whole
+        cost of a capture pattern's match there); elsewhere the engine
+        produces them anyway and they are dropped."""
+        var out = List[Tuple[Int, Int]]()
+        comptime if Self._use_lf_lane:
+            if self._required_byte_absent(input):
+                return out^
+            var input_bytes = input.as_bytes()
+            var input_len = input.byte_length()
+            var pos = 0
+            var pike = _SpanPike[Self._num_slots, Self._span_lane]()
+            var walk = _LFWalk(Pointer(to=pike))
+            while pos <= input_len:
+                var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
+                var rng = self._lf_next_match(
+                    input_bytes, pos, walk, slots, fill=False
+                )
+                if rng[0] < 0:
+                    break
+                out.append(rng)
+                if rng[1] > rng[0]:
+                    pos = rng[1]
+                else:
+                    pos = _scan_bump[Self._is_unicode](input_bytes, rng[0])
+            return out^
+        else:
+            for m in self.finditer(input):
+                out.append((m.start, m.end))
+            return out^
+
     def findall(mut self, input: String) -> List[String]:
         """Find all non-overlapping matches and return their text.
 
@@ -2651,7 +3346,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             var input_bytes = input.as_bytes()
             var pos = 0
             while True:
-                pos = simd_find_literal(input_bytes, lit, pos)
+                pos = self._lit_find(input_bytes, lit, pos)
                 if pos < 0:
                     break
                 results.append(
@@ -2857,19 +3552,13 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             else:
                 var pos = 0
                 while pos <= input_len:
-                    comptime if Self._use_scan_filter:
-                        pos = self._scan_candidate(input_bytes, input_len, pos)
-                        if pos < 0:
-                            break
-                    else:
-                        comptime if Self._strategy.first_byte_useful:
-                            pos = self._next_candidate_pos(
-                                input_bytes, input_len, pos
-                            )
+                    pos = self._bt_candidate(input_bytes, input_len, pos)
+                    if pos < 0:
+                        break
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end < 0:
-                        pos = _scan_bump[Self._is_unicode](input_bytes, pos)
+                        pos = self._bt_fail_next(input_bytes, pos)
                         continue
                     self._findall_append(results, input, pos, end, slots)
                     if end > pos:
@@ -2983,19 +3672,13 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             else:
                 var pos = 0
                 while pos <= input_len:
-                    comptime if Self._use_scan_filter:
-                        pos = self._scan_candidate(input_bytes, input_len, pos)
-                        if pos < 0:
-                            break
-                    else:
-                        comptime if Self._strategy.first_byte_useful:
-                            pos = self._next_candidate_pos(
-                                input_bytes, input_len, pos
-                            )
+                    pos = self._bt_candidate(input_bytes, input_len, pos)
+                    if pos < 0:
+                        break
                     var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
                     var end = self._bt(input_bytes, pos, slots, sbt_memo)
                     if end < 0:
-                        pos = _scan_bump[Self._is_unicode](input_bytes, pos)
+                        pos = self._bt_fail_next(input_bytes, pos)
                         continue
                     results.append(
                         MatchResult[Self._num_slots](
@@ -3026,7 +3709,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             )
             var prev_end = 0
             while prev_end < input_len:
-                var pos = simd_find_literal(input_bytes, lit, prev_end)
+                var pos = self._lit_find(input_bytes, lit, prev_end)
                 if pos < 0:
                     break
                 if pos > prev_end:
@@ -3192,17 +3875,13 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         var prev_end = 0
         var pos = 0
         while pos <= input_len:
-            comptime if Self._use_scan_filter:
-                pos = self._scan_candidate(input_bytes, input_len, pos)
-                if pos < 0:
-                    break
-            else:
-                comptime if Self._strategy.first_byte_useful:
-                    pos = self._next_candidate_pos(input_bytes, input_len, pos)
+            pos = self._bt_candidate(input_bytes, input_len, pos)
+            if pos < 0:
+                break
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = self._bt(input_bytes, pos, slots, sbt_memo)
             if end < 0:
-                pos = _scan_bump[Self._is_unicode](input_bytes, pos)
+                pos = self._bt_fail_next(input_bytes, pos)
                 continue
             # Add text before match
             if pos > prev_end:
@@ -3358,17 +4037,13 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         var pos = 0
         var prev_end = 0
         while pos <= input_len:
-            comptime if Self._use_scan_filter:
-                pos = self._scan_candidate(input_bytes, input_len, pos)
-                if pos < 0:
-                    break
-            else:
-                comptime if Self._strategy.first_byte_useful:
-                    pos = self._next_candidate_pos(input_bytes, input_len, pos)
+            pos = self._bt_candidate(input_bytes, input_len, pos)
+            if pos < 0:
+                break
             var slots = materialize[ALL_NEG_ONES[Self._num_slots]]()
             var end = self._bt(input_bytes, pos, slots, sbt_memo)
             if end < 0:
-                pos = _scan_bump[Self._is_unicode](input_bytes, pos)
+                pos = self._bt_fail_next(input_bytes, pos)
                 continue
             parts.append(String(unsafe_from_utf8=input_bytes[prev_end:pos]))
             if end > pos:
@@ -3402,6 +4077,28 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
             )[0]
 
     @always_inline
+    def _lit_find[
+        origin: Origin, //
+    ](
+        self,
+        input: Span[Byte, origin],
+        lit: TypeForPrefixLength[Self._strategy.prefix_len],
+        pos: Int,
+    ) -> Int:
+        """Next occurrence of the pure literal at or after `pos` (SIMD-
+        literal lane), or -1: the two-rarest-probe memmem when the filter
+        prefix is the whole literal (always, for a pure literal of 2+
+        bytes), else a first-byte scan. Probing `S` and `k` finds
+        "Sherlock" where memchr on its first byte stopped at every
+        sentence-initial capital."""
+        comptime if (
+            Self._strategy.fprefix_len == Self._strategy.prefix_len
+            and Self._strategy.prefix_len >= 2
+        ):
+            return self._find_prefix_candidate(input, len(input), pos)
+        else:
+            return simd_find_literal(input, lit, pos)
+
     def _find_prefix_candidate[
         origin: Origin, //
     ](self, input: Span[Byte, origin], input_len: Int, start: Int) -> Int:
@@ -3465,12 +4162,33 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         `_compute_strategy`): True when a byte every match contains is
         missing from `input`. Always False, at comptime, without one."""
         comptime if Self._strategy.required_byte >= 0:
-            return (
-                simd_find_byte(
-                    input.as_bytes(), UInt8(Self._strategy.required_byte), 0
-                )
-                < 0
+            comptime lits = extract_required_literals(
+                Self.nfa, Self._strategy.required_byte
             )
+            comptime if (
+                lits.valid
+                and len(lits.lits) >= 2
+                and HAS_FAST_BYTE_SHUFFLE
+                and not Self._use_rev_literal
+            ):
+                # The chains the byte sits in (see
+                # extract_required_literals): a stricter test in one scan.
+                # Not for one literal, which the reverse-literal memmem
+                # already fails fast on (`[a-z]+://` would scan its whole
+                # miss twice), nor where that memmem runs anyway.
+                return (
+                    teddy_search_forward[alt=lits, want_end=False](
+                        input.as_bytes(), 0
+                    )[0]
+                    < 0
+                )
+            else:
+                return (
+                    simd_find_byte(
+                        input.as_bytes(), UInt8(Self._strategy.required_byte), 0
+                    )
+                    < 0
+                )
         else:
             return False
 
@@ -3484,6 +4202,65 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         return (Self._first_byte_bitmap[byte_idx] & (UInt8(1) << bit_idx)) != 0
 
     @always_inline
+    @always_inline
+    def _bt_candidate[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
+        """The backtracker search loops' next start candidate >= `pos`, or
+        -1 when none remains: the filter-prefix / Teddy scanner, else the
+        required-literal window (`_use_bt_window`), else the first-byte
+        class (which answers `input_len` rather than -1, so the end
+        position is still attempted), else `pos` itself."""
+        comptime if Self._use_scan_filter:
+            return self._scan_candidate(input, input_len, pos)
+        elif Self._use_bt_window:
+            var from_ = pos + Self._bt_lit.min_offset
+            var lit_pos: Int
+            comptime if Self._BTL_N == 1:
+                comptime b0 = Self._BTL_LIT[0]
+                lit_pos = simd_find_byte(input, b0, from_)
+            else:
+                lit_pos = simd_find_literal_rare[
+                    lit=Self._BTL_LIT,
+                    cl=Self._BTL_CL,
+                    off_a=Self._BTL_PROBES[0],
+                    off_b=Self._BTL_PROBES[1],
+                    alt=Self._BTL_PROBES[2],
+                ](input, from_)
+            if lit_pos < 0:
+                return -1
+            var c = lit_pos - Self._bt_lit.max_offset
+            return c if c > pos else pos
+        elif Self._use_word_start:
+            comptime km = build_class_masks(
+                stops_from_bitmap(Self._first_byte_bitmap)
+            )
+            comptime wm = build_class_masks(_word_bytes())
+            return find_word_start[
+                kind=km[0], t0=km[1], t1=km[2], wkind=wm[0], w0=wm[1], w1=wm[2]
+            ](input, pos)
+        elif Self._strategy.first_byte_useful:
+            return self._next_candidate_pos(input, input_len, pos)
+        else:
+            return pos
+
+    @always_inline
+    def _bt_fail_next[
+        origin: Origin, //
+    ](self, input: Span[Byte, origin], pos: Int) -> Int:
+        """Where the backtracker search loops resume after the attempt at
+        `pos` failed: past `pos`'s run of the pattern's leading loop class
+        when it has one (`_lead_loop_class` — every later start in the run
+        fails too; `(?m)\\w+$` tries each word once, not each letter),
+        else the next position."""
+        comptime lead = _lead_loop_class(Self.nfa)
+        comptime if lead[0] and not Self._is_unicode:
+            comptime km = build_class_masks(stops_from_bitmap(~lead[1]))
+            var r = find_in_class[kind=km[0], t0=km[1], t1=km[2]](input, pos)
+            return max(r, pos + 1)
+        else:
+            return _scan_bump[Self._is_unicode](input, pos)
+
     def _next_candidate_pos[
         origin: Origin, //
     ](self, input: Span[Byte, origin], input_len: Int, pos: Int) -> Int:
@@ -3495,10 +4272,20 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         byte shuffle; scalar bitmap walk elsewhere. Only meaningful when
         Self._strategy.first_byte_useful is True.
         """
-        comptime if HAS_FAST_BYTE_SHUFFLE:
-            comptime km = build_class_masks(
-                stops_from_bitmap(Self._first_byte_bitmap)
+        comptime fb = stops_from_bitmap(Self._first_byte_bitmap)
+        comptime if len(fb) <= 3:
+            # A set of one to three bytes: direct compares (memchr2/3),
+            # four vectors per iteration, instead of nibble shuffles.
+            comptime t = SIMD[DType.uint8, 4](
+                UInt8(fb[0]),
+                UInt8(fb[1 % len(fb)]),
+                UInt8(fb[2 % len(fb)]),
+                0,
             )
+            var r = simd_find_any[n=len(fb), targets=t](input, pos)
+            return r if r >= 0 else input_len
+        elif HAS_FAST_BYTE_SHUFFLE:
+            comptime km = build_class_masks(fb)
             # Scalar peek first (same rationale as the DFA search
             # prefilters): on dense-candidate text the byte at pos already
             # qualifies almost every call, and the peek resolves that in a
@@ -3569,10 +4356,11 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
     ](self, input: Span[Byte, origin], start: Int, dfa_end: Int) -> Int:
         """Resolve the leftmost-first (Python re) end of the match at `start`.
 
-        The Teddy and LazyDFA lanes report leftmost-longest ends — their
-        state sets carry no thread priority, so `a|ab` on "ab" yields end
-        2 where Python yields 1. Those lanes are still authoritative for
-        *finding* the leftmost start; this runs the backtracker once,
+        The LazyDFA lane reports leftmost-longest ends — its state sets
+        carry no thread priority, so `a|ab` on "ab" yields end 2 where
+        Python yields 1 (Teddy's ends are already leftmost-first and pass
+        through). That lane is still authoritative for *finding* the
+        leftmost start; this runs the backtracker once,
         anchored there, to disambiguate the end with the same semantics
         as every other engine. Costs one anchored run per reported match.
         The eager search lane no longer needs it: its leftmost-first table
@@ -3587,7 +4375,9 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         _dfa_end_is_leftmost_first), the re-run is skipped at compile time
         and the DFA's end is returned directly.
         """
-        comptime if Self._lf_end_is_dfa_end:
+        comptime if Self._lf_end_is_dfa_end or Self._strategy.use_teddy:
+            # Teddy's end is the first literal in pattern order that
+            # matches: leftmost-first already (teddy_match_at).
             return dfa_end
         else:
             try:
@@ -3617,13 +4407,19 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
         var bufs = _VMBuffers(num_states, Self._num_slots)
         return vm.full_match_with_bufs(input, bufs)
 
-    def _pike_search(self, input: String) -> MatchResult[Self._num_slots]:
+    def _pike_search(
+        self, input: String, start_pos: Int = 0
+    ) -> MatchResult[Self._num_slots]:
         """PikeVM fallback for search when backtracker exhausts budget."""
         var nfa = materialize[Self.nfa]()
         var num_states = len(nfa.states)
         var vm = PikeVM[Self._num_slots](nfa^)
         var bufs = _VMBuffers(num_states, Self._num_slots)
-        return vm.search_with_bufs(input, bufs)
+        if start_pos == 0:
+            return vm.search_with_bufs(input, bufs)
+        return vm._execute_with_bufs(
+            input.as_bytes(), start_pos, bufs, unanchored=True
+        )
 
     def _pike_finditer(
         self, input: String

@@ -455,6 +455,14 @@ def test_parse_literal_escapes() raises:
     assert_equal(_lit(parse("\\a"), 0), 7)
     var meta = parse("\\.\\*\\+\\?\\[\\]\\(\\)\\|\\{\\}\\^\\$\\\\")
     assert_equal(_literals(meta, meta.root), ".*+?[]()|{}^$\\")
+    # Python's rule outside a class too: any escaped non-alphanumeric is
+    # itself (rebar's veryl lexer writes `\-` and `\#`) ...
+    var punct = parse("\\-\\#\\@\\/\\'\\\"\\:\\,\\~\\&\\ \\<\\=")
+    assert_equal(_literals(punct, punct.root), "-#@/'\":,~& <=")
+    # ... a non-ASCII escape is its codepoint under (?u) ...
+    var uesc = parse("(?u)\\é")
+    assert_equal(_lit(uesc, _after_flags(uesc)), 0xE9)
+    # ... and an unknown letter escape stays an error.
     assert_equal(
         _err("\\q"), "RegexError at position 0: Invalid escape sequence '\\q'"
     )

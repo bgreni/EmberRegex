@@ -73,9 +73,21 @@ def test_multiline_bol_findall() raises:
 
 
 def test_multiline_eol_findall() raises:
-    var re = Regex["(?m)\\w+$"]()
+    # Also bench multiline_eol_findall_100_lines. Unanchored, the loop's
+    # exit into `$` fails for every word that does not end a line, so the
+    # search verbs take the table walk (one pass) instead of an attempt
+    # per word. Python: ['hello', 'world'] and ['here', 'cd'].
+    comptime R = Regex["(?m)\\w+$"]
+    assert_true(R._use_lf_dfa)
+    var re = R()
     var results = re.findall("hello\nworld")
-    assert_true(len(results) >= 1)
+    assert_equal(len(results), 2)
+    assert_equal(results[0], "hello")
+    assert_equal(results[1], "world")
+    var r2 = re.findall("line 0 some text here\nab cd\n")
+    assert_equal(len(r2), 2)
+    assert_equal(r2[0], "here")
+    assert_equal(r2[1], "cd")
 
 
 # --- DOTALL ---

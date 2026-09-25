@@ -11,6 +11,7 @@ with restore-on-return to eliminate slot copying.
 """
 
 from .constants import CHAR_NEWLINE, ascii_to_lower, is_word_byte
+from .utf8 import backref_icase_unicode
 from .nfa import NFA, NFAStateKind
 from .ast import AnchorKind
 from .result import MatchResult
@@ -707,6 +708,13 @@ def _heapbt_core[
                 if gs < 0 or ge < 0:
                     break
                 var n = ge - gs
+                if state.icase_unicode:
+                    var bend = backref_icase_unicode(input, gs, ge, pos)
+                    if bend < 0:
+                        break
+                    pos = bend
+                    s = state.out1
+                    continue
                 if pos + n > input_len:
                     break
                 var same = True

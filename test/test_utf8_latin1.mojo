@@ -37,6 +37,31 @@ def test_latin1_literal_not_a_raw_byte() raises:
     assert_equal(m.end, 5)
 
 
+def test_icase_unicode_folds_python_orbits() raises:
+    # (?iu) is Python str-pattern IGNORECASE: a character matches its
+    # whole case orbit — Cyrillic pairs, and ASCII `s`/`k` also `ſ` and
+    # the Kelvin sign (3 bytes) — and a negated class rejects the orbit.
+    # Python: re.fullmatch(r'(?i)ш[k]s[^а-я]', 'Шkſ1') -> match,
+    # ... 'ШKsП' -> None.
+    var re = Regex["(?iu)ш[k]s[^а-я]"]()
+    assert_true(re.match("Шkſ1").matched)
+    assert_true(re.match("шKS!").matched)
+    assert_false(re.match("ШKsП").matched)
+    assert_false(re.match("Шxs1").matched)
+
+
+def test_icase_unicode_backref_compares_lowercase() raises:
+    # A backreference folds by simple lowercase only (Python's
+    # GROUPREF_UNI_IGNORE), not by orbit: `ſ` lowers to itself, so it
+    # does not repeat an `s`, though the literal `s` matches it. The
+    # sides may differ in byte length (`K`/`k`).
+    var re = Regex["(?iu)(ш|s|k)\\1"]()
+    assert_true(re.match("шШ").matched)
+    assert_true(re.match("sS").matched)
+    assert_true(re.match("kK").matched)
+    assert_false(re.match("sſ").matched)
+
+
 def test_set_unicode_empty_matches_on_boundaries() raises:
     # All-ends reports of a vacuous (*UTF8) pattern must stay on
     # codepoint boundaries: (*UTF8)A* over "Aģ" reports ends {0,1,3} —

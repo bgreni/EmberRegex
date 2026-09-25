@@ -552,6 +552,14 @@ def teddy_front_end[
         _teddy_emit[k](cand, lane_bits(cand.ne(0)), at, verify)
 
 
+def _folds(cl: List[Bool]) -> List[Int]:
+    """Comptime: caseless flags as `_lit_at` fold bits."""
+    var f = List[Int]()
+    for c in cl:
+        f.append(0x20 if c else 0)
+    return f^
+
+
 @always_inline
 def _litset_verify_at[
     origin: Origin, //, ls: LiteralSet
@@ -570,10 +578,10 @@ def _litset_verify_at[
                 comptime for t in range(len(blits)):
                     comptime i = blits[t]
                     comptime lit = ls.lits[i].copy()
-                    comptime cli = ls.caseless[i].copy()
+                    comptime fi = _folds(ls.caseless[i])
                     comptime rid = ls.ids[i]
                     comptime L = len(lit)
-                    if _lit_at[lit=lit, cl=cli](input, at):
+                    if _lit_at[lit=lit, fold=fi](input, at):
                         push_report(out, SetMatch(rid, at + L))
 
 

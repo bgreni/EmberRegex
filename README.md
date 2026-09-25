@@ -32,7 +32,7 @@ platforms = ["osx-arm64"]          # and/or linux-64
 preview = ["pixi-build"]           # required for git/source dependencies
 
 [dependencies]
-mojo = "=1.0.0"
+mojo = "=1.1.0"
 emberregex = { git = "https://github.com/bgreni/EmberRegex.git" }
 ```
 
@@ -61,7 +61,7 @@ emberregex = { git = "https://github.com/bgreni/EmberRegex.git", rev = "28d5baa"
 Notes for consumers:
 
 - The `https://conda.modular.com/max` channel must be in your workspace — the package's
-  build and run dependency is `mojo-compiler ==1.0.0`, and a `.mojoc` is only loadable by
+  build and run dependency is `mojo-compiler ==1.1.0`, and a `.mojoc` is only loadable by
   the compiler version that produced it.
 - `preview = ["pixi-build"]` is required; without it Pixi rejects `git` dependencies.
 
@@ -102,6 +102,16 @@ if result:
     print(result.start, result.end)  # 4 6
 ```
 
+An optional start offset works like Python's `Pattern.search(string, pos)`:
+the search begins at `pos`, but the bytes before it are still context, so
+lookbehind and `\b` see them, while `^` (without MULTILINE) still only
+matches at offset 0:
+
+```mojo
+var r = re.search("abc 42 def 99", 6)
+print(r.start, r.end)  # 11 13
+```
+
 ### Find All
 
 `findall()` returns all non-overlapping matches as a list of strings. If the pattern has a capture group, it returns group 1 instead of the full match:
@@ -131,6 +141,19 @@ for i in range(len(matches)):
     ref m = matches[i]
     print(m.start, m.end, m.group_str(input, 1), m.group_str(input, 2))
 # 5 13 bob host
+```
+
+### Spans
+
+`spans()` returns the `(start, end)` of every match `finditer()` would
+report, without the capture slots. For a pattern with groups this is
+cheaper than `finditer()`: the DFA lanes find a span without ever running
+a capture engine.
+
+```mojo
+var re = Regex["(\\w+)@(\\w+)"]()
+var sp = re.spans("mail bob@host now x@y")
+# sp: [(5, 13), (18, 21)]
 ```
 
 ### Replace
@@ -190,7 +213,7 @@ re4.match("a\nb").matched  # True
 
 | Flag | Inline | Effect |
 | --- | --- | --- |
-| `RegexFlags.IGNORECASE` | `(?i)` | case-insensitive matching |
+| `RegexFlags.IGNORECASE` | `(?i)` | case-insensitive matching (ASCII; with `(?u)`, Unicode case — see below) |
 | `RegexFlags.MULTILINE` | `(?m)` | `^` and `$` also match at `\n` boundaries |
 | `RegexFlags.DOTALL` | `(?s)` | `.` also matches `\n` |
 | `RegexFlags.VERBOSE` | `(?x)` | whitespace and `#` comments in the pattern are ignored |
@@ -273,7 +296,7 @@ The `MatchResult` type is returned by `match()` and `search()`:
 | `[a-z]` | Character range |
 | `[^abc]` | Negated class |
 | `\p{L}`, `\P{L}` | Unicode property / negation — needs `(?u)`, see below |
-| `\\` | Escaped metacharacter |
+| `\.`, `\-`, `\#`, … | Any escaped non-alphanumeric character is that character (Python's rule); an escaped ASCII letter or digit that is not a known escape is a compile error |
 
 ### Unicode (UTF-8 mode)
 
@@ -302,6 +325,14 @@ Tables are generated from the Unicode Character Database (17.0) by
 `tools/gen_unicode_tables.py` and checked in, so building needs no
 Python.
 
+`(?iu)` is Python's `str`-pattern IGNORECASE: a character matches its whole
+case orbit, not just its upper/lower pair — `s` also matches `ſ`, `k` the
+Kelvin sign, and every Cyrillic, Greek or Latin-extended letter its other
+cases. The orbits come from CPython's own tables
+(`tools/gen_case_tables.py` → `case_tables.mojo`). Backreferences compare
+by simple lowercase instead, as Python does, so `(?iu)(s)\1` matches `sS`
+but not `sſ`.
+
 Three caveats worth knowing:
 
 - **`\d`, `\w`, `\s`, `\b` stay ASCII**, even under `(?u)`.
@@ -311,10 +342,11 @@ Three caveats worth knowing:
   `(*UCP)` is rejected at compile time rather than silently accepted as
   a UTF-8 alias — matching differently from PCRE would be worse than
   refusing.
-- **Big classes cost compile time.** `\p{L}` is 836 UTF-8 byte-sequences,
-  and all of that automaton construction happens at compile time
-  (`\p{Lu}` ≈ 3 min). Prefer the narrowest property that says what you
-  mean (`\p{Nd}` over `\p{L}` where it fits).
+- **Big classes cost compile time.** `\p{L}` is 836 UTF-8 byte-sequences.
+  They compile to their minimal byte automaton (968 NFA states), but all
+  of that construction happens at compile time, and a `\p{L}` pattern
+  still costs tens of seconds. Prefer the narrowest property that says
+  what you mean (`\p{Nd}` over `\p{L}` where it fits).
 - **Lookbehind is refused in UTF-8 mode.** It needs a fixed byte width,
   and a codepoint class spans 1-4 bytes.
 
@@ -463,7 +495,7 @@ At compile time, EmberRegex selects the fastest engine for the pattern:
 | DFA fits a shuffle tier (16/32/64 states on NEON, 16 on x86) | Sheng |
 | `can_use_dfa`, ≤ `EDFA_STATE_CAP` states, `match()` | eager comptime DFA |
 | the same pattern's search-family verbs | leftmost-first DFA for the end + reverse DFA for the start |
-| `can_use_dfa`, classic table larger than the cap | lazy DFA |
+| `can_use_dfa`, classic table larger than the cap | lazy DFA; its search verbs run a runtime-built leftmost-first DFA + reverse DFA (`lazy_lf.mojo`) |
 | captures, one-pass NFA with an alternation loop | one-pass DFA |
 | captures, same shape, search-family verbs | DFA-bounded span, then the slots filled on that span |
 | backrefs / lookaround / other capture shapes | specialized backtracker |
@@ -474,9 +506,11 @@ multi-pattern (`RegexSet`) engine ladder.
 
 Additional search accelerations applied regardless of engine:
 
-- **SIMD literal prefix scan** — when the pattern starts with a fixed string (e.g. `<` in `<\w+>`), scans 16 bytes at a time to skip non-candidate positions.
-- **First-byte bitmap** — 256-bit SIMD bitmap rejects positions where the first byte can't match.
-- **Position-skip optimization** — when the DFA dies at position P after starting at S, skips directly to P rather than trying every position in between.
+- **SIMD literal prefix scan** — when the pattern starts with a fixed string (e.g. `<` in `<\w+>`), memmem on its two rarest bytes skips non-candidate positions. An alternation of literals at the start (`(?:GET|POST) /...`) gets a Teddy scan instead.
+- **Required literals** — a literal every match must contain after an unbounded gap (`\w+\.txt`) is found with memmem first: no occurrence means no match, and a reverse DFA over the part before it recovers where the match starts (Rust regex's ReverseInner). A required byte, or the set of required literals it sits in (`ASIA|AKIA|...` in the AWS-key pattern), fails a search fast.
+- **First-byte bitmap** — 256-bit SIMD bitmap rejects positions where the first byte can't match; a pattern led by `\b` and a word character only tries word starts.
+- **Position-skip optimization** — when the DFA dies at position P after starting at S, skips directly to P rather than trying every position in between. The backtracker does the same for a pattern led by a greedy class loop: a failed attempt rules out every later start in the same run.
+- **DFA acceleration** — states that self-loop on almost every byte, and bounded counting runs like `[^"]{0,30}`, are skipped with a SIMD scan instead of stepped byte by byte. Each walk drops a kind of skip that stops paying.
 - **BOL/MULTILINE position skip** — patterns anchored at `^` with MULTILINE only try positions after each `\n`, reducing O(n) to O(lines).
 
 ## Development & Benchmarks
@@ -491,6 +525,10 @@ pixi run bench
 # Run Python re vs EmberRegex comparison
 pixi run compare
 pixi run -e pdf compare_pdf  # generate PDF report (requires reportlab)
+
+# Run Rust regex vs EmberRegex comparison: the bench suite plus a subset
+# of rebar (needs cargo on PATH; clones rebar on first run)
+pixi run compare_rust
 
 # Run PCRE2 JIT vs EmberRegex comparison (compiles C benchmark via CMake)
 pixi run -e pcre compare_pcre2

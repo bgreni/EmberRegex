@@ -807,3 +807,66 @@ def rdfa_find_start[
             return best
         cur = nxt
         pos -= 1
+
+
+@always_inline
+def rdfa_find_start_lim[
+    origin: Origin,
+    ns: Int,
+    //,
+    d: RDFA,
+    table: StringLiteral,
+    flags: Array[UInt8, ns],
+](input: Span[Byte, origin], end: Int, floor: Int) -> Int:
+    """`rdfa_find_start`, except that reaching `floor` (> 0) with the walk
+    still alive answers -2: a start further left cannot be ruled out. The
+    reverse-inner prefilter floors each walk at the previous literal
+    occurrence and falls back to the plain scan on -2, which is what
+    keeps its total work linear."""
+    comptime dt = edfa_id_dtype(d.num_states)
+    var tbl = table.ptr().unsafe_bitcast[Scalar[dt]]()
+    var flg = materialize[flags]()
+    var input_len = len(input)
+    var cur: Int
+    if end >= input_len:
+        cur = d.seed_at_end
+    elif input.unsafe_get(end) == CHAR_NEWLINE:
+        cur = d.seed_at_nl
+    else:
+        comptime if d.seed_other_word != d.seed_other:
+            cur = d.seed_other_word if is_word_byte(
+                input.unsafe_get(end)
+            ) else d.seed_other
+        else:
+            cur = d.seed_other
+    var pos = end
+    var best = -1
+    while True:
+        var f = flg.unsafe_get(cur)
+        comptime if d.accel.any():
+            pos = _rdfa_accel_skip[d=d](input, cur, pos, floor)
+        if (f & RDFA_NORM) != 0:
+            best = pos
+        if pos == 0:
+            comptime if d.any_bol0:
+                if (f & RDFA_BOL0) != 0:
+                    best = 0
+            comptime if d.any_wb:
+                if (f & RDFA_WB_LEFT_NONWORD) != 0:
+                    best = 0  # out of input is non-word
+            return best
+        var b = input.unsafe_get(pos - 1)
+        comptime if d.any_bolnl:
+            if (f & RDFA_BOLNL) != 0 and b == CHAR_NEWLINE:
+                best = pos
+        comptime if d.any_wb:
+            if (f & (RDFA_WB_LEFT_WORD | RDFA_WB_LEFT_NONWORD)) != 0:
+                if ((f & RDFA_WB_LEFT_WORD) != 0) == is_word_byte(b):
+                    best = pos
+        var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
+        if pos <= floor:
+            return best if nxt < 0 else -2
+        if nxt < 0:
+            return best
+        cur = nxt
+        pos -= 1

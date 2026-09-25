@@ -65,13 +65,27 @@ comptime SHENG_STATE_CAP = 64 if HAS_WIDE_BYTE_SHUFFLE else NIBBLE_TABLE_SIZE
 # regex instance plus init plumbing; the flat constant needs neither.
 
 
-def sheng_viable(d: EagerDFA) -> Bool:
-    """Comptime: can this DFA run on the shuffle engine?
+def _sheng_lanes(d: EagerDFA) -> Int:
+    """Comptime: lanes a shuffle table needs for this DFA — its states,
+    plus lane `d.num_states` for the dead state when some transition
+    dies. A leftmost-first table never dies (its restart threads stay
+    live), so a 64-state one fits the 64-lane tier exactly."""
+    var zero = SIMD[DType.int64, 256](0)
+    for s in range(d.num_states):
+        var row = (
+            Pointer(to=d.table[s * 256])
+            .unsafe_bitcast[Int64]()
+            .unsafe_load[width=256]()
+        )
+        if row.lt(zero).reduce_or():
+            return d.num_states + 1
+    return d.num_states
 
-    Strictly fewer than SHENG_STATE_CAP states because lane
-    `d.num_states` is reserved for the dead state.
-    """
-    return d.valid and d.num_states < SHENG_STATE_CAP
+
+def sheng_viable(d: EagerDFA) -> Bool:
+    """Comptime: can this DFA run on the shuffle engine — do its states,
+    and its dead lane if it has dead transitions, fit SHENG_STATE_CAP?"""
+    return d.valid and _sheng_lanes(d) <= SHENG_STATE_CAP
 
 
 def sheng_cap_for(d: EagerDFA, enabled: Bool) -> Int:
@@ -84,13 +98,12 @@ def sheng_cap_for(d: EagerDFA, enabled: Bool) -> Int:
     Never reports a tier this target cannot do in one instruction: off
     NEON, SHENG_STATE_CAP is NIBBLE_TABLE_SIZE and so is every answer.
     """
-    if (
-        not enabled
-        or SHENG_STATE_CAP == NIBBLE_TABLE_SIZE
-        or d.num_states < NIBBLE_TABLE_SIZE
-    ):
+    if not enabled or SHENG_STATE_CAP == NIBBLE_TABLE_SIZE:
         return NIBBLE_TABLE_SIZE
-    if d.num_states < 32:
+    var lanes = _sheng_lanes(d)
+    if lanes <= NIBBLE_TABLE_SIZE:
+        return NIBBLE_TABLE_SIZE
+    if lanes <= 32:
         return 32
     return 64
 

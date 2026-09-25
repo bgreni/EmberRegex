@@ -225,6 +225,50 @@ def test_finditer_spans() raises:
     assert_equal(matches[2].end, 9)
 
 
+def test_spans_is_finditer_without_slots() raises:
+    # `spans` reports what finditer would, minus the capture slots: the
+    # plain lane, the capture lane (slots never computed there) and
+    # empty matches. Python: [m.span() for m in re.finditer(...)].
+    var re = Regex["\\d+"]()
+    var sp = re.spans("a1b22c333")
+    assert_equal(len(sp), 3)
+    assert_equal(sp[1][0], 3)
+    assert_equal(sp[1][1], 5)
+    var cap = Regex["(\\w+)@(\\w+)"]()
+    var sp2 = cap.spans("mail bob@host now x@y")
+    assert_equal(len(sp2), 2)
+    assert_equal(sp2[0][0], 5)
+    assert_equal(sp2[0][1], 13)
+    assert_equal(sp2[1][0], 18)
+    assert_equal(sp2[1][1], 21)
+    var empty = Regex["x*"]()
+    var sp3 = empty.spans("axb")
+    assert_equal(len(sp3), 4)
+    assert_equal(sp3[1][0], 1)
+    assert_equal(sp3[1][1], 2)
+    assert_equal(sp3[3][0], 3)
+
+
+def test_search_from_pos() raises:
+    # Python's Pattern.search(string, pos): the search starts at `pos`,
+    # the input before it is still context.
+    var re = Regex["\\d+"]()
+    var a = re.search("a1b22c333", 2)
+    assert_equal(a.start, 3)
+    assert_equal(a.end, 5)
+    assert_false(re.search("a1b22c333", 9).matched)
+    var cap = Regex["(\\w+)@(\\w+)"]()
+    var input = "mail bob@host now"
+    var b = cap.search(input, 6)
+    assert_equal(b.start, 6)
+    assert_equal(b.end, 13)
+    assert_equal(b.group_str(input, 1), "ob")
+    var empty = Regex["x*"]()
+    var c = empty.search("axb", 2)
+    assert_equal(c.start, 2)
+    assert_equal(c.end, 2)
+
+
 def test_finditer_groups() raises:
     # Python: re.search(r'(\w+)@(\w+)', 'mail bob@host now')
     #         span (5, 13), groups ('bob', 'host')

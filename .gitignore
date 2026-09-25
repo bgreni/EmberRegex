@@ -16,3 +16,6 @@ FEATURES.md
 docs/superpowers
 .test_cache/
 .coverage/
+comparisons/rust_regex/target/
+comparisons/rebar/
+comparisons/rebar_gen/

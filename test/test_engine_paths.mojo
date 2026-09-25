@@ -18,6 +18,7 @@ from emberregex.ast import AnchorKind
 from emberregex.backtrack import sbt_memo_rows_of
 from emberregex.engine import (
     _build_static_nfa,
+    _lead_loop_class,
     _lf_end_deterministic_list,
     _lf_end_single_loop,
 )
@@ -113,6 +114,9 @@ def test_heapbt_backreferences() raises:
     var s2 = Array[Int, 2](fill=-1)
     assert_equal(_hbt[2]("(?i)(a)\\1", "aA", s2), 2)
     assert_equal(_hbt[2]("(?i)(a)\\1", "Ab", s2), -1)
+    # (?iu): codepoint-wise simple lowercase; the Kelvin sign is 3 bytes.
+    assert_equal(_hbt[2]("(?iu)(k)\\1", "k\u212a", s2), 4)
+    assert_equal(_hbt[2]("(?iu)(s)\\1", "s\u017f", s2), -1)
     assert_equal(_hbt[2]("(?:(a)|x)\\1", "x", s2), -1)
     assert_equal(_hbt[2]("(?:(a)|x)\\1", "aa", s2), 2)
     var s0 = Array[Int, 0](fill=-1)
@@ -391,6 +395,28 @@ def test_lazy_any_loop_stops_at_newline_when_stepping() raises:
     assert_equal(m.start, 2)
     assert_equal(m.end, 5)
     assert_equal(m.group_str(text, 1), "")
+
+
+def test_backtracker_skips_a_failed_leading_run() raises:
+    # `\\w+(?=,)` leads with a greedy loop and has no backreference: after
+    # the attempt at a word's first letter fails, every later start in
+    # that word fails too (each reaches a subset of the lookahead's
+    # positions), so the loops resume past the run. Lookaround keeps it on
+    # the backtracker. Python: [(3, 5), (10, 12)].
+    comptime R = Regex["\\w+(?=,)"]
+    comptime lead = _lead_loop_class(R.nfa)
+    assert_true(lead[0])
+    assert_false(R._use_lf_dfa)
+    var re = R()
+    var ms = re.finditer("ab cd, ef gh, ij kl")
+    assert_equal(len(ms), 2)
+    assert_equal(ms[0].start, 3)
+    assert_equal(ms[0].end, 5)
+    assert_equal(ms[1].start, 10)
+    assert_equal(ms[1].end, 12)
+    var mid = re.search("ab cd, ef", 4)
+    assert_equal(mid.start, 4)
+    assert_equal(mid.end, 5)
 
 
 def main() raises:

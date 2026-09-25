@@ -15,6 +15,7 @@ from emberregex import Regex
 from emberregex.simd_kernels import HAS_FAST_BYTE_SHUFFLE
 from emberregex.static_bytes import int_arr, static_bytes, table_bytes
 from emberregex.static_dfa import (
+    edfa_ladders,
     EDFA_TABLE_MIN_BYTES,
     EagerDFA,
     edfa_id_dtype,
@@ -870,6 +871,40 @@ def test_differential_prefilters() raises:
     _differential["foo(?:b|a[rz])"](_ALPHA_WORDS, "foo(?:b|a[rz])")
     # Pivot prefilter (`[class]+ P ...`).
     _differential["[a-z]+:[a-z.]+"]("abc:.: \né€", "[a-z]+:[a-z.]+")
+
+
+def test_rare_first_byte_class_stops_the_walk() raises:
+    # A first-byte class rare in text (quotes, LF_STOP_MAX_WEIGHT) gets
+    # the restart stops: the walk returns at a bare restart state and
+    # resumes from the class scan. A letter-led class keeps the
+    # accelerated walk (stopping at every word measured 3.4x slower).
+    # Python spans below.
+    comptime Q = Regex["[\"'][^\"']{0,30}[?!.][\"']"]
+    assert_true(Q._use_lf_dfa)
+    assert_true(Q._lf_restart_stops[0] >= 0)
+    # The `{0,30}` counting states form one ladder (edfa_ladders): 31
+    # rungs, then the state the last leaves for. The 40-byte run below
+    # outlasts it: the scan lands on the bare restart, a stop.
+    comptime lad = edfa_ladders(Q._lfdfa)
+    comptime nlad = len(lad.chains)
+    assert_equal(nlad, 1)
+    comptime rungs = len(lad.chains[0]) - 1
+    assert_equal(rungs, 31)
+    assert_equal(Regex["[a-zA-Z]+ing"]._lf_restart_stops[0], -1)
+    var re = Q()
+    var t = (
+        String('He said, "Stop!" and \'why?\' then "x')
+        + String("y") * 40
+        + '." and "ok." "'
+    )
+    var ms = re.finditer(t)
+    assert_equal(len(ms), 3)
+    assert_equal(ms[0].start, 9)
+    assert_equal(ms[0].end, 16)
+    assert_equal(ms[1].start, 21)
+    assert_equal(ms[1].end, 27)
+    assert_equal(ms[2].start, 82)
+    assert_equal(ms[2].end, 87)
 
 
 def main() raises:

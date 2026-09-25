@@ -22,6 +22,20 @@ records. With it, `(?u)` patterns are codepoint-correct while the engines
 stay byte-level.
 """
 
+from .case_tables import (
+    CASE_CPS,
+    CASE_LOWER_KEYS,
+    CASE_LOWER_VALS,
+    CASE_NCPS,
+    CASE_NLOWER,
+    CASE_NORBITS,
+    CASE_ORBIT_MEMBERS,
+    CASE_ORBIT_OF,
+    CASE_ORBIT_START,
+    CASE_W,
+)
+from .static_bytes import static_bytes, table_bytes
+
 # Largest codepoint encodable in n bytes.
 comptime _MAX1 = 0x7F
 comptime _MAX2 = 0x7FF
@@ -615,3 +629,242 @@ def negate_ranges(ranges: List[Int]) -> List[Int]:
         out.append(cursor)
         out.append(0x10FFFF)
     return out^
+
+
+def _case_vec(t: List[Int]) -> SIMD[DType.int32, CASE_W]:
+    """A padded case table as one vector: lane reads are free in the
+    comptime interpreter, where every List access costs 35-70 us."""
+    return (
+        Pointer(to=t[0])
+        .unsafe_bitcast[Int64]()
+        .unsafe_load[width=CASE_W]()
+        .cast[DType.int32]()
+    )
+
+
+comptime _CPS = _case_vec(materialize[CASE_CPS]())
+comptime _ORBIT_OF = _case_vec(materialize[CASE_ORBIT_OF]())
+comptime _ORBIT_START = _case_vec(materialize[CASE_ORBIT_START]())
+comptime _ORBIT_MEMBERS = _case_vec(materialize[CASE_ORBIT_MEMBERS]())
+
+
+def _case_index(cps: SIMD[DType.int32, CASE_W], cp: Int, start: Int) -> Int:
+    """First index `>= start` of the ascending case codepoints whose value
+    is `>= cp` (`CASE_NCPS` when there is none)."""
+    var lo = start
+    var hi = CASE_NCPS
+    while lo < hi:
+        var mid = (lo + hi) // 2
+        if Int(cps[mid]) < cp:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@no_inline
+def case_orbit(cp: Int) -> List[Int]:
+    """Comptime: the codepoints `(?iu)` matches for literal `cp`, ascending —
+    CPython `re`'s IGNORECASE orbit (case_tables.mojo), or `[cp]` when
+    `cp` is uncased."""
+    var cps = _CPS
+    var i = _case_index(cps, cp, 0)
+    if i == CASE_NCPS or Int(cps[i]) != cp:
+        return [cp]
+    var starts = _ORBIT_START
+    var members = _ORBIT_MEMBERS
+    var oid = Int(_ORBIT_OF[i])
+    var out = List[Int]()
+    for k in range(Int(starts[oid]), Int(starts[oid + 1])):
+        out.append(Int(members[k]))
+    return out^
+
+
+@no_inline
+def normalize_ranges(ranges: List[Int]) -> List[Int]:
+    """Flat (lo, hi) pairs sorted by `lo`, overlapping and adjacent pairs
+    merged. Already-sorted input (every property table) costs one element
+    access per pair on the sort."""
+    var n = len(ranges) // 2
+    var los = List[Int]()
+    var his = List[Int]()
+    for i in range(n):
+        los.append(ranges[2 * i])
+        his.append(ranges[2 * i + 1])
+    var prev = los[0] if n > 0 else 0
+    for i in range(1, n):
+        var cur = los[i]
+        if cur >= prev:
+            prev = cur
+            continue
+        var kh = his[i]
+        var j = i - 1
+        while j >= 0 and los[j] > cur:
+            los[j + 1] = los[j]
+            his[j + 1] = his[j]
+            j -= 1
+        los[j + 1] = cur
+        his[j + 1] = kh
+    var out = List[Int]()
+    for i in range(n):
+        if len(out) > 0 and los[i] <= out[len(out) - 1] + 1:
+            if his[i] > out[len(out) - 1]:
+                out[len(out) - 1] = his[i]
+        else:
+            out.append(los[i])
+            out.append(his[i])
+    return out^
+
+
+@no_inline
+def case_fold_ranges(ranges: List[Int]) -> List[Int]:
+    """Comptime: `ranges` closed under CPython `re`'s IGNORECASE orbits,
+    sorted and merged — what a `(?iu)` class matches before negation.
+
+    Two linear passes instead of a sort: pass 1 walks the (ascending)
+    orbit codepoints that fall in the class and marks their orbits; pass 2
+    lists the marked orbits' members in ascending order — by gathering
+    them when few orbits were hit, by one walk of the table otherwise.
+    """
+    var norm = normalize_ranges(ranges)
+    var cps = _CPS
+    var orbit_of = _ORBIT_OF
+    var hit = List[Bool](length=CASE_NORBITS, fill=False)
+    var hit_ids = List[Int]()
+    var i = 0
+    for r in range(len(norm) // 2):
+        i = _case_index(cps, norm[2 * r], i)
+        var hi = norm[2 * r + 1]
+        while i < CASE_NCPS and Int(cps[i]) <= hi:
+            var o = Int(orbit_of[i])
+            if not hit[o]:
+                hit[o] = True
+                hit_ids.append(o)
+            i += 1
+    if len(hit_ids) == 0:
+        return norm^
+
+    var added = List[Int]()
+    if len(hit_ids) <= 32:
+        var starts = _ORBIT_START
+        var members = _ORBIT_MEMBERS
+        for o in hit_ids:
+            for k in range(Int(starts[o]), Int(starts[o + 1])):
+                var v = Int(members[k])
+                var j = len(added)
+                added.append(v)
+                while j > 0 and added[j - 1] > v:
+                    added[j] = added[j - 1]
+                    j -= 1
+                added[j] = v
+    else:
+        for j in range(CASE_NCPS):
+            if hit[Int(orbit_of[j])]:
+                added.append(Int(cps[j]))
+
+    # Merge the class ranges with the (ascending) orbit members.
+    var both = List[Int]()
+    var a = 0
+    var b = 0
+    while a < len(norm) or b < len(added):
+        var lo: Int
+        var hi: Int
+        if b == len(added) or (a < len(norm) and norm[a] <= added[b]):
+            lo = norm[a]
+            hi = norm[a + 1]
+            a += 2
+        else:
+            lo = added[b]
+            hi = lo
+            b += 1
+        if len(both) > 0 and lo <= both[len(both) - 1] + 1:
+            if hi > both[len(both) - 1]:
+                both[len(both) - 1] = hi
+        else:
+            both.append(lo)
+            both.append(hi)
+    return both^
+
+
+# --- runtime: `(?iu)` backreferences ----------------------------------------
+
+comptime _LOWER_KEYS_S = table_bytes[DType.int32](
+    materialize[CASE_LOWER_KEYS](), CASE_NLOWER
+)
+comptime _LOWER_VALS_S = table_bytes[DType.int32](
+    materialize[CASE_LOWER_VALS](), CASE_NLOWER
+)
+
+
+def _simple_lower(cp: Int) -> Int:
+    """`_sre.unicode_tolower`: CPython's simple lowercase mapping."""
+    if cp < 0x80:
+        return cp + 32 if cp >= 0x41 and cp <= 0x5A else cp
+    var keys = static_bytes[_LOWER_KEYS_S]().ptr().unsafe_bitcast[Int32]()
+    var lo = 0
+    var hi = CASE_NLOWER
+    while lo < hi:
+        var mid = (lo + hi) // 2
+        if Int(keys[unsafe_offset=mid]) < cp:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < CASE_NLOWER and Int(keys[unsafe_offset=lo]) == cp:
+        return Int(
+            static_bytes[_LOWER_VALS_S]()
+            .ptr()
+            .unsafe_bitcast[Int32]()[unsafe_offset=lo]
+        )
+    return cp
+
+
+def _utf8_decode_at(input: Span[Byte, _], pos: Int, mut cp: Int) -> Int:
+    """Byte length of the UTF-8 sequence at `pos` (< len(input)), its
+    codepoint in `cp`. A malformed or truncated sequence decodes as its
+    lead byte alone (0x80+), so raw bytes still compare byte for byte."""
+    var b0 = Int(input.unsafe_get(pos))
+    cp = b0
+    if b0 < 0xC0:
+        return 1
+    var n = 2 if b0 < 0xE0 else (3 if b0 < 0xF0 else 4)
+    if b0 >= 0xF8 or pos + n > len(input):
+        return 1
+    var v = b0 & (0x7F >> n)
+    for k in range(1, n):
+        var c = Int(input.unsafe_get(pos + k))
+        if c & 0xC0 != 0x80:
+            return 1
+        v = (v << 6) | (c & 0x3F)
+    cp = v
+    return n
+
+
+def backref_icase_unicode(
+    input: Span[Byte, _], gs: Int, ge: Int, pos: Int
+) -> Int:
+    """End of a `(?iu)` backreference to `input[gs:ge]` matched at `pos`, or
+    -1. Python str semantics (`GROUPREF_UNI_IGNORE`): codepoint by codepoint,
+    equal under simple lowercase — which is NOT the literal orbit (`s` and
+    `ſ` fold together in a literal, not here). The two sides may differ in
+    byte length (`K` is 3 bytes, `k` one)."""
+    var p = gs
+    var q = pos
+    var n = len(input)
+    while p < ge:
+        if q >= n:
+            return -1
+        var a = Int(input.unsafe_get(p))
+        var b = Int(input.unsafe_get(q))
+        if a < 0x80 and b < 0x80:
+            if a != b and _simple_lower(a) != _simple_lower(b):
+                return -1
+            p += 1
+            q += 1
+            continue
+        var ca = 0
+        var cb = 0
+        p += _utf8_decode_at(input, p, ca)
+        q += _utf8_decode_at(input, q, cb)
+        if ca != cb and _simple_lower(ca) != _simple_lower(cb):
+            return -1
+    return q

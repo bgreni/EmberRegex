@@ -86,8 +86,9 @@ def simd_find_byte[
 ](input: Span[Byte, origin], byte_val: UInt8, start: Int,) -> Int:
     """Find the first occurrence of byte_val in input starting from start.
 
-    Uses SIMD to scan simd_width_of[DType.uint8]() bytes at a time,
-    with scalar fallback for the tail.
+    Uses SIMD to scan simd_width_of[DType.uint8]() bytes at a time; the
+    tail is one more chunk overlapping the last (scalar only for inputs
+    shorter than a chunk).
     """
     comptime W = simd_width_of[DType.uint8]()
     var length = len(input)
@@ -99,7 +100,21 @@ def simd_find_byte[
     # SIMD scan W bytes at a time. The miss check (xor + min-reduce) is
     # deliberately separate from the hit-index extraction: it measures
     # faster than deriving both from one movemask on NEON, and the
-    # extraction then runs at most once per call.
+    # extraction then runs at most once per call. One chunk first (a
+    # near hit pays nothing extra), then four per miss test, memchr-style.
+    if i + W <= length:
+        var chunk = ptr.unsafe_offset(i).unsafe_load[width=W]()
+        if (chunk ^ target).reduce_min() == 0:
+            return i + first_lane_index(lane_bits(chunk.eq(target)))
+        i += W
+    while i + 4 * W <= length:
+        var x0 = ptr.unsafe_offset(i).unsafe_load[width=W]() ^ target
+        var x1 = ptr.unsafe_offset(i + W).unsafe_load[width=W]() ^ target
+        var x2 = ptr.unsafe_offset(i + 2 * W).unsafe_load[width=W]() ^ target
+        var x3 = ptr.unsafe_offset(i + 3 * W).unsafe_load[width=W]() ^ target
+        if min(min(x0, x1), min(x2, x3)).reduce_min() == 0:
+            break
+        i += 4 * W
     while i + W <= length:
         var chunk = ptr.unsafe_offset(i).unsafe_load[width=W]()
         if (chunk ^ target).reduce_min() == 0:
@@ -107,12 +122,84 @@ def simd_find_byte[
             return i + first_lane_index(bits)
         i += W
 
-    # Scalar tail
+    if i >= length:
+        return -1
+    if length >= W:
+        var base = length - W
+        var m = ptr.unsafe_offset(base).unsafe_load[width=W]().eq(
+            target
+        ) & iota[DType.uint8, W]().ge(UInt8(i - base))
+        var bits = lane_bits(m)
+        return base + first_lane_index(bits) if bits != 0 else -1
+
     while i < length:
         if UInt8(ptr[unsafe_offset=i]) == byte_val:
             return i
         i += 1
 
+    return -1
+
+
+def simd_find_any[
+    origin: Origin, //, n: Int, targets: SIMD[DType.uint8, 4]
+](input: Span[Byte, origin], start: Int) -> Int:
+    """First position >= `start` whose byte is one of the first `n` (1-4)
+    `targets`, or -1: memchr2/3-style, four vectors per iteration with one
+    combined miss test."""
+    comptime W = simd_width_of[DType.uint8]()
+    comptime V = SIMD[DType.uint8, W]
+    var length = len(input)
+    var i = start
+    var ptr = Pointer(input.unsafe_ptr())
+
+    @always_inline
+    def hits(chunk: V) -> SIMD[DType.bool, W]:
+        var m = chunk.eq(V(targets[0]))
+        comptime for k in range(1, n):
+            m = m | chunk.eq(V(targets[k]))
+        return m
+
+    while i + 4 * W <= length:
+        var a = hits(ptr.unsafe_offset(i).unsafe_load[width=W]())
+        var b = hits(ptr.unsafe_offset(i + W).unsafe_load[width=W]())
+        var c = hits(ptr.unsafe_offset(i + 2 * W).unsafe_load[width=W]())
+        var d = hits(ptr.unsafe_offset(i + 3 * W).unsafe_load[width=W]())
+        if ((a | b) | (c | d)).reduce_or():
+            var ba = lane_bits(a)
+            if ba != 0:
+                return i + first_lane_index(ba)
+            var bb = lane_bits(b)
+            if bb != 0:
+                return i + W + first_lane_index(bb)
+            var bc = lane_bits(c)
+            if bc != 0:
+                return i + 2 * W + first_lane_index(bc)
+            return i + 3 * W + first_lane_index(lane_bits(d))
+        i += 4 * W
+    while i + W <= length:
+        var a = hits(ptr.unsafe_offset(i).unsafe_load[width=W]())
+        var ba = lane_bits(a)
+        if ba != 0:
+            return i + first_lane_index(ba)
+        i += W
+    if i >= length:
+        return -1
+    if length >= W:
+        # The tail as one chunk ending at the input's end, overlapping
+        # the last with the lanes before `i` masked off: short inputs
+        # (grep's per-line calls) end on a vector compare, not a byte loop.
+        var base = length - W
+        var a = hits(ptr.unsafe_offset(base).unsafe_load[width=W]()) & iota[
+            DType.uint8, W
+        ]().ge(UInt8(i - base))
+        var ba = lane_bits(a)
+        return base + first_lane_index(ba) if ba != 0 else -1
+    while i < length:
+        var c = UInt8(ptr[unsafe_offset=i])
+        comptime for k in range(n):
+            if c == targets[k]:
+                return i
+        i += 1
     return -1
 
 
@@ -215,26 +302,24 @@ def simd_find_literal_rare[
     inner-literal strategy shares one kernel.
 
     The ranks are a static guess: `[`/`]` are rare in prose and on
-    every line of a log. When more than a quarter of the blocks so far
-    raised a gate candidate that did not verify, the scan re-enters
-    gated on `alt` (a literal byte that is neither probe byte; -1 = no
-    such byte, never switch). One switch per call — the hit path is at
-    worst the pre-switch cost again, never a loop. The switch leaves the
-    scan as a sentinel and re-enters here, so the scan stays a leaf.
+    every line of a log, and a CJK lead byte ranked rare shows up every
+    few dozen bytes of Chinese. When more than a quarter of the blocks
+    so far raised a gate candidate that did not verify, the scan
+    re-enters PAIRED — every chunk tests two bytes and branches only on
+    a joint hit (memchr's packed pair) — on `alt` (a literal byte that
+    is neither probe byte) and the gate, or on both probes when there is
+    no `alt`. One switch per call. The switch leaves the scan as a
+    sentinel and re-enters here, so the scan stays a leaf.
     """
-    comptime if alt >= 0:
-        var r = _rare_scan[
-            lit=lit, cl=cl, off_a=off_a, off_b=off_b, adapt=True
-        ](input, start)
-        if r >= -1:
-            return r
-        return _rare_scan[lit=lit, cl=cl, off_a=alt, off_b=off_a, adapt=False](
-            input, -2 - r
-        )
-    else:
-        return _rare_scan[
-            lit=lit, cl=cl, off_a=off_a, off_b=off_b, adapt=False
-        ](input, start)
+    var r = _rare_scan[
+        lit=lit, cl=cl, off_a=off_a, off_b=off_b, adapt=True, paired=False
+    ](input, start)
+    if r >= -1:
+        return r
+    comptime pa = alt if alt >= 0 else off_b
+    return _rare_scan[
+        lit=lit, cl=cl, off_a=pa, off_b=off_a, adapt=False, paired=True
+    ](input, -2 - r)
 
 
 def _rare_scan[
@@ -246,10 +331,12 @@ def _rare_scan[
     off_a: Int,
     off_b: Int,
     adapt: Bool,
+    paired: Bool,
 ](input: Span[Byte, origin], start: Int) -> Int:
     """simd_find_literal_rare's scan. With `adapt`, returns `-2 - pos`
     when the gate proved dense: `pos` is where the scan stopped, every
-    candidate before it rejected."""
+    candidate before it rejected. `paired` tests both probes in the
+    unrolled body instead of gating on `off_a` alone."""
     comptime assert n >= 2, "simd_find_literal_rare needs a >= 2 byte literal"
     comptime assert (
         0 <= off_a < n and 0 <= off_b < n and off_a != off_b
@@ -290,19 +377,43 @@ def _rare_scan[
             e1 = probe_eq[caseless=ca, target=byte_a](b1)
             e2 = probe_eq[caseless=ca, target=byte_a](b2)
             e3 = probe_eq[caseless=ca, target=byte_a](b3)
+            comptime if paired:
+                var c0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
+                var c1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[
+                    width=W
+                ]()
+                var c2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[
+                    width=W
+                ]()
+                var c3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[
+                    width=W
+                ]()
+                e0 = e0 & probe_eq[caseless=cb, target=byte_b](c0)
+                e1 = e1 & probe_eq[caseless=cb, target=byte_b](c1)
+                e2 = e2 & probe_eq[caseless=cb, target=byte_b](c2)
+                e3 = e3 & probe_eq[caseless=cb, target=byte_b](c3)
             if (e0 | e1 | e2 | e3).reduce_or():
                 break
             pos += 4 * W
         if pos + 4 * W + last_off > input_len:
             break
-        var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
-        var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[width=W]()
-        var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[width=W]()
-        var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[width=W]()
-        var m0 = e0 & probe_eq[caseless=cb, target=byte_b](l0)
-        var m1 = e1 & probe_eq[caseless=cb, target=byte_b](l1)
-        var m2 = e2 & probe_eq[caseless=cb, target=byte_b](l2)
-        var m3 = e3 & probe_eq[caseless=cb, target=byte_b](l3)
+        var m0 = e0
+        var m1 = e1
+        var m2 = e2
+        var m3 = e3
+        comptime if not paired:
+            var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
+            var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[width=W]()
+            var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[
+                width=W
+            ]()
+            var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[
+                width=W
+            ]()
+            m0 = e0 & probe_eq[caseless=cb, target=byte_b](l0)
+            m1 = e1 & probe_eq[caseless=cb, target=byte_b](l1)
+            m2 = e2 & probe_eq[caseless=cb, target=byte_b](l2)
+            m3 = e3 & probe_eq[caseless=cb, target=byte_b](l3)
         if (m0 | m1 | m2 | m3).reduce_or():
             var r = _lit_first_verified_lane[
                 lit=lit, cl=cl, off_a=off_a, off_b=off_b

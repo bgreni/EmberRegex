@@ -992,10 +992,21 @@ struct Parser[origin: Origin](Movable):
         ):
             return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
-        raise _regex_error(
-            "Invalid escape sequence '\\" + chr(Int(ch)) + "'",
-            self.pos - 2,
-        )
+        # Python's rule: an escaped ASCII letter or digit that is not a
+        # recognized escape is an ERROR; anything else — `\-`, `\#`, `\@`,
+        # a non-ASCII character — is that character.
+        if (
+            (ch >= CHAR_A_LOWER and ch <= CHAR_Z_LOWER)
+            or (ch >= CHAR_A_UPPER and ch <= CHAR_Z_UPPER)
+            or (ch >= CHAR_ZERO and ch <= CHAR_NINE)
+        ):
+            raise _regex_error(
+                "Invalid escape sequence '\\" + chr(Int(ch)) + "'",
+                self.pos - 2,
+            )
+        if self.inline_flags.unicode() and ch >= 0xC0:
+            return self.ast.add_node(ASTNode.literal(self._utf8_tail(ch)))
+        return self.ast.add_node(ASTNode.literal(UInt32(ch)))
 
     def _parse_cc_codepoint(mut self) raises -> UInt32:
         """Parse one code-point value inside a char class (after consuming the

@@ -84,6 +84,7 @@ from .set_literal import (
     TeddyMasks,
     _NUM_BUCKETS,
     _assign_buckets,
+    _folds,
     teddy_front_end,
 )
 from .set_pike import (
@@ -1377,7 +1378,7 @@ def _rose_verify_at[
                 comptime for t in range(len(blits)):
                     comptime i = blits[t]
                     comptime lit = _entry_bytes(meta, lits, i)
-                    comptime cli = _entry_caseless(meta, lits, i)
+                    comptime cli = _folds(_entry_caseless(meta, lits, i))
                     comptime off = Int(meta[_M_STRIDE * i + _M_OFFSET])
                     comptime pid = Int(meta[_M_STRIDE * i + _M_PID])
                     comptime L = len(lit)
@@ -1394,7 +1395,7 @@ def _rose_verify_at[
                         # ending here. Every start inside that run reaches
                         # this literal in the same automaton state, so one
                         # confirm from the earliest yields every end.
-                        if _lit_at[lit=lit, cl=cli](input, at) and _look_ok[
+                        if _lit_at[lit=lit, fold=cli](input, at) and _look_ok[
                             look=look, base=kb, n=n_look
                         ](input, at):
                             var s0 = at
@@ -1415,7 +1416,7 @@ def _rose_verify_at[
                         # resume past them in the baked state.
                         if (
                             at >= off
-                            and _lit_at[lit=lit, cl=cli](input, at)
+                            and _lit_at[lit=lit, fold=cli](input, at)
                             and _look_ok[look=look, base=kb, n=n_look](
                                 input, at
                             )
@@ -1434,7 +1435,7 @@ def _rose_verify_at[
                     elif not skip:
                         if (
                             at >= off
-                            and _lit_at[lit=lit, cl=cli](input, at)
+                            and _lit_at[lit=lit, fold=cli](input, at)
                             and _look_ok[look=look, base=kb, n=n_look](
                                 input, at
                             )

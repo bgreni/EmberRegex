@@ -18,16 +18,26 @@ Two input shapes drive the two regimes:
 - `_burst_ab` (long `a` runs punctuated by short random bursts) consumes
   ~90 bytes per state minted, so clearing keeps paying and the walk runs
   to completion on the DFA.
+
+`match()` walks that LazyDFA. The search-family verbs run on the
+leftmost-first lazy engine (lazy_lf.mojo) instead, whose cache has the
+same clear / give-up discipline at a larger cap: WIDE is the shape that
+thrashes it.
 """
 
 from emberregex import Regex
 from emberregex.dfa import LazyDFA
 from emberregex.engine import _build_static_nfa
+from emberregex.lazy_lf import LazyLF, LLF_MIN_CLEARS
 from emberregex.nfa import NFA
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 
 comptime BLOWUP = "(?:a|b)*a(?:a|b){12}"
+# Three more window bytes: past the leftmost-first lazy DFA's 16384-state
+# cache on random a/b input (~2^16 ordered states), which the search verbs
+# run on (lazy_lf.mojo) — the cache-thrash regimes of THAT engine.
+comptime WIDE = "(?:a|b)*a(?:a|b){15}"
 # The same shape with an empty alternative: still past the eager cap, and
 # every position without the long match is an empty match.
 comptime EMPTY_ALT = BLOWUP + "|"
@@ -68,10 +78,10 @@ def test_blowup_pattern_rides_the_lazy_dfa() raises:
     assert_true(S._use_lazy_dfa)
     assert_false(S._strategy.use_eager_dfa)
     assert_false(S._strategy.use_teddy)
-    assert_false(S._use_lf_lane)
-    # No literal prefix, so the search-family verbs scan with
-    # `_dfa_search_forward` (not the prefix-filter + `_dfa_match_at`
-    # branch): that unanchored walk is where the give-up below raises.
+    # match() walks the LazyDFA; the search-family verbs ride the
+    # leftmost-first lane on its lazy engine (no anchors to model).
+    assert_true(S._use_lazy_lf)
+    assert_true(S._use_lf_lane)
     assert_false(S._use_scan_filter)
 
 
@@ -162,32 +172,42 @@ def test_hostile_input_gives_up_and_falls_back() raises:
 
 
 def test_hostile_search_still_matches_pike() raises:
+    # The search verbs' lazy engine on its thrash regime: random a/b mints
+    # a new ordered state every few bytes, so after LLF_MIN_CLEARS clears
+    # the walk gives up and `_llf_next_match` answers on the Pike VM.
     var input = _lcg_ab(12345, 200 * 1024)
-    var re = Regex[BLOWUP]()
+    var re = Regex[WIDE]()
     var got = re.search(input)
     var want = re._pike_search(input)
+    assert_true(want.matched)
     assert_equal(got.matched, want.matched)
     assert_equal(got.start, want.start)
     assert_equal(got.end, want.end)
-    # The cache was cleared and re-filled before the walk was given up on.
-    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+    assert_equal(rebind[LazyLF](re._llf).fwd.clears, LLF_MIN_CLEARS)
 
 
-# --- Pike VM fallbacks of the search-family verbs ------------------------
+def test_lazy_lf_search_across_a_clear_matches_pike() raises:
+    # ... and on the regime where clearing pays: ~20 bytes per state, so
+    # the forward cache fills, clears and the walk carries on.
+    var input = _burst_ab(7, 1024 * 1024, 300, 17)
+    var re = Regex[WIDE]()
+    var got = re.search(input)
+    var want = re._pike_search(input)
+    assert_true(want.matched)
+    assert_equal(got.start, want.start)
+    assert_equal(got.end, want.end)
+    ref llf = rebind[LazyLF](re._llf)
+    assert_true(llf.fwd.clears > 0)
+    assert_true(llf.fwd.clears < LLF_MIN_CLEARS)
+
+
+# --- The search-family verbs over a long walk --------------------------
 #
-# Each verb's lazy-lane loop opens with `_dfa_search_forward` from position
-# 0. Nothing in an a/b string kills `(?:a|b)*`, and the lazy DFA reports the
-# leftmost-LONGEST end, so that first walk covers the whole input: on
-# `_lcg_ab` it thrashes (a state every ~1.4 bytes), clears three times and
-# raises `DFA_STATE_CAP` on the fourth full cache, which `Regex` catches and
-# answers with `_pike_<verb>` for the entire call. `_burst_ab` never gets
-# there -- ~90 bytes per state, clearing keeps paying (see
-# `test_search_across_a_clear_matches_pike`) -- so the hostile input the
-# `match`/`search` give-up tests already build is reused (a fresh `_lcg_ab`
-# string first raises at ~24 KB, the fourth cache fill; anything shorter
-# completes with <= 3 clears). A completed walk over 200 KB would clear ~35
-# times (204800 / 1.4 / 4096); `clear_count == 3` after the verb pins that
-# the DFA was abandoned after the third clear.
+# Each verb's lane loop opens with `_lf_next_match` from position 0.
+# Nothing in an a/b string kills `(?:a|b)*`, so the first leftmost-first
+# walk covers the whole input: ~8200 ordered states for BLOWUP, inside the
+# lazy engine's cache, so every verb completes on it without a clear (the
+# give-up path is pinned on WIDE above).
 #
 # Expected values from Python on the same input (the pattern is Python
 # syntax): with s = _lcg_ab(4242, 204800) reproduced in Python,
@@ -202,17 +222,17 @@ comptime HOSTILE_END = 204798
 comptime HOSTILE_TAIL = "aa"
 
 
-def test_hostile_finditer_falls_back_to_pike() raises:
+def test_long_walk_finditer() raises:
     var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
     var re = Regex[BLOWUP]()
     var it = re.finditer(input)
     assert_equal(len(it), 1)
     assert_equal(it[0].start, 0)
     assert_equal(it[0].end, HOSTILE_END)
-    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+    assert_equal(rebind[LazyLF](re._llf).fwd.clears, 0)
 
 
-def test_hostile_findall_falls_back_to_pike() raises:
+def test_long_walk_findall() raises:
     var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
     var re = Regex[BLOWUP]()
     var all = re.findall(input)
@@ -221,24 +241,24 @@ def test_hostile_findall_falls_back_to_pike() raises:
     assert_equal(
         all[0], String(unsafe_from_utf8=input.as_bytes()[0:HOSTILE_END])
     )
-    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+    assert_equal(rebind[LazyLF](re._llf).fwd.clears, 0)
 
 
-def test_hostile_replace_falls_back_to_pike() raises:
+def test_long_walk_replace() raises:
     var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
     var re = Regex[BLOWUP]()
     assert_equal(re.replace(input, "X"), "X" + HOSTILE_TAIL)
-    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+    assert_equal(rebind[LazyLF](re._llf).fwd.clears, 0)
 
 
-def test_hostile_split_falls_back_to_pike() raises:
+def test_long_walk_split() raises:
     var input = _lcg_ab(HOSTILE_SEED, HOSTILE_LEN)
     var re = Regex[BLOWUP]()
     var parts = re.split(input)
     assert_equal(len(parts), 2)
     assert_equal(parts[0], "")
     assert_equal(parts[1], HOSTILE_TAIL)
-    assert_equal(rebind[LazyDFA](re._dfa).clear_count, 3)
+    assert_equal(rebind[LazyLF](re._llf).fwd.clears, 0)
 
 
 def test_small_inputs_never_clear() raises:

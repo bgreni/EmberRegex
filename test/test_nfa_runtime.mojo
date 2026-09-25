@@ -23,6 +23,7 @@ from emberregex.nfa import (
     build_nfa,
     split_cycle_flags,
 )
+from emberregex.optimize import extract_required_byte, extract_required_literals
 from emberregex.parser import parse
 from std.testing import (
     assert_equal,
@@ -272,26 +273,27 @@ def test_counted_repetition_lowering() raises:
     assert_true(cyc[3])
     assert_false(cyc[4])
 
-    # {1,3}: one required copy, then a ladder of two `?` copies — each
-    # optional SPLIT's skip edge is patched forward, never back.
-    var ladder = _nfa("a{1,3}")
-    assert_equal(len(ladder.states), 6)
-    assert_equal(ladder.start, 0)
-    _assert_state(ladder, 0, NFAStateKind.CHAR, 2, -1)
-    _assert_state(ladder, 2, NFAStateKind.SPLIT, 1, 4)
-    _assert_state(ladder, 1, NFAStateKind.CHAR, 4, -1)
-    _assert_state(ladder, 4, NFAStateKind.SPLIT, 3, 5)
-    _assert_state(ladder, 3, NFAStateKind.CHAR, 5, -1)
-    assert_equal(ladder.states[5].kind, NFAStateKind.MATCH)
-    var lcyc = split_cycle_flags[fast=False](ladder)
-    assert_false(lcyc[2])
-    assert_false(lcyc[4])
+    # {1,3}: one required copy, then two optional copies in the nested
+    # shape — each SPLIT's skip edge goes straight to the continuation
+    # (MATCH), and each body leads into the next copy's SPLIT.
+    var nest = _nfa("a{1,3}")
+    assert_equal(len(nest.states), 6)
+    assert_equal(nest.start, 0)
+    _assert_state(nest, 0, NFAStateKind.CHAR, 2, -1)
+    _assert_state(nest, 2, NFAStateKind.SPLIT, 1, 5)
+    _assert_state(nest, 1, NFAStateKind.CHAR, 4, -1)
+    _assert_state(nest, 4, NFAStateKind.SPLIT, 3, 5)
+    _assert_state(nest, 3, NFAStateKind.CHAR, 5, -1)
+    assert_equal(nest.states[5].kind, NFAStateKind.MATCH)
+    var ncyc = split_cycle_flags[fast=False](nest)
+    assert_false(ncyc[2])
+    assert_false(ncyc[4])
 
     # {0,2}: no required copy, so the first optional copy IS the start.
     var opt = _nfa("a{0,2}")
     assert_equal(len(opt.states), 5)
     assert_equal(opt.start, 1)
-    _assert_state(opt, 1, NFAStateKind.SPLIT, 0, 3)
+    _assert_state(opt, 1, NFAStateKind.SPLIT, 0, 4)
     _assert_state(opt, 0, NFAStateKind.CHAR, 3, -1)
     _assert_state(opt, 3, NFAStateKind.SPLIT, 2, 4)
     _assert_state(opt, 2, NFAStateKind.CHAR, 4, -1)
@@ -334,24 +336,25 @@ def test_ignorecase_folds_charsets_at_use_site() raises:
 
 
 def test_unicode_literals_lower_to_utf8_byte_chains() raises:
-    # U+0100 = C4 80: two single-byte CHARSETs in sequence.
+    # U+0100 = C4 80: two single-byte CHARSETs in sequence, emitted
+    # continuation first (the automaton is built targets-before-sources).
     var cp = _nfa("(?u)\\x{100}")
     assert_true(cp.is_unicode)
     assert_equal(len(cp.states), 4)
     assert_equal(len(cp.charsets), 2)
-    _assert_state(cp, 0, NFAStateKind.SPLIT, 1, -1)
-    _assert_state(cp, 1, NFAStateKind.CHARSET, 2, -1)
-    assert_equal(cp.states[1].charset_index, 0)
-    _assert_state(cp, 2, NFAStateKind.CHARSET, 3, -1)
+    _assert_state(cp, 0, NFAStateKind.SPLIT, 2, -1)
+    _assert_state(cp, 2, NFAStateKind.CHARSET, 1, -1)
     assert_equal(cp.states[2].charset_index, 1)
-    assert_equal(_ranges(cp, 0), "[196-196]")
-    assert_equal(_ranges(cp, 1), "[128-128]")
+    _assert_state(cp, 1, NFAStateKind.CHARSET, 3, -1)
+    assert_equal(cp.states[1].charset_index, 0)
+    assert_equal(_ranges(cp, 1), "[196-196]")
+    assert_equal(_ranges(cp, 0), "[128-128]")
 
     # U+00E9 under (?u) is its encoding C3 A9, never the raw byte E9.
     var latin1 = _nfa("(?u)\\xe9")
     assert_equal(len(latin1.states), 4)
-    assert_equal(_ranges(latin1, 0), "[195-195]")
-    assert_equal(_ranges(latin1, 1), "[169-169]")
+    assert_equal(_ranges(latin1, 1), "[195-195]")
+    assert_equal(_ranges(latin1, 0), "[169-169]")
 
     # ASCII is its own encoding: still a CHAR state.
     var ascii = _nfa("(?u)a")
@@ -361,34 +364,36 @@ def test_unicode_literals_lower_to_utf8_byte_chains() raises:
 
 
 def test_unicode_dot_is_one_codepoint() raises:
-    # `.` is a trie over well-formed sequences; the lead classes are the
-    # standard UTF-8 ones (C2-DF, E0, E1-EC, ED, EE-EF, F0, F1-F3, F4),
-    # with `\n` carved out of the ASCII class.
+    # `.` is the MINIMAL automaton over well-formed sequences: equal tails
+    # are one state, so the lead bytes E1-EC and EE-EF (same continuation)
+    # share one multi-range charset, and `\\n` is carved out of the ASCII
+    # class. Continuations come first in the pool (targets before sources).
     var dot = _nfa("(?u).")
-    assert_equal(len(dot.states), 39)
-    assert_equal(len(dot.charsets), 15)
+    assert_equal(len(dot.states), 24)
+    assert_equal(len(dot.charsets), 13)
     var classes = String("")
-    for i in range(15):
+    for i in range(13):
         classes += _ranges(dot, i)
     assert_equal(
         classes,
         (
-            "[0-9][11-127][194-223][224-224][225-236][237-237][238-239]"
-            "[240-240][241-243][244-244][128-191][160-191][128-159][144-191]"
-            "[128-143]"
+            "[128-191][128-143][144-191][128-159][160-191][0-9][11-127]"
+            "[194-223][224-224][225-236][238-239][237-237][240-240]"
+            "[241-243][244-244]"
         ),
     )
-    _assert_state(dot, 0, NFAStateKind.SPLIT, 19, -1)
-    _assert_state(dot, 19, NFAStateKind.SPLIT, 1, 18)
-    _assert_state(dot, 1, NFAStateKind.CHARSET, 38, -1)
-    assert_equal(dot.states[38].kind, NFAStateKind.MATCH)
+    _assert_state(dot, 0, NFAStateKind.SPLIT, 22, -1)
+    _assert_state(dot, 22, NFAStateKind.SPLIT, 8, 21)
+    _assert_state(dot, 8, NFAStateKind.CHARSET, 23, -1)
+    assert_equal(dot.states[8].charset_index, 5)
+    assert_equal(dot.states[23].kind, NFAStateKind.MATCH)
 
-    # DOTALL: one ASCII class, one fewer alternative.
+    # DOTALL: the ASCII class takes `\\n` back; same shape otherwise.
     var dotall = _nfa("(?us).")
-    assert_equal(len(dotall.states), 37)
-    assert_equal(len(dotall.charsets), 14)
-    assert_equal(_ranges(dotall, 0), "[0-127]")
-    assert_equal(_ranges(dotall, 1), "[194-223]")
+    assert_equal(len(dotall.states), 24)
+    assert_equal(len(dotall.charsets), 13)
+    assert_equal(_ranges(dotall, 5), "[0-127]")
+    assert_equal(_ranges(dotall, 6), "[194-223]")
 
     # Byte mode: DOTALL is one CHARSET over everything (no trie); plain
     # `.` stays an ANY state.
@@ -405,28 +410,25 @@ def test_unicode_dot_is_one_codepoint() raises:
 
 def test_unicode_negated_class_complements_codepoints() raises:
     # `[^a]` is complemented over CODEPOINTS before encoding: the ASCII
-    # side splits around `a`, and the pooled original (charset 0) keeps
-    # its negation flag untouched.
+    # side splits around `a` (both pieces one charset: same target), and
+    # the pooled original (charset 0) keeps its negation flag untouched.
     var one = _nfa("(?u)[^a]")
-    assert_equal(len(one.states), 39)
-    assert_equal(len(one.charsets), 16)
+    assert_equal(len(one.states), 24)
+    assert_equal(len(one.charsets), 14)
     assert_true(one.charsets[0].negated)
     assert_equal(_ranges(one, 0), "[97-97]")
-    assert_equal(_ranges(one, 1), "[0-96]")
-    assert_equal(_ranges(one, 2), "[98-127]")
-    assert_equal(_ranges(one, 3), "[194-223]")
-    assert_false(one.charsets[1].negated)
+    assert_equal(_ranges(one, 6), "[0-96][98-127]")
+    assert_equal(_ranges(one, 7), "[194-223]")
+    assert_false(one.charsets[6].negated)
 
     # Out-of-order members (`x` before `a`) go through the insertion
     # sort in `negate_ranges`; the complement is still ascending.
     var two = _nfa("(?u)[^xa]")
-    assert_equal(len(two.states), 41)
-    assert_equal(len(two.charsets), 17)
+    assert_equal(len(two.states), 24)
+    assert_equal(len(two.charsets), 14)
     assert_equal(_ranges(two, 0), "[120-120][97-97]")
-    assert_equal(_ranges(two, 1), "[0-96]")
-    assert_equal(_ranges(two, 2), "[98-119]")
-    assert_equal(_ranges(two, 3), "[121-127]")
-    assert_equal(_ranges(two, 4), "[194-223]")
+    assert_equal(_ranges(two, 6), "[0-96][98-119][121-127]")
+    assert_equal(_ranges(two, 7), "[194-223]")
 
     # The in-order spelling takes the sort's skip path; only the pooled
     # original differs, every derived charset and state is identical.
@@ -456,96 +458,51 @@ def test_unicode_empty_class_is_dead_charset() raises:
     assert_equal(dead.states[2].kind, NFAStateKind.MATCH)
 
 
-def test_unicode_class_buckets_out_of_order_ranges_first_seen() raises:
-    # Hand-written classes are not in codepoint order, which breaks the
-    # trie builder's monotone fast path; the fallback buckets in
-    # FIRST-SEEN order (a-c, A-C, 0-3), which the state numbering shows.
+def test_unicode_class_ranges_normalized_into_one_charset() raises:
+    # Hand-written classes are not in codepoint order; the builder sorts
+    # and merges the ranges first, and every ASCII range leads to the
+    # same accept node, so the class is ONE multi-range CHARSET state.
     var cls = _nfa("(?u)[a-cA-C0-3]")
-    assert_equal(len(cls.states), 7)
-    assert_equal(len(cls.charsets), 4)
+    assert_equal(len(cls.states), 3)
+    assert_equal(len(cls.charsets), 2)
     assert_equal(_ranges(cls, 0), "[97-99][65-67][48-51]")
-    assert_equal(_ranges(cls, 1), "[97-99]")
-    assert_equal(_ranges(cls, 2), "[65-67]")
-    assert_equal(_ranges(cls, 3), "[48-51]")
-    _assert_state(cls, 0, NFAStateKind.SPLIT, 5, -1)
-    _assert_state(cls, 5, NFAStateKind.SPLIT, 1, 4)
-    _assert_state(cls, 4, NFAStateKind.SPLIT, 2, 3)
-    for i in range(1, 4):
-        _assert_state(cls, i, NFAStateKind.CHARSET, 6, -1)
-        assert_equal(cls.states[i].charset_index, i)
-    assert_equal(cls.states[6].kind, NFAStateKind.MATCH)
+    assert_equal(_ranges(cls, 1), "[48-51][65-67][97-99]")
+    _assert_state(cls, 0, NFAStateKind.SPLIT, 1, -1)
+    _assert_state(cls, 1, NFAStateKind.CHARSET, 2, -1)
+    assert_equal(cls.states[1].charset_index, 1)
+    assert_equal(cls.states[2].kind, NFAStateKind.MATCH)
 
 
-def test_unicode_trie_merges_repeated_lead_byte_buckets() raises:
-    # Sequences C4 80-9F, C2 80-9F, C2 A0-BF, C4 A0-BF. Codepoint order is
-    # broken at the second, so the trie takes its general bucketing path:
-    # the third member's key equals the most recently CREATED bucket (C2,
-    # the adjacent shortcut) and the fourth's an EARLIER one (C4, found by
-    # the bucket scan). Each lead byte must end up as ONE state whose
-    # continuation ranges are pooled — the C2 subtree reuses the C4
-    # subtree's two charsets, so there are 5 charsets, not 7.
+def test_unicode_trie_merges_equal_continuations() raises:
+    # U+80-BF and U+100-13F, written out of order and split in four:
+    # normalized they are C2 80-BF and C4 80-BF. Both lead bytes reach the
+    # same continuation node, which the suffix merge makes one state, so
+    # the leads are one charset [C2][C4] into one [80-BF] state.
     var t = _nfa(
         "(?u)[\\x{100}-\\x{11F}\\x{80}-\\x{9F}\\x{A0}-\\x{BF}\\x{120}-\\x{13F}]"
     )
-    assert_equal(len(t.states), 11)
-    assert_equal(len(t.charsets), 5)
-    assert_equal(_ranges(t, 1), "[196-196]")
-    assert_equal(_ranges(t, 2), "[194-194]")
-    assert_equal(_ranges(t, 3), "[128-159]")
-    assert_equal(_ranges(t, 4), "[160-191]")
-    _assert_state(t, 0, NFAStateKind.SPLIT, 3, -1)
-    _assert_state(t, 3, NFAStateKind.SPLIT, 1, 2)
-    # C4 -> SPLIT(80-9F, A0-BF)
-    _assert_state(t, 1, NFAStateKind.CHARSET, 6, -1)
-    assert_equal(t.states[1].charset_index, 1)
-    _assert_state(t, 6, NFAStateKind.SPLIT, 4, 5)
-    _assert_state(t, 4, NFAStateKind.CHARSET, 10, -1)
-    _assert_state(t, 5, NFAStateKind.CHARSET, 10, -1)
-    assert_equal(t.states[4].charset_index, 3)
-    assert_equal(t.states[5].charset_index, 4)
-    # C2 -> SPLIT(80-9F, A0-BF), same pooled charsets.
-    _assert_state(t, 2, NFAStateKind.CHARSET, 9, -1)
+    assert_equal(len(t.states), 4)
+    assert_equal(len(t.charsets), 3)
+    assert_equal(_ranges(t, 1), "[128-191]")
+    assert_equal(_ranges(t, 2), "[194-194][196-196]")
+    _assert_state(t, 0, NFAStateKind.SPLIT, 2, -1)
+    _assert_state(t, 2, NFAStateKind.CHARSET, 1, -1)
     assert_equal(t.states[2].charset_index, 2)
-    _assert_state(t, 9, NFAStateKind.SPLIT, 7, 8)
-    _assert_state(t, 7, NFAStateKind.CHARSET, 10, -1)
-    _assert_state(t, 8, NFAStateKind.CHARSET, 10, -1)
-    assert_equal(t.states[7].charset_index, 3)
-    assert_equal(t.states[8].charset_index, 4)
-    assert_equal(t.states[10].kind, NFAStateKind.MATCH)
-
-    # In codepoint order the same C4 merge rides the monotone fast path:
-    # the second sequence's key is a repeat of the run in progress.
-    var mono = _nfa("(?u)[\\x{100}-\\x{11F}\\x{120}-\\x{13F}]")
-    assert_equal(len(mono.states), 6)
-    assert_equal(len(mono.charsets), 4)
-    assert_equal(_ranges(mono, 1), "[196-196]")
-    assert_equal(_ranges(mono, 2), "[128-159]")
-    assert_equal(_ranges(mono, 3), "[160-191]")
-    _assert_state(mono, 0, NFAStateKind.SPLIT, 1, -1)
-    _assert_state(mono, 1, NFAStateKind.CHARSET, 4, -1)
-    _assert_state(mono, 4, NFAStateKind.SPLIT, 2, 3)
-    _assert_state(mono, 2, NFAStateKind.CHARSET, 5, -1)
-    _assert_state(mono, 3, NFAStateKind.CHARSET, 5, -1)
-    assert_equal(mono.states[5].kind, NFAStateKind.MATCH)
+    _assert_state(t, 1, NFAStateKind.CHARSET, 3, -1)
+    assert_equal(t.states[1].charset_index, 1)
+    assert_equal(t.states[3].kind, NFAStateKind.MATCH)
 
 
 def test_unicode_icase_class_folds_before_encoding() raises:
-    # Folding appends [A-C] after [a-c]; the trie then sees two ASCII
-    # ranges out of order and buckets them first-seen.
+    # Folding closes [a-c] under Python's case orbits and hands the
+    # builder [A-C][a-c], sorted: one charset, one state.
     var cls = _nfa("(?ui)[a-c]")
-    assert_equal(len(cls.states), 5)
-    assert_equal(len(cls.charsets), 3)
+    assert_equal(len(cls.states), 3)
+    assert_equal(len(cls.charsets), 2)
     assert_equal(_ranges(cls, 0), "[97-99]")
-    assert_equal(_ranges(cls, 1), "[97-99]")
-    assert_equal(_ranges(cls, 2), "[65-67]")
-    _assert_state(cls, 3, NFAStateKind.SPLIT, 1, 2)
-    _assert_state(cls, 1, NFAStateKind.CHARSET, 4, -1)
-    _assert_state(cls, 2, NFAStateKind.CHARSET, 4, -1)
+    assert_equal(_ranges(cls, 1), "[65-67][97-99]")
+    _assert_state(cls, 1, NFAStateKind.CHARSET, 2, -1)
     assert_equal(cls.states[1].charset_index, 1)
-    assert_equal(cls.states[2].charset_index, 2)
-
-
-# --- Lookbehind --------------------------------------------------------------
 
 
 def test_lookbehind_state_fields() raises:
@@ -694,6 +651,25 @@ def test_split_cycle_flags_self_edge_singletons() raises:
     var c3 = split_cycle_flags[fast=False](dangling)
     assert_false(c3[0])
     assert_false(c3[1])
+
+
+def test_required_literals_from_the_required_byte() raises:
+    # `A` is required (every path crosses a CHAR `A`) and each such state
+    # sits in a forced chain, so the chains are a required set — the
+    # aws-keys fast-fail. A chain the byte starts alone (`[xz]A[0-9]`:
+    # a class on each side) filters no better than the byte: invalid.
+    var nfa = _nfa("x(?:ASIA|AKIA)\\d|(?:AROA|AIDA)y")
+    var b = extract_required_byte(nfa)
+    assert_equal(b, 65)
+    var lits = extract_required_literals(nfa, b)
+    assert_true(lits.valid)
+    assert_equal(len(lits.lits), 4)
+    assert_equal(lits.min_len, 4)
+    assert_equal(len(lits.lits[2]), 5)  # AROA, then the forced `y`
+    var one = _nfa("[xz]A[0-9]")
+    assert_false(
+        extract_required_literals(one, extract_required_byte(one)).valid
+    )
 
 
 def main() raises:
