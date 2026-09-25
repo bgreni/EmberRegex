@@ -1054,13 +1054,16 @@ def _probe_rank_table() -> List[Int]:
 
 def select_probe_offsets(
     prefix: List[UInt8], caseless: List[Bool]
-) -> Tuple[Int, Int]:
+) -> Tuple[Int, Int, Int]:
     """Comptime: offsets of the two rarest prefix positions for the
     two-byte candidate filter, per PROBE_RANKS. A caseless position
     matches both cases, so its rank is the sum of both cases' frequencies.
     Ties prefer later offsets (larger spread rejects repeated-byte runs
-    sooner). Requires len(prefix) >= 2; returns (off_a, off_b) with
-    off_a < off_b."""
+    sooner). Requires len(prefix) >= 2; returns (gate, second, alt):
+    the rarest offset (the kernel's gate probe), the second rarest, and
+    the rarest offset whose byte is neither probe byte — the gate the
+    kernel falls back to when the static ranks guessed wrong for the
+    haystack at hand — or -1 when every byte is a probe byte."""
     var ranks = PROBE_RANKS
     var n = len(prefix)
     var pr = List[Int]()
@@ -1079,9 +1082,13 @@ def select_probe_offsets(
             continue
         if pr[i] <= pr[best2]:
             best2 = i
-    if best1 < best2:
-        return (best1, best2)
-    return (best2, best1)
+    var alt = -1
+    for i in range(n):
+        if prefix[i] == prefix[best1] or prefix[i] == prefix[best2]:
+            continue
+        if alt < 0 or pr[i] <= pr[alt]:
+            alt = i
+    return (best1, best2, alt)
 
 
 def extract_first_byte_bitmap(nfa: NFA) -> SIMD[DType.uint8, BITMAP_WIDTH]:

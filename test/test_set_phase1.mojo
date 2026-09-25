@@ -228,8 +228,11 @@ def test_differential_high_bytes() raises:
             )
 
 
+comptime SPARSE_PATS: List[String] = ["needle", "pin"]
+
+
 def test_differential_sparse_hits() raises:
-    comptime PATS: List[String] = ["needle", "pin"]
+    comptime PATS = SPARSE_PATS
     # mostly filler with occasional n/p bytes
     var alphabet: List[Byte] = [
         122,
@@ -247,6 +250,23 @@ def test_differential_sparse_hits() raises:
             var data = _lcg_bytes(seed, n, alphabet)
             _assert_matches_pike[PATS](
                 data, String("sparse seed=", seed, " n=", n)
+            )
+
+
+def test_differential_planted_in_quiet_filler() raises:
+    # Long candidate-free gaps go to `_teddy_skip`, which tests four chunks
+    # at a time; the LCG sweeps above hit too often to get there. Planting
+    # the literal at every offset of quiet filler lands a hit in each of
+    # the four chunk slots, across every chunk boundary, and in the
+    # overlapping tail chunk.
+    var lit = "needle".as_bytes()
+    for n in [150, 211]:
+        for p in range(n - len(lit) + 1):
+            var data = List[Byte](length=n, fill=Byte(ord("z")))
+            for j in range(len(lit)):
+                data[p + j] = lit[j]
+            _assert_matches_pike[SPARSE_PATS](
+                data, String("planted n=", n, " p=", p)
             )
 
 

@@ -18,6 +18,8 @@ time, so this engine has no capability gaps against the pattern surface
 the union builder accepts.
 """
 
+from std.sys.intrinsics import unlikely
+
 from .constants import CHAR_NEWLINE
 from .executor import _bt_check_anchor
 from .nfa import NFA, NFAStateKind
@@ -67,6 +69,22 @@ struct SetSpan(Equatable, TrivialRegisterPassable, Writable):
         )
 
 
+# Capacity a scan's report list reserves at its first report. Grown from
+# empty, a dense 16 KB scan (~500 reports) spent ~0.5 us of ~4 in ten
+# reallocations; reserved up front instead, a scan that finds nothing paid
+# ~35 ns for the allocation (a 16 B miss went from 3.5 to 41 ns). The
+# `unlikely` matters: without it the check cost teddy64_dense 17%.
+comptime REPORT_INIT_CAP = 64
+
+
+@always_inline
+def push_report(mut out: List[SetMatch], m: SetMatch):
+    """`out.append(m)`, reserving REPORT_INIT_CAP at the first report."""
+    if unlikely(out.capacity() == 0):
+        out.reserve(REPORT_INIT_CAP)
+    out.append(m)
+
+
 @always_inline
 def _before(a: SetMatch, b: SetMatch) -> Bool:
     """Contract order: nondecreasing end, ties ascending id."""
@@ -84,22 +102,39 @@ def sort_reports(mut r: List[SetMatch]):
     which matters: on dense input this runs over thousands of reports per
     scan.
     """
+    if len(r) < 2:
+        return
+    # The running maximum stays in a register: comparing against r[i - 1]
+    # instead reloads what the previous iteration may have just stored,
+    # and that store-forwarding stall set the pace on in-order input.
+    var top = r.unsafe_get(0)
     for i in range(1, len(r)):
-        var key = r[i]
+        var key = r.unsafe_get(i)
+        if _before(top, key):
+            top = key
+            continue
+        # Out of order: shift it down. The maximum (`top`) only moves up
+        # one slot, so it stays the maximum.
         var j = i - 1
-        while j >= 0 and not _before(r[j], key):
-            r[j + 1] = r[j]
+        while j >= 0 and not _before(r.unsafe_get(j), key):
+            r.unsafe_set(j + 1, r.unsafe_get(j))
             j -= 1
-        r[j + 1] = key
+        r.unsafe_set(j + 1, key)
 
 
 def dedup_reports(mut r: List[SetMatch]):
     """Collapse duplicate (id, end) pairs in a sorted report list."""
-    var w = 0
-    for i in range(len(r)):
-        if w > 0 and r[i] == r[w - 1]:
+    if len(r) < 2:
+        return
+    # `last` in a register for the same reason as `sort_reports`' `top`.
+    var last = r.unsafe_get(0)
+    var w = 1
+    for i in range(1, len(r)):
+        var m = r.unsafe_get(i)
+        if m == last:
             continue
-        r[w] = r[i]
+        r.unsafe_set(w, m)
+        last = m
         w += 1
     r.resize(w, SetMatch(0, 0))
 

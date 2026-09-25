@@ -20,12 +20,17 @@ Selection requires HAS_FAST_BYTE_SHUFFLE; other targets stay on the
 tagged Pike reference engine.
 """
 
-from std.math import min
+from std.math import iota, max, min
 from std.sys import simd_width_of
 
 from .nfa import NFA, NFAStateKind
 from .optimize import _charset_filter_byte
-from .set_pike import SetMatch, dedup_reports, sort_reports
+from .set_pike import (
+    SetMatch,
+    dedup_reports,
+    push_report,
+    sort_reports,
+)
 from .simd_kernels import NIBBLE_TABLE_SIZE, nibble_lookup
 from .simd_scan import clear_first_lane, first_lane_index, lane_bits
 from .teddy import _lit_at
@@ -316,6 +321,181 @@ def litset_masks(ls: LiteralSet) -> TeddyMasks:
     )
 
 
+comptime _TW = simd_width_of[DType.uint8]()
+# Consecutive candidate-free chunks the front end walks inline before
+# handing the rest of the gap to `_teddy_skip`.
+comptime _TEDDY_QUIET_RUN = 4
+comptime _TVec = SIMD[DType.uint8, _TW]
+
+
+@always_inline
+def _carry[n: Int](prev: _TVec, cur: _TVec) -> _TVec:
+    """`cur` moved up n lanes, the low n lanes filled from `prev`'s top n
+    (one `ext` on NEON)."""
+    return prev.join(cur).slice[_TW, offset=_TW - n]()
+
+
+@always_inline
+def _teddy_cand[
+    k: Int, masks: TeddyMasks
+](v: _TVec, mut p0: _TVec, mut p1: _TVec) -> _TVec:
+    """END-space candidates for one chunk: lane j flags the buckets whose
+    first k bytes may end at lane j, so the literal starts at j - (k - 1).
+    Starts that fall in the previous chunk read its lookups from `p0`/`p1`
+    (zero before the first chunk), which then advance to this chunk's —
+    every chunk advances a full W, no overlapping reload."""
+    comptime m0 = masks[0]
+    comptime m1 = masks[1]
+    comptime m2 = masks[2]
+    var lo = v & 0x0F
+    var hi = v >> 4
+    var r0 = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
+    comptime if k == 1:
+        return r0
+    else:
+        var r1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
+        var c: _TVec
+        comptime if k == 2:
+            c = _carry[1](p0, r0) & r1
+        else:
+            var r2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
+            c = _carry[2](p0, r0) & _carry[1](p1, r1) & r2
+        p0 = r0
+        p1 = r1
+        return c
+
+
+# Out of line on purpose: inlined into the caller's verify-heavy body, the
+# masks were reloaded from the stack and every per-entry offset the verify
+# code derives from the position became a spilled induction variable,
+# updated in memory each chunk (measured 7 GB/s against 10.6 for the same
+# loop with a small verify). Alone, the loop keeps all of it in registers.
+@no_inline
+def _teddy_skip[
+    origin: ImmOrigin, //, k: Int, masks: TeddyMasks
+](
+    input: Span[Byte, origin],
+    start: Int,
+    mut p0: _TVec,
+    mut p1: _TVec,
+    mut cand: _TVec,
+) -> Int:
+    """First chunk offset >= `start` (stepping by W) with end-space
+    candidates, which land in `cand`; or the first offset whose chunk does
+    not fit. `p0`/`p1` enter as the carries for `start` and leave as the
+    carries past the returned chunk, so the caller resumes without
+    recomputing anything."""
+    comptime W = _TW
+    var n = len(input)
+    var ptr = input.unsafe_ptr()
+    var pos = start
+    # One chunk alone first: when hits are spaced just past the quiet run,
+    # the next one is usually here, and a 4-chunk probe would compute 3
+    # chunks for nothing (measured ~5% at an 80-byte hit spacing).
+    if pos + W <= n:
+        cand = _teddy_cand[k, masks](ptr.unsafe_load[width=W](pos), p0, p1)
+        if cand.reduce_max() != 0:
+            return pos
+        pos += W
+    # Four chunks per any-test: one horizontal max per 4W bytes.
+    while pos + 4 * W <= n:
+        var c0 = _teddy_cand[k, masks](ptr.unsafe_load[width=W](pos), p0, p1)
+        var a0 = p0
+        var a1 = p1
+        var c1 = _teddy_cand[k, masks](
+            ptr.unsafe_load[width=W](pos + W), p0, p1
+        )
+        var b0 = p0
+        var b1 = p1
+        var c2 = _teddy_cand[k, masks](
+            ptr.unsafe_load[width=W](pos + 2 * W), p0, p1
+        )
+        var d0 = p0
+        var d1 = p1
+        var c3 = _teddy_cand[k, masks](
+            ptr.unsafe_load[width=W](pos + 3 * W), p0, p1
+        )
+        if ((c0 | c1) | (c2 | c3)).reduce_max() != 0:
+            if c0.reduce_max() != 0:
+                cand = c0
+                p0 = a0
+                p1 = a1
+                return pos
+            if c1.reduce_max() != 0:
+                cand = c1
+                p0 = b0
+                p1 = b1
+                return pos + W
+            if c2.reduce_max() != 0:
+                cand = c2
+                p0 = d0
+                p1 = d1
+                return pos + 2 * W
+            cand = c3
+            return pos + 3 * W
+        pos += 4 * W
+    while pos + W <= n:
+        cand = _teddy_cand[k, masks](ptr.unsafe_load[width=W](pos), p0, p1)
+        if cand.reduce_max() != 0:
+            return pos
+        pos += W
+    return pos
+
+
+# Out of line so the front end inlines `verify` at one tail site, not two.
+@no_inline
+def _teddy_tail[
+    origin: ImmOrigin, //, k: Int, masks: TeddyMasks
+](
+    input: Span[Byte, origin],
+    pos: Int,
+    mut p0: _TVec,
+    mut p1: _TVec,
+    mut at: Int,
+) -> _TVec:
+    """End-space candidates for the ends in [`pos`, len(input)) that the
+    full-chunk loop left (`pos` < len(input)), as the chunk at `at`, other
+    lanes zero. A start past len(input) - k cannot hold even the shortest
+    literal (k <= min_len), so those ends are all there is."""
+    comptime W = _TW
+    var input_len = len(input)
+    var lane = iota[DType.uint8, W]()
+    var q = input_len - W
+    if q >= W:
+        # One overlapping chunk, carries from the chunk before it (whose
+        # own candidates are moot), already-covered ends masked off.
+        var ptr = input.unsafe_ptr()
+        _ = _teddy_cand[k, masks](ptr.unsafe_load[width=W](q - W), p0, p1)
+        var cand = _teddy_cand[k, masks](ptr.unsafe_load[width=W](q), p0, p1)
+        at = q
+        return lane.ge(_TVec(UInt8(pos - q))).select(cand, _TVec(0))
+    # Under 2W bytes, only the partial chunk at `pos` (0 or W) is left, and
+    # `p0`/`p1` already hold its carries: run it over a zero-padded copy,
+    # ends past the input masked off. Only real candidates reach `verify`
+    # (a per-start scalar tail called it at every start, and on short
+    # inputs that cost more than the scan itself).
+    var buf = Array[UInt8, W](fill=0)
+    for i in range(input_len - pos):
+        buf[i] = input.unsafe_get(pos + i)
+    var cand = _teddy_cand[k, masks](
+        buf.unsafe_ptr().unsafe_load[width=W](), p0, p1
+    )
+    at = pos
+    return lane.lt(_TVec(UInt8(input_len - pos))).select(cand, _TVec(0))
+
+
+@always_inline
+def _teddy_emit[
+    F: def(Int, UInt8) -> None, //, k: Int
+](cand: _TVec, var bits: UInt64, pos: Int, verify: F):
+    """`verify(start, buckets)` for every lane of `bits` (the nonzero
+    end-space lanes of `cand`, the chunk at `pos`)."""
+    while bits != 0:
+        var lane = first_lane_index(bits)
+        verify(pos + lane - (k - 1), cand[lane])
+        bits = clear_first_lane(bits)
+
+
 @always_inline
 def teddy_front_end[
     origin: ImmOrigin,
@@ -325,43 +505,51 @@ def teddy_front_end[
     masks: TeddyMasks,
 ](input: Span[Byte, origin], verify: F):
     """The bucketed-Teddy candidate loop shared by `litset_scan` and
-    `rose_scan`: `verify(at, bucket_mask)` for every candidate lane, then
-    `verify(at, 0xFF)` at each tail position with room for the shortest
-    literal. `input` is an immutable view so the verify closure can
-    capture it too."""
-    comptime W = simd_width_of[DType.uint8]()
+    `rose_scan`: `verify(at, bucket_mask)` for every candidate start, in
+    ascending order. Candidates are found in end space (`_teddy_cand`), so
+    each chunk advances a full W; once `_TEDDY_QUIET_RUN` chunks in a row
+    are candidate-free, `_teddy_skip` runs the rest of the gap out of line,
+    and `_teddy_tail` finds the candidates past the last full chunk.
+    `input` is an immutable view so the verify closure can capture it too.
+
+    Keep this body minimal: it inlines `verify` (for Rose, the whole
+    confirm machinery), and one extra condition in the quiet branch or an
+    inline tail was enough for LLVM to spill the six nibble masks and
+    reload them every chunk (~10% on the dense rows)."""
+    comptime W = _TW
     comptime k = min(3, min_len)
-    comptime m0 = masks[0]
-    comptime m1 = masks[1]
-    comptime m2 = masks[2]
 
     var input_len = len(input)
+    var ptr = input.unsafe_ptr()
     var pos = 0
-    var ptr = Pointer(input.unsafe_ptr())
-
+    var p0 = _TVec(0)
+    var p1 = _TVec(0)
+    var quiet = 0
     while pos + W <= input_len:
-        var v = ptr.unsafe_offset(pos).unsafe_load[width=W]()
-        var lo = v & 0x0F
-        var hi = v >> 4
-        var cand = nibble_lookup(m0[0], lo) & nibble_lookup(m0[1], hi)
-        comptime if k > 1:
-            var c1 = nibble_lookup(m1[0], lo) & nibble_lookup(m1[1], hi)
-            cand &= c1.shift_left[1]()
-        comptime if k > 2:
-            var c2 = nibble_lookup(m2[0], lo) & nibble_lookup(m2[1], hi)
-            cand &= c2.shift_left[2]()
+        var cand = _teddy_cand[k, masks](ptr.unsafe_load[width=W](pos), p0, p1)
         var bits = lane_bits(cand.ne(0))
-        while bits != 0:
-            var lane = first_lane_index(bits)
-            verify(pos + lane, cand[lane])
-            bits = clear_first_lane(bits)
-        # The last k-1 lanes were masked off by the zero-filling lane
-        # shifts; rescan them as the head of the next chunk.
-        pos += W - (k - 1)
+        if bits == 0:
+            # Short quiet gaps (dense input) stay inline: a skip call per
+            # gap, plus the chunks its 4-wide probe computes past the next
+            # hit, measured slower than the inline loop. A long gap goes
+            # to the skip loop, which returns the next candidate chunk.
+            pos += W
+            quiet += 1
+            if quiet < _TEDDY_QUIET_RUN:
+                continue
+            pos = _teddy_skip[k, masks](input, pos, p0, p1, cand)
+            if pos + W > input_len:
+                break
+            bits = lane_bits(cand.ne(0))
+        quiet = 0
+        _teddy_emit[k](cand, bits, pos, verify)
+        pos += W
 
-    while pos + min_len <= input_len:
-        verify(pos, UInt8(0xFF))
-        pos += 1
+    # Ends in [pos, input_len) remain.
+    if pos < input_len:
+        var at = pos
+        var cand = _teddy_tail[k, masks](input, pos, p0, p1, at)
+        _teddy_emit[k](cand, lane_bits(cand.ne(0)), at, verify)
 
 
 @always_inline
@@ -386,7 +574,7 @@ def _litset_verify_at[
                     comptime rid = ls.ids[i]
                     comptime L = len(lit)
                     if _lit_at[lit=lit, cl=cli](input, at):
-                        out.append(SetMatch(rid, at + L))
+                        push_report(out, SetMatch(rid, at + L))
 
 
 # `@always_inline` for the same reason as `mdfa_scan` and the eager

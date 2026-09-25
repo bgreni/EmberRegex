@@ -241,12 +241,40 @@ def test_memmem_basic() raises:
 
 
 def test_memmem_across_simd_boundaries() raises:
-    # One hit at every offset around chunk boundaries of a 200-byte
-    # haystack; the filler carries probe-pair false positives (".qx").
-    for hit in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 196]:
+    # One hit at every offset around chunk boundaries of a 1100-byte
+    # haystack; the filler carries probe-pair false positives (".qx") on
+    # every block, so from 0 the gate ('.') switches to `alt` ('t') at
+    # 512 — hits around there pin the resume point. Starts swept up to
+    # each hit exercise the masked overlapping tail chunk.
+    comptime N = 1100
+    for hit in [
+        0,
+        1,
+        15,
+        16,
+        17,
+        31,
+        32,
+        33,
+        63,
+        64,
+        65,
+        127,
+        128,
+        447,
+        448,
+        510,
+        511,
+        512,
+        513,
+        600,
+        1000,
+        N - 5,
+        N - 4,
+    ]:
         var body = List[Byte]()
         var filler = ".qx.".as_bytes()
-        while len(body) < 200:
+        while len(body) < N:
             body.append(filler[len(body) & 3])
         var s = String(unsafe_from_utf8=Span(body))
         var bytes = s.as_bytes()
@@ -257,23 +285,28 @@ def test_memmem_across_simd_boundaries() raises:
         for i in range(4):
             edited[hit + i] = lit[i]
         var hs = String(unsafe_from_utf8=Span(edited))
-        var got = simd_find_literal_rare[
-            lit=_TXT_LIT, cl=_TXT_CL, off_a=0, off_b=2
-        ](hs.as_bytes(), 0)
-        # The edit can create an earlier ".txt" only by accident; assert
-        # the first occurrence via a scalar reference scan instead.
-        var expect = -1
         var eb = hs.as_bytes()
-        for i in range(len(eb) - 3):
-            if (
-                eb[i] == lit[0]
-                and eb[i + 1] == lit[1]
-                and eb[i + 2] == lit[2]
-                and eb[i + 3] == lit[3]
-            ):
-                expect = i
-                break
-        assert_equal(got, expect, String("hit at ", hit))
+        for start in range(max(0, hit - 70), hit + 3):
+            var got = simd_find_literal_rare[
+                lit=_TXT_LIT, cl=_TXT_CL, off_a=0, off_b=2, alt=3
+            ](eb, start)
+            # The edit can create an earlier ".txt" only by accident;
+            # assert the first occurrence via a scalar reference scan.
+            var expect = -1
+            for i in range(start, len(eb) - 3):
+                if (
+                    eb[i] == lit[0]
+                    and eb[i + 1] == lit[1]
+                    and eb[i + 2] == lit[2]
+                    and eb[i + 3] == lit[3]
+                ):
+                    expect = i
+                    break
+            assert_equal(got, expect, String("hit at ", hit, " from ", start))
+        var from0 = simd_find_literal_rare[
+            lit=_TXT_LIT, cl=_TXT_CL, off_a=0, off_b=2, alt=3
+        ](eb, 0)
+        assert_equal(from0, hit, String("hit at ", hit, " from 0"))
 
 
 def test_memmem_caseless_positions() raises:

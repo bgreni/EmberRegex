@@ -264,9 +264,11 @@ struct RegexSet[
     comptime _ROSE_TABLE_S = table_bytes[DType.int32](
         Self._rose.conf_table, Self._rose.num_conf_states * 256
     )
-    comptime _ROSE_FLAGS = int_arr[DType.uint8, Self._rose.num_conf_states](
-        Self._rose.conf_flags, 0
-    )
+    comptime _ROSE_FLAGS = static_bytes[
+        table_bytes[DType.uint8](
+            Self._rose.conf_flags, Self._rose.num_conf_states
+        )
+    ]()
     # The walkers take the table-free view: comptime parameter values are
     # mangled into symbol names, and carrying the confirm table there too
     # blew the linker's symbol-length limit on a 32-pattern set.

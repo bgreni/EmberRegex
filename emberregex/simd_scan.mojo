@@ -21,6 +21,7 @@ bitmask into a lane index.
 
 from std.bit import count_leading_zeros, count_trailing_zeros
 from std.collections import Array
+from std.math import iota
 from std.memory import bitcast, pack_bits
 from std.sys import simd_width_of
 from std.sys.info import CompilationTarget
@@ -186,6 +187,7 @@ def _lit_first_verified_lane[
     return -1
 
 
+@always_inline
 def simd_find_literal_rare[
     origin: Origin,
     n: Int,
@@ -194,6 +196,7 @@ def simd_find_literal_rare[
     cl: Array[Bool, n],
     off_a: Int,
     off_b: Int,
+    alt: Int = -1,
 ](input: Span[Byte, origin], start: Int) -> Int:
     """Find the first position >= `start` where the `n`-byte literal
     matches (exact bytes; caseless positions store the lowercase letter
@@ -201,17 +204,56 @@ def simd_find_literal_rare[
     -1.
 
     Mula's vectorized memmem with rarest-position probes: a 4x-unrolled
-    two-byte SIMD filter probing offsets `off_a` < `off_b` (pick them
-    with select_probe_offsets so the probes are the two rarest literal
-    positions). Each iteration processes 4*W bytes, loading 4 chunks at
-    the first probe offset and OR-combining their equality masks for a
-    single early-out; when any chunk has a candidate, the second probe's
-    chunks combine branch-free and surviving lanes are verified across
-    the whole literal. Lifted out of the engine's filter-prefix scanner
-    so the inner-literal strategy shares one kernel.
+    two-byte SIMD filter probing offsets `off_a` (the gate) and `off_b`
+    (pick them with select_probe_offsets so the gate is the rarest
+    literal position and `off_b` the second rarest). Each iteration
+    processes 4*W bytes, loading 4 chunks at the gate offset and
+    OR-combining their equality masks for a single early-out; when any
+    chunk has a candidate, the second probe's chunks combine
+    branch-free and surviving lanes are verified across the whole
+    literal. Lifted out of the engine's filter-prefix scanner so the
+    inner-literal strategy shares one kernel.
+
+    The ranks are a static guess: `[`/`]` are rare in prose and on
+    every line of a log. When more than a quarter of the blocks so far
+    raised a gate candidate that did not verify, the scan re-enters
+    gated on `alt` (a literal byte that is neither probe byte; -1 = no
+    such byte, never switch). One switch per call — the hit path is at
+    worst the pre-switch cost again, never a loop. The switch leaves the
+    scan as a sentinel and re-enters here, so the scan stays a leaf.
     """
+    comptime if alt >= 0:
+        var r = _rare_scan[
+            lit=lit, cl=cl, off_a=off_a, off_b=off_b, adapt=True
+        ](input, start)
+        if r >= -1:
+            return r
+        return _rare_scan[lit=lit, cl=cl, off_a=alt, off_b=off_a, adapt=False](
+            input, -2 - r
+        )
+    else:
+        return _rare_scan[
+            lit=lit, cl=cl, off_a=off_a, off_b=off_b, adapt=False
+        ](input, start)
+
+
+def _rare_scan[
+    origin: Origin,
+    n: Int,
+    //,
+    lit: Array[UInt8, n],
+    cl: Array[Bool, n],
+    off_a: Int,
+    off_b: Int,
+    adapt: Bool,
+](input: Span[Byte, origin], start: Int) -> Int:
+    """simd_find_literal_rare's scan. With `adapt`, returns `-2 - pos`
+    when the gate proved dense: `pos` is where the scan stopped, every
+    candidate before it rejected."""
     comptime assert n >= 2, "simd_find_literal_rare needs a >= 2 byte literal"
-    comptime assert 0 <= off_a < off_b < n, "probe offsets out of order"
+    comptime assert (
+        0 <= off_a < n and 0 <= off_b < n and off_a != off_b
+    ), "probe offsets out of range"
     comptime W = simd_width_of[DType.uint8]()
     comptime byte_a = lit[off_a]
     comptime byte_b = lit[off_b]
@@ -223,51 +265,69 @@ def simd_find_literal_rare[
     var input_len = len(input)
     var ptr = Pointer(input.unsafe_ptr())
     var pos = start
+    var gate_misses = 0
+    var e0 = SIMD[DType.bool, W](fill=False)
+    var e1 = e0
+    var e2 = e0
+    var e3 = e0
 
-    # 4x-unrolled SIMD body: 4*W bytes per iter
-    while pos + 4 * W + last_off <= input_len:
-        var b0 = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
-        var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[width=W]()
-        var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[width=W]()
-        var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[width=W]()
-        var e0 = probe_eq[caseless=ca, target=byte_a](b0)
-        var e1 = probe_eq[caseless=ca, target=byte_a](b1)
-        var e2 = probe_eq[caseless=ca, target=byte_a](b2)
-        var e3 = probe_eq[caseless=ca, target=byte_a](b3)
-        if (e0 | e1 | e2 | e3).reduce_or():
-            var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
-            var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[width=W]()
-            var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[
+    # 4x-unrolled SIMD body: 4*W bytes per iter. Blocks without a gate
+    # candidate stay in the inner loop, which carries nothing but `pos`:
+    # with the hit path in the same loop, LLVM if-converted the
+    # `gate_misses` update into the latch of every block (+28% on 1 MB
+    # without a single gate hit).
+    while True:
+        while pos + 4 * W + last_off <= input_len:
+            var b0 = ptr.unsafe_offset(pos + off_a).unsafe_load[width=W]()
+            var b1 = ptr.unsafe_offset(pos + W + off_a).unsafe_load[width=W]()
+            var b2 = ptr.unsafe_offset(pos + 2 * W + off_a).unsafe_load[
                 width=W
             ]()
-            var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[
+            var b3 = ptr.unsafe_offset(pos + 3 * W + off_a).unsafe_load[
                 width=W
             ]()
-            var m0 = e0 & probe_eq[caseless=cb, target=byte_b](l0)
-            var m1 = e1 & probe_eq[caseless=cb, target=byte_b](l1)
-            var m2 = e2 & probe_eq[caseless=cb, target=byte_b](l2)
-            var m3 = e3 & probe_eq[caseless=cb, target=byte_b](l3)
-            if (m0 | m1 | m2 | m3).reduce_or():
-                var r = _lit_first_verified_lane[
-                    lit=lit, cl=cl, off_a=off_a, off_b=off_b
-                ](input, pos, m0)
-                if r >= 0:
-                    return r
-                r = _lit_first_verified_lane[
-                    lit=lit, cl=cl, off_a=off_a, off_b=off_b
-                ](input, pos + W, m1)
-                if r >= 0:
-                    return r
-                r = _lit_first_verified_lane[
-                    lit=lit, cl=cl, off_a=off_a, off_b=off_b
-                ](input, pos + 2 * W, m2)
-                if r >= 0:
-                    return r
-                r = _lit_first_verified_lane[
-                    lit=lit, cl=cl, off_a=off_a, off_b=off_b
-                ](input, pos + 3 * W, m3)
-                if r >= 0:
-                    return r
+            e0 = probe_eq[caseless=ca, target=byte_a](b0)
+            e1 = probe_eq[caseless=ca, target=byte_a](b1)
+            e2 = probe_eq[caseless=ca, target=byte_a](b2)
+            e3 = probe_eq[caseless=ca, target=byte_a](b3)
+            if (e0 | e1 | e2 | e3).reduce_or():
+                break
+            pos += 4 * W
+        if pos + 4 * W + last_off > input_len:
+            break
+        var l0 = ptr.unsafe_offset(pos + off_b).unsafe_load[width=W]()
+        var l1 = ptr.unsafe_offset(pos + W + off_b).unsafe_load[width=W]()
+        var l2 = ptr.unsafe_offset(pos + 2 * W + off_b).unsafe_load[width=W]()
+        var l3 = ptr.unsafe_offset(pos + 3 * W + off_b).unsafe_load[width=W]()
+        var m0 = e0 & probe_eq[caseless=cb, target=byte_b](l0)
+        var m1 = e1 & probe_eq[caseless=cb, target=byte_b](l1)
+        var m2 = e2 & probe_eq[caseless=cb, target=byte_b](l2)
+        var m3 = e3 & probe_eq[caseless=cb, target=byte_b](l3)
+        if (m0 | m1 | m2 | m3).reduce_or():
+            var r = _lit_first_verified_lane[
+                lit=lit, cl=cl, off_a=off_a, off_b=off_b
+            ](input, pos, m0)
+            if r >= 0:
+                return r
+            r = _lit_first_verified_lane[
+                lit=lit, cl=cl, off_a=off_a, off_b=off_b
+            ](input, pos + W, m1)
+            if r >= 0:
+                return r
+            r = _lit_first_verified_lane[
+                lit=lit, cl=cl, off_a=off_a, off_b=off_b
+            ](input, pos + 2 * W, m2)
+            if r >= 0:
+                return r
+            r = _lit_first_verified_lane[
+                lit=lit, cl=cl, off_a=off_a, off_b=off_b
+            ](input, pos + 3 * W, m3)
+            if r >= 0:
+                return r
+        comptime if adapt:
+            gate_misses += 1
+            if gate_misses >= 8 and 4 * gate_misses > (pos - start) // (4 * W):
+                return -2 - (pos + 4 * W)
         pos += 4 * W
 
     # Single-chunk SIMD body for the bytes between the unrolled body and
@@ -286,7 +346,27 @@ def simd_find_literal_rare[
                     return r
         pos += W
 
-    # Tail (< W + last_off remaining positions). With an exact first
+    # Tail (< W remaining candidates): one more chunk, overlapping the
+    # last one and ending at the input's end, with the lanes before
+    # `pos` masked off (they were already scanned).
+    if input_len >= W + last_off:
+        if pos + last_off >= input_len:
+            return -1
+        var base = input_len - last_off - W
+        var block_a = ptr.unsafe_offset(base + off_a).unsafe_load[width=W]()
+        var block_b = ptr.unsafe_offset(base + off_b).unsafe_load[width=W]()
+        var mask = (
+            probe_eq[caseless=ca, target=byte_a](block_a)
+            & probe_eq[caseless=cb, target=byte_b](block_b)
+            & iota[DType.uint8, W]().ge(UInt8(pos - base))
+        )
+        if not mask.reduce_or():
+            return -1
+        return _lit_first_verified_lane[
+            lit=lit, cl=cl, off_a=off_a, off_b=off_b
+        ](input, base, mask)
+
+    # Inputs shorter than one chunk. With an exact first
     # byte, hop between its occurrences via simd_find_byte (a scalar
     # per-position verify measured 1.9x slower on 100B-input searches,
     # where the tail dominates); a caseless first byte falls back to the

@@ -86,7 +86,13 @@ from .set_literal import (
     _assign_buckets,
     teddy_front_end,
 )
-from .set_pike import SetMatch, _before, dedup_reports, sort_reports
+from .set_pike import (
+    SetMatch,
+    _before,
+    dedup_reports,
+    push_report,
+    sort_reports,
+)
 from .set_semantics import (
     EXT_EDIT_DISTANCE,
     EXT_HAMMING_DISTANCE,
@@ -1267,11 +1273,10 @@ def _look_ok[
 @always_inline
 def _rose_walk[
     origin: Origin,
-    fn_: Int,
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: Array[UInt8, fn_],
+    flags: StringLiteral,
     pid: Int,
 ](
     input: Span[Byte, origin],
@@ -1289,41 +1294,40 @@ def _rose_walk[
     """
     # Comptime arrays bound to the binary's constant data (no copy).
     var tbl = table.ptr().unsafe_bitcast[Int32]()
-    var flg = materialize[flags]()
+    var flg = flags.ptr()
     var cur = start_state
     var pos = start_pos
     var input_len = len(input)
-    if (flg.unsafe_get(cur) & EDFA_MATCH) != 0:
-        out.append(SetMatch(pid, pos))
+    if (flg[unsafe_offset=cur] & EDFA_MATCH) != 0:
+        push_report(out, SetMatch(pid, pos))
     while pos < input_len:
         var b = input.unsafe_get(pos)
         comptime if r.any_eol_nl:
             if (
                 b == CHAR_NEWLINE
-                and (flg.unsafe_get(cur) & EDFA_EOL_AT_NEWLINE) != 0
+                and (flg[unsafe_offset=cur] & EDFA_EOL_AT_NEWLINE) != 0
             ):
-                out.append(SetMatch(pid, pos))
+                push_report(out, SetMatch(pid, pos))
         var nxt = Int(tbl[unsafe_offset=cur * 256 + Int(b)])
         if nxt < 0:
             return  # died mid-input: EOL-at-end flags cannot apply
         cur = nxt
         pos += 1
-        if (flg.unsafe_get(cur) & EDFA_MATCH) != 0:
-            out.append(SetMatch(pid, pos))
+        if (flg[unsafe_offset=cur] & EDFA_MATCH) != 0:
+            push_report(out, SetMatch(pid, pos))
     comptime if r.any_eol_end:
-        if (flg.unsafe_get(cur) & EDFA_EOL_AT_END) != 0:
-            out.append(SetMatch(pid, pos))
+        if (flg[unsafe_offset=cur] & EDFA_EOL_AT_END) != 0:
+            push_report(out, SetMatch(pid, pos))
 
 
 @always_inline
 def _rose_confirm[
     origin: Origin,
-    fn_: Int,
     mn: Int,
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: Array[UInt8, fn_],
+    flags: StringLiteral,
     meta: Array[Int32, mn],
     entry: Int,
     pid: Int,
@@ -1346,7 +1350,6 @@ def _rose_confirm[
 @always_inline
 def _rose_verify_at[
     origin: Origin,
-    fn_: Int,
     mn: Int,
     ln: Int,
     bn: Int,
@@ -1354,7 +1357,7 @@ def _rose_verify_at[
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: Array[UInt8, fn_],
+    flags: StringLiteral,
     meta: Array[Int32, mn],
     lits: Array[Int32, ln],
     bcls: Array[Int32, bn],
@@ -1454,7 +1457,6 @@ def _rose_verify_at[
 @always_inline
 def rose_scan[
     origin: Origin,
-    fn_: Int,
     mn: Int,
     ln: Int,
     bn: Int,
@@ -1462,7 +1464,7 @@ def rose_scan[
     //,
     r: RoseView,
     table: StringLiteral,
-    flags: Array[UInt8, fn_],
+    flags: StringLiteral,
     meta: Array[Int32, mn],
     lits: Array[Int32, ln],
     bcls: Array[Int32, bn],

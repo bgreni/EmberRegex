@@ -43,7 +43,8 @@ def _run(args: list, **kwargs) -> subprocess.CompletedProcess:
 def ensure_pcre2_built() -> None:
     """Build PCRE2 static library and the C benchmark binary if not cached."""
     need_lib = not os.path.isfile(PCRE2_LIB)
-    need_bin = not os.path.isfile(BENCH_BIN)
+    need_bin = (not os.path.isfile(BENCH_BIN)
+                or os.path.getmtime(BENCH_C_SRC) > os.path.getmtime(BENCH_BIN))
 
     if not need_lib and not need_bin:
         print("  [cache] PCRE2 library and benchmark binary already built.")

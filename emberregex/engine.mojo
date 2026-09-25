@@ -1886,6 +1886,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                     cl=Self._IL_CL,
                     off_a=Self._IL_PROBES[0],
                     off_b=Self._IL_PROBES[1],
+                    alt=Self._IL_PROBES[2],
                 ](input, p + Self._inner_lit.min_offset)
                 if lit_pos < 0:
                     return (-1, -1)
@@ -3455,6 +3456,7 @@ struct Regex[pattern: String, flags: RegexFlags = RegexFlags()](
                 cl=Self._FPRE_CL,
                 off_a=probes[0],
                 off_b=probes[1],
+                alt=probes[2],
             ](input, start)
 
     @always_inline
